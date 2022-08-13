@@ -524,8 +524,8 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
 	 */
 	if (error_sector)
 		*error_sector = bio->bi_iter.bi_sector;
-
-	bio_put(bio);
+	if (!ret)
+		bio_put(bio);
 	return ret;
 }
 EXPORT_SYMBOL(blkdev_issue_flush);

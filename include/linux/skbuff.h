@@ -602,6 +602,7 @@ static inline bool skb_mstamp_after(const struct skb_mstamp *t1,
  *	@hash: the packet hash
  *	@queue_mapping: Queue mapping for multiqueue devices
  *	@xmit_more: More SKBs are pending for this queue
+ *	@pfmemalloc: skbuff was allocated from PFMEMALLOC reserves
  *	@ndisc_nodetype: router type (from link layer)
  *	@ooo_okay: allow the mapping of a socket to a queue to be changed
  *	@l4_hash: indicate hash is a canonical 4-tuple hash over transport
@@ -642,9 +643,14 @@ struct sk_buff {
 				struct skb_mstamp skb_mstamp;
 			};
 		};
-		struct rb_node	rbnode; /* used in netem & tcp stack */
+		struct rb_node		rbnode; /* used in netem, ip4 defrag, and tcp stack */
 	};
-	struct sock		*sk;
+
+	union {
+		struct sock		*sk;
+		int			ip_defrag_offset;
+	};
+
 	struct net_device	*dev;
 
 	/*
@@ -692,7 +698,7 @@ struct sk_buff {
 				peeked:1,
 				head_frag:1,
 				xmit_more:1,
-				__unused:1; /* one bit hole */
+				pfmemalloc:1;
 	kmemcheck_bitfield_end(flags1);
 
 	/* fields enclosed in headers_start/headers_end are copied
@@ -712,19 +718,18 @@ struct sk_buff {
 
 	__u8			__pkt_type_offset[0];
 	__u8			pkt_type:3;
-	__u8			pfmemalloc:1;
 	__u8			ignore_df:1;
 	__u8			nfctinfo:3;
-
 	__u8			nf_trace:1;
+
 	__u8			ip_summed:2;
 	__u8			ooo_okay:1;
 	__u8			l4_hash:1;
 	__u8			sw_hash:1;
 	__u8			wifi_acked_valid:1;
 	__u8			wifi_acked:1;
-
 	__u8			no_fcs:1;
+
 	/* Indicates the inner headers are valid in the skbuff. */
 	__u8			encapsulation:1;
 	__u8			encap_hdr_csum:1;
@@ -732,11 +737,11 @@ struct sk_buff {
 	__u8			csum_complete_sw:1;
 	__u8			csum_level:2;
 	__u8			csum_bad:1;
-
 #ifdef CONFIG_IPV6_NDISC_NODETYPE
 	__u8			ndisc_nodetype:2;
 #endif
 	__u8			ipvs_property:1;
+
 	__u8			inner_protocol_type:1;
 	__u8			remcsum_offload:1;
 #ifdef CONFIG_NET_SWITCHDEV
@@ -984,10 +989,10 @@ struct sk_buff *skb_realloc_headroom(struct sk_buff *skb,
 				     unsigned int headroom);
 struct sk_buff *skb_copy_expand(const struct sk_buff *skb, int newheadroom,
 				int newtailroom, gfp_t priority);
-int skb_to_sgvec_nomark(struct sk_buff *skb, struct scatterlist *sg,
-			int offset, int len);
-int skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset,
-		 int len);
+int __must_check skb_to_sgvec_nomark(struct sk_buff *skb, struct scatterlist *sg,
+				     int offset, int len);
+int __must_check skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg,
+			      int offset, int len);
 int skb_cow_data(struct sk_buff *skb, int tailbits, struct sk_buff **trailer);
 int skb_pad(struct sk_buff *skb, int pad);
 #define dev_kfree_skb(a)	consume_skb(a)
@@ -1173,7 +1178,8 @@ static inline __u32 skb_get_hash_flowi4(struct sk_buff *skb, const struct flowi4
 	return skb->hash;
 }
 
-__u32 skb_get_hash_perturb(const struct sk_buff *skb, u32 perturb);
+__u32 skb_get_hash_perturb(const struct sk_buff *skb,
+			   const siphash_key_t *perturb);
 
 static inline __u32 skb_get_hash_raw(const struct sk_buff *skb)
 {
@@ -1544,6 +1550,18 @@ static inline __u32 skb_queue_len(const struct sk_buff_head *list_)
 }
 
 /**
+ *	skb_queue_len_lockless	- get queue length
+ *	@list_: list to measure
+ *
+ *	Return the length of an &sk_buff queue.
+ *	This variant can be used in lockless contexts.
+ */
+static inline __u32 skb_queue_len_lockless(const struct sk_buff_head *list_)
+{
+	return READ_ONCE(list_->qlen);
+}
+
+/**
  *	__skb_queue_head_init - initialize non-spinlock portions of sk_buff_head
  *	@list: queue to initialize
  *
@@ -1746,7 +1764,7 @@ static inline void __skb_unlink(struct sk_buff *skb, struct sk_buff_head *list)
 {
 	struct sk_buff *next, *prev;
 
-	list->qlen--;
+	WRITE_ONCE(list->qlen, list->qlen - 1);
 	next	   = skb->next;
 	prev	   = skb->prev;
 	skb->next  = skb->prev = NULL;
@@ -2413,7 +2431,7 @@ static inline void __skb_queue_purge(struct sk_buff_head *list)
 		kfree_skb(skb);
 }
 
-void skb_rbtree_purge(struct rb_root *root);
+unsigned int skb_rbtree_purge(struct rb_root *root);
 
 void *netdev_alloc_frag(unsigned int fragsz);
 
@@ -2789,7 +2807,7 @@ static inline int skb_padto(struct sk_buff *skb, unsigned int len)
  *	is untouched. Otherwise it is extended. Returns zero on
  *	success. The skb is freed on error.
  */
-static inline int skb_put_padto(struct sk_buff *skb, unsigned int len)
+static inline int __must_check skb_put_padto(struct sk_buff *skb, unsigned int len)
 {
 	unsigned int size = skb->len;
 
@@ -2949,6 +2967,7 @@ static inline unsigned char *skb_push_rcsum(struct sk_buff *skb,
 	return skb->data;
 }
 
+int pskb_trim_rcsum_slow(struct sk_buff *skb, unsigned int len);
 /**
  *	pskb_trim_rcsum - trim received skb and update checksum
  *	@skb: buffer to trim
@@ -2956,15 +2975,14 @@ static inline unsigned char *skb_push_rcsum(struct sk_buff *skb,
  *
  *	This is exactly the same as pskb_trim except that it ensures the
  *	checksum of received packets are still valid after the operation.
+ *	It can change skb pointers.
  */
 
 static inline int pskb_trim_rcsum(struct sk_buff *skb, unsigned int len)
 {
 	if (likely(len >= skb->len))
 		return 0;
-	if (skb->ip_summed == CHECKSUM_COMPLETE)
-		skb->ip_summed = CHECKSUM_NONE;
-	return __pskb_trim(skb, len);
+	return pskb_trim_rcsum_slow(skb, len);
 }
 
 static inline int __skb_trim_rcsum(struct sk_buff *skb, unsigned int len)
@@ -2982,6 +3000,14 @@ static inline int __skb_grow_rcsum(struct sk_buff *skb, unsigned int len)
 	return __skb_grow(skb, len);
 }
 
+#define rb_to_skb(rb) rb_entry_safe(rb, struct sk_buff, rbnode)
+
+#define rb_to_skb(rb) rb_entry_safe(rb, struct sk_buff, rbnode)
+#define skb_rb_first(root) rb_to_skb(rb_first(root))
+#define skb_rb_last(root)  rb_to_skb(rb_last(root))
+#define skb_rb_next(skb)   rb_to_skb(rb_next(&(skb)->rbnode))
+#define skb_rb_prev(skb)   rb_to_skb(rb_prev(&(skb)->rbnode))
+
 #define skb_queue_walk(queue, skb) \
 		for (skb = (queue)->next;					\
 		     skb != (struct sk_buff *)(queue);				\
@@ -2995,6 +3021,18 @@ static inline int __skb_grow_rcsum(struct sk_buff *skb, unsigned int len)
 #define skb_queue_walk_from(queue, skb)						\
 		for (; skb != (struct sk_buff *)(queue);			\
 		     skb = skb->next)
+
+#define skb_rbtree_walk(skb, root)						\
+		for (skb = skb_rb_first(root); skb != NULL;			\
+		     skb = skb_rb_next(skb))
+
+#define skb_rbtree_walk_from(skb)						\
+		for (; skb != NULL;						\
+		     skb = skb_rb_next(skb))
+
+#define skb_rbtree_walk_from_safe(skb, tmp)					\
+		for (; tmp = skb ? skb_rb_next(skb) : NULL, (skb != NULL);	\
+		     skb = tmp)
 
 #define skb_queue_walk_from_safe(queue, skb, tmp)				\
 		for (tmp = skb->next;						\
@@ -3077,6 +3115,7 @@ int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen);
 void skb_scrub_packet(struct sk_buff *skb, bool xnet);
 unsigned int skb_gso_transport_seglen(const struct sk_buff *skb);
 bool skb_gso_validate_mtu(const struct sk_buff *skb, unsigned int mtu);
+bool skb_gso_validate_mac_len(const struct sk_buff *skb, unsigned int len);
 struct sk_buff *skb_segment(struct sk_buff *skb, netdev_features_t features);
 struct sk_buff *skb_vlan_untag(struct sk_buff *skb);
 int skb_ensure_writable(struct sk_buff *skb, int write_len);
@@ -3584,6 +3623,13 @@ static inline void nf_reset_trace(struct sk_buff *skb)
 #endif
 }
 
+static inline void ipvs_reset(struct sk_buff *skb)
+{
+#if IS_ENABLED(CONFIG_IP_VS)
+	skb->ipvs_property = 0;
+#endif
+}
+
 /* Note: This doesn't put any conntrack and bridge info in dst. */
 static inline void __nf_copy(struct sk_buff *dst, const struct sk_buff *src,
 			     bool copy)
@@ -3845,6 +3891,21 @@ static inline unsigned int skb_gso_network_seglen(const struct sk_buff *skb)
 {
 	unsigned int hdr_len = skb_transport_header(skb) -
 			       skb_network_header(skb);
+	return hdr_len + skb_gso_transport_seglen(skb);
+}
+
+/**
+ * skb_gso_mac_seglen - Return length of individual segments of a gso packet
+ *
+ * @skb: GSO skb
+ *
+ * skb_gso_mac_seglen is used to determine the real size of the
+ * individual segments, including MAC/L2, Layer3 (IP, IPv6) and L4
+ * headers (TCP/UDP).
+ */
+static inline unsigned int skb_gso_mac_seglen(const struct sk_buff *skb)
+{
+	unsigned int hdr_len = skb_transport_header(skb) - skb_mac_header(skb);
 	return hdr_len + skb_gso_transport_seglen(skb);
 }
 

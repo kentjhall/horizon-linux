@@ -48,7 +48,7 @@ static const unsigned long vaddr_start = __PAGE_OFFSET_BASE;
 #if defined(CONFIG_X86_ESPFIX64)
 static const unsigned long vaddr_end = ESPFIX_BASE_ADDR;
 #elif defined(CONFIG_EFI)
-static const unsigned long vaddr_end = EFI_VA_START;
+static const unsigned long vaddr_end = EFI_VA_END;
 #else
 static const unsigned long vaddr_end = __START_KERNEL_map;
 #endif
@@ -105,7 +105,7 @@ void __init kernel_randomize_memory(void)
 	 */
 	BUILD_BUG_ON(vaddr_start >= vaddr_end);
 	BUILD_BUG_ON(IS_ENABLED(CONFIG_X86_ESPFIX64) &&
-		     vaddr_end >= EFI_VA_START);
+		     vaddr_end >= EFI_VA_END);
 	BUILD_BUG_ON((IS_ENABLED(CONFIG_X86_ESPFIX64) ||
 		      IS_ENABLED(CONFIG_EFI)) &&
 		     vaddr_end >= __START_KERNEL_map);
@@ -189,6 +189,6 @@ void __meminit init_trampoline(void)
 		*pud_tramp = *pud;
 	}
 
-	set_pgd(&trampoline_pgd_entry,
-		__pgd(_KERNPG_TABLE | __pa(pud_page_tramp)));
+	/* Avoid set_pgd(), in case it's complicated by CONFIG_PAGE_TABLE_ISOLATION */
+	trampoline_pgd_entry = __pgd(_KERNPG_TABLE | __pa(pud_page_tramp));
 }

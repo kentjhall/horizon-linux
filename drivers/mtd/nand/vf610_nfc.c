@@ -752,10 +752,8 @@ static int vf610_nfc_probe(struct platform_device *pdev)
 		if (mtd->oobsize > 64)
 			mtd->oobsize = 64;
 
-		/*
-		 * mtd->ecclayout is not specified here because we're using the
-		 * default large page ECC layout defined in NAND core.
-		 */
+		/* Use default large page ECC layout defined in NAND core */
+		mtd_set_ooblayout(mtd, &nand_ooblayout_lp_ops);
 		if (chip->ecc.strength == 32) {
 			nfc->ecc_mode = ECC_60_BYTE;
 			chip->ecc.bytes = 60;
@@ -797,7 +795,7 @@ static int vf610_nfc_remove(struct platform_device *pdev)
 	struct mtd_info *mtd = platform_get_drvdata(pdev);
 	struct vf610_nfc *nfc = mtd_to_nfc(mtd);
 
-	nand_release(mtd);
+	nand_release(mtd_to_nand(mtd));
 	clk_disable_unprepare(nfc->clk);
 	return 0;
 }

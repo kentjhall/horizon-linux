@@ -280,7 +280,8 @@ intel_dp_init_panel_power_sequencer(struct drm_device *dev,
 				    struct intel_dp *intel_dp);
 static void
 intel_dp_init_panel_power_sequencer_registers(struct drm_device *dev,
-					      struct intel_dp *intel_dp);
+					      struct intel_dp *intel_dp,
+					      bool force_disable_vdd);
 static void
 intel_dp_pps_init(struct drm_device *dev, struct intel_dp *intel_dp);
 
@@ -442,7 +443,7 @@ vlv_power_sequencer_pipe(struct intel_dp *intel_dp)
 
 	/* init power sequencer on this pipe and port */
 	intel_dp_init_panel_power_sequencer(dev, intel_dp);
-	intel_dp_init_panel_power_sequencer_registers(dev, intel_dp);
+	intel_dp_init_panel_power_sequencer_registers(dev, intel_dp, true);
 
 	/*
 	 * Even vdd force doesn't work until we've made
@@ -479,7 +480,7 @@ bxt_power_sequencer_idx(struct intel_dp *intel_dp)
 	 * Only the HW needs to be reprogrammed, the SW state is fixed and
 	 * has been setup during connector init.
 	 */
-	intel_dp_init_panel_power_sequencer_registers(dev, intel_dp);
+	intel_dp_init_panel_power_sequencer_registers(dev, intel_dp, false);
 
 	return 0;
 }
@@ -562,7 +563,7 @@ vlv_initial_power_sequencer_setup(struct intel_dp *intel_dp)
 		      port_name(port), pipe_name(intel_dp->pps_pipe));
 
 	intel_dp_init_panel_power_sequencer(dev, intel_dp);
-	intel_dp_init_panel_power_sequencer_registers(dev, intel_dp);
+	intel_dp_init_panel_power_sequencer_registers(dev, intel_dp, false);
 }
 
 void intel_power_sequencer_reset(struct drm_i915_private *dev_priv)
@@ -2192,8 +2193,8 @@ static void edp_panel_off(struct intel_dp *intel_dp)
 	I915_WRITE(pp_ctrl_reg, pp);
 	POSTING_READ(pp_ctrl_reg);
 
-	intel_dp->panel_power_off_time = ktime_get_boottime();
 	wait_panel_off(intel_dp);
+	intel_dp->panel_power_off_time = ktime_get_boottime();
 
 	/* We got a reference when we enabled the VDD. */
 	power_domain = intel_display_port_aux_power_domain(intel_encoder);
@@ -2831,6 +2832,9 @@ static void vlv_detach_power_sequencer(struct intel_dp *intel_dp)
 	enum pipe pipe = intel_dp->pps_pipe;
 	i915_reg_t pp_on_reg = PP_ON_DELAYS(pipe);
 
+	if (WARN_ON(pipe != PIPE_A && pipe != PIPE_B))
+		return;
+
 	edp_panel_vdd_off_sync(intel_dp);
 
 	/*
@@ -2857,9 +2861,6 @@ static void vlv_steal_power_sequencer(struct drm_device *dev,
 	struct intel_encoder *encoder;
 
 	lockdep_assert_held(&dev_priv->pps_mutex);
-
-	if (WARN_ON(pipe != PIPE_A && pipe != PIPE_B))
-		return;
 
 	for_each_intel_encoder(dev, encoder) {
 		struct intel_dp *intel_dp;
@@ -2924,7 +2925,7 @@ static void vlv_init_panel_power_sequencer(struct intel_dp *intel_dp)
 
 	/* init power sequencer on this pipe and port */
 	intel_dp_init_panel_power_sequencer(dev, intel_dp);
-	intel_dp_init_panel_power_sequencer_registers(dev, intel_dp);
+	intel_dp_init_panel_power_sequencer_registers(dev, intel_dp, true);
 }
 
 static void vlv_pre_enable_dp(struct intel_encoder *encoder,
@@ -3557,9 +3558,16 @@ intel_edp_init_dpcd(struct intel_dp *intel_dp)
 			      dev_priv->psr.psr2_support ? "supported" : "not supported");
 	}
 
-	/* Read the eDP Display control capabilities registers */
-	if ((intel_dp->dpcd[DP_EDP_CONFIGURATION_CAP] & DP_DPCD_DISPLAY_CONTROL_CAPABLE) &&
-	    drm_dp_dpcd_read(&intel_dp->aux, DP_EDP_DPCD_REV,
+	/*
+	 * Read the eDP display control registers.
+	 *
+	 * Do this independent of DP_DPCD_DISPLAY_CONTROL_CAPABLE bit in
+	 * DP_EDP_CONFIGURATION_CAP, because some buggy displays do not have it
+	 * set, but require eDP 1.4+ detection (e.g. for supported link rates
+	 * method). The display control registers should read zero if they're
+	 * not supported anyway.
+	 */
+	if (drm_dp_dpcd_read(&intel_dp->aux, DP_EDP_DPCD_REV,
 			     intel_dp->edp_dpcd, sizeof(intel_dp->edp_dpcd)) ==
 			     sizeof(intel_dp->edp_dpcd))
 		DRM_DEBUG_KMS("EDP DPCD : %*ph\n", (int) sizeof(intel_dp->edp_dpcd),
@@ -4015,6 +4023,11 @@ intel_dp_check_link_status(struct intel_dp *intel_dp)
 		return;
 
 	if (!to_intel_crtc(intel_encoder->base.crtc)->active)
+		return;
+
+	/* FIXME: we need to synchronize this sort of stuff with hardware
+	 * readout. Currently fast link training doesn't work on boot-up. */
+	if (!intel_dp->lane_count)
 		return;
 
 	/* if link training is requested we should perform it always */
@@ -5050,11 +5063,18 @@ intel_dp_init_panel_power_sequencer(struct drm_device *dev,
 	 */
 	final->t8 = 1;
 	final->t9 = 1;
+
+	/*
+	 * HW has only a 100msec granularity for t11_t12 so round it up
+	 * accordingly.
+	 */
+	final->t11_t12 = roundup(final->t11_t12, 100 * 10);
 }
 
 static void
 intel_dp_init_panel_power_sequencer_registers(struct drm_device *dev,
-					      struct intel_dp *intel_dp)
+					      struct intel_dp *intel_dp,
+					      bool force_disable_vdd)
 {
 	struct drm_i915_private *dev_priv = to_i915(dev);
 	u32 pp_on, pp_off, pp_div, port_sel = 0;
@@ -5066,6 +5086,31 @@ intel_dp_init_panel_power_sequencer_registers(struct drm_device *dev,
 	lockdep_assert_held(&dev_priv->pps_mutex);
 
 	intel_pps_get_registers(dev_priv, intel_dp, &regs);
+
+	/*
+	 * On some VLV machines the BIOS can leave the VDD
+	 * enabled even on power seqeuencers which aren't
+	 * hooked up to any port. This would mess up the
+	 * power domain tracking the first time we pick
+	 * one of these power sequencers for use since
+	 * edp_panel_vdd_on() would notice that the VDD was
+	 * already on and therefore wouldn't grab the power
+	 * domain reference. Disable VDD first to avoid this.
+	 * This also avoids spuriously turning the VDD on as
+	 * soon as the new power seqeuencer gets initialized.
+	 */
+	if (force_disable_vdd) {
+		u32 pp = ironlake_get_pp_control(intel_dp);
+
+		WARN(pp & PANEL_POWER_ON, "Panel power already on\n");
+
+		if (pp & EDP_FORCE_VDD)
+			DRM_DEBUG_KMS("VDD already on, disabling first\n");
+
+		pp &= ~EDP_FORCE_VDD;
+
+		I915_WRITE(regs.pp_ctrl, pp);
+	}
 
 	pp_on = (seq->t1_t3 << PANEL_POWER_UP_DELAY_SHIFT) |
 		(seq->t8 << PANEL_LIGHT_ON_DELAY_SHIFT);
@@ -5119,7 +5164,7 @@ static void intel_dp_pps_init(struct drm_device *dev,
 		vlv_initial_power_sequencer_setup(intel_dp);
 	} else {
 		intel_dp_init_panel_power_sequencer(dev, intel_dp);
-		intel_dp_init_panel_power_sequencer_registers(dev, intel_dp);
+		intel_dp_init_panel_power_sequencer_registers(dev, intel_dp, false);
 	}
 }
 

@@ -87,7 +87,7 @@ static struct mlx5_profile profile[] = {
 	[2] = {
 		.mask		= MLX5_PROF_MASK_QP_SIZE |
 				  MLX5_PROF_MASK_MR_CACHE,
-		.log_max_qp	= 17,
+		.log_max_qp	= 18,
 		.mr_cache[0]	= {
 			.size	= 500,
 			.limit	= 250
@@ -155,8 +155,9 @@ static struct mlx5_profile profile[] = {
 	},
 };
 
-#define FW_INIT_TIMEOUT_MILI	2000
-#define FW_INIT_WAIT_MS		2
+#define FW_INIT_TIMEOUT_MILI		2000
+#define FW_INIT_WAIT_MS			2
+#define FW_PRE_INIT_TIMEOUT_MILI	10000
 
 static int wait_fw_init(struct mlx5_core_dev *dev, u32 max_wait_mili)
 {
@@ -468,6 +469,13 @@ static int handle_hca_cap(struct mlx5_core_dev *dev)
 	MLX5_SET(cmd_hca_cap, set_hca_cap, pkey_table_size,
 		 to_fw_pkey_sz(dev, 128));
 
+	/* Check log_max_qp from HCA caps to set in current profile */
+	if (MLX5_CAP_GEN_MAX(dev, log_max_qp) < profile[prof_sel].log_max_qp) {
+		mlx5_core_warn(dev, "log_max_qp value in current profile is %d, changing it to HCA capability limit (%d)\n",
+			       profile[prof_sel].log_max_qp,
+			       MLX5_CAP_GEN_MAX(dev, log_max_qp));
+		profile[prof_sel].log_max_qp = MLX5_CAP_GEN_MAX(dev, log_max_qp);
+	}
 	if (prof->mask & MLX5_PROF_MASK_QP_SIZE)
 		MLX5_SET(cmd_hca_cap, set_hca_cap, log_max_qp,
 			 prof->log_max_qp);
@@ -540,29 +548,20 @@ static int mlx5_irq_set_affinity_hint(struct mlx5_core_dev *mdev, int i)
 	struct mlx5_priv *priv  = &mdev->priv;
 	struct msix_entry *msix = priv->msix_arr;
 	int irq                 = msix[i + MLX5_EQ_VEC_COMP_BASE].vector;
-	int numa_node           = priv->numa_node;
-	int err;
 
 	if (!zalloc_cpumask_var(&priv->irq_info[i].mask, GFP_KERNEL)) {
 		mlx5_core_warn(mdev, "zalloc_cpumask_var failed");
 		return -ENOMEM;
 	}
 
-	cpumask_set_cpu(cpumask_local_spread(i, numa_node),
+	cpumask_set_cpu(cpumask_local_spread(i, priv->numa_node),
 			priv->irq_info[i].mask);
 
-	err = irq_set_affinity_hint(irq, priv->irq_info[i].mask);
-	if (err) {
-		mlx5_core_warn(mdev, "irq_set_affinity_hint failed,irq 0x%.4x",
-			       irq);
-		goto err_clear_mask;
-	}
+	if (IS_ENABLED(CONFIG_SMP) &&
+	    irq_set_affinity_hint(irq, priv->irq_info[i].mask))
+		mlx5_core_warn(mdev, "irq_set_affinity_hint failed, irq 0x%.4x", irq);
 
 	return 0;
-
-err_clear_mask:
-	free_cpumask_var(priv->irq_info[i].mask);
-	return err;
 }
 
 static void mlx5_irq_clear_affinity_hint(struct mlx5_core_dev *mdev, int i)
@@ -787,9 +786,9 @@ static int mlx5_pci_init(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 
 	priv->numa_node = dev_to_node(&dev->pdev->dev);
 
-	priv->dbg_root = debugfs_create_dir(dev_name(&pdev->dev), mlx5_debugfs_root);
-	if (!priv->dbg_root)
-		return -ENOMEM;
+	if (mlx5_debugfs_root)
+		priv->dbg_root =
+			debugfs_create_dir(pci_name(pdev), mlx5_debugfs_root);
 
 	err = mlx5_pci_enable_device(dev);
 	if (err) {
@@ -838,7 +837,7 @@ static void mlx5_pci_close(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 	pci_clear_master(dev->pdev);
 	release_bar(dev->pdev);
 	mlx5_pci_disable_device(dev);
-	debugfs_remove(priv->dbg_root);
+	debugfs_remove_recursive(priv->dbg_root);
 }
 
 static int mlx5_init_once(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
@@ -950,6 +949,15 @@ static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
 	 */
 	dev->state = MLX5_DEVICE_STATE_UP;
 
+	/* wait for firmware to accept initialization segments configurations
+	 */
+	err = wait_fw_init(dev, FW_PRE_INIT_TIMEOUT_MILI);
+	if (err) {
+		dev_err(&dev->pdev->dev, "Firmware over %d MS in pre-initializing state, aborting\n",
+			FW_PRE_INIT_TIMEOUT_MILI);
+		goto out_err;
+	}
+
 	err = mlx5_cmd_init(dev);
 	if (err) {
 		dev_err(&pdev->dev, "Failed initializing command interface, aborting\n");
@@ -960,7 +968,7 @@ static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
 	if (err) {
 		dev_err(&dev->pdev->dev, "Firmware over %d MS in initializing state, aborting\n",
 			FW_INIT_TIMEOUT_MILI);
-		goto out_err;
+		goto err_cmd_cleanup;
 	}
 
 	err = mlx5_core_enable_hca(dev, 0);
@@ -1122,7 +1130,7 @@ err_cleanup_once:
 		mlx5_cleanup_once(dev);
 
 err_stop_poll:
-	mlx5_stop_health_poll(dev);
+	mlx5_stop_health_poll(dev, boot);
 	if (mlx5_cmd_teardown_hca(dev)) {
 		dev_err(&dev->pdev->dev, "tear_down_hca failed, skip cleanup\n");
 		goto out_err;
@@ -1152,6 +1160,9 @@ static int mlx5_unload_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
 {
 	int err = 0;
 
+	if (cleanup)
+		mlx5_drain_health_recovery(dev);
+
 	mutex_lock(&dev->intf_state_mutex);
 	if (test_bit(MLX5_INTERFACE_STATE_DOWN, &dev->intf_state)) {
 		dev_warn(&dev->pdev->dev, "%s: interface is down, NOP\n",
@@ -1176,7 +1187,7 @@ static int mlx5_unload_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
 	mlx5_disable_msix(dev);
 	if (cleanup)
 		mlx5_cleanup_once(dev);
-	mlx5_stop_health_poll(dev);
+	mlx5_stop_health_poll(dev, cleanup);
 	err = mlx5_cmd_teardown_hca(dev);
 	if (err) {
 		dev_err(&dev->pdev->dev, "tear_down_hca failed, skip cleanup\n");
@@ -1264,6 +1275,10 @@ static int init_one(struct pci_dev *pdev,
 	if (err)
 		goto clean_load;
 
+	if (mlx5_thermal_init(dev))
+		pr_info("failed to register thermal device\n");
+
+	pci_save_state(pdev);
 	return 0;
 
 clean_load:
@@ -1286,6 +1301,7 @@ static void remove_one(struct pci_dev *pdev)
 	struct devlink *devlink = priv_to_devlink(dev);
 	struct mlx5_priv *priv = &dev->priv;
 
+	mlx5_thermal_deinit(dev);
 	devlink_unregister(devlink);
 	mlx5_unregister_device(dev);
 
@@ -1312,9 +1328,8 @@ static pci_ers_result_t mlx5_pci_err_detected(struct pci_dev *pdev,
 
 	mlx5_enter_error_state(dev);
 	mlx5_unload_one(dev, priv, false);
-	/* In case of kernel call save the pci state and drain health wq */
+	/* In case of kernel call drain the health wq */
 	if (state) {
-		pci_save_state(pdev);
 		mlx5_drain_health_wq(dev);
 		mlx5_pci_disable_device(dev);
 	}
@@ -1366,6 +1381,7 @@ static pci_ers_result_t mlx5_pci_slot_reset(struct pci_dev *pdev)
 
 	pci_set_master(pdev);
 	pci_restore_state(pdev);
+	pci_save_state(pdev);
 
 	if (wait_vital(pdev)) {
 		dev_err(&pdev->dev, "%s: wait_vital timed out\n", __func__);
@@ -1403,6 +1419,7 @@ static void shutdown(struct pci_dev *pdev)
 	struct mlx5_priv *priv = &dev->priv;
 
 	dev_info(&pdev->dev, "Shutdown was called\n");
+	mlx5_thermal_deinit(dev);
 	/* Notify mlx5 clients that the kernel is being shut down */
 	set_bit(MLX5_INTERFACE_STATE_SHUTDOWN, &dev->intf_state);
 	mlx5_unload_one(dev, priv, false);
@@ -1419,6 +1436,15 @@ static const struct pci_device_id mlx5_core_pci_table[] = {
 	{ PCI_VDEVICE(MELLANOX, 0x1017) },			/* ConnectX-5, PCIe 3.0 */
 	{ PCI_VDEVICE(MELLANOX, 0x1018), MLX5_PCI_DEV_IS_VF},	/* ConnectX-5 VF */
 	{ PCI_VDEVICE(MELLANOX, 0x1019) },			/* ConnectX-5, PCIe 4.0 */
+	{ PCI_VDEVICE(MELLANOX, 0x101a), MLX5_PCI_DEV_IS_VF},	/* ConnectX-5 Ex VF */
+	{ PCI_VDEVICE(MELLANOX, 0x101b) },			/* ConnectX-6 */
+	{ PCI_VDEVICE(MELLANOX, 0x101c), MLX5_PCI_DEV_IS_VF},	/* ConnectX-6 VF */
+	{ PCI_VDEVICE(MELLANOX, 0x101d) },			/* ConnectX-6 Dx */
+	{ PCI_VDEVICE(MELLANOX, 0x101e), MLX5_PCI_DEV_IS_VF},	/* ConnectX Family mlx5Gen Virtual Function */
+	{ PCI_VDEVICE(MELLANOX, 0x101f) },			/* ConnectX-6 Lx */
+	{ PCI_VDEVICE(MELLANOX, 0xa2d2) },			/* BlueField integrated ConnectX-5 network controller */
+	{ PCI_VDEVICE(MELLANOX, 0xa2d3), MLX5_PCI_DEV_IS_VF},	/* BlueField integrated ConnectX-5 network controller VF */
+	{ PCI_VDEVICE(MELLANOX, 0xa2d6) },			/* BlueField integrated Connectx-6Dx */
 	{ 0, }
 };
 

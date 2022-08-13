@@ -411,7 +411,7 @@ ath_cmn_process_ht20_40_fft(struct ath_rx_status *rs,
 
 		ath_dbg(common, SPECTRAL_SCAN,
 			"Calculated new upper max 0x%X at %i\n",
-			tmp_mag, i);
+			tmp_mag, fft_sample_40.upper_max_index);
 	} else
 	for (i = dc_pos; i < SPECTRAL_HT20_40_NUM_BINS; i++) {
 		if (fft_sample_40.data[i] == (upper_mag >> max_exp))
@@ -527,6 +527,9 @@ int ath_cmn_process_fft(struct ath_spec_scan_priv *spec_priv, struct ieee80211_h
 	radar_info = ((struct ath_radar_info *)&vdata[len]) - 1;
 	if (!(radar_info->pulse_bw_info & SPECTRAL_SCAN_BITMASK))
 		return 0;
+
+	if (!spec_priv->rfs_chan_spec_scan)
+		return 1;
 
 	/* Output buffers are full, no need to process anything
 	 * since there is no space to put the result anyway
@@ -1072,7 +1075,7 @@ static struct rchan_callbacks rfs_spec_scan_cb = {
 
 void ath9k_cmn_spectral_deinit_debug(struct ath_spec_scan_priv *spec_priv)
 {
-	if (IS_ENABLED(CONFIG_ATH9K_DEBUGFS)) {
+	if (IS_ENABLED(CONFIG_ATH9K_DEBUGFS) && spec_priv->rfs_chan_spec_scan) {
 		relay_close(spec_priv->rfs_chan_spec_scan);
 		spec_priv->rfs_chan_spec_scan = NULL;
 	}
@@ -1086,6 +1089,9 @@ void ath9k_cmn_spectral_init_debug(struct ath_spec_scan_priv *spec_priv,
 					    debugfs_phy,
 					    1024, 256, &rfs_spec_scan_cb,
 					    NULL);
+	if (!spec_priv->rfs_chan_spec_scan)
+		return;
+
 	debugfs_create_file("spectral_scan_ctl",
 			    S_IRUSR | S_IWUSR,
 			    debugfs_phy, spec_priv,

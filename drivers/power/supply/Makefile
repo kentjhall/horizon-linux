@@ -5,6 +5,7 @@ power_supply-$(CONFIG_SYSFS)		+= power_supply_sysfs.o
 power_supply-$(CONFIG_LEDS_TRIGGERS)	+= power_supply_leds.o
 
 obj-$(CONFIG_POWER_SUPPLY)	+= power_supply.o
+obj-$(CONFIG_POWER_SUPPLY_EXTCON)	+= power_supply_extcon.o
 obj-$(CONFIG_GENERIC_ADC_BATTERY)	+= generic-adc-battery.o
 
 obj-$(CONFIG_PDA_POWER)		+= pda_power.o
@@ -31,8 +32,12 @@ obj-$(CONFIG_BATTERY_COLLIE)	+= collie_battery.o
 obj-$(CONFIG_BATTERY_IPAQ_MICRO) += ipaq_micro_battery.o
 obj-$(CONFIG_BATTERY_WM97XX)	+= wm97xx_battery.o
 obj-$(CONFIG_BATTERY_SBS)	+= sbs-battery.o
+obj-$(CONFIG_CHARGER_BQ2419X)   += bq2419x-charger.o
+obj-$(CONFIG_BATTERY_BQ27441)	+= bq27441_battery.o
+obj-$(CONFIG_BATTERY_CHARGER_GAUGE_COMM) += battery-charger-gauge-comm.o
 obj-$(CONFIG_BATTERY_BQ27XXX)	+= bq27xxx_battery.o
 obj-$(CONFIG_BATTERY_BQ27XXX_I2C) += bq27xxx_battery_i2c.o
+obj-$(CONFIG_BATTERY_GPIO)	+= gpio-battery.o
 obj-$(CONFIG_BATTERY_DA9030)	+= da9030_battery.o
 obj-$(CONFIG_BATTERY_DA9052)	+= da9052-battery.o
 obj-$(CONFIG_CHARGER_DA9150)	+= da9150-charger.o
@@ -72,3 +77,5 @@ obj-$(CONFIG_CHARGER_TPS65090)	+= tps65090-charger.o
 obj-$(CONFIG_CHARGER_TPS65217)	+= tps65217_charger.o
 obj-$(CONFIG_AXP288_FUEL_GAUGE) += axp288_fuel_gauge.o
 obj-$(CONFIG_AXP288_CHARGER)	+= axp288_charger.o
+obj-$(CONFIG_CHARGER_ISL9238)	+= isl9238_charger.o
+obj-$(CONFIG_BATTERY_BQ40Z50)	+= bq40z50_battery.o

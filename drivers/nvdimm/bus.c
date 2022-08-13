@@ -218,7 +218,10 @@ long nvdimm_clear_poison(struct device *dev, phys_addr_t phys,
 	if (cmd_rc < 0)
 		return cmd_rc;
 
-	nvdimm_clear_from_poison_list(nvdimm_bus, phys, len);
+	if (clear_err.cleared > 0)
+		nvdimm_clear_from_poison_list(nvdimm_bus, phys,
+					      clear_err.cleared);
+
 	return clear_err.cleared;
 }
 EXPORT_SYMBOL_GPL(nvdimm_clear_poison);
@@ -421,6 +424,8 @@ static void nd_async_device_register(void *d, async_cookie_t cookie)
 		put_device(dev);
 	}
 	put_device(dev);
+	if (dev->parent)
+		put_device(dev->parent);
 }
 
 static void nd_async_device_unregister(void *d, async_cookie_t cookie)
@@ -440,6 +445,8 @@ void __nd_device_register(struct device *dev)
 	if (!dev)
 		return;
 	dev->bus = &nvdimm_bus_type;
+	if (dev->parent)
+		get_device(dev->parent);
 	get_device(dev);
 	async_schedule_domain(nd_async_device_register, dev,
 			&nd_async_domain);
@@ -502,14 +509,18 @@ int nvdimm_revalidate_disk(struct gendisk *disk)
 {
 	struct device *dev = disk_to_dev(disk)->parent;
 	struct nd_region *nd_region = to_nd_region(dev->parent);
-	const char *pol = nd_region->ro ? "only" : "write";
+	int disk_ro = get_disk_ro(disk);
 
-	if (nd_region->ro == get_disk_ro(disk))
+	/*
+	 * Upgrade to read-only if the region is read-only preserve as
+	 * read-only if the disk is already read-only.
+	 */
+	if (disk_ro || nd_region->ro == disk_ro)
 		return 0;
 
-	dev_info(dev, "%s read-%s, marking %s read-%s\n",
-			dev_name(&nd_region->dev), pol, disk->disk_name, pol);
-	set_disk_ro(disk, nd_region->ro);
+	dev_info(dev, "%s read-only, marking %s read-only\n",
+			dev_name(&nd_region->dev), disk->disk_name);
+	set_disk_ro(disk, 1);
 
 	return 0;
 
@@ -741,9 +752,9 @@ u32 nd_cmd_out_size(struct nvdimm *nvdimm, int cmd,
 		 * overshoots the remainder by 4 bytes, assume it was
 		 * including 'status'.
 		 */
-		if (out_field[1] - 8 == remainder)
+		if (out_field[1] - 4 == remainder)
 			return remainder;
-		return out_field[1] - 4;
+		return out_field[1] - 8;
 	} else if (cmd == ND_CMD_CALL) {
 		struct nd_cmd_pkg *pkg = (struct nd_cmd_pkg *) in_field;
 
@@ -809,16 +820,17 @@ static int __nd_ioctl(struct nvdimm_bus *nvdimm_bus, struct nvdimm *nvdimm,
 		int read_only, unsigned int ioctl_cmd, unsigned long arg)
 {
 	struct nvdimm_bus_descriptor *nd_desc = nvdimm_bus->nd_desc;
-	size_t buf_len = 0, in_len = 0, out_len = 0;
 	static char out_env[ND_CMD_MAX_ENVELOPE];
 	static char in_env[ND_CMD_MAX_ENVELOPE];
 	const struct nd_cmd_desc *desc = NULL;
 	unsigned int cmd = _IOC_NR(ioctl_cmd);
 	void __user *p = (void __user *) arg;
 	struct device *dev = &nvdimm_bus->dev;
-	struct nd_cmd_pkg pkg;
 	const char *cmd_name, *dimm_name;
+	u32 in_len = 0, out_len = 0;
 	unsigned long cmd_mask;
+	struct nd_cmd_pkg pkg;
+	u64 buf_len = 0;
 	void *buf;
 	int rc, i;
 
@@ -839,8 +851,10 @@ static int __nd_ioctl(struct nvdimm_bus *nvdimm_bus, struct nvdimm *nvdimm,
 			return -EFAULT;
 	}
 
-	if (!desc || (desc->out_num + desc->in_num == 0) ||
-			!test_bit(cmd, &cmd_mask))
+	if (!desc ||
+	    (desc->out_num + desc->in_num == 0) ||
+	    cmd > ND_CMD_CALL ||
+	    !test_bit(cmd, &cmd_mask))
 		return -ENOTTY;
 
 	/* fail write commands (when read-only) */
@@ -879,7 +893,7 @@ static int __nd_ioctl(struct nvdimm_bus *nvdimm_bus, struct nvdimm *nvdimm,
 	}
 
 	if (cmd == ND_CMD_CALL) {
-		dev_dbg(dev, "%s:%s, idx: %llu, in: %zu, out: %zu, len %zu\n",
+		dev_dbg(dev, "%s:%s, idx: %llu, in: %u, out: %u, len %llu\n",
 				__func__, dimm_name, pkg.nd_command,
 				in_len, out_len, buf_len);
 
@@ -909,9 +923,9 @@ static int __nd_ioctl(struct nvdimm_bus *nvdimm_bus, struct nvdimm *nvdimm,
 		out_len += out_size;
 	}
 
-	buf_len = out_len + in_len;
+	buf_len = (u64) out_len + (u64) in_len;
 	if (buf_len > ND_IOCTL_MAX_BUFLEN) {
-		dev_dbg(dev, "%s:%s cmd: %s buf_len: %zu > %d\n", __func__,
+		dev_dbg(dev, "%s:%s cmd: %s buf_len: %llu > %d\n", __func__,
 				dimm_name, cmd_name, buf_len,
 				ND_IOCTL_MAX_BUFLEN);
 		return -EINVAL;
@@ -934,8 +948,14 @@ static int __nd_ioctl(struct nvdimm_bus *nvdimm_bus, struct nvdimm *nvdimm,
 	rc = nd_desc->ndctl(nd_desc, nvdimm, cmd, buf, buf_len, NULL);
 	if (rc < 0)
 		goto out_unlock;
+	nvdimm_bus_unlock(&nvdimm_bus->dev);
+
 	if (copy_to_user(p, buf, buf_len))
 		rc = -EFAULT;
+
+	vfree(buf);
+	return rc;
+
  out_unlock:
 	nvdimm_bus_unlock(&nvdimm_bus->dev);
  out:

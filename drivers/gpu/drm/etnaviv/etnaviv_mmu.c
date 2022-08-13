@@ -116,9 +116,14 @@ static int etnaviv_iommu_find_iova(struct etnaviv_iommu *mmu,
 		struct list_head list;
 		bool found;
 
+		/*
+		 * XXX: The DRM_MM_SEARCH_BELOW is really a hack to trick
+		 * drm_mm into giving out a low IOVA after address space
+		 * rollover. This needs a proper fix.
+		 */
 		ret = drm_mm_insert_node_in_range(&mmu->mm, node,
 			size, 0, mmu->last_iova, ~0UL,
-			DRM_MM_SEARCH_DEFAULT);
+			mmu->last_iova ? DRM_MM_SEARCH_DEFAULT : DRM_MM_SEARCH_BELOW);
 
 		if (ret != -ENOSPC)
 			break;
@@ -129,7 +134,7 @@ static int etnaviv_iommu_find_iova(struct etnaviv_iommu *mmu,
 		 */
 		if (mmu->last_iova) {
 			mmu->last_iova = 0;
-			mmu->need_flush = true;
+			mmu->flush_seq++;
 			continue;
 		}
 
@@ -192,7 +197,7 @@ static int etnaviv_iommu_find_iova(struct etnaviv_iommu *mmu,
 		 * associated commit requesting this mapping, and retry the
 		 * allocation one more time.
 		 */
-		mmu->need_flush = true;
+		mmu->flush_seq++;
 	}
 
 	return ret;
@@ -349,7 +354,7 @@ u32 etnaviv_iommu_get_cmdbuf_va(struct etnaviv_gpu *gpu,
 		 * that the FE MMU prefetch won't load invalid entries.
 		 */
 		mmu->last_iova = buf->vram_node.start + buf->size + SZ_64K;
-		gpu->mmu->need_flush = true;
+		mmu->flush_seq++;
 		mutex_unlock(&mmu->lock);
 
 		return (u32)buf->vram_node.start;

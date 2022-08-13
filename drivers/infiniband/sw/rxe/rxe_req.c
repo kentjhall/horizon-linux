@@ -72,9 +72,6 @@ static void req_retry(struct rxe_qp *qp)
 	int npsn;
 	int first = 1;
 
-	wqe = queue_head(qp->sq.queue);
-	npsn = (qp->comp.psn - wqe->first_psn) & BTH_PSN_MASK;
-
 	qp->req.wqe_index	= consumer_index(qp->sq.queue);
 	qp->req.psn		= qp->comp.psn;
 	qp->req.opcode		= -1;
@@ -106,11 +103,17 @@ static void req_retry(struct rxe_qp *qp)
 		if (first) {
 			first = 0;
 
-			if (mask & WR_WRITE_OR_SEND_MASK)
+			if (mask & WR_WRITE_OR_SEND_MASK) {
+				npsn = (qp->comp.psn - wqe->first_psn) &
+					BTH_PSN_MASK;
 				retry_first_write_send(qp, wqe, mask, npsn);
+			}
 
-			if (mask & WR_READ_MASK)
+			if (mask & WR_READ_MASK) {
+				npsn = (wqe->dma.length - wqe->dma.resid) /
+					qp->mtu;
 				wqe->iova += npsn * qp->mtu;
+			}
 		}
 
 		wqe->state = wqe_state_posted;
@@ -409,7 +412,7 @@ static struct sk_buff *init_req_packet(struct rxe_qp *qp,
 
 	/* init skb */
 	av = rxe_get_av(pkt);
-	skb = rxe->ifc_ops->init_packet(rxe, av, paylen, pkt);
+	skb = rxe_init_packet(rxe, av, paylen, pkt);
 	if (unlikely(!skb))
 		return NULL;
 
@@ -439,7 +442,7 @@ static struct sk_buff *init_req_packet(struct rxe_qp *qp,
 	if (pkt->mask & RXE_RETH_MASK) {
 		reth_set_rkey(pkt, ibwr->wr.rdma.rkey);
 		reth_set_va(pkt, wqe->iova);
-		reth_set_len(pkt, wqe->dma.length);
+		reth_set_len(pkt, wqe->dma.resid);
 	}
 
 	if (pkt->mask & RXE_IMMDT_MASK)
@@ -480,7 +483,7 @@ static int fill_packet(struct rxe_qp *qp, struct rxe_send_wqe *wqe,
 	u32 *p;
 	int err;
 
-	err = rxe->ifc_ops->prepare(rxe, pkt, skb, &crc);
+	err = rxe_prepare(rxe, pkt, skb, &crc);
 	if (err)
 		return err;
 
@@ -548,23 +551,23 @@ static void update_wqe_psn(struct rxe_qp *qp,
 static void save_state(struct rxe_send_wqe *wqe,
 		       struct rxe_qp *qp,
 		       struct rxe_send_wqe *rollback_wqe,
-		       struct rxe_qp *rollback_qp)
+		       u32 *rollback_psn)
 {
 	rollback_wqe->state     = wqe->state;
 	rollback_wqe->first_psn = wqe->first_psn;
 	rollback_wqe->last_psn  = wqe->last_psn;
-	rollback_qp->req.psn    = qp->req.psn;
+	*rollback_psn		= qp->req.psn;
 }
 
 static void rollback_state(struct rxe_send_wqe *wqe,
 			   struct rxe_qp *qp,
 			   struct rxe_send_wqe *rollback_wqe,
-			   struct rxe_qp *rollback_qp)
+			   u32 rollback_psn)
 {
 	wqe->state     = rollback_wqe->state;
 	wqe->first_psn = rollback_wqe->first_psn;
 	wqe->last_psn  = rollback_wqe->last_psn;
-	qp->req.psn    = rollback_qp->req.psn;
+	qp->req.psn    = rollback_psn;
 }
 
 static void update_state(struct rxe_qp *qp, struct rxe_send_wqe *wqe,
@@ -593,8 +596,8 @@ int rxe_requester(void *arg)
 	int mtu;
 	int opcode;
 	int ret;
-	struct rxe_qp rollback_qp;
 	struct rxe_send_wqe rollback_wqe;
+	u32 rollback_psn;
 
 next_wqe:
 	if (unlikely(!qp->valid || qp->req.state == QP_STATE_ERROR))
@@ -633,6 +636,7 @@ next_wqe:
 				goto exit;
 			}
 			rmr->state = RXE_MEM_STATE_FREE;
+			rxe_drop_ref(rmr);
 			wqe->state = wqe_state_done;
 			wqe->status = IB_WC_SUCCESS;
 		} else if (wqe->wr.opcode == IB_WR_REG_MR) {
@@ -642,18 +646,23 @@ next_wqe:
 			rmr->access = wqe->wr.wr.reg.access;
 			rmr->lkey = wqe->wr.wr.reg.key;
 			rmr->rkey = wqe->wr.wr.reg.key;
+			rmr->iova = wqe->wr.wr.reg.mr->iova;
 			wqe->state = wqe_state_done;
 			wqe->status = IB_WC_SUCCESS;
 		} else {
 			goto exit;
 		}
+		if ((wqe->wr.send_flags & IB_SEND_SIGNALED) ||
+		    qp->sq_sig_type == IB_SIGNAL_ALL_WR)
+			rxe_run_task(&qp->comp.task, 1);
 		qp->req.wqe_index = next_index(qp->sq.queue,
 						qp->req.wqe_index);
 		goto next_wqe;
 	}
 
 	if (unlikely(qp_type(qp) == IB_QPT_RC &&
-		     qp->req.psn > (qp->comp.psn + RXE_MAX_UNACKED_PSNS))) {
+		psn_compare(qp->req.psn, (qp->comp.psn +
+				RXE_MAX_UNACKED_PSNS)) > 0)) {
 		qp->req.wait_psn = 1;
 		goto exit;
 	}
@@ -719,17 +728,17 @@ next_wqe:
 	 * rxe_xmit_packet().
 	 * Otherwise, completer might initiate an unjustified retry flow.
 	 */
-	save_state(wqe, qp, &rollback_wqe, &rollback_qp);
+	save_state(wqe, qp, &rollback_wqe, &rollback_psn);
 	update_wqe_state(qp, wqe, &pkt);
 	update_wqe_psn(qp, wqe, &pkt, payload);
 	ret = rxe_xmit_packet(to_rdev(qp->ibqp.device), qp, &pkt, skb);
 	if (ret) {
 		qp->need_req_skb = 1;
-		kfree_skb(skb);
 
-		rollback_state(wqe, qp, &rollback_wqe, &rollback_qp);
+		rollback_state(wqe, qp, &rollback_wqe, rollback_psn);
 
 		if (ret == -EAGAIN) {
+			kfree_skb(skb);
 			rxe_run_task(&qp->req.task, 1);
 			goto exit;
 		}

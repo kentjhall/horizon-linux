@@ -154,8 +154,20 @@ struct dino_device
 };
 
 /* Looks nice and keeps the compiler happy */
-#define DINO_DEV(d) ((struct dino_device *) d)
+#define DINO_DEV(d) ({				\
+	void *__pdata = d;			\
+	BUG_ON(!__pdata);			\
+	(struct dino_device *)__pdata; })
 
+
+/* Check if PCI device is behind a Card-mode Dino. */
+static int pci_dev_is_behind_card_dino(struct pci_dev *dev)
+{
+	struct dino_device *dino_dev;
+
+	dino_dev = DINO_DEV(parisc_walk_tree(dev->bus->bridge));
+	return is_card_dino(&dino_dev->hba.dev->id);
+}
 
 /*
  * Dino Configuration Space Accessor Functions
@@ -439,6 +451,21 @@ static void quirk_cirrus_cardbus(struct pci_dev *dev)
 }
 DECLARE_PCI_FIXUP_ENABLE(PCI_VENDOR_ID_CIRRUS, PCI_DEVICE_ID_CIRRUS_6832, quirk_cirrus_cardbus );
 
+#ifdef CONFIG_TULIP
+static void pci_fixup_tulip(struct pci_dev *dev)
+{
+	if (!pci_dev_is_behind_card_dino(dev))
+		return;
+	if (!(pci_resource_flags(dev, 1) & IORESOURCE_MEM))
+		return;
+	pr_warn("%s: HP HSC-PCI Cards with card-mode Dino not yet supported.\n",
+		pci_name(dev));
+	/* Disable this card by zeroing the PCI resources */
+	memset(&dev->resource[0], 0, sizeof(dev->resource[0]));
+	memset(&dev->resource[1], 0, sizeof(dev->resource[1]));
+}
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_DEC, PCI_ANY_ID, pci_fixup_tulip);
+#endif /* CONFIG_TULIP */
 
 static void __init
 dino_bios_init(void)
@@ -953,7 +980,7 @@ static int __init dino_probe(struct parisc_device *dev)
 
 	dino_dev->hba.dev = dev;
 	dino_dev->hba.base_addr = ioremap_nocache(hpa, 4096);
-	dino_dev->hba.lmmio_space_offset = 0;	/* CPU addrs == bus addrs */
+	dino_dev->hba.lmmio_space_offset = PCI_F_EXTEND;
 	spin_lock_init(&dino_dev->dinosaur_pen);
 	dino_dev->hba.iommu = ccio_get_iommu(dev);
 

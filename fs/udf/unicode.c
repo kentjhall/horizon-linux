@@ -28,6 +28,9 @@
 
 #include "udf_sb.h"
 
+#define SURROGATE_MASK 0xfffff800
+#define SURROGATE_PAIR 0x0000d800
+
 static int udf_uni2char_utf8(wchar_t uni,
 			     unsigned char *out,
 			     int boundlen)
@@ -36,6 +39,9 @@ static int udf_uni2char_utf8(wchar_t uni,
 
 	if (boundlen <= 0)
 		return -ENAMETOOLONG;
+
+	if ((uni & SURROGATE_MASK) == SURROGATE_PAIR)
+		return -EINVAL;
 
 	if (uni < 0x80) {
 		out[u_len++] = (unsigned char)uni;
@@ -335,6 +341,11 @@ try_again:
 	return u_len;
 }
 
+/*
+ * Convert CS0 dstring to output charset. Warning: This function may truncate
+ * input string if it is too long as it is used for informational strings only
+ * and it is better to truncate the string than to refuse mounting a media.
+ */
 int udf_dstrCS0toUTF8(uint8_t *utf_o, int o_len,
 		      const uint8_t *ocu_i, int i_len)
 {
@@ -343,9 +354,12 @@ int udf_dstrCS0toUTF8(uint8_t *utf_o, int o_len,
 	if (i_len > 0) {
 		s_len = ocu_i[i_len - 1];
 		if (s_len >= i_len) {
-			pr_err("incorrect dstring lengths (%d/%d)\n",
-			       s_len, i_len);
-			return -EINVAL;
+			pr_warn("incorrect dstring lengths (%d/%d),"
+				" truncating\n", s_len, i_len);
+			s_len = i_len - 1;
+			/* 2-byte encoding? Need to round properly... */
+			if (ocu_i[0] == 16)
+				s_len -= (s_len - 1) & 2;
 		}
 	}
 

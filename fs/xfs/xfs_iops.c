@@ -98,12 +98,27 @@ xfs_init_security(
 static void
 xfs_dentry_to_name(
 	struct xfs_name	*namep,
+	struct dentry	*dentry)
+{
+	namep->name = dentry->d_name.name;
+	namep->len = dentry->d_name.len;
+	namep->type = XFS_DIR3_FT_UNKNOWN;
+}
+
+static int
+xfs_dentry_mode_to_name(
+	struct xfs_name	*namep,
 	struct dentry	*dentry,
 	int		mode)
 {
 	namep->name = dentry->d_name.name;
 	namep->len = dentry->d_name.len;
-	namep->type = xfs_mode_to_ftype[(mode & S_IFMT) >> S_SHIFT];
+	namep->type = xfs_mode_to_ftype(mode);
+
+	if (unlikely(namep->type == XFS_DIR3_FT_UNKNOWN))
+		return -EFSCORRUPTED;
+
+	return 0;
 }
 
 STATIC void
@@ -119,7 +134,7 @@ xfs_cleanup_inode(
 	 * xfs_init_security we must back out.
 	 * ENOSPC can hit here, among other things.
 	 */
-	xfs_dentry_to_name(&teardown, dentry, 0);
+	xfs_dentry_to_name(&teardown, dentry);
 
 	xfs_remove(XFS_I(dir), &teardown, XFS_I(inode));
 }
@@ -154,8 +169,12 @@ xfs_generic_create(
 	if (error)
 		return error;
 
+	/* Verify mode is valid also for tmpfile case */
+	error = xfs_dentry_mode_to_name(&name, dentry, mode);
+	if (unlikely(error))
+		goto out_free_acl;
+
 	if (!tmpfile) {
-		xfs_dentry_to_name(&name, dentry, mode);
 		error = xfs_create(XFS_I(dir), &name, mode, rdev, &ip);
 	} else {
 		error = xfs_create_tmpfile(XFS_I(dir), dentry, mode, &ip);
@@ -171,12 +190,12 @@ xfs_generic_create(
 
 #ifdef CONFIG_XFS_POSIX_ACL
 	if (default_acl) {
-		error = xfs_set_acl(inode, default_acl, ACL_TYPE_DEFAULT);
+		error = __xfs_set_acl(inode, default_acl, ACL_TYPE_DEFAULT);
 		if (error)
 			goto out_cleanup_inode;
 	}
 	if (acl) {
-		error = xfs_set_acl(inode, acl, ACL_TYPE_ACCESS);
+		error = __xfs_set_acl(inode, acl, ACL_TYPE_ACCESS);
 		if (error)
 			goto out_cleanup_inode;
 	}
@@ -248,7 +267,7 @@ xfs_vn_lookup(
 	if (dentry->d_name.len >= MAXNAMELEN)
 		return ERR_PTR(-ENAMETOOLONG);
 
-	xfs_dentry_to_name(&name, dentry, 0);
+	xfs_dentry_to_name(&name, dentry);
 	error = xfs_lookup(XFS_I(dir), &name, &cip, NULL);
 	if (unlikely(error)) {
 		if (unlikely(error != -ENOENT))
@@ -275,7 +294,7 @@ xfs_vn_ci_lookup(
 	if (dentry->d_name.len >= MAXNAMELEN)
 		return ERR_PTR(-ENAMETOOLONG);
 
-	xfs_dentry_to_name(&xname, dentry, 0);
+	xfs_dentry_to_name(&xname, dentry);
 	error = xfs_lookup(XFS_I(dir), &xname, &ip, &ci_name);
 	if (unlikely(error)) {
 		if (unlikely(error != -ENOENT))
@@ -310,7 +329,9 @@ xfs_vn_link(
 	struct xfs_name	name;
 	int		error;
 
-	xfs_dentry_to_name(&name, dentry, inode->i_mode);
+	error = xfs_dentry_mode_to_name(&name, dentry, inode->i_mode);
+	if (unlikely(error))
+		return error;
 
 	error = xfs_link(XFS_I(dir), XFS_I(inode), &name);
 	if (unlikely(error))
@@ -329,7 +350,7 @@ xfs_vn_unlink(
 	struct xfs_name	name;
 	int		error;
 
-	xfs_dentry_to_name(&name, dentry, 0);
+	xfs_dentry_to_name(&name, dentry);
 
 	error = xfs_remove(XFS_I(dir), &name, XFS_I(d_inode(dentry)));
 	if (error)
@@ -359,7 +380,9 @@ xfs_vn_symlink(
 
 	mode = S_IFLNK |
 		(irix_symlink_mode ? 0777 & ~current_umask() : S_IRWXUGO);
-	xfs_dentry_to_name(&name, dentry, mode);
+	error = xfs_dentry_mode_to_name(&name, dentry, mode);
+	if (unlikely(error))
+		goto out;
 
 	error = xfs_symlink(XFS_I(dir), &name, symname, mode, &cip);
 	if (unlikely(error))
@@ -395,6 +418,7 @@ xfs_vn_rename(
 {
 	struct inode	*new_inode = d_inode(ndentry);
 	int		omode = 0;
+	int		error;
 	struct xfs_name	oname;
 	struct xfs_name	nname;
 
@@ -405,8 +429,14 @@ xfs_vn_rename(
 	if (flags & RENAME_EXCHANGE)
 		omode = d_inode(ndentry)->i_mode;
 
-	xfs_dentry_to_name(&oname, odentry, omode);
-	xfs_dentry_to_name(&nname, ndentry, d_inode(odentry)->i_mode);
+	error = xfs_dentry_mode_to_name(&oname, odentry, omode);
+	if (omode && unlikely(error))
+		return error;
+
+	error = xfs_dentry_mode_to_name(&nname, ndentry,
+					d_inode(odentry)->i_mode);
+	if (unlikely(error))
+		return error;
 
 	return xfs_rename(XFS_I(odir), &oname, XFS_I(d_inode(odentry)),
 			  XFS_I(ndir), &nname,
@@ -744,6 +774,7 @@ xfs_setattr_nonsize(
 
 out_cancel:
 	xfs_trans_cancel(tp);
+	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 out_dqrele:
 	xfs_qm_dqrele(udqp);
 	xfs_qm_dqrele(gdqp);
@@ -772,7 +803,7 @@ xfs_vn_setattr_nonsize(
  * Caution: The caller of this function is responsible for calling
  * setattr_prepare() or otherwise verifying the change is fine.
  */
-int
+STATIC int
 xfs_setattr_size(
 	struct xfs_inode	*ip,
 	struct iattr		*iattr)
@@ -833,28 +864,22 @@ xfs_setattr_size(
 	if (newsize > oldsize) {
 		error = xfs_zero_eof(ip, newsize, oldsize, &did_zeroing);
 	} else {
+		/*
+		 * iomap won't detect a dirty page over an unwritten block (or a
+		 * cow block over a hole) and subsequently skips zeroing the
+		 * newly post-EOF portion of the page. Flush the new EOF to
+		 * convert the block before the pagecache truncate.
+		 */
+		error = filemap_write_and_wait_range(inode->i_mapping, newsize,
+						     newsize);
+		if (error)
+			return error;
 		error = iomap_truncate_page(inode, newsize, &did_zeroing,
 				&xfs_iomap_ops);
 	}
 
 	if (error)
 		return error;
-
-	/*
-	 * We are going to log the inode size change in this transaction so
-	 * any previous writes that are beyond the on disk EOF and the new
-	 * EOF that have not been written out need to be written here.  If we
-	 * do not write the data out, we expose ourselves to the null files
-	 * problem. Note that this includes any block zeroing we did above;
-	 * otherwise those blocks may not be zeroed after a crash.
-	 */
-	if (did_zeroing ||
-	    (newsize > ip->i_d.di_size && oldsize != ip->i_d.di_size)) {
-		error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
-						      ip->i_d.di_size, newsize);
-		if (error)
-			return error;
-	}
 
 	/*
 	 * We've already locked out new page faults, so now we can safely remove
@@ -872,8 +897,28 @@ xfs_setattr_size(
 	 * user visible changes). There's not much we can do about this, except
 	 * to hope that the caller sees ENOMEM and retries the truncate
 	 * operation.
+	 *
+	 * And we update in-core i_size and truncate page cache beyond newsize
+	 * before writeback the [di_size, newsize] range, so we're guaranteed
+	 * not to write stale data past the new EOF on truncate down.
 	 */
 	truncate_setsize(inode, newsize);
+
+	/*
+	 * We are going to log the inode size change in this transaction so
+	 * any previous writes that are beyond the on disk EOF and the new
+	 * EOF that have not been written out need to be written here.  If we
+	 * do not write the data out, we expose ourselves to the null files
+	 * problem. Note that this includes any block zeroing we did above;
+	 * otherwise those blocks may not be zeroed after a crash.
+	 */
+	if (did_zeroing ||
+	    (newsize > ip->i_d.di_size && oldsize != ip->i_d.di_size)) {
+		error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
+						ip->i_d.di_size, newsize - 1);
+		if (error)
+			return error;
+	}
 
 	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate, 0, 0, 0, &tp);
 	if (error)

@@ -39,6 +39,8 @@ static int __blk_rq_unmap_user(struct bio *bio)
 			bio_unmap_user(bio);
 		else
 			ret = bio_uncopy_user(bio);
+
+		bio_put(bio);
 	}
 
 	return ret;
@@ -116,7 +118,7 @@ int blk_rq_map_user_iov(struct request_queue *q, struct request *rq,
 	unsigned long align = q->dma_pad_mask | queue_dma_alignment(q);
 	struct bio *bio = NULL;
 	struct iov_iter i;
-	int ret;
+	int ret = -EINVAL;
 
 	if (!iter_is_iovec(iter))
 		goto fail;
@@ -142,10 +144,10 @@ int blk_rq_map_user_iov(struct request_queue *q, struct request *rq,
 	return 0;
 
 unmap_rq:
-	__blk_rq_unmap_user(bio);
+	blk_rq_unmap_user(bio);
 fail:
 	rq->bio = NULL;
-	return -EINVAL;
+	return ret;
 }
 EXPORT_SYMBOL(blk_rq_map_user_iov);
 
@@ -183,13 +185,10 @@ int blk_rq_unmap_user(struct bio *bio)
 		if (unlikely(bio_flagged(bio, BIO_BOUNCED)))
 			mapped_bio = bio->bi_private;
 
+		bio = bio->bi_next;
 		ret2 = __blk_rq_unmap_user(mapped_bio);
 		if (ret2 && !ret)
 			ret = ret2;
-
-		mapped_bio = bio;
-		bio = bio->bi_next;
-		bio_put(mapped_bio);
 	}
 
 	return ret;

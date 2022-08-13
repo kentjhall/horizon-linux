@@ -1007,6 +1007,7 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 	case V4L2_CID_FLASH_STROBE_STOP:
 	case V4L2_CID_AUTO_FOCUS_START:
 	case V4L2_CID_AUTO_FOCUS_STOP:
+	case V4L2_CID_DO_WHITE_BALANCE:
 		*type = V4L2_CTRL_TYPE_BUTTON;
 		*flags |= V4L2_CTRL_FLAG_WRITE_ONLY |
 			  V4L2_CTRL_FLAG_EXECUTE_ON_WRITE;
@@ -1219,14 +1220,24 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 }
 EXPORT_SYMBOL(v4l2_ctrl_fill);
 
+static u32 user_flags(const struct v4l2_ctrl *ctrl)
+{
+	u32 flags = ctrl->flags;
+
+	if (ctrl->is_ptr)
+		flags |= V4L2_CTRL_FLAG_HAS_PAYLOAD;
+
+	return flags;
+}
+
 static void fill_event(struct v4l2_event *ev, struct v4l2_ctrl *ctrl, u32 changes)
 {
-	memset(ev->reserved, 0, sizeof(ev->reserved));
+	memset(ev, 0, sizeof(*ev));
 	ev->type = V4L2_EVENT_CTRL;
 	ev->id = ctrl->id;
 	ev->u.ctrl.changes = changes;
 	ev->u.ctrl.type = ctrl->type;
-	ev->u.ctrl.flags = ctrl->flags;
+	ev->u.ctrl.flags = user_flags(ctrl);
 	if (ctrl->is_ptr)
 		ev->u.ctrl.value64 = 0;
 	else
@@ -1472,10 +1483,16 @@ static int ptr_to_user(struct v4l2_ext_control *c,
 		       union v4l2_ctrl_ptr ptr)
 {
 	u32 len;
+	long err = 0;
+	mm_segment_t old_fs = get_fs();
 
-	if (ctrl->is_ptr && !ctrl->is_string)
-		return copy_to_user(c->ptr, ptr.p, c->size) ?
-		       -EFAULT : 0;
+	if (ctrl->is_ptr && !ctrl->is_string) {
+		set_fs(USER_DS);
+		if (copy_to_user(c->ptr, ptr.p, c->size))
+			err = -EFAULT;
+		set_fs(old_fs);
+		return err;
+	}
 
 	switch (ctrl->type) {
 	case V4L2_CTRL_TYPE_STRING:
@@ -1484,8 +1501,11 @@ static int ptr_to_user(struct v4l2_ext_control *c,
 			c->size = ctrl->elem_size;
 			return -ENOSPC;
 		}
-		return copy_to_user(c->string, ptr.p_char, len + 1) ?
-		       -EFAULT : 0;
+		set_fs(USER_DS);
+		if (copy_to_user(c->string, ptr.p_char, len + 1))
+			err = -EFAULT;
+		set_fs(old_fs);
+		return err;
 	case V4L2_CTRL_TYPE_INTEGER64:
 		c->value64 = *ptr.p_s64;
 		break;
@@ -2093,16 +2113,15 @@ struct v4l2_ctrl *v4l2_ctrl_new_custom(struct v4l2_ctrl_handler *hdl,
 		v4l2_ctrl_fill(cfg->id, &name, &type, &min, &max, &step,
 								&def, &flags);
 
-	is_menu = (cfg->type == V4L2_CTRL_TYPE_MENU ||
-		   cfg->type == V4L2_CTRL_TYPE_INTEGER_MENU);
+	is_menu = (type == V4L2_CTRL_TYPE_MENU ||
+		   type == V4L2_CTRL_TYPE_INTEGER_MENU);
 	if (is_menu)
 		WARN_ON(step);
 	else
 		WARN_ON(cfg->menu_skip_mask);
-	if (cfg->type == V4L2_CTRL_TYPE_MENU && qmenu == NULL)
+	if (type == V4L2_CTRL_TYPE_MENU && !qmenu) {
 		qmenu = v4l2_ctrl_get_menu(cfg->id);
-	else if (cfg->type == V4L2_CTRL_TYPE_INTEGER_MENU &&
-		 qmenu_int == NULL) {
+	} else if (type == V4L2_CTRL_TYPE_INTEGER_MENU && !qmenu_int) {
 		handler_set_err(hdl, -EINVAL);
 		return NULL;
 	}
@@ -2550,10 +2569,8 @@ int v4l2_query_ext_ctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_query_ext_ctr
 	else
 		qc->id = ctrl->id;
 	strlcpy(qc->name, ctrl->name, sizeof(qc->name));
-	qc->flags = ctrl->flags;
+	qc->flags = user_flags(ctrl);
 	qc->type = ctrl->type;
-	if (ctrl->is_ptr)
-		qc->flags |= V4L2_CTRL_FLAG_HAS_PAYLOAD;
 	qc->elem_size = ctrl->elem_size;
 	qc->elems = ctrl->elems;
 	qc->nr_of_dims = ctrl->nr_of_dims;
@@ -3409,7 +3426,7 @@ int v4l2_ctrl_subscribe_event(struct v4l2_fh *fh,
 				const struct v4l2_event_subscription *sub)
 {
 	if (sub->type == V4L2_EVENT_CTRL)
-		return v4l2_event_subscribe(fh, sub, 0, &v4l2_ctrl_sub_ev_ops);
+		return v4l2_event_subscribe(fh, sub, 2, &v4l2_ctrl_sub_ev_ops);
 	return -EINVAL;
 }
 EXPORT_SYMBOL(v4l2_ctrl_subscribe_event);

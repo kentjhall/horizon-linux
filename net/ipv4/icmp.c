@@ -246,7 +246,7 @@ static struct {
 /**
  * icmp_global_allow - Are we allowed to send one more ICMP message ?
  *
- * Uses a token bucket to limit our ICMP messages to sysctl_icmp_msgs_per_sec.
+ * Uses a token bucket to limit our ICMP messages to ~sysctl_icmp_msgs_per_sec.
  * Returns false if we reached the limit and can not send another packet.
  * Note: called with BH disabled
  */
@@ -256,10 +256,11 @@ bool icmp_global_allow(void)
 	bool rc = false;
 
 	/* Check if token bucket is empty and cannot be refilled
-	 * without taking the spinlock.
+	 * without taking the spinlock. The READ_ONCE() are paired
+	 * with the following WRITE_ONCE() in this same function.
 	 */
-	if (!icmp_global.credit) {
-		delta = min_t(u32, now - icmp_global.stamp, HZ);
+	if (!READ_ONCE(icmp_global.credit)) {
+		delta = min_t(u32, now - READ_ONCE(icmp_global.stamp), HZ);
 		if (delta < HZ / 50)
 			return false;
 	}
@@ -269,14 +270,17 @@ bool icmp_global_allow(void)
 	if (delta >= HZ / 50) {
 		incr = sysctl_icmp_msgs_per_sec * delta / HZ ;
 		if (incr)
-			icmp_global.stamp = now;
+			WRITE_ONCE(icmp_global.stamp, now);
 	}
 	credit = min_t(u32, icmp_global.credit + incr, sysctl_icmp_msgs_burst);
 	if (credit) {
-		credit--;
+		/* We want to use a credit of one in average, but need to randomize
+		 * it for security reasons.
+		 */
+		credit = max_t(int, credit - prandom_u32_max(3), 0);
 		rc = true;
 	}
-	icmp_global.credit = credit;
+	WRITE_ONCE(icmp_global.credit, credit);
 	spin_unlock(&icmp_global.lock);
 	return rc;
 }
@@ -425,6 +429,7 @@ static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
 	fl4.daddr = daddr;
 	fl4.saddr = saddr;
 	fl4.flowi4_mark = mark;
+	fl4.flowi4_uid = sock_net_uid(net, NULL);
 	fl4.flowi4_tos = RT_TOS(ip_hdr(skb)->tos);
 	fl4.flowi4_proto = IPPROTO_ICMP;
 	fl4.flowi4_oif = l3mdev_master_ifindex(skb->dev);
@@ -473,6 +478,7 @@ static struct rtable *icmp_route_lookup(struct net *net,
 		      param->replyopts.opt.opt.faddr : iph->saddr);
 	fl4->saddr = saddr;
 	fl4->flowi4_mark = mark;
+	fl4->flowi4_uid = sock_net_uid(net, NULL);
 	fl4->flowi4_tos = RT_TOS(tos);
 	fl4->flowi4_proto = IPPROTO_ICMP;
 	fl4->fl4_icmp_type = type;
@@ -565,7 +571,8 @@ relookup_failed:
  *			MUST reply to only the first fragment.
  */
 
-void icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info)
+void __icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info,
+		 const struct ip_options *opt)
 {
 	struct iphdr *iph;
 	int room;
@@ -679,7 +686,7 @@ void icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info)
 					  iph->tos;
 	mark = IP4_REPLY_MARK(net, skb_in->mark);
 
-	if (ip_options_echo(&icmp_param->replyopts.opt.opt, skb_in))
+	if (__ip_options_echo(&icmp_param->replyopts.opt.opt, skb_in, opt))
 		goto out_unlock;
 
 
@@ -731,7 +738,7 @@ out_free:
 	kfree(icmp_param);
 out:;
 }
-EXPORT_SYMBOL(icmp_send);
+EXPORT_SYMBOL(__icmp_send);
 
 
 static void icmp_socket_deliver(struct sk_buff *skb, u32 info)
@@ -766,7 +773,7 @@ static bool icmp_tag_validation(int proto)
 }
 
 /*
- *	Handle ICMP_DEST_UNREACH, ICMP_TIME_EXCEED, ICMP_QUENCH, and
+ *	Handle ICMP_DEST_UNREACH, ICMP_TIME_EXCEEDED, ICMP_QUENCH, and
  *	ICMP_PARAMETERPROB.
  */
 
@@ -794,7 +801,8 @@ static bool icmp_unreach(struct sk_buff *skb)
 	if (iph->ihl < 5) /* Mangled header, drop. */
 		goto out_err;
 
-	if (icmph->type == ICMP_DEST_UNREACH) {
+	switch (icmph->type) {
+	case ICMP_DEST_UNREACH:
 		switch (icmph->code & 15) {
 		case ICMP_NET_UNREACH:
 		case ICMP_HOST_UNREACH:
@@ -830,8 +838,16 @@ static bool icmp_unreach(struct sk_buff *skb)
 		}
 		if (icmph->code > NR_ICMP_UNREACH)
 			goto out;
-	} else if (icmph->type == ICMP_PARAMETERPROB)
+		break;
+	case ICMP_PARAMETERPROB:
 		info = ntohl(icmph->un.gateway) >> 24;
+		break;
+	case ICMP_TIME_EXCEEDED:
+		__ICMP_INC_STATS(net, ICMP_MIB_INTIMEEXCDS);
+		if (icmph->code == ICMP_EXC_FRAGTIME)
+			goto out;
+		break;
+	}
 
 	/*
 	 *	Throw it at our lower layers

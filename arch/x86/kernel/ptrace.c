@@ -23,6 +23,7 @@
 #include <linux/rcupdate.h>
 #include <linux/export.h>
 #include <linux/context_tracking.h>
+#include <linux/nospec.h>
 
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
@@ -652,7 +653,8 @@ static unsigned long ptrace_get_debugreg(struct task_struct *tsk, int n)
 	unsigned long val = 0;
 
 	if (n < HBP_NUM) {
-		struct perf_event *bp = thread->ptrace_bps[n];
+		int index = array_index_nospec(n, HBP_NUM);
+		struct perf_event *bp = thread->ptrace_bps[index];
 
 		if (bp)
 			val = bp->hw.info.address;
@@ -934,7 +936,7 @@ static int putreg32(struct task_struct *child, unsigned regno, u32 value)
 		 */
 		regs->orig_ax = value;
 		if (syscall_get_nr(child, regs) >= 0)
-			child->thread.status |= TS_I386_REGS_POKED;
+			child->thread_info.status |= TS_I386_REGS_POKED;
 		break;
 
 	case offsetof(struct user32, regs.eflags):

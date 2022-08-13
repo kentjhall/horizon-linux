@@ -22,6 +22,8 @@ struct usb_mixer_interface {
 	struct urb *rc_urb;
 	struct usb_ctrlrequest *rc_setup_packet;
 	u8 rc_buffer[6];
+
+	bool disconnected;
 };
 
 #define MAX_CHANNELS	16	/* max logical channels */
@@ -46,9 +48,16 @@ struct usb_mixer_elem_list {
 	struct usb_mixer_elem_list *next_id_elem; /* list of controls with same id */
 	struct snd_kcontrol *kctl;
 	unsigned int id;
+	bool is_std_info;
 	usb_mixer_elem_dump_func_t dump;
 	usb_mixer_elem_resume_func_t resume;
 };
+
+/* iterate over mixer element list of the given unit id */
+#define for_each_mixer_elem(list, mixer, id)	\
+	for ((list) = (mixer)->id_elems[id]; (list); (list) = (list)->next_id_elem)
+#define mixer_elem_list_to_info(list) \
+	container_of(list, struct usb_mixer_elem_info, head)
 
 struct usb_mixer_elem_info {
 	struct usb_mixer_elem_list head;
@@ -64,6 +73,7 @@ struct usb_mixer_elem_info {
 	int cached;
 	int cache_val[MAX_CHANNELS];
 	u8 initialized;
+	u8 min_mute;
 	void *private_data;
 };
 
@@ -76,8 +86,12 @@ void snd_usb_mixer_notify_id(struct usb_mixer_interface *mixer, int unitid);
 int snd_usb_mixer_set_ctl_value(struct usb_mixer_elem_info *cval,
 				int request, int validx, int value_set);
 
-int snd_usb_mixer_add_control(struct usb_mixer_elem_list *list,
-			      struct snd_kcontrol *kctl);
+int snd_usb_mixer_add_list(struct usb_mixer_elem_list *list,
+			   struct snd_kcontrol *kctl,
+			   bool is_std_info);
+
+#define snd_usb_mixer_add_control(list, kctl) \
+	snd_usb_mixer_add_list(list, kctl, true)
 
 void snd_usb_mixer_elem_init_std(struct usb_mixer_elem_list *list,
 				 struct usb_mixer_interface *mixer,

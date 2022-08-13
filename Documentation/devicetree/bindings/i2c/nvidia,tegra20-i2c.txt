@@ -56,6 +56,7 @@ Required properties:
 - dma-names: Must include the following entries:
   - rx
   - tx
+- print-rate-limit: Limit the error print rate
 
 Example:
 
@@ -72,4 +73,5 @@ Example:
 		dmas = <&apbdma 16>, <&apbdma 16>;
 		dma-names = "rx", "tx";
 		status = "disabled";
+		print-rate-limit = <120 1>;
 	};

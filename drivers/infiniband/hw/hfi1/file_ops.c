@@ -609,7 +609,7 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
 			ret = -EINVAL;
 			goto done;
 		}
-		if (flags & VM_WRITE) {
+		if ((flags & VM_WRITE) || !uctxt->rcvhdrtail_kvaddr) {
 			ret = -EPERM;
 			goto done;
 		}
@@ -751,6 +751,9 @@ static int hfi1_file_close(struct inode *inode, struct file *fp)
 	/* release the cpu */
 	hfi1_put_proc_affinity(fdata->rec_cpu_num);
 
+	/* clean up rcv side */
+	hfi1_user_exp_rcv_free(fdata);
+
 	/*
 	 * Clear any left over, unhandled events so the next process that
 	 * gets this context doesn't get confused.
@@ -790,7 +793,7 @@ static int hfi1_file_close(struct inode *inode, struct file *fp)
 
 	dd->rcd[uctxt->ctxt] = NULL;
 
-	hfi1_user_exp_rcv_free(fdata);
+	hfi1_user_exp_rcv_grp_free(uctxt);
 	hfi1_clear_ctxt_pkey(dd, uctxt->ctxt);
 
 	uctxt->rcvwait_to = 0;

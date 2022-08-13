@@ -12,9 +12,8 @@
 #include <linux/filter.h>
 #include <linux/if_vlan.h>
 #include <asm/cacheflush.h>
+#include <asm/nospec-branch.h>
 #include <linux/bpf.h>
-
-int bpf_jit_enable __read_mostly;
 
 /*
  * assembly code in arch/x86/net/bpf_jit.S
@@ -151,6 +150,19 @@ static bool is_ereg(u32 reg)
 			     BIT(BPF_REG_AX));
 }
 
+/*
+ * is_ereg_8l() == true if BPF register 'reg' is mapped to access x86-64
+ * lower 8-bit registers dil,sil,bpl,spl,r8b..r15b, which need extra byte
+ * of encoding. al,cl,dl,bl have simpler encoding.
+ */
+static bool is_ereg_8l(u32 reg)
+{
+	return is_ereg(reg) ||
+	    (1 << reg) & (BIT(BPF_REG_1) |
+			  BIT(BPF_REG_2) |
+			  BIT(BPF_REG_FP));
+}
+
 /* add modifiers if 'reg' maps to x64 registers r8..r15 */
 static u8 add_1mod(u8 byte, u32 reg)
 {
@@ -278,10 +290,10 @@ static void emit_bpf_tail_call(u8 **pprog)
 	/* if (index >= array->map.max_entries)
 	 *   goto out;
 	 */
-	EMIT4(0x48, 0x8B, 0x46,                   /* mov rax, qword ptr [rsi + 16] */
+	EMIT2(0x89, 0xD2);                        /* mov edx, edx */
+	EMIT3(0x39, 0x56,                         /* cmp dword ptr [rsi + 16], edx */
 	      offsetof(struct bpf_array, map.max_entries));
-	EMIT3(0x48, 0x39, 0xD0);                  /* cmp rax, rdx */
-#define OFFSET1 47 /* number of bytes to jump */
+#define OFFSET1 (41 + RETPOLINE_RAX_BPF_JIT_SIZE) /* number of bytes to jump */
 	EMIT2(X86_JBE, OFFSET1);                  /* jbe out */
 	label1 = cnt;
 
@@ -290,22 +302,21 @@ static void emit_bpf_tail_call(u8 **pprog)
 	 */
 	EMIT2_off32(0x8B, 0x85, -STACKSIZE + 36); /* mov eax, dword ptr [rbp - 516] */
 	EMIT3(0x83, 0xF8, MAX_TAIL_CALL_CNT);     /* cmp eax, MAX_TAIL_CALL_CNT */
-#define OFFSET2 36
+#define OFFSET2 (30 + RETPOLINE_RAX_BPF_JIT_SIZE)
 	EMIT2(X86_JA, OFFSET2);                   /* ja out */
 	label2 = cnt;
 	EMIT3(0x83, 0xC0, 0x01);                  /* add eax, 1 */
 	EMIT2_off32(0x89, 0x85, -STACKSIZE + 36); /* mov dword ptr [rbp - 516], eax */
 
 	/* prog = array->ptrs[index]; */
-	EMIT4_off32(0x48, 0x8D, 0x84, 0xD6,       /* lea rax, [rsi + rdx * 8 + offsetof(...)] */
+	EMIT4_off32(0x48, 0x8B, 0x84, 0xD6,       /* mov rax, [rsi + rdx * 8 + offsetof(...)] */
 		    offsetof(struct bpf_array, ptrs));
-	EMIT3(0x48, 0x8B, 0x00);                  /* mov rax, qword ptr [rax] */
 
 	/* if (prog == NULL)
 	 *   goto out;
 	 */
-	EMIT4(0x48, 0x83, 0xF8, 0x00);            /* cmp rax, 0 */
-#define OFFSET3 10
+	EMIT3(0x48, 0x85, 0xC0);		  /* test rax,rax */
+#define OFFSET3 (8 + RETPOLINE_RAX_BPF_JIT_SIZE)
 	EMIT2(X86_JE, OFFSET3);                   /* je out */
 	label3 = cnt;
 
@@ -318,7 +329,7 @@ static void emit_bpf_tail_call(u8 **pprog)
 	 * rdi == ctx (1st arg)
 	 * rax == prog->bpf_func + prologue_size
 	 */
-	EMIT2(0xFF, 0xE0);                        /* jmp rax */
+	RETPOLINE_RAX_BPF_JIT();
 
 	/* out: */
 	BUILD_BUG_ON(cnt - label1 != OFFSET1);
@@ -773,9 +784,8 @@ st:			if (is_imm8(insn->off))
 			/* STX: *(u8*)(dst_reg + off) = src_reg */
 		case BPF_STX | BPF_MEM | BPF_B:
 			/* emit 'mov byte ptr [rax + off], al' */
-			if (is_ereg(dst_reg) || is_ereg(src_reg) ||
-			    /* have to add extra byte for x86 SIL, DIL regs */
-			    src_reg == BPF_REG_1 || src_reg == BPF_REG_2)
+			if (is_ereg(dst_reg) || is_ereg_8l(src_reg))
+				/* Add extra byte for eregs or SIL,DIL,BPL in src_reg */
 				EMIT2(add_2mod(0x40, dst_reg, src_reg), 0x88);
 			else
 				EMIT1(0x88);
@@ -1135,7 +1145,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	 * may converge on the last pass. In such case do one more
 	 * pass to emit the final image
 	 */
-	for (pass = 0; pass < 10 || image; pass++) {
+	for (pass = 0; pass < 20 || image; pass++) {
 		proglen = do_jit(prog, addrs, image, oldproglen, &ctx);
 		if (proglen <= 0) {
 			image = NULL;
@@ -1162,6 +1172,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 			}
 		}
 		oldproglen = proglen;
+		cond_resched();
 	}
 
 	if (bpf_jit_enable > 1)
@@ -1172,6 +1183,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		set_memory_ro((unsigned long)header, header->pages);
 		prog->bpf_func = (void *)image;
 		prog->jited = 1;
+	} else {
+		prog = orig_prog;
 	}
 
 out_addrs:

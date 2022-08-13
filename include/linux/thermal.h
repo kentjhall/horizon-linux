@@ -4,6 +4,7 @@
  *  Copyright (C) 2008  Intel Corp
  *  Copyright (C) 2008  Zhang Rui <rui.zhang@intel.com>
  *  Copyright (C) 2008  Sujith Thomas <sujith.thomas@intel.com>
+ *  Copyright (c) 2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *  This program is free software; you can redistribute it and/or modify
@@ -32,10 +33,10 @@
 #include <uapi/linux/thermal.h>
 
 #define THERMAL_TRIPS_NONE	-1
-#define THERMAL_MAX_TRIPS	12
+#define THERMAL_MAX_TRIPS	48
 
 /* invalid cooling state */
-#define THERMAL_CSTATE_INVALID -1UL
+#define THERMAL_CSTATE_INVALID	0xffffffff
 
 /* No upper/lower limit requirement */
 #define THERMAL_NO_LIMIT	((u32)~0)
@@ -66,6 +67,8 @@
 #define DEFAULT_THERMAL_GOVERNOR       "user_space"
 #elif defined(CONFIG_THERMAL_DEFAULT_GOV_POWER_ALLOCATOR)
 #define DEFAULT_THERMAL_GOVERNOR       "power_allocator"
+#elif defined(CONFIG_THERMAL_DEFAULT_GOV_PID)
+#define DEFAULT_THERMAL_GOVERNOR       "pid_thermal_gov"
 #endif
 
 struct thermal_zone_device;
@@ -204,6 +207,7 @@ struct thermal_zone_device {
 	int id;
 	char type[THERMAL_NAME_LENGTH];
 	struct device device;
+	struct device_node *np;
 	struct thermal_attr *trip_temp_attrs;
 	struct thermal_attr *trip_type_attrs;
 	struct thermal_attr *trip_hyst_attrs;
@@ -249,6 +253,7 @@ struct thermal_governor {
 	int (*bind_to_tz)(struct thermal_zone_device *tz);
 	void (*unbind_from_tz)(struct thermal_zone_device *tz);
 	int (*throttle)(struct thermal_zone_device *tz, int trip);
+	int (*of_parse)(struct thermal_zone_params *tp, struct device_node *np);
 	struct list_head	governor_list;
 };
 
@@ -272,7 +277,7 @@ struct thermal_bind_params {
 	 * thermal zone and cdev, for a particular trip point.
 	 * See Documentation/thermal/sysfs-api.txt for more information.
 	 */
-	int trip_mask;
+	u64 trip_mask;
 
 	/*
 	 * This is an array of cooling state limits. Must have exactly
@@ -290,6 +295,7 @@ struct thermal_bind_params {
 /* Structure to define Thermal Zone parameters */
 struct thermal_zone_params {
 	char governor_name[THERMAL_NAME_LENGTH];
+	void *governor_params;
 
 	/*
 	 * a boolean to indicate if the thermal to hwmon sysfs interface
@@ -367,6 +373,7 @@ struct thermal_zone_of_device_ops {
 	int (*set_trips)(void *, int, int);
 	int (*set_emul_temp)(void *, int);
 	int (*set_trip_temp)(void *, int, int);
+	int (*trip_update)(void *, int);
 };
 
 /**
@@ -438,7 +445,7 @@ int power_actor_get_min_power(struct thermal_cooling_device *,
 			      struct thermal_zone_device *tz, u32 *min_power);
 int power_actor_set_power(struct thermal_cooling_device *,
 			  struct thermal_instance *, u32);
-struct thermal_zone_device *thermal_zone_device_register(const char *, int, int,
+struct thermal_zone_device *thermal_zone_device_register(const char *, int, u64,
 		void *, struct thermal_zone_device_ops *,
 		struct thermal_zone_params *, int, int);
 void thermal_zone_device_unregister(struct thermal_zone_device *);
@@ -460,16 +467,23 @@ thermal_of_cooling_device_register(struct device_node *np, char *, void *,
 				   const struct thermal_cooling_device_ops *);
 void thermal_cooling_device_unregister(struct thermal_cooling_device *);
 struct thermal_zone_device *thermal_zone_get_zone_by_name(const char *name);
+struct thermal_zone_device *
+thermal_zone_get_zone_by_node(struct device_node *node);
 int thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp);
 int thermal_zone_get_slope(struct thermal_zone_device *tz);
 int thermal_zone_get_offset(struct thermal_zone_device *tz);
-
+struct thermal_zone_device *thermal_zone_device_find(void *data,
+	int (*match)(struct thermal_zone_device *, void *));
 int get_tz_trend(struct thermal_zone_device *, int);
 struct thermal_instance *get_thermal_instance(struct thermal_zone_device *,
 		struct thermal_cooling_device *, int);
 void thermal_cdev_update(struct thermal_cooling_device *);
 void thermal_notify_framework(struct thermal_zone_device *, int);
 #else
+static inline struct thermal_zone_device *
+thermal_zone_get_zone_by_node(struct device_node *node)
+{ return ERR_PTR(-EOPNOTSUPP); }
+
 static inline bool cdev_is_power_actor(struct thermal_cooling_device *cdev)
 { return false; }
 static inline int power_actor_get_max_power(struct thermal_cooling_device *cdev,
@@ -483,7 +497,7 @@ static inline int power_actor_set_power(struct thermal_cooling_device *cdev,
 			  struct thermal_instance *tz, u32 power)
 { return 0; }
 static inline struct thermal_zone_device *thermal_zone_device_register(
-	const char *type, int trips, int mask, void *devdata,
+	const char *type, int trips, u64 mask, void *devdata,
 	struct thermal_zone_device_ops *ops,
 	const struct thermal_zone_params *tzp,
 	int passive_delay, int polling_delay)

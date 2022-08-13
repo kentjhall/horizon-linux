@@ -215,7 +215,7 @@ static void davinci_spi_chipselect(struct spi_device *spi, int value)
 	pdata = &dspi->pdata;
 
 	/* program delay transfers if tx_delay is non zero */
-	if (spicfg->wdelay)
+	if (spicfg && spicfg->wdelay)
 		spidat1 |= SPIDAT1_WDEL;
 
 	/*
@@ -646,7 +646,7 @@ static int davinci_spi_bufs(struct spi_device *spi, struct spi_transfer *t)
 			buf = t->rx_buf;
 		t->rx_dma = dma_map_single(&spi->dev, buf,
 				t->len, DMA_FROM_DEVICE);
-		if (!t->rx_dma) {
+		if (dma_mapping_error(&spi->dev, t->rx_dma)) {
 			ret = -EFAULT;
 			goto err_rx_map;
 		}
@@ -660,7 +660,7 @@ static int davinci_spi_bufs(struct spi_device *spi, struct spi_transfer *t)
 			buf = (void *)t->tx_buf;
 		t->tx_dma = dma_map_single(&spi->dev, buf,
 				t->len, DMA_TO_DEVICE);
-		if (!t->tx_dma) {
+		if (dma_mapping_error(&spi->dev, t->tx_dma)) {
 			ret = -EFAULT;
 			goto err_tx_map;
 		}
@@ -1099,13 +1099,13 @@ static int davinci_spi_remove(struct platform_device *pdev)
 	spi_bitbang_stop(&dspi->bitbang);
 
 	clk_disable_unprepare(dspi->clk);
-	spi_master_put(master);
 
 	if (dspi->dma_rx) {
 		dma_release_channel(dspi->dma_rx);
 		dma_release_channel(dspi->dma_tx);
 	}
 
+	spi_master_put(master);
 	return 0;
 }
 

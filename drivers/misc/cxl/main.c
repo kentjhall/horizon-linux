@@ -268,7 +268,7 @@ struct cxl_afu *cxl_alloc_afu(struct cxl *adapter, int slice)
 	idr_init(&afu->contexts_idr);
 	mutex_init(&afu->contexts_lock);
 	spin_lock_init(&afu->afu_cntl_lock);
-
+	atomic_set(&afu->configured_state, -1);
 	afu->prefault_mode = CXL_PREFAULT_NONE;
 	afu->irqs_max = afu->adapter->user_irqs;
 
@@ -293,7 +293,7 @@ int cxl_adapter_context_get(struct cxl *adapter)
 	int rc;
 
 	rc = atomic_inc_unless_negative(&adapter->contexts_num);
-	return rc >= 0 ? 0 : -EBUSY;
+	return rc ? 0 : -EBUSY;
 }
 
 void cxl_adapter_context_put(struct cxl *adapter)

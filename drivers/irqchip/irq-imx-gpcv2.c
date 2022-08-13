@@ -145,6 +145,7 @@ static struct irq_chip gpcv2_irqchip_data_chip = {
 	.irq_unmask		= imx_gpcv2_irq_unmask,
 	.irq_set_wake		= imx_gpcv2_irq_set_wake,
 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+	.irq_set_type		= irq_chip_set_type_parent,
 #ifdef CONFIG_SMP
 	.irq_set_affinity	= irq_chip_set_affinity_parent,
 #endif
@@ -229,6 +230,8 @@ static int __init imx_gpcv2_irqchip_init(struct device_node *node,
 		pr_err("kzalloc failed!\n");
 		return -ENOMEM;
 	}
+
+	raw_spin_lock_init(&cd->rlock);
 
 	cd->gpc_base = of_iomap(node, 0);
 	if (!cd->gpc_base) {

@@ -56,6 +56,7 @@ struct virtblk_req {
 	struct virtio_blk_outhdr out_hdr;
 	struct virtio_scsi_inhdr in_hdr;
 	u8 status;
+	u8 sense[SCSI_SENSE_BUFFERSIZE];
 	struct scatterlist sg[];
 };
 
@@ -102,7 +103,8 @@ static int __virtblk_add_req(struct virtqueue *vq,
 	}
 
 	if (type == cpu_to_virtio32(vq->vdev, VIRTIO_BLK_T_SCSI_CMD)) {
-		sg_init_one(&sense, vbr->req->sense, SCSI_SENSE_BUFFERSIZE);
+		memcpy(vbr->sense, vbr->req->sense, SCSI_SENSE_BUFFERSIZE);
+		sg_init_one(&sense, vbr->sense, SCSI_SENSE_BUFFERSIZE);
 		sgs[num_out + num_in++] = &sense;
 		sg_init_one(&inhdr, &vbr->in_hdr, sizeof(vbr->in_hdr));
 		sgs[num_out + num_in++] = &inhdr;
@@ -213,10 +215,12 @@ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
 	err = __virtblk_add_req(vblk->vqs[qid].vq, vbr, vbr->sg, num);
 	if (err) {
 		virtqueue_kick(vblk->vqs[qid].vq);
-		blk_mq_stop_hw_queue(hctx);
+		/* Don't stop the queue if -ENOMEM: we may have failed to
+		 * bounce the buffer due to global resource outage.
+		 */
+		if (err == -ENOSPC)
+			blk_mq_stop_hw_queue(hctx);
 		spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
-		/* Out of mem doesn't actually happen, since we fall back
-		 * to direct descriptors */
 		if (err == -ENOMEM || err == -ENOSPC)
 			return BLK_MQ_RQ_QUEUE_BUSY;
 		return BLK_MQ_RQ_QUEUE_ERROR;
@@ -389,6 +393,8 @@ static int init_vq(struct virtio_blk *vblk)
 				   &num_vqs);
 	if (err)
 		num_vqs = 1;
+
+	num_vqs = min_t(unsigned int, nr_cpu_ids, num_vqs);
 
 	vblk->vqs = kmalloc_array(num_vqs, sizeof(*vblk->vqs), GFP_KERNEL);
 	if (!vblk->vqs)
@@ -628,11 +634,12 @@ static int virtblk_probe(struct virtio_device *vdev)
 	if (err)
 		goto out_put_disk;
 
-	q = vblk->disk->queue = blk_mq_init_queue(&vblk->tag_set);
+	q = blk_mq_init_queue(&vblk->tag_set);
 	if (IS_ERR(q)) {
 		err = -ENOMEM;
 		goto out_free_tags;
 	}
+	vblk->disk->queue = q;
 
 	q->queuedata = vblk;
 
@@ -742,6 +749,7 @@ out_put_disk:
 	put_disk(vblk->disk);
 out_free_vq:
 	vdev->config->del_vqs(vdev);
+	kfree(vblk->vqs);
 out_free_vblk:
 	kfree(vblk);
 out_free_index:

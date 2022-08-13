@@ -45,7 +45,7 @@ config X86
 	select ARCH_USE_CMPXCHG_LOCKREF		if X86_64
 	select ARCH_USE_QUEUED_RWLOCKS
 	select ARCH_USE_QUEUED_SPINLOCKS
-	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH if SMP
+	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
 	select ARCH_WANTS_DYNAMIC_TASK_STRUCT
 	select ARCH_WANT_FRAME_POINTERS
 	select ARCH_WANT_IPC_PARSE_VERSION	if X86_32
@@ -64,6 +64,7 @@ config X86
 	select GENERIC_CLOCKEVENTS_MIN_ADJUST
 	select GENERIC_CMOS_UPDATE
 	select GENERIC_CPU_AUTOPROBE
+	select GENERIC_CPU_VULNERABILITIES
 	select GENERIC_EARLY_IOREMAP
 	select GENERIC_FIND_FIRST_BIT
 	select GENERIC_IOMAP
@@ -146,6 +147,7 @@ config X86
 	select HAVE_UID16			if X86_32 || IA32_EMULATION
 	select HAVE_UNSTABLE_SCHED_CLOCK
 	select HAVE_USER_RETURN_NOTIFIER
+	select HOTPLUG_SMT			if SMP
 	select IRQ_FORCED_THREADING
 	select MODULES_USE_ELF_RELA		if X86_64
 	select MODULES_USE_ELF_REL		if X86_32
@@ -406,6 +408,19 @@ config X86_BIGSMP
 config GOLDFISH
        def_bool y
        depends on X86_GOLDFISH
+
+config RETPOLINE
+	bool "Avoid speculative indirect branches in kernel"
+	default y
+	---help---
+	  Compile kernel with the retpoline compiler options to guard against
+	  kernel-to-user data leaks by avoiding speculative indirect
+	  branches. Requires a compiler with -mindirect-branch=thunk-extern
+	  support for full protection. The kernel may run slower.
+
+	  Without compiler support, at least indirect branches in assembler
+	  code are eliminated. Since this includes the syscall entry path,
+	  it is not entirely pointless.
 
 if X86_32
 config X86_EXTENDED_PLATFORM
@@ -922,13 +937,7 @@ config NR_CPUS
 	  approximately eight kilobytes to the kernel image.
 
 config SCHED_SMT
-	bool "SMT (Hyperthreading) scheduler support"
-	depends on SMP
-	---help---
-	  SMT scheduler support improves the CPU scheduler's decision making
-	  when dealing with Intel Pentium 4 chips with HyperThreading at a
-	  cost of slightly increased overhead in some places. If unsure say
-	  N here.
+	def_bool y if SMP
 
 config SCHED_MC
 	def_bool y
@@ -1043,7 +1052,7 @@ config X86_MCE_THRESHOLD
 	def_bool y
 
 config X86_MCE_INJECT
-	depends on X86_MCE
+	depends on X86_MCE && X86_LOCAL_APIC
 	tristate "Machine check injector support"
 	---help---
 	  Provide support for injecting machine checks for testing purposes.
@@ -1746,6 +1755,51 @@ config X86_INTEL_MEMORY_PROTECTION_KEYS
 
 	  If unsure, say y.
 
+choice
+	prompt "TSX enable mode"
+	depends on CPU_SUP_INTEL
+	default X86_INTEL_TSX_MODE_OFF
+	help
+	  Intel's TSX (Transactional Synchronization Extensions) feature
+	  allows to optimize locking protocols through lock elision which
+	  can lead to a noticeable performance boost.
+
+	  On the other hand it has been shown that TSX can be exploited
+	  to form side channel attacks (e.g. TAA) and chances are there
+	  will be more of those attacks discovered in the future.
+
+	  Therefore TSX is not enabled by default (aka tsx=off). An admin
+	  might override this decision by tsx=on the command line parameter.
+	  Even with TSX enabled, the kernel will attempt to enable the best
+	  possible TAA mitigation setting depending on the microcode available
+	  for the particular machine.
+
+	  This option allows to set the default tsx mode between tsx=on, =off
+	  and =auto. See Documentation/kernel-parameters.txt for more
+	  details.
+
+	  Say off if not sure, auto if TSX is in use but it should be used on safe
+	  platforms or on if TSX is in use and the security aspect of tsx is not
+	  relevant.
+
+config X86_INTEL_TSX_MODE_OFF
+	bool "off"
+	help
+	  TSX is disabled if possible - equals to tsx=off command line parameter.
+
+config X86_INTEL_TSX_MODE_ON
+	bool "on"
+	help
+	  TSX is always enabled on TSX capable HW - equals the tsx=on command
+	  line parameter.
+
+config X86_INTEL_TSX_MODE_AUTO
+	bool "auto"
+	help
+	  TSX is enabled on TSX capable HW that is believed to be safe against
+	  side channel attacks- equals the tsx=auto command line parameter.
+endchoice
+
 config EFI
 	bool "EFI runtime service support"
 	depends on ACPI
@@ -2036,14 +2090,8 @@ config RANDOMIZE_MEMORY_PHYSICAL_PADDING
 	   If unsure, leave at the default value.
 
 config HOTPLUG_CPU
-	bool "Support for hot-pluggable CPUs"
+	def_bool y
 	depends on SMP
-	---help---
-	  Say Y here to allow turning CPUs off and on. CPUs can be
-	  controlled through /sys/devices/system/cpu.
-	  ( Note: power management support will enable this option
-	    automatically on SMP systems. )
-	  Say N if you want to disable CPU hotplug.
 
 config BOOTPARAM_HOTPLUG_CPU0
 	bool "Set default setting of cpu0_hotpluggable"
@@ -2225,6 +2273,10 @@ config MODIFY_LDT_SYSCALL
 source "kernel/livepatch/Kconfig"
 
 endmenu
+
+config ARCH_HAS_ADD_PAGES
+	def_bool y
+	depends on X86_64 && ARCH_ENABLE_MEMORY_HOTPLUG
 
 config ARCH_ENABLE_MEMORY_HOTPLUG
 	def_bool y
@@ -2566,8 +2618,7 @@ config OLPC
 
 config OLPC_XO1_PM
 	bool "OLPC XO-1 Power Management"
-	depends on OLPC && MFD_CS5535 && PM_SLEEP
-	select MFD_CORE
+	depends on OLPC && MFD_CS5535=y && PM_SLEEP
 	---help---
 	  Add support for poweroff and suspend of the OLPC XO-1 laptop.
 
@@ -2732,10 +2783,6 @@ config COMPAT_FOR_U64_ALIGNMENT
 config SYSVIPC_COMPAT
 	def_bool y
 	depends on SYSVIPC
-
-config KEYS_COMPAT
-	def_bool y
-	depends on KEYS
 endif
 
 endmenu

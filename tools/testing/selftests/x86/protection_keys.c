@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/futex.h>
+#include <time.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
 #include <string.h>
@@ -188,17 +189,29 @@ void lots_o_noops_around_write(int *write_to_me)
 #define u64 uint64_t
 
 #ifdef __i386__
-#define SYS_mprotect_key 380
-#define SYS_pkey_alloc	 381
-#define SYS_pkey_free	 382
+
+#ifndef SYS_mprotect_key
+# define SYS_mprotect_key 380
+#endif
+#ifndef SYS_pkey_alloc
+# define SYS_pkey_alloc	 381
+# define SYS_pkey_free	 382
+#endif
 #define REG_IP_IDX REG_EIP
-#define si_pkey_offset 0x18
+#define si_pkey_offset 0x14
+
 #else
-#define SYS_mprotect_key 329
-#define SYS_pkey_alloc	 330
-#define SYS_pkey_free	 331
+
+#ifndef SYS_mprotect_key
+# define SYS_mprotect_key 329
+#endif
+#ifndef SYS_pkey_alloc
+# define SYS_pkey_alloc	 330
+# define SYS_pkey_free	 331
+#endif
 #define REG_IP_IDX REG_RIP
 #define si_pkey_offset 0x20
+
 #endif
 
 void dump_mem(void *dumpme, int len_bytes)
@@ -212,19 +225,18 @@ void dump_mem(void *dumpme, int len_bytes)
 	}
 }
 
-#define __SI_FAULT      (3 << 16)
-#define SEGV_BNDERR     (__SI_FAULT|3)  /* failed address bound checks */
-#define SEGV_PKUERR     (__SI_FAULT|4)
+#define SEGV_BNDERR     3  /* failed address bound checks */
+#define SEGV_PKUERR     4
 
 static char *si_code_str(int si_code)
 {
-	if (si_code & SEGV_MAPERR)
+	if (si_code == SEGV_MAPERR)
 		return "SEGV_MAPERR";
-	if (si_code & SEGV_ACCERR)
+	if (si_code == SEGV_ACCERR)
 		return "SEGV_ACCERR";
-	if (si_code & SEGV_BNDERR)
+	if (si_code == SEGV_BNDERR)
 		return "SEGV_BNDERR";
-	if (si_code & SEGV_PKUERR)
+	if (si_code == SEGV_PKUERR)
 		return "SEGV_PKUERR";
 	return "UNKNOWN";
 }
@@ -238,7 +250,7 @@ void signal_handler(int signum, siginfo_t *si, void *vucontext)
 	unsigned long ip;
 	char *fpregs;
 	u32 *pkru_ptr;
-	u64 si_pkey;
+	u64 siginfo_pkey;
 	u32 *si_pkey_ptr;
 	int pkru_offset;
 	fpregset_t fpregset;
@@ -280,9 +292,9 @@ void signal_handler(int signum, siginfo_t *si, void *vucontext)
 	si_pkey_ptr = (u32 *)(((u8 *)si) + si_pkey_offset);
 	dprintf1("si_pkey_ptr: %p\n", si_pkey_ptr);
 	dump_mem(si_pkey_ptr - 8, 24);
-	si_pkey = *si_pkey_ptr;
-	pkey_assert(si_pkey < NR_PKEYS);
-	last_si_pkey = si_pkey;
+	siginfo_pkey = *si_pkey_ptr;
+	pkey_assert(siginfo_pkey < NR_PKEYS);
+	last_si_pkey = siginfo_pkey;
 
 	if ((si->si_code == SEGV_MAPERR) ||
 	    (si->si_code == SEGV_ACCERR) ||
@@ -294,7 +306,7 @@ void signal_handler(int signum, siginfo_t *si, void *vucontext)
 	dprintf1("signal pkru from xsave: %08x\n", *pkru_ptr);
 	/* need __rdpkru() version so we do not do shadow_pkru checking */
 	dprintf1("signal pkru from  pkru: %08x\n", __rdpkru());
-	dprintf1("si_pkey from siginfo: %jx\n", si_pkey);
+	dprintf1("pkey from siginfo: %jx\n", siginfo_pkey);
 	*(u64 *)pkru_ptr = 0x00000000;
 	dprintf1("WARNING: set PRKU=0 to allow faulting instruction to continue\n");
 	pkru_faults++;
@@ -379,34 +391,6 @@ pid_t fork_lazy_child(void)
 		}
 	}
 	return forkret;
-}
-
-void davecmp(void *_a, void *_b, int len)
-{
-	int i;
-	unsigned long *a = _a;
-	unsigned long *b = _b;
-
-	for (i = 0; i < len / sizeof(*a); i++) {
-		if (a[i] == b[i])
-			continue;
-
-		dprintf3("[%3d]: a: %016lx b: %016lx\n", i, a[i], b[i]);
-	}
-}
-
-void dumpit(char *f)
-{
-	int fd = open(f, O_RDONLY);
-	char buf[100];
-	int nr_read;
-
-	dprintf2("maps fd: %d\n", fd);
-	do {
-		nr_read = read(fd, &buf[0], sizeof(buf));
-		write(1, buf, nr_read);
-	} while (nr_read > 0);
-	close(fd);
 }
 
 #define PKEY_DISABLE_ACCESS    0x1
@@ -625,10 +609,10 @@ int alloc_random_pkey(void)
 	int nr_alloced = 0;
 	int random_index;
 	memset(alloced_pkeys, 0, sizeof(alloced_pkeys));
+	srand((unsigned int)time(NULL));
 
 	/* allocate every possible key and make a note of which ones we got */
 	max_nr_pkey_allocs = NR_PKEYS;
-	max_nr_pkey_allocs = 1;
 	for (i = 0; i < max_nr_pkey_allocs; i++) {
 		int new_pkey = alloc_pkey();
 		if (new_pkey < 0)
@@ -1146,6 +1130,21 @@ void test_pkey_syscalls_bad_args(int *ptr, u16 pkey)
 	pkey_assert(err);
 }
 
+void become_child(void)
+{
+	pid_t forkret;
+
+	forkret = fork();
+	pkey_assert(forkret >= 0);
+	dprintf3("[%d] fork() ret: %d\n", getpid(), forkret);
+
+	if (!forkret) {
+		/* in the child */
+		return;
+	}
+	exit(0);
+}
+
 /* Assumes that all pkeys other than 'pkey' are unallocated */
 void test_pkey_alloc_exhaust(int *ptr, u16 pkey)
 {
@@ -1156,7 +1155,7 @@ void test_pkey_alloc_exhaust(int *ptr, u16 pkey)
 	int nr_allocated_pkeys = 0;
 	int i;
 
-	for (i = 0; i < NR_PKEYS*2; i++) {
+	for (i = 0; i < NR_PKEYS*3; i++) {
 		int new_pkey;
 		dprintf1("%s() alloc loop: %d\n", __func__, i);
 		new_pkey = alloc_pkey();
@@ -1167,19 +1166,25 @@ void test_pkey_alloc_exhaust(int *ptr, u16 pkey)
 		if ((new_pkey == -1) && (errno == ENOSPC)) {
 			dprintf2("%s() failed to allocate pkey after %d tries\n",
 				__func__, nr_allocated_pkeys);
-			break;
+		} else {
+			/*
+			 * Ensure the number of successes never
+			 * exceeds the number of keys supported
+			 * in the hardware.
+			 */
+			pkey_assert(nr_allocated_pkeys < NR_PKEYS);
+			allocated_pkeys[nr_allocated_pkeys++] = new_pkey;
 		}
-		pkey_assert(nr_allocated_pkeys < NR_PKEYS);
-		allocated_pkeys[nr_allocated_pkeys++] = new_pkey;
+
+		/*
+		 * Make sure that allocation state is properly
+		 * preserved across fork().
+		 */
+		if (i == NR_PKEYS*2)
+			become_child();
 	}
 
 	dprintf3("%s()::%d\n", __func__, __LINE__);
-
-	/*
-	 * ensure it did not reach the end of the loop without
-	 * failure:
-	 */
-	pkey_assert(i < NR_PKEYS*2);
 
 	/*
 	 * There are 16 pkeys supported in hardware.  One is taken

@@ -49,12 +49,13 @@
 
 	memory {
 		device_type = "memory";
-		reg = <0x60000000 0x80000000>;
+		reg = <0x60000000 0x20000000>;
 	};
 
 	gpio-restart {
 		compatible = "gpio-restart";
 		gpios = <&gpioa 15 GPIO_ACTIVE_LOW>;
+		open-source;
 		priority = <200>;
 	};
 };

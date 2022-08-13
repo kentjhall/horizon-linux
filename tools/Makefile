@@ -71,7 +71,7 @@ PERF_O   = $(if $(O),$(O)/tools/perf,)
 
 perf: FORCE
 	$(Q)mkdir -p $(PERF_O) .
-	$(Q)$(MAKE) --no-print-directory -C perf O=$(PERF_O) subdir=
+	$(Q)$(MAKE) --no-print-directory -C perf LDFLAGS=-static O=$(PERF_O) subdir=
 
 selftests: FORCE
 	$(call descend,testing/$@)

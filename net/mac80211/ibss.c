@@ -66,6 +66,8 @@ ieee80211_ibss_build_presp(struct ieee80211_sub_if_data *sdata,
 		    2 + (IEEE80211_MAX_SUPP_RATES - 8) +
 		    2 + sizeof(struct ieee80211_ht_cap) +
 		    2 + sizeof(struct ieee80211_ht_operation) +
+		    2 + sizeof(struct ieee80211_vht_cap) +
+		    2 + sizeof(struct ieee80211_vht_operation) +
 		    ifibss->ie_len;
 	presp = kzalloc(sizeof(*presp) + frame_len, GFP_KERNEL);
 	if (!presp)
@@ -425,7 +427,7 @@ static void ieee80211_sta_join_ibss(struct ieee80211_sub_if_data *sdata,
 	case NL80211_CHAN_WIDTH_5:
 	case NL80211_CHAN_WIDTH_10:
 		cfg80211_chandef_create(&chandef, cbss->channel,
-					NL80211_CHAN_WIDTH_20_NOHT);
+					NL80211_CHAN_NO_HT);
 		chandef.width = sdata->u.ibss.chandef.width;
 		break;
 	case NL80211_CHAN_WIDTH_80:
@@ -437,7 +439,7 @@ static void ieee80211_sta_join_ibss(struct ieee80211_sub_if_data *sdata,
 	default:
 		/* fall back to 20 MHz for unsupported modes */
 		cfg80211_chandef_create(&chandef, cbss->channel,
-					NL80211_CHAN_WIDTH_20_NOHT);
+					NL80211_CHAN_NO_HT);
 		break;
 	}
 
@@ -487,14 +489,14 @@ int ieee80211_ibss_csa_beacon(struct ieee80211_sub_if_data *sdata,
 	struct beacon_data *presp, *old_presp;
 	struct cfg80211_bss *cbss;
 	const struct cfg80211_bss_ies *ies;
-	u16 capability = 0;
+	u16 capability = WLAN_CAPABILITY_IBSS;
 	u64 tsf;
 	int ret = 0;
 
 	sdata_assert_lock(sdata);
 
 	if (ifibss->privacy)
-		capability = WLAN_CAPABILITY_PRIVACY;
+		capability |= WLAN_CAPABILITY_PRIVACY;
 
 	cbss = cfg80211_get_bss(sdata->local->hw.wiphy, ifibss->chandef.chan,
 				ifibss->bssid, ifibss->ssid,
@@ -946,8 +948,8 @@ static void ieee80211_rx_mgmt_deauth_ibss(struct ieee80211_sub_if_data *sdata,
 	if (len < IEEE80211_DEAUTH_FRAME_LEN)
 		return;
 
-	ibss_dbg(sdata, "RX DeAuth SA=%pM DA=%pM BSSID=%pM (reason: %d)\n",
-		 mgmt->sa, mgmt->da, mgmt->bssid, reason);
+	ibss_dbg(sdata, "RX DeAuth SA=%pM DA=%pM\n", mgmt->sa, mgmt->da);
+	ibss_dbg(sdata, "\tBSSID=%pM (reason: %d)\n", mgmt->bssid, reason);
 	sta_info_destroy_addr(sdata, mgmt->sa);
 }
 
@@ -965,9 +967,9 @@ static void ieee80211_rx_mgmt_auth_ibss(struct ieee80211_sub_if_data *sdata,
 	auth_alg = le16_to_cpu(mgmt->u.auth.auth_alg);
 	auth_transaction = le16_to_cpu(mgmt->u.auth.auth_transaction);
 
-	ibss_dbg(sdata,
-		 "RX Auth SA=%pM DA=%pM BSSID=%pM (auth_transaction=%d)\n",
-		 mgmt->sa, mgmt->da, mgmt->bssid, auth_transaction);
+	ibss_dbg(sdata, "RX Auth SA=%pM DA=%pM\n", mgmt->sa, mgmt->da);
+	ibss_dbg(sdata, "\tBSSID=%pM (auth_transaction=%d)\n",
+		 mgmt->bssid, auth_transaction);
 
 	if (auth_alg != WLAN_AUTH_OPEN || auth_transaction != 1)
 		return;
@@ -992,7 +994,7 @@ static void ieee80211_update_sta_info(struct ieee80211_sub_if_data *sdata,
 	enum nl80211_band band = rx_status->band;
 	enum nl80211_bss_scan_width scan_width;
 	struct ieee80211_local *local = sdata->local;
-	struct ieee80211_supported_band *sband = local->hw.wiphy->bands[band];
+	struct ieee80211_supported_band *sband;
 	bool rates_updated = false;
 	u32 supp_rates = 0;
 
@@ -1000,6 +1002,10 @@ static void ieee80211_update_sta_info(struct ieee80211_sub_if_data *sdata,
 		return;
 
 	if (!ether_addr_equal(mgmt->bssid, sdata->u.ibss.bssid))
+		return;
+
+	sband = local->hw.wiphy->bands[band];
+	if (WARN_ON(!sband))
 		return;
 
 	rcu_read_lock();
@@ -1170,10 +1176,10 @@ static void ieee80211_rx_bss_info(struct ieee80211_sub_if_data *sdata,
 		rx_timestamp = drv_get_tsf(local, sdata);
 	}
 
-	ibss_dbg(sdata,
-		 "RX beacon SA=%pM BSSID=%pM TSF=0x%llx BCN=0x%llx diff=%lld @%lu\n",
+	ibss_dbg(sdata, "RX beacon SA=%pM BSSID=%pM TSF=0x%llx\n",
 		 mgmt->sa, mgmt->bssid,
-		 (unsigned long long)rx_timestamp,
+		 (unsigned long long)rx_timestamp);
+	ibss_dbg(sdata, "\tBCN=0x%llx diff=%lld @%lu\n",
 		 (unsigned long long)beacon_timestamp,
 		 (unsigned long long)(rx_timestamp - beacon_timestamp),
 		 jiffies);
@@ -1532,9 +1538,9 @@ static void ieee80211_rx_mgmt_probe_req(struct ieee80211_sub_if_data *sdata,
 
 	tx_last_beacon = drv_tx_last_beacon(local);
 
-	ibss_dbg(sdata,
-		 "RX ProbeReq SA=%pM DA=%pM BSSID=%pM (tx_last_beacon=%d)\n",
-		 mgmt->sa, mgmt->da, mgmt->bssid, tx_last_beacon);
+	ibss_dbg(sdata, "RX ProbeReq SA=%pM DA=%pM\n", mgmt->sa, mgmt->da);
+	ibss_dbg(sdata, "\tBSSID=%pM (tx_last_beacon=%d)\n",
+		 mgmt->bssid, tx_last_beacon);
 
 	if (!tx_last_beacon && is_multicast_ether_addr(mgmt->da))
 		return;

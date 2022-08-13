@@ -92,6 +92,8 @@ struct of_phandle_iterator {
 	struct device_node *node;
 };
 
+#define of_phandle_iter of_phandle_iterator
+
 struct of_reconfig_data {
 	struct device_node	*dn;
 	struct property		*prop;
@@ -148,16 +150,20 @@ extern raw_spinlock_t devtree_lock;
 #ifdef CONFIG_OF
 void of_core_init(void);
 
-static inline bool is_of_node(struct fwnode_handle *fwnode)
+static inline bool is_of_node(const struct fwnode_handle *fwnode)
 {
 	return !IS_ERR_OR_NULL(fwnode) && fwnode->type == FWNODE_OF;
 }
 
-static inline struct device_node *to_of_node(struct fwnode_handle *fwnode)
-{
-	return is_of_node(fwnode) ?
-		container_of(fwnode, struct device_node, fwnode) : NULL;
-}
+#define to_of_node(__fwnode)						\
+	({								\
+		typeof(__fwnode) __to_of_node_fwnode = (__fwnode);	\
+									\
+		is_of_node(__to_of_node_fwnode) ?			\
+			container_of(__to_of_node_fwnode,		\
+				     struct device_node, fwnode) :	\
+			NULL;						\
+	})
 
 static inline bool of_have_populated_dt(void)
 {
@@ -216,8 +222,8 @@ extern struct device_node *of_find_all_nodes(struct device_node *prev);
 static inline u64 of_read_number(const __be32 *cell, int size)
 {
 	u64 r = 0;
-	while (size--)
-		r = (r << 32) | be32_to_cpu(*(cell++));
+	for (; size--; cell++)
+		r = (r << 32) | be32_to_cpu(*cell);
 	return r;
 }
 
@@ -275,6 +281,8 @@ extern struct device_node *of_get_next_child(const struct device_node *node,
 extern struct device_node *of_get_next_available_child(
 	const struct device_node *node, struct device_node *prev);
 
+extern struct device_node *of_get_compatible_child(const struct device_node *parent,
+					const char *compatible);
 extern struct device_node *of_get_child_by_name(const struct device_node *node,
 					const char *name);
 
@@ -521,18 +529,24 @@ const char *of_prop_next_string(struct property *prop, const char *cur);
 
 bool of_console_check(struct device_node *dn, char *name, int index);
 
+#define of_property_for_each_phandle_with_args(iter, np, list_name,	\
+					       cells_name, cell_count)	\
+	for (of_phandle_iterator_init(&iter, np, list_name,		\
+				   cells_name, cell_count);		\
+	     iter.cur; of_phandle_iterator_next(&iter))
+
 #else /* CONFIG_OF */
 
 static inline void of_core_init(void)
 {
 }
 
-static inline bool is_of_node(struct fwnode_handle *fwnode)
+static inline bool is_of_node(const struct fwnode_handle *fwnode)
 {
 	return false;
 }
 
-static inline struct device_node *to_of_node(struct fwnode_handle *fwnode)
+static inline struct device_node *to_of_node(const struct fwnode_handle *fwnode)
 {
 	return NULL;
 }
@@ -604,6 +618,12 @@ static inline struct device_node *of_find_node_with_property(
 static inline bool of_have_populated_dt(void)
 {
 	return false;
+}
+
+static inline struct device_node *of_get_compatible_child(const struct device_node *parent,
+					const char *compatible)
+{
+	return NULL;
 }
 
 static inline struct device_node *of_get_child_by_name(
@@ -1120,6 +1140,7 @@ static inline int of_get_available_child_count(const struct device_node *np)
 #define _OF_DECLARE(table, name, compat, fn, fn_type)			\
 	static const struct of_device_id __of_table_##name		\
 		__used __section(__##table##_of_table)			\
+		__aligned(__alignof__(struct of_device_id))		\
 		 = { .compatible = compat,				\
 		     .data = (fn == (fn_type)NULL) ? fn : fn  }
 #else

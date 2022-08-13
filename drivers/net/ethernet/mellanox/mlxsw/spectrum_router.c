@@ -500,30 +500,40 @@ static int
 mlxsw_sp_vr_lpm_tree_check(struct mlxsw_sp *mlxsw_sp, struct mlxsw_sp_vr *vr,
 			   struct mlxsw_sp_prefix_usage *req_prefix_usage)
 {
-	struct mlxsw_sp_lpm_tree *lpm_tree;
+	struct mlxsw_sp_lpm_tree *lpm_tree = vr->lpm_tree;
+	struct mlxsw_sp_lpm_tree *new_tree;
+	int err;
 
-	if (mlxsw_sp_prefix_usage_eq(req_prefix_usage,
-				     &vr->lpm_tree->prefix_usage))
+	if (mlxsw_sp_prefix_usage_eq(req_prefix_usage, &lpm_tree->prefix_usage))
 		return 0;
 
-	lpm_tree = mlxsw_sp_lpm_tree_get(mlxsw_sp, req_prefix_usage,
+	new_tree = mlxsw_sp_lpm_tree_get(mlxsw_sp, req_prefix_usage,
 					 vr->proto, false);
-	if (IS_ERR(lpm_tree)) {
+	if (IS_ERR(new_tree)) {
 		/* We failed to get a tree according to the required
 		 * prefix usage. However, the current tree might be still good
 		 * for us if our requirement is subset of the prefixes used
 		 * in the tree.
 		 */
 		if (mlxsw_sp_prefix_usage_subset(req_prefix_usage,
-						 &vr->lpm_tree->prefix_usage))
+						 &lpm_tree->prefix_usage))
 			return 0;
-		return PTR_ERR(lpm_tree);
+		return PTR_ERR(new_tree);
 	}
 
-	mlxsw_sp_vr_lpm_tree_unbind(mlxsw_sp, vr);
-	mlxsw_sp_lpm_tree_put(mlxsw_sp, vr->lpm_tree);
+	/* Prevent packet loss by overwriting existing binding */
+	vr->lpm_tree = new_tree;
+	err = mlxsw_sp_vr_lpm_tree_bind(mlxsw_sp, vr);
+	if (err)
+		goto err_tree_bind;
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, lpm_tree);
+
+	return 0;
+
+err_tree_bind:
 	vr->lpm_tree = lpm_tree;
-	return mlxsw_sp_vr_lpm_tree_bind(mlxsw_sp, vr);
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, new_tree);
+	return err;
 }
 
 static struct mlxsw_sp_vr *mlxsw_sp_vr_get(struct mlxsw_sp *mlxsw_sp,
@@ -755,11 +765,8 @@ static void mlxsw_sp_router_neigh_ent_ipv4_process(struct mlxsw_sp *mlxsw_sp,
 	dipn = htonl(dip);
 	dev = mlxsw_sp->rifs[rif]->dev;
 	n = neigh_lookup(&arp_tbl, &dipn, dev);
-	if (!n) {
-		netdev_err(dev, "Failed to find matching neighbour for IP=%pI4h\n",
-			   &dip);
+	if (!n)
 		return;
-	}
 
 	netdev_dbg(dev, "Updating neighbour with IP=%pI4h\n", &dip);
 	neigh_event_send(n, NULL);
@@ -1168,7 +1175,8 @@ static int mlxsw_sp_nexthop_mac_update(struct mlxsw_sp *mlxsw_sp, u32 adj_index,
 
 static int
 mlxsw_sp_nexthop_group_mac_update(struct mlxsw_sp *mlxsw_sp,
-				  struct mlxsw_sp_nexthop_group *nh_grp)
+				  struct mlxsw_sp_nexthop_group *nh_grp,
+				  bool reallocate)
 {
 	u32 adj_index = nh_grp->adj_index; /* base */
 	struct mlxsw_sp_nexthop *nh;
@@ -1183,7 +1191,7 @@ mlxsw_sp_nexthop_group_mac_update(struct mlxsw_sp *mlxsw_sp,
 			continue;
 		}
 
-		if (nh->update) {
+		if (nh->update || reallocate) {
 			err = mlxsw_sp_nexthop_mac_update(mlxsw_sp,
 							  adj_index, nh);
 			if (err)
@@ -1244,7 +1252,8 @@ mlxsw_sp_nexthop_group_refresh(struct mlxsw_sp *mlxsw_sp,
 		/* Nothing was added or removed, so no need to reallocate. Just
 		 * update MAC on existing adjacency indexes.
 		 */
-		err = mlxsw_sp_nexthop_group_mac_update(mlxsw_sp, nh_grp);
+		err = mlxsw_sp_nexthop_group_mac_update(mlxsw_sp, nh_grp,
+							false);
 		if (err) {
 			dev_warn(mlxsw_sp->bus_info->dev, "Failed to update neigh MAC in adjacency table.\n");
 			goto set_trap;
@@ -1272,7 +1281,7 @@ mlxsw_sp_nexthop_group_refresh(struct mlxsw_sp *mlxsw_sp,
 	nh_grp->adj_index_valid = 1;
 	nh_grp->adj_index = adj_index;
 	nh_grp->ecmp_size = ecmp_size;
-	err = mlxsw_sp_nexthop_group_mac_update(mlxsw_sp, nh_grp);
+	err = mlxsw_sp_nexthop_group_mac_update(mlxsw_sp, nh_grp, true);
 	if (err) {
 		dev_warn(mlxsw_sp->bus_info->dev, "Failed to update neigh MAC in adjacency table.\n");
 		goto set_trap;
@@ -1316,9 +1325,9 @@ set_trap:
 static void __mlxsw_sp_nexthop_neigh_update(struct mlxsw_sp_nexthop *nh,
 					    bool removing)
 {
-	if (!removing && !nh->should_offload)
+	if (!removing)
 		nh->should_offload = 1;
-	else if (removing && nh->offloaded)
+	else
 		nh->should_offload = 0;
 	nh->update = 1;
 }

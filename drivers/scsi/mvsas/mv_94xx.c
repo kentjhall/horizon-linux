@@ -26,6 +26,7 @@
 #include "mv_sas.h"
 #include "mv_94xx.h"
 #include "mv_chips.h"
+#include <linux/nospec.h>
 
 static void mvs_94xx_detect_porttype(struct mvs_info *mvi, int i)
 {
@@ -668,7 +669,7 @@ static void mvs_94xx_command_active(struct mvs_info *mvi, u32 slot_idx)
 {
 	u32 tmp;
 	tmp = mvs_cr32(mvi, MVS_COMMAND_ACTIVE+(slot_idx >> 3));
-	if (tmp && 1 << (slot_idx % 32)) {
+	if (tmp & 1 << (slot_idx % 32)) {
 		mv_printk("command active %08X,  slot [%x].\n", tmp, slot_idx);
 		mvs_cw32(mvi, MVS_COMMAND_ACTIVE + (slot_idx >> 3),
 			1 << (slot_idx % 32));
@@ -1080,16 +1081,16 @@ static int mvs_94xx_gpio_write(struct mvs_prv_info *mvs_prv,
 			void __iomem *regs = mvi->regs_ex - 0x10200;
 
 			int drive = (i/3) & (4-1); /* drive number on host */
-			u32 block = mr32(MVS_SGPIO_DCTRL +
+			int driveshift = drive * 8; /* bit offset of drive */
+			u32 block = ioread32be(regs + MVS_SGPIO_DCTRL +
 				MVS_SGPIO_HOST_OFFSET * mvi->id);
-
 
 			/*
 			* if bit is set then create a mask with the first
 			* bit of the drive set in the mask ...
 			*/
-			u32 bit = (write_data[i/8] & (1 << (i&(8-1)))) ?
-				1<<(24-drive*8) : 0;
+			u32 bit = get_unaligned_be32(write_data) & (1 << i) ?
+				1 << driveshift : 0;
 
 			/*
 			* ... and then shift it to the right position based
@@ -1098,43 +1099,46 @@ static int mvs_94xx_gpio_write(struct mvs_prv_info *mvs_prv,
 			switch (i%3) {
 			case 0: /* activity */
 				block &= ~((0x7 << MVS_SGPIO_DCTRL_ACT_SHIFT)
-					<< (24-drive*8));
+					<< driveshift);
 					/* hardwire activity bit to SOF */
 				block |= LED_BLINKA_SOF << (
 					MVS_SGPIO_DCTRL_ACT_SHIFT +
-					(24-drive*8));
+					driveshift);
 				break;
 			case 1: /* id */
 				block &= ~((0x3 << MVS_SGPIO_DCTRL_LOC_SHIFT)
-					<< (24-drive*8));
+					<< driveshift);
 				block |= bit << MVS_SGPIO_DCTRL_LOC_SHIFT;
 				break;
 			case 2: /* fail */
 				block &= ~((0x7 << MVS_SGPIO_DCTRL_ERR_SHIFT)
-					<< (24-drive*8));
+					<< driveshift);
 				block |= bit << MVS_SGPIO_DCTRL_ERR_SHIFT;
 				break;
 			}
 
-			mw32(MVS_SGPIO_DCTRL + MVS_SGPIO_HOST_OFFSET * mvi->id,
-				block);
+			iowrite32be(block,
+				regs + MVS_SGPIO_DCTRL +
+				MVS_SGPIO_HOST_OFFSET * mvi->id);
 
 		}
 
 		return reg_count;
 
 	case SAS_GPIO_REG_TX:
-		if (reg_index + reg_count > mvs_prv->n_host)
-			return -EINVAL;
+		if (reg_index + reg_count <= mvs_prv->n_host) {
+			for (i = 0; i < reg_count; i++) {
+				int temp = array_index_nospec(i+reg_index, mvs_prv->n_host);
+				struct mvs_info *mvi = mvs_prv->mvi[temp];
+				void __iomem *regs = mvi->regs_ex - 0x10200;
 
-		for (i = 0; i < reg_count; i++) {
-			struct mvs_info *mvi = mvs_prv->mvi[i+reg_index];
-			void __iomem *regs = mvi->regs_ex - 0x10200;
-
-			mw32(MVS_SGPIO_DCTRL + MVS_SGPIO_HOST_OFFSET * mvi->id,
-				be32_to_cpu(((u32 *) write_data)[i]));
+				mw32(MVS_SGPIO_DCTRL + MVS_SGPIO_HOST_OFFSET * mvi->id,
+					((u32 *) write_data)[i]);
+			}
+			return reg_count;
 		}
-		return reg_count;
+		else
+			return -EINVAL;
 	}
 	return -ENOSYS;
 }

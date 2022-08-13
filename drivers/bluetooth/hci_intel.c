@@ -307,6 +307,9 @@ static int intel_set_power(struct hci_uart *hu, bool powered)
 	struct list_head *p;
 	int err = -ENODEV;
 
+	if (!hu->tty->dev)
+		return err;
+
 	mutex_lock(&intel_device_list_lock);
 
 	list_for_each(p, &intel_device_list) {
@@ -379,6 +382,9 @@ static void intel_busy_work(struct work_struct *work)
 	struct intel_data *intel = container_of(work, struct intel_data,
 						busy_work);
 
+	if (!intel->hu->tty->dev)
+		return;
+
 	/* Link is busy, delay the suspend */
 	mutex_lock(&intel_device_list_lock);
 	list_for_each(p, &intel_device_list) {
@@ -400,6 +406,9 @@ static int intel_open(struct hci_uart *hu)
 	struct intel_data *intel;
 
 	BT_DBG("hu %p", hu);
+
+	if (!hci_uart_has_flow_control(hu))
+		return -EOPNOTSUPP;
 
 	intel = kzalloc(sizeof(*intel), GFP_KERNEL);
 	if (!intel)
@@ -889,6 +898,8 @@ done:
 	list_for_each(p, &intel_device_list) {
 		struct intel_device *dev = list_entry(p, struct intel_device,
 						      list);
+		if (!hu->tty->dev)
+			break;
 		if (hu->tty->dev->parent == dev->pdev->dev.parent) {
 			if (device_may_wakeup(&dev->pdev->dev)) {
 				set_bit(STATE_LPM_ENABLED, &intel->flags);
@@ -1056,6 +1067,9 @@ static int intel_enqueue(struct hci_uart *hu, struct sk_buff *skb)
 
 	BT_DBG("hu %p skb %p", hu, skb);
 
+	if (!hu->tty->dev)
+		goto out_enqueue;
+
 	/* Be sure our controller is resumed and potential LPM transaction
 	 * completed before enqueuing any packet.
 	 */
@@ -1072,7 +1086,7 @@ static int intel_enqueue(struct hci_uart *hu, struct sk_buff *skb)
 		}
 	}
 	mutex_unlock(&intel_device_list_lock);
-
+out_enqueue:
 	skb_queue_tail(&intel->txq, skb);
 
 	return 0;

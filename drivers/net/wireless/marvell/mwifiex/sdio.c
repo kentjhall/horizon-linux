@@ -1458,7 +1458,7 @@ static int mwifiex_sdio_card_to_host_mp_aggr(struct mwifiex_adapter *adapter,
 		}
 
 		if (card->mpa_rx.pkt_cnt == 1)
-			mport = adapter->ioport + port;
+			mport = adapter->ioport + card->mpa_rx.start_port;
 
 		if (mwifiex_read_data_sync(adapter, card->mpa_rx.buf,
 					   card->mpa_rx.buf_len, mport, 1))
@@ -1891,7 +1891,7 @@ static int mwifiex_host_to_card_mp_aggr(struct mwifiex_adapter *adapter,
 		}
 
 		if (card->mpa_tx.pkt_cnt == 1)
-			mport = adapter->ioport + port;
+			mport = adapter->ioport + card->mpa_tx.start_port;
 
 		ret = mwifiex_write_data_to_card(adapter, card->mpa_tx.buf,
 						 card->mpa_tx.buf_len, mport);
@@ -2049,6 +2049,8 @@ error:
 		kfree(card->mpa_rx.buf);
 		card->mpa_tx.buf_size = 0;
 		card->mpa_rx.buf_size = 0;
+		card->mpa_tx.buf = NULL;
+		card->mpa_rx.buf = NULL;
 	}
 
 	return ret;
@@ -2295,6 +2297,12 @@ static void mwifiex_recreate_adapter(struct sdio_mmc_card *card)
 	sdio_claim_host(func);
 	mmc_hw_reset(func->card->host);
 	sdio_release_host(func);
+
+	/* Previous save_adapter won't be valid after this. We will cancel
+	 * pending work requests.
+	 */
+	clear_bit(MWIFIEX_IFACE_WORK_DEVICE_DUMP, &iface_work_flags);
+	clear_bit(MWIFIEX_IFACE_WORK_CARD_RESET, &iface_work_flags);
 
 	mwifiex_sdio_probe(func, device_id);
 }

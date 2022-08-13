@@ -36,6 +36,10 @@ static irqreturn_t mmc_gpio_cd_irqt(int irq, void *dev_id)
 	struct mmc_host *host = dev_id;
 
 	host->trigger_card_event = true;
+	if (!host->cd_cap_invert)
+		host->rem_card_present = (mmc_gpio_get_cd(host) == 0);
+	else
+		host->rem_card_present = mmc_gpio_get_cd(host);
 	mmc_detect_change(host, msecs_to_jiffies(200));
 
 	return IRQ_HANDLED;

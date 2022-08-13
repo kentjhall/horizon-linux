@@ -209,7 +209,7 @@ static int __wmi_send(struct wil6210_priv *wil, u16 cmdid, void *buf, u16 len)
 	uint retry;
 	int rc = 0;
 
-	if (sizeof(cmd) + len > r->entry_size) {
+	if (len > r->entry_size - sizeof(cmd)) {
 		wil_err(wil, "WMI size too large: %d bytes, max is %d\n",
 			(int)(sizeof(cmd) + len), r->entry_size);
 		return -ERANGE;
@@ -501,15 +501,15 @@ static void wmi_evt_connect(struct wil6210_priv *wil, int id, void *d, int len)
 		assoc_resp_ielen = 0;
 	}
 
-	mutex_lock(&wil->mutex);
 	if (test_bit(wil_status_resetting, wil->status) ||
 	    !test_bit(wil_status_fwready, wil->status)) {
 		wil_err(wil, "status_resetting, cancel connect event, CID %d\n",
 			evt->cid);
-		mutex_unlock(&wil->mutex);
 		/* no need for cleanup, wil_reset will do that */
 		return;
 	}
+
+	mutex_lock(&wil->mutex);
 
 	if ((wdev->iftype == NL80211_IFTYPE_STATION) ||
 	    (wdev->iftype == NL80211_IFTYPE_P2P_CLIENT)) {
@@ -607,6 +607,13 @@ static void wmi_evt_disconnect(struct wil6210_priv *wil, int id,
 		 evt->bssid, reason_code, evt->disconnect_reason);
 
 	wil->sinfo_gen++;
+
+	if (test_bit(wil_status_resetting, wil->status) ||
+	    !test_bit(wil_status_fwready, wil->status)) {
+		wil_err(wil, "status_resetting, cancel disconnect event\n");
+		/* no need for cleanup, wil_reset will do that */
+		return;
+	}
 
 	mutex_lock(&wil->mutex);
 	wil6210_disconnect(wil, evt->bssid, reason_code, true);
@@ -1295,8 +1302,14 @@ int wmi_set_ie(struct wil6210_priv *wil, u8 type, u16 ie_len, const void *ie)
 	};
 	int rc;
 	u16 len = sizeof(struct wmi_set_appie_cmd) + ie_len;
-	struct wmi_set_appie_cmd *cmd = kzalloc(len, GFP_KERNEL);
+	struct wmi_set_appie_cmd *cmd;
 
+	if (len < ie_len) {
+		rc = -EINVAL;
+		goto out;
+	}
+
+	cmd = kzalloc(len, GFP_KERNEL);
 	if (!cmd) {
 		rc = -ENOMEM;
 		goto out;

@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2008-2009 Rodolfo Giometti <giometti@linux.it>
  * Copyright (c) 2008-2009 Eurotech S.p.A. <info@eurotech.it>
+ * Copyright (c) 2016-2017 NVIDIA CORPORATION.  All rights reserved.
  *
  * This module supports the PCA954x series of I2C multiplexer/switch chips
  * made by Philips Semiconductors.
@@ -45,6 +46,7 @@
 #include <linux/of_device.h>
 #include <linux/pm.h>
 #include <linux/slab.h>
+#include <linux/regulator/consumer.h>
 
 #define PCA954X_MAX_NCHANS 8
 
@@ -74,6 +76,8 @@ struct pca954x {
 	u8 last_chan;		/* last register value */
 	u8 deselect;
 	struct i2c_client *client;
+	struct regulator *vcc_reg;
+	struct regulator *pullup_reg;
 };
 
 /* Provide specs for the PCA954x types we know about */
@@ -96,6 +100,10 @@ static const struct chip_desc chips[] = {
 		.nchans = 4,
 		.muxtype = pca954x_isswi,
 	},
+	[pca_9546] = {
+		.nchans = 4,
+		.muxtype = pca954x_isswi,
+	},
 	[pca_9547] = {
 		.nchans = 8,
 		.enable = 0x8,
@@ -113,7 +121,7 @@ static const struct i2c_device_id pca954x_id[] = {
 	{ "pca9543", pca_9543 },
 	{ "pca9544", pca_9544 },
 	{ "pca9545", pca_9545 },
-	{ "pca9546", pca_9545 },
+	{ "pca9546", pca_9546 },
 	{ "pca9547", pca_9547 },
 	{ "pca9548", pca_9548 },
 	{ }
@@ -127,7 +135,7 @@ static const struct of_device_id pca954x_of_match[] = {
 	{ .compatible = "nxp,pca9543", .data = &chips[pca_9543] },
 	{ .compatible = "nxp,pca9544", .data = &chips[pca_9544] },
 	{ .compatible = "nxp,pca9545", .data = &chips[pca_9545] },
-	{ .compatible = "nxp,pca9546", .data = &chips[pca_9546] },
+	{ .compatible = "nxp,pca9546", .data = &chips[pca_9545] },
 	{ .compatible = "nxp,pca9547", .data = &chips[pca_9547] },
 	{ .compatible = "nxp,pca9548", .data = &chips[pca_9548] },
 	{}
@@ -151,6 +159,9 @@ static int pca954x_reg_write(struct i2c_adapter *adap,
 		buf[0] = val;
 		msg.buf = buf;
 		ret = __i2c_transfer(adap, &msg, 1);
+
+		if (ret >= 0 && ret != 1)
+			ret = -EREMOTEIO;
 	} else {
 		union i2c_smbus_data data;
 		ret = adap->algo->smbus_xfer(adap, client->addr,
@@ -179,7 +190,7 @@ static int pca954x_select_chan(struct i2c_mux_core *muxc, u32 chan)
 	/* Only select the channel if its different from the last channel */
 	if (data->last_chan != regval) {
 		ret = pca954x_reg_write(muxc->parent, client, regval);
-		data->last_chan = ret ? 0 : regval;
+		data->last_chan = ret < 0 ? 0 : regval;
 	}
 
 	return ret;
@@ -214,6 +225,8 @@ static int pca954x_probe(struct i2c_client *client,
 	struct pca954x *data;
 	const struct of_device_id *match;
 	int ret;
+	bool fskip = false;
+	int force_bus = 0;
 
 	if (!i2c_check_functionality(adap, I2C_FUNC_SMBUS_BYTE))
 		return -ENODEV;
@@ -228,10 +241,64 @@ static int pca954x_probe(struct i2c_client *client,
 	i2c_set_clientdata(client, muxc);
 	data->client = client;
 
+	/* Get regulator pointer for pca954x vcc */
+	data->vcc_reg = devm_regulator_get(&client->dev, "vcc");
+	if (PTR_ERR(data->vcc_reg) == -EPROBE_DEFER)
+		data->vcc_reg = NULL;
+	else if (IS_ERR(data->vcc_reg)) {
+		ret = PTR_ERR(data->vcc_reg);
+		dev_err(&client->dev, "vcc regualtor get failed, %d\n", ret);
+		return ret;
+	}
+
+	/* Get regulator pointer for pca954x vcc-pullup */
+	data->pullup_reg = devm_regulator_get(&client->dev, "vcc-pullup");
+	if (IS_ERR(data->pullup_reg)) {
+		dev_info(&client->dev, "vcc-pullup regulator not found\n");
+		data->pullup_reg = NULL;
+	}
+
+	/* Enable vcc regulator for pca954x */
+	if (data->vcc_reg) {
+		ret = regulator_enable(data->vcc_reg);
+		if (ret < 0) {
+			dev_err(&client->dev, "failed to enable vcc\n");
+			return ret;
+		}
+	}
+	/* Enable vcc-pullup regulator for pca954x */
+	if (data->pullup_reg) {
+		ret = regulator_enable(data->pullup_reg);
+		if (ret < 0) {
+			dev_err(&client->dev, "failed to enable vcc-pullup\n");
+			return ret;
+		}
+	}
+
 	/* Get the mux out of reset if a reset GPIO is specified. */
 	gpio = devm_gpiod_get_optional(&client->dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(gpio))
 		return PTR_ERR(gpio);
+
+
+	if (of_property_read_u32(client->dev.of_node, "force_bus_start",
+			&force_bus)) {
+		dev_info(&client->dev, "%s: could not read force bus number\n",
+			__func__);
+	} else {
+		if (force_bus > 0) {
+			dev_info(&client->dev,
+				"%s: forcing device bus number, start %i.\n",
+				__func__, force_bus);
+		}
+	}
+
+	fskip = of_property_read_bool(client->dev.of_node,
+			"skip_mux_detect");
+	if (fskip) {
+		dev_info(&client->dev, "device detect skipped.\n");
+		goto pca954x_probe_skip_detect;
+	}
 
 	/* Write the mux register at addr to verify
 	 * that the mux is in fact present. This also
@@ -242,6 +309,7 @@ static int pca954x_probe(struct i2c_client *client,
 		return -ENODEV;
 	}
 
+pca954x_probe_skip_detect:
 	match = of_match_device(of_match_ptr(pca954x_of_match), &client->dev);
 	if (match)
 		data->chip = of_device_get_match_data(&client->dev);
@@ -259,6 +327,10 @@ static int pca954x_probe(struct i2c_client *client,
 
 		force = 0;			  /* dynamic adap number */
 		class = 0;			  /* no class by default */
+
+		if (force_bus)
+			force = force_bus + num;
+
 		if (pdata) {
 			if (num < pdata->num_modes) {
 				/* force static number */
@@ -269,6 +341,9 @@ static int pca954x_probe(struct i2c_client *client,
 				break;
 			idle_disconnect_pd = pdata->modes[num].deselect_on_exit;
 		}
+		if (client->dev.of_node)
+			idle_disconnect_pd = true;
+
 		data->deselect |= (idle_disconnect_pd ||
 				   idle_disconnect_dt) << num;
 

@@ -291,6 +291,8 @@ static void fw_free_buf(struct firmware_buf *buf)
 static char fw_path_para[256];
 static const char * const fw_path[] = {
 	fw_path_para,
+	"/vendor/firmware",
+	"/system/etc/firmware",
 	"/lib/firmware/updates/" UTS_RELEASE,
 	"/lib/firmware/updates",
 	"/lib/firmware/" UTS_RELEASE,
@@ -955,13 +957,14 @@ static int _request_firmware_load(struct firmware_priv *fw_priv,
 		timeout = MAX_JIFFY_OFFSET;
 	}
 
-	retval = wait_for_completion_interruptible_timeout(&buf->completion,
+	timeout = wait_for_completion_interruptible_timeout(&buf->completion,
 			timeout);
-	if (retval == -ERESTARTSYS || !retval) {
+	if (timeout == -ERESTARTSYS || !timeout) {
+		retval = timeout;
 		mutex_lock(&fw_lock);
 		fw_load_abort(fw_priv);
 		mutex_unlock(&fw_lock);
-	} else if (retval > 0) {
+	} else if (timeout > 0) {
 		retval = 0;
 	}
 
@@ -1162,7 +1165,7 @@ _request_firmware(const struct firmware **firmware_p, const char *name,
 		}
 	} else {
 		ret = usermodehelper_read_trylock();
-		if (WARN_ON(ret)) {
+		if (ret) {
 			dev_err(device, "firmware: %s will not be loaded\n",
 				name);
 			goto out;
@@ -1176,7 +1179,8 @@ _request_firmware(const struct firmware **firmware_p, const char *name,
 				 "Direct firmware load for %s failed with error %d\n",
 				 name, ret);
 		if (opt_flags & FW_OPT_USERHELPER) {
-			dev_warn(device, "Falling back to user helper\n");
+			if (!(opt_flags & FW_OPT_NO_WARN))
+				dev_warn(device, "Falling back to user helper\n");
 			ret = fw_load_from_user_helper(fw, name, device,
 						       opt_flags, timeout);
 		}
@@ -1231,6 +1235,34 @@ request_firmware(const struct firmware **firmware_p, const char *name,
 	return ret;
 }
 EXPORT_SYMBOL(request_firmware);
+
+/**
+ * firmware_request_nowarn() - request for an optional fw module
+ * @firmware: pointer to firmware image
+ * @name: name of firmware file
+ * @device: device for which firmware is being loaded
+ *
+ * This function is similar in behaviour to request_firmware(), except
+ * it doesn't produce warning messages when the file is not found.
+ * The sysfs fallback mechanism is enabled if direct filesystem lookup fails,
+ * however, however failures to find the firmware file with it are still
+ * suppressed. It is therefore up to the driver to check for the return value
+ * of this call and to decide when to inform the users of errors.
+ **/
+int firmware_request_nowarn(const struct firmware **firmware, const char *name,
+			    struct device *device)
+{
+	int ret;
+
+	/* Need to pin this module until return */
+	__module_get(THIS_MODULE);
+	ret = _request_firmware(firmware, name, device, NULL, 0,
+				FW_OPT_UEVENT | FW_OPT_FALLBACK |
+				FW_OPT_NO_WARN);
+	module_put(THIS_MODULE);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(firmware_request_nowarn);
 
 /**
  * request_firmware_direct: - load firmware directly without usermode helper

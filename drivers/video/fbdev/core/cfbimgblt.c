@@ -238,30 +238,30 @@ static inline void fast_imageblit(const struct fb_image *image, struct fb_info *
 	}
 
 	for (i = ppw-1; i--; ) {
-		fgx <<= bpp;
-		bgx <<= bpp;
+		fgx <<= (bpp & 0x1f);
+		bgx <<= (bpp & 0x1f);
 		fgx |= fgcolor;
 		bgx |= bgcolor;
 	}
-	
+
 	bit_mask = (1 << ppw) - 1;
 	eorx = fgx ^ bgx;
 	k = image->width/ppw;
 
 	for (i = image->height; i--; ) {
 		dst = (u32 __iomem *) dst1, shift = 8; src = s;
-		
+
 		for (j = k; j--; ) {
 			shift -= ppw;
 			end_mask = tab[(*src >> shift) & bit_mask];
 			FB_WRITEL((end_mask & eorx)^bgx, dst++);
-			if (!shift) { shift = 8; src++; }		
+			if (!shift) { shift = 8; src++; }
 		}
 		dst1 += p->fix.line_length;
 		s += spitch;
 	}
-}	
-	
+}
+
 void cfb_imageblit(struct fb_info *p, const struct fb_image *image)
 {
 	u32 fgcolor, bgcolor, start_index, bitstart, pitch_index = 0;

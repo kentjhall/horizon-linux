@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2013-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -42,11 +42,6 @@
 
 #define FUSE_HAS_REVISION_INFO	BIT(0)
 
-#if defined(CONFIG_ARCH_TEGRA_3x_SOC) || \
-    defined(CONFIG_ARCH_TEGRA_114_SOC) || \
-    defined(CONFIG_ARCH_TEGRA_124_SOC) || \
-    defined(CONFIG_ARCH_TEGRA_132_SOC) || \
-    defined(CONFIG_ARCH_TEGRA_210_SOC)
 static u32 tegra30_fuse_read_early(struct tegra_fuse *fuse, unsigned int offset)
 {
 	return readl_relaxed(fuse->base + FUSE_BEGIN + offset);
@@ -68,6 +63,43 @@ static u32 tegra30_fuse_read(struct tegra_fuse *fuse, unsigned int offset)
 	clk_disable_unprepare(fuse->clk);
 
 	return value;
+}
+
+static u32 tegra30_fuse_control_read(struct tegra_fuse *fuse,
+	unsigned int offset)
+{
+	u32 value;
+	int err;
+
+	err = clk_prepare_enable(fuse->clk);
+	if (err < 0) {
+		dev_err(fuse->dev, "failed to enable FUSE clock: %d\n", err);
+		return 0;
+	}
+
+	value = readl_relaxed(fuse->base + offset);
+
+	clk_disable_unprepare(fuse->clk);
+
+	return value;
+}
+
+static int tegra30_fuse_control_write(struct tegra_fuse *fuse, u32 value,
+	unsigned int offset)
+{
+	int err;
+
+	err = clk_prepare_enable(fuse->clk);
+	if (err < 0) {
+		dev_err(fuse->dev, "failed to enable FUSE clock: %d\n", err);
+		return -EIO;
+	}
+
+	writel(value, fuse->base + offset);
+
+	clk_disable_unprepare(fuse->clk);
+
+	return 0;
 }
 
 static void __init tegra30_fuse_add_randomness(void)
@@ -92,18 +124,38 @@ static void __init tegra30_fuse_add_randomness(void)
 	add_device_randomness(randomness, sizeof(randomness));
 }
 
+static int tegra30_fuse_write(struct tegra_fuse *fuse, u32 value,
+	unsigned int offset)
+{
+	int err;
+
+	err = clk_prepare_enable(fuse->clk);
+	if (err < 0) {
+		dev_err(fuse->dev, "failed to enable FUSE clock: %d\n", err);
+		return -EIO;
+	}
+
+	writel(value, fuse->base + FUSE_BEGIN + offset);
+
+	clk_disable_unprepare(fuse->clk);
+
+	return 0;
+}
+
 static void __init tegra30_fuse_init(struct tegra_fuse *fuse)
 {
 	fuse->read_early = tegra30_fuse_read_early;
 	fuse->read = tegra30_fuse_read;
+	fuse->write = tegra30_fuse_write;
+	fuse->control_read = tegra30_fuse_control_read;
+	fuse->control_write = tegra30_fuse_control_write;
 
 	tegra_init_revision();
-	fuse->soc->speedo_init(&tegra_sku_info);
+	if (fuse->soc->speedo_init)
+		fuse->soc->speedo_init(&tegra_sku_info);
 	tegra30_fuse_add_randomness();
 }
-#endif
 
-#ifdef CONFIG_ARCH_TEGRA_3x_SOC
 static const struct tegra_fuse_info tegra30_fuse_info = {
 	.read = tegra30_fuse_read,
 	.size = 0x2a4,
@@ -115,9 +167,7 @@ const struct tegra_fuse_soc tegra30_fuse_soc = {
 	.speedo_init = tegra30_init_speedo_data,
 	.info = &tegra30_fuse_info,
 };
-#endif
 
-#ifdef CONFIG_ARCH_TEGRA_114_SOC
 static const struct tegra_fuse_info tegra114_fuse_info = {
 	.read = tegra30_fuse_read,
 	.size = 0x2a0,
@@ -129,9 +179,7 @@ const struct tegra_fuse_soc tegra114_fuse_soc = {
 	.speedo_init = tegra114_init_speedo_data,
 	.info = &tegra114_fuse_info,
 };
-#endif
 
-#if defined(CONFIG_ARCH_TEGRA_124_SOC) || defined(CONFIG_ARCH_TEGRA_132_SOC)
 static const struct tegra_fuse_info tegra124_fuse_info = {
 	.read = tegra30_fuse_read,
 	.size = 0x300,
@@ -143,11 +191,10 @@ const struct tegra_fuse_soc tegra124_fuse_soc = {
 	.speedo_init = tegra124_init_speedo_data,
 	.info = &tegra124_fuse_info,
 };
-#endif
 
-#if defined(CONFIG_ARCH_TEGRA_210_SOC)
 static const struct tegra_fuse_info tegra210_fuse_info = {
 	.read = tegra30_fuse_read,
+	.write = tegra30_fuse_write,
 	.size = 0x300,
 	.spare = 0x280,
 };
@@ -157,4 +204,20 @@ const struct tegra_fuse_soc tegra210_fuse_soc = {
 	.speedo_init = tegra210_init_speedo_data,
 	.info = &tegra210_fuse_info,
 };
-#endif
+
+static const struct tegra_fuse_info tegra186_fuse_info = {
+	.read = tegra30_fuse_read,
+	.write = tegra30_fuse_write,
+	.size = 0x300,
+	.spare = 0x280,
+};
+
+const struct tegra_fuse_soc tegra186_fuse_soc = {
+	.init = tegra30_fuse_init,
+	.info = &tegra186_fuse_info,
+};
+
+const struct tegra_fuse_soc tegra194_fuse_soc = {
+	.init = tegra30_fuse_init,
+	.info = &tegra186_fuse_info,
+};

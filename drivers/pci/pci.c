@@ -58,6 +58,7 @@ struct pci_pme_device {
 };
 
 #define PME_TIMEOUT 1000 /* How long between PME checks */
+#define CRS_TIMEOUT (60 * 1000) /* Configuration Request Retry timeout */
 
 static void pci_dev_d3_sleep(struct pci_dev *dev)
 {
@@ -89,6 +90,7 @@ unsigned long pci_hotplug_mem_size = DEFAULT_HOTPLUG_MEM_SIZE;
 unsigned long pci_hotplug_bus_size = DEFAULT_HOTPLUG_BUS_SIZE;
 
 enum pcie_bus_config_types pcie_bus_config = PCIE_BUS_DEFAULT;
+EXPORT_SYMBOL(pcie_bus_config);
 
 /*
  * The default CLS is used if arch didn't set CLS explicitly and not
@@ -564,10 +566,6 @@ static void pci_restore_bars(struct pci_dev *dev)
 {
 	int i;
 
-	/* Per SR-IOV spec 3.4.1.11, VF BARs are RO zero */
-	if (dev->is_virtfn)
-		return;
-
 	for (i = 0; i < PCI_BRIDGE_RESOURCES; i++)
 		pci_update_resource(dev, i);
 }
@@ -758,19 +756,6 @@ void pci_update_current_state(struct pci_dev *dev, pci_power_t state)
 }
 
 /**
- * pci_power_up - Put the given device into D0 forcibly
- * @dev: PCI device to power up
- */
-void pci_power_up(struct pci_dev *dev)
-{
-	if (platform_pci_power_manageable(dev))
-		platform_pci_set_power_state(dev, PCI_D0);
-
-	pci_raw_set_power_state(dev, PCI_D0);
-	pci_update_current_state(dev, PCI_D0);
-}
-
-/**
  * pci_platform_power_transition - Use platform to change device power state
  * @dev: PCI device to handle.
  * @state: State to put the device into.
@@ -946,6 +931,17 @@ int pci_set_power_state(struct pci_dev *dev, pci_power_t state)
 EXPORT_SYMBOL(pci_set_power_state);
 
 /**
+ * pci_power_up - Put the given device into D0 forcibly
+ * @dev: PCI device to power up
+ */
+void pci_power_up(struct pci_dev *dev)
+{
+	__pci_start_power_transition(dev, PCI_D0);
+	pci_raw_set_power_state(dev, PCI_D0);
+	pci_update_current_state(dev, PCI_D0);
+}
+
+/**
  * pci_choose_state - Choose the power state of a PCI device
  * @dev: PCI device to be suspended
  * @state: target sleep state for the whole system. This is the value
@@ -1092,6 +1088,44 @@ static void pci_restore_pcix_state(struct pci_dev *dev)
 	pci_write_config_word(dev, pos + PCI_X_CMD, cap[i++]);
 }
 
+static int pci_save_l1_pm_ss_state(struct pci_dev *dev)
+{
+	int pos;
+	struct pci_cap_saved_state *save_state;
+
+	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_L1SS);
+	if (pos <= 0)
+		return 0;
+
+	save_state = pci_find_saved_ext_cap(dev, PCI_EXT_CAP_ID_L1SS);
+	if (!save_state) {
+		dev_err(&dev->dev, "buffer not found in %s\n", __func__);
+		return -ENOMEM;
+	}
+
+	pci_read_config_dword(dev, pos + PCI_L1SS_CTRL1,
+		&save_state->cap.data[0]);
+	pci_read_config_dword(dev, pos + PCI_L1SS_CTRL2,
+		&save_state->cap.data[1]);
+
+	return 0;
+}
+
+static void pci_restore_l1_pm_ss_state(struct pci_dev *dev)
+{
+	int pos;
+	struct pci_cap_saved_state *save_state;
+
+	save_state = pci_find_saved_ext_cap(dev, PCI_EXT_CAP_ID_L1SS);
+	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_L1SS);
+	if (!save_state || pos <= 0)
+		return;
+
+	pci_write_config_dword(dev, pos + PCI_L1SS_CTRL1,
+		save_state->cap.data[0]);
+	pci_write_config_dword(dev, pos + PCI_L1SS_CTRL2,
+		save_state->cap.data[1]);
+}
 
 /**
  * pci_save_state - save the PCI configuration space of a device before suspending
@@ -1113,17 +1147,21 @@ int pci_save_state(struct pci_dev *dev)
 	if (i != 0)
 		return i;
 
+	i = pci_save_l1_pm_ss_state(dev);
+	if (i != 0)
+		return i;
+
 	return pci_save_vc_state(dev);
 }
 EXPORT_SYMBOL(pci_save_state);
 
 static void pci_restore_config_dword(struct pci_dev *pdev, int offset,
-				     u32 saved_val, int retry)
+				     u32 saved_val, int retry, bool force)
 {
 	u32 val;
 
 	pci_read_config_dword(pdev, offset, &val);
-	if (val == saved_val)
+	if (!force && val == saved_val)
 		return;
 
 	for (;;) {
@@ -1142,25 +1180,36 @@ static void pci_restore_config_dword(struct pci_dev *pdev, int offset,
 }
 
 static void pci_restore_config_space_range(struct pci_dev *pdev,
-					   int start, int end, int retry)
+					   int start, int end, int retry,
+					   bool force)
 {
 	int index;
 
 	for (index = end; index >= start; index--)
 		pci_restore_config_dword(pdev, 4 * index,
 					 pdev->saved_config_space[index],
-					 retry);
+					 retry, force);
 }
 
 static void pci_restore_config_space(struct pci_dev *pdev)
 {
 	if (pdev->hdr_type == PCI_HEADER_TYPE_NORMAL) {
-		pci_restore_config_space_range(pdev, 10, 15, 0);
+		pci_restore_config_space_range(pdev, 10, 15, 0, false);
 		/* Restore BARs before the command register. */
-		pci_restore_config_space_range(pdev, 4, 9, 10);
-		pci_restore_config_space_range(pdev, 0, 3, 0);
+		pci_restore_config_space_range(pdev, 4, 9, 10, false);
+		pci_restore_config_space_range(pdev, 0, 3, 0, false);
+	} else if (pdev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
+		pci_restore_config_space_range(pdev, 12, 15, 0, false);
+
+		/*
+		 * Force rewriting of prefetch registers to avoid S3 resume
+		 * issues on Intel PCI bridges that occur when these
+		 * registers are not explicitly written.
+		 */
+		pci_restore_config_space_range(pdev, 9, 11, 0, true);
+		pci_restore_config_space_range(pdev, 0, 8, 0, false);
 	} else {
-		pci_restore_config_space_range(pdev, 0, 15, 0);
+		pci_restore_config_space_range(pdev, 0, 15, 0, false);
 	}
 }
 
@@ -1183,7 +1232,11 @@ void pci_restore_state(struct pci_dev *dev)
 	pci_restore_config_space(dev);
 
 	pci_restore_pcix_state(dev);
+	pci_restore_l1_pm_ss_state(dev);
 	pci_restore_msi_state(dev);
+#ifdef CONFIG_PCIEAER
+	pci_restore_aer_state(dev);
+#endif
 
 	/* Restore ACS and IOV configuration state */
 	pci_enable_acs(dev);
@@ -1779,6 +1832,13 @@ static void pci_pme_list_scan(struct work_struct *work)
 			 */
 			if (bridge && bridge->current_state != PCI_D0)
 				continue;
+			/*
+			 * If the device is in D3cold it should not be
+			 * polled either.
+			 */
+			if (pme_dev->dev->current_state == PCI_D3cold)
+				continue;
+
 			pci_pme_wakeup(pme_dev->dev, NULL);
 		} else {
 			list_del(&pme_dev->list);
@@ -1786,8 +1846,8 @@ static void pci_pme_list_scan(struct work_struct *work)
 		}
 	}
 	if (!list_empty(&pci_pme_list))
-		schedule_delayed_work(&pci_pme_work,
-				      msecs_to_jiffies(PME_TIMEOUT));
+		queue_delayed_work(system_freezable_wq, &pci_pme_work,
+				   msecs_to_jiffies(PME_TIMEOUT));
 	mutex_unlock(&pci_pme_list_mutex);
 }
 
@@ -1852,8 +1912,9 @@ void pci_pme_active(struct pci_dev *dev, bool enable)
 			mutex_lock(&pci_pme_list_mutex);
 			list_add(&pme_dev->list, &pci_pme_list);
 			if (list_is_singular(&pci_pme_list))
-				schedule_delayed_work(&pci_pme_work,
-						      msecs_to_jiffies(PME_TIMEOUT));
+				queue_delayed_work(system_freezable_wq,
+						   &pci_pme_work,
+						   msecs_to_jiffies(PME_TIMEOUT));
 			mutex_unlock(&pci_pme_list_mutex);
 		} else {
 			mutex_lock(&pci_pme_list_mutex);
@@ -2106,6 +2167,10 @@ bool pci_dev_run_wake(struct pci_dev *dev)
 	if (!dev->pme_support)
 		return false;
 
+	/* PME-capable in principle, but not from the intended sleep state */
+	if (!pci_pme_capable(dev, pci_target_state(dev)))
+		return false;
+
 	while (bus->parent) {
 		struct pci_dev *bridge = bus->self;
 
@@ -2141,7 +2206,8 @@ bool pci_dev_keep_suspended(struct pci_dev *pci_dev)
 
 	if (!pm_runtime_suspended(dev)
 	    || pci_target_state(pci_dev) != pci_dev->current_state
-	    || platform_pci_need_resume(pci_dev))
+	    || platform_pci_need_resume(pci_dev)
+	    || (pci_dev->dev_flags & PCI_DEV_FLAGS_NEEDS_RESUME))
 		return false;
 
 	/*
@@ -2709,6 +2775,12 @@ void pci_allocate_cap_save_buffers(struct pci_dev *dev)
 	if (error)
 		dev_err(&dev->dev,
 			"unable to preallocate PCI-X save buffer\n");
+
+	error = pci_add_ext_cap_save_buffer(dev, PCI_EXT_CAP_ID_L1SS,
+		2 * sizeof(u32));
+	if (error)
+		dev_err(&dev->dev,
+			"unable to preallocate L1 PM-SS save buffer\n");
 
 	pci_allocate_vc_save_buffers(dev);
 }
@@ -3387,6 +3459,7 @@ int __weak pci_remap_iospace(const struct resource *res, phys_addr_t phys_addr)
 	return -ENODEV;
 #endif
 }
+EXPORT_SYMBOL(pci_remap_iospace);
 
 /**
  *	pci_unmap_iospace - Unmap the memory mapped I/O space
@@ -3404,6 +3477,75 @@ void pci_unmap_iospace(struct resource *res)
 	unmap_kernel_range(vaddr, resource_size(res));
 #endif
 }
+EXPORT_SYMBOL(pci_unmap_iospace);
+
+static void devm_pci_unmap_iospace(struct device *dev, void *ptr)
+{
+	struct resource **res = ptr;
+
+	pci_unmap_iospace(*res);
+}
+
+/**
+ * devm_pci_remap_iospace - Managed pci_remap_iospace()
+ * @dev: Generic device to remap IO address for
+ * @res: Resource describing the I/O space
+ * @phys_addr: physical address of range to be mapped
+ *
+ * Managed pci_remap_iospace().  Map is automatically unmapped on driver
+ * detach.
+ */
+int devm_pci_remap_iospace(struct device *dev, const struct resource *res,
+			   phys_addr_t phys_addr)
+{
+	const struct resource **ptr;
+	int error;
+
+	ptr = devres_alloc(devm_pci_unmap_iospace, sizeof(*ptr), GFP_KERNEL);
+	if (!ptr)
+		return -ENOMEM;
+
+	error = pci_remap_iospace(res, phys_addr);
+	if (error) {
+		devres_free(ptr);
+	} else	{
+		*ptr = res;
+		devres_add(dev, ptr);
+	}
+
+	return error;
+}
+EXPORT_SYMBOL(devm_pci_remap_iospace);
+
+/**
+ * devm_pci_remap_cfgspace - Managed pci_remap_cfgspace()
+ * @dev: Generic device to remap IO address for
+ * @offset: Resource address to map
+ * @size: Size of map
+ *
+ * Managed pci_remap_cfgspace().  Map is automatically unmapped on driver
+ * detach.
+ */
+void __iomem *devm_pci_remap_cfgspace(struct device *dev,
+				      resource_size_t offset,
+				      resource_size_t size)
+{
+	void __iomem **ptr, *addr;
+
+	ptr = devres_alloc(devm_ioremap_release, sizeof(*ptr), GFP_KERNEL);
+	if (!ptr)
+		return NULL;
+
+	addr = pci_remap_cfgspace(offset, size);
+	if (addr) {
+		*ptr = addr;
+		devres_add(dev, ptr);
+	} else
+		devres_free(ptr);
+
+	return addr;
+}
+EXPORT_SYMBOL(devm_pci_remap_cfgspace);
 
 static void __pci_set_master(struct pci_dev *dev, bool enable)
 {
@@ -3754,27 +3896,49 @@ int pci_wait_for_pending_transaction(struct pci_dev *dev)
 }
 EXPORT_SYMBOL(pci_wait_for_pending_transaction);
 
-/*
- * We should only need to wait 100ms after FLR, but some devices take longer.
- * Wait for up to 1000ms for config space to return something other than -1.
- * Intel IGD requires this when an LCD panel is attached.  We read the 2nd
- * dword because VFs don't implement the 1st dword.
- */
 static void pci_flr_wait(struct pci_dev *dev)
 {
-	int i = 0;
+	int delay = 1, timeout = 60000;
 	u32 id;
 
-	do {
-		msleep(100);
-		pci_read_config_dword(dev, PCI_COMMAND, &id);
-	} while (i++ < 10 && id == ~0);
+	/*
+	 * Per PCIe r3.1, sec 6.6.2, a device must complete an FLR within
+	 * 100ms, but may silently discard requests while the FLR is in
+	 * progress.  Wait 100ms before trying to access the device.
+	 */
+	msleep(100);
 
-	if (id == ~0)
-		dev_warn(&dev->dev, "Failed to return from FLR\n");
-	else if (i > 1)
-		dev_info(&dev->dev, "Required additional %dms to return from FLR\n",
-			 (i - 1) * 100);
+	/*
+	 * After 100ms, the device should not silently discard config
+	 * requests, but it may still indicate that it needs more time by
+	 * responding to them with CRS completions.  The Root Port will
+	 * generally synthesize ~0 data to complete the read (except when
+	 * CRS SV is enabled and the read was for the Vendor ID; in that
+	 * case it synthesizes 0x0001 data).
+	 *
+	 * Wait for the device to return a non-CRS completion.  Read the
+	 * Command register instead of Vendor ID so we don't have to
+	 * contend with the CRS SV value.
+	 */
+	pci_read_config_dword(dev, PCI_COMMAND, &id);
+	while (id == ~0) {
+		if (delay > timeout) {
+			dev_warn(&dev->dev, "not ready %dms after FLR; giving up\n",
+				 100 + delay - 1);
+			return;
+		}
+
+		if (delay > 1000)
+			dev_info(&dev->dev, "not ready %dms after FLR; waiting\n",
+				 100 + delay - 1);
+
+		msleep(delay);
+		delay *= 2;
+		pci_read_config_dword(dev, PCI_COMMAND, &id);
+	}
+
+	if (delay > 1000)
+		dev_info(&dev->dev, "ready %dms after FLR\n", 100 + delay - 1);
 }
 
 static int pcie_flr(struct pci_dev *dev, int probe)
@@ -4211,6 +4375,10 @@ EXPORT_SYMBOL_GPL(pci_try_reset_function);
 static bool pci_bus_resetable(struct pci_bus *bus)
 {
 	struct pci_dev *dev;
+
+
+	if (bus->self && (bus->self->dev_flags & PCI_DEV_FLAGS_NO_BUS_RESET))
+		return false;
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
 		if (dev->dev_flags & PCI_DEV_FLAGS_NO_BUS_RESET ||
@@ -4831,36 +4999,6 @@ int pci_select_bars(struct pci_dev *dev, unsigned long flags)
 }
 EXPORT_SYMBOL(pci_select_bars);
 
-/**
- * pci_resource_bar - get position of the BAR associated with a resource
- * @dev: the PCI device
- * @resno: the resource number
- * @type: the BAR type to be filled in
- *
- * Returns BAR position in config space, or 0 if the BAR is invalid.
- */
-int pci_resource_bar(struct pci_dev *dev, int resno, enum pci_bar_type *type)
-{
-	int reg;
-
-	if (resno < PCI_ROM_RESOURCE) {
-		*type = pci_bar_unknown;
-		return PCI_BASE_ADDRESS_0 + 4 * resno;
-	} else if (resno == PCI_ROM_RESOURCE) {
-		*type = pci_bar_mem32;
-		return dev->rom_base_reg;
-	} else if (resno < PCI_BRIDGE_RESOURCES) {
-		/* device specific resource */
-		*type = pci_bar_unknown;
-		reg = pci_iov_resource_bar(dev, resno);
-		if (reg)
-			return reg;
-	}
-
-	dev_err(&dev->dev, "BAR %d: invalid resource\n", resno);
-	return 0;
-}
-
 /* Some architectures require additional programming to enable VGA */
 static arch_set_vga_state_t arch_set_vga_state;
 
@@ -4966,7 +5104,8 @@ bool pci_device_is_present(struct pci_dev *pdev)
 {
 	u32 v;
 
-	return pci_bus_read_dev_vendor_id(pdev->bus, pdev->devfn, &v, 0);
+	return pci_bus_read_dev_vendor_id(pdev->bus, pdev->devfn, &v,
+					  CRS_TIMEOUT);
 }
 EXPORT_SYMBOL_GPL(pci_device_is_present);
 
@@ -5061,7 +5200,7 @@ static resource_size_t pci_specified_resource_alignment(struct pci_dev *dev)
 				if (align_order == -1)
 					align = PAGE_SIZE;
 				else
-					align = 1 << align_order;
+					align = (resource_size_t)1 << align_order;
 				/* Found */
 				break;
 			}

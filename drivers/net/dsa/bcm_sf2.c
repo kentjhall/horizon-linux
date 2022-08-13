@@ -393,7 +393,7 @@ static int bcm_sf2_sw_mdio_read(struct mii_bus *bus, int addr, int regnum)
 	if (addr == BRCM_PSEUDO_PHY_ADDR && priv->indir_phy_mask & BIT(addr))
 		return bcm_sf2_sw_indir_rw(priv, 1, addr, regnum, 0);
 	else
-		return mdiobus_read(priv->master_mii_bus, addr, regnum);
+		return mdiobus_read_nested(priv->master_mii_bus, addr, regnum);
 }
 
 static int bcm_sf2_sw_mdio_write(struct mii_bus *bus, int addr, int regnum,
@@ -405,11 +405,10 @@ static int bcm_sf2_sw_mdio_write(struct mii_bus *bus, int addr, int regnum,
 	 * send them to our master MDIO bus controller
 	 */
 	if (addr == BRCM_PSEUDO_PHY_ADDR && priv->indir_phy_mask & BIT(addr))
-		bcm_sf2_sw_indir_rw(priv, 0, addr, regnum, val);
+		return bcm_sf2_sw_indir_rw(priv, 0, addr, regnum, val);
 	else
-		mdiobus_write(priv->master_mii_bus, addr, regnum, val);
-
-	return 0;
+		return mdiobus_write_nested(priv->master_mii_bus, addr,
+				regnum, val);
 }
 
 static irqreturn_t bcm_sf2_switch_0_isr(int irq, void *dev_id)
@@ -744,7 +743,6 @@ static int bcm_sf2_sw_suspend(struct dsa_switch *ds)
 static int bcm_sf2_sw_resume(struct dsa_switch *ds)
 {
 	struct bcm_sf2_priv *priv = bcm_sf2_to_priv(ds);
-	unsigned int port;
 	int ret;
 
 	ret = bcm_sf2_sw_rst(priv);
@@ -756,12 +754,7 @@ static int bcm_sf2_sw_resume(struct dsa_switch *ds)
 	if (priv->hw_params.num_gphy == 1)
 		bcm_sf2_gphy_enable_set(ds, true);
 
-	for (port = 0; port < DSA_MAX_PORTS; port++) {
-		if ((1 << port) & ds->enabled_port_mask)
-			bcm_sf2_port_setup(ds, port, NULL);
-		else if (dsa_is_cpu_port(ds, port))
-			bcm_sf2_imp_setup(ds, port);
-	}
+	ds->ops->setup(ds);
 
 	return 0;
 }
@@ -982,6 +975,8 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
 	const char *reg_names[BCM_SF2_REGS_NUM] = BCM_SF2_REGS_NAME;
 	struct device_node *dn = pdev->dev.of_node;
 	struct b53_platform_data *pdata;
+	struct dsa_switch_ops *ops;
+	struct device_node *ports;
 	struct bcm_sf2_priv *priv;
 	struct b53_device *dev;
 	struct dsa_switch *ds;
@@ -993,6 +988,10 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
+		return -ENOMEM;
+
+	ops = devm_kzalloc(&pdev->dev, sizeof(*ops), GFP_KERNEL);
+	if (!ops)
 		return -ENOMEM;
 
 	dev = b53_switch_alloc(&pdev->dev, &bcm_sf2_io_ops, priv);
@@ -1014,6 +1013,8 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
 	ds = dev->ds;
 
 	/* Override the parts that are non-standard wrt. normal b53 devices */
+	memcpy(ops, ds->ops, sizeof(*ops));
+	ds->ops = ops;
 	ds->ops->get_tag_protocol = bcm_sf2_sw_get_tag_protocol;
 	ds->ops->setup = bcm_sf2_sw_setup;
 	ds->ops->get_phy_flags = bcm_sf2_sw_get_phy_flags;
@@ -1038,7 +1039,13 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
 	spin_lock_init(&priv->indir_lock);
 	mutex_init(&priv->stats_mutex);
 
-	bcm_sf2_identify_ports(priv, dn->child);
+	/* Balance of_node_put() done by of_find_node_by_name() */
+	of_node_get(dn);
+	ports = of_find_node_by_name(dn, "ports");
+	if (ports) {
+		bcm_sf2_identify_ports(priv, ports);
+		of_node_put(ports);
+	}
 
 	priv->irq0 = irq_of_parse_and_map(dn, 0);
 	priv->irq1 = irq_of_parse_and_map(dn, 1);
@@ -1128,10 +1135,10 @@ static int bcm_sf2_sw_remove(struct platform_device *pdev)
 {
 	struct bcm_sf2_priv *priv = platform_get_drvdata(pdev);
 
-	/* Disable all ports and interrupts */
 	priv->wol_ports_mask = 0;
-	bcm_sf2_sw_suspend(priv->dev->ds);
 	dsa_unregister_switch(priv->dev->ds);
+	/* Disable all ports and interrupts */
+	bcm_sf2_sw_suspend(priv->dev->ds);
 	bcm_sf2_mdio_unregister(priv);
 
 	return 0;

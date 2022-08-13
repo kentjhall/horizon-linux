@@ -527,7 +527,7 @@ static int qedr_set_device_attr(struct qedr_dev *dev)
 	qed_attr = dev->ops->rdma_query_device(dev->rdma_ctx);
 
 	/* Part 2 - check capabilities */
-	page_size = ~dev->attr.page_size_caps + 1;
+	page_size = ~qed_attr->page_size_caps + 1;
 	if (page_size > PAGE_SIZE) {
 		DP_ERR(dev,
 		       "Kernel PAGE_SIZE is %ld which is smaller than minimum page size (%d) required by qedr\n",
@@ -762,7 +762,8 @@ static struct qedr_dev *qedr_add(struct qed_dev *cdev, struct pci_dev *pdev,
 
 	dev->num_cnq = dev->ops->rdma_get_min_cnq_msix(cdev);
 	if (!dev->num_cnq) {
-		DP_ERR(dev, "not enough CNQ resources.\n");
+		DP_ERR(dev, "Failed. At least one CNQ is required.\n");
+		rc = -ENOMEM;
 		goto init_err;
 	}
 
@@ -791,6 +792,9 @@ static struct qedr_dev *qedr_add(struct qed_dev *cdev, struct pci_dev *pdev,
 	for (i = 0; i < ARRAY_SIZE(qedr_attributes); i++)
 		if (device_create_file(&dev->ibdev.dev, qedr_attributes[i]))
 			goto sysfs_err;
+
+	if (!test_and_set_bit(QEDR_ENET_STATE_BIT, &dev->enet_state))
+		qedr_ib_dispatch_event(dev, QEDR_PORT, IB_EVENT_PORT_ACTIVE);
 
 	DP_DEBUG(dev, QEDR_MSG_INIT, "qedr driver loaded successfully\n");
 	return dev;
@@ -824,17 +828,22 @@ static void qedr_remove(struct qedr_dev *dev)
 	ib_dealloc_device(&dev->ibdev);
 }
 
-static int qedr_close(struct qedr_dev *dev)
+static void qedr_close(struct qedr_dev *dev)
 {
-	qedr_ib_dispatch_event(dev, 1, IB_EVENT_PORT_ERR);
-
-	return 0;
+	if (test_and_clear_bit(QEDR_ENET_STATE_BIT, &dev->enet_state))
+		qedr_ib_dispatch_event(dev, QEDR_PORT, IB_EVENT_PORT_ERR);
 }
 
 static void qedr_shutdown(struct qedr_dev *dev)
 {
 	qedr_close(dev);
 	qedr_remove(dev);
+}
+
+static void qedr_open(struct qedr_dev *dev)
+{
+	if (!test_and_set_bit(QEDR_ENET_STATE_BIT, &dev->enet_state))
+		qedr_ib_dispatch_event(dev, QEDR_PORT, IB_EVENT_PORT_ACTIVE);
 }
 
 static void qedr_mac_address_change(struct qedr_dev *dev)
@@ -863,7 +872,7 @@ static void qedr_mac_address_change(struct qedr_dev *dev)
 
 	ether_addr_copy(dev->gsi_ll2_mac_address, dev->ndev->dev_addr);
 
-	qedr_ib_dispatch_event(dev, 1, IB_EVENT_GID_CHANGE);
+	qedr_ib_dispatch_event(dev, QEDR_PORT, IB_EVENT_GID_CHANGE);
 
 	if (rc)
 		DP_ERR(dev, "Error updating mac filter\n");
@@ -877,7 +886,7 @@ static void qedr_notify(struct qedr_dev *dev, enum qede_roce_event event)
 {
 	switch (event) {
 	case QEDE_UP:
-		qedr_ib_dispatch_event(dev, 1, IB_EVENT_PORT_ACTIVE);
+		qedr_open(dev);
 		break;
 	case QEDE_DOWN:
 		qedr_close(dev);

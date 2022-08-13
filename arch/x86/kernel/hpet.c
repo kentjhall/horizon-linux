@@ -1,6 +1,7 @@
 #include <linux/clocksource.h>
 #include <linux/clockchips.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/export.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
@@ -352,8 +353,9 @@ static int hpet_resume(struct clock_event_device *evt, int timer)
 	} else {
 		struct hpet_dev *hdev = EVT_TO_HPET_DEV(evt);
 
+		irq_domain_deactivate_irq(irq_get_irq_data(hdev->irq));
 		irq_domain_activate_irq(irq_get_irq_data(hdev->irq));
-		disable_irq(hdev->irq);
+		disable_hardirq(hdev->irq);
 		irq_set_affinity(hdev->irq, cpumask_of(hdev->cpu));
 		enable_irq(hdev->irq);
 	}
@@ -912,6 +914,8 @@ int __init hpet_enable(void)
 		return 0;
 
 	hpet_set_mapping();
+	if (!hpet_virt_address)
+		return 0;
 
 	/*
 	 * Read the period and check for a sane value:

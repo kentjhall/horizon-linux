@@ -222,7 +222,7 @@
 #define USB3_EP0_SS_MAX_PACKET_SIZE	512
 #define USB3_EP0_HSFS_MAX_PACKET_SIZE	64
 #define USB3_EP0_BUF_SIZE		8
-#define USB3_MAX_NUM_PIPES		30
+#define USB3_MAX_NUM_PIPES		6	/* This includes PIPE 0 */
 #define USB3_WAIT_US			3
 
 struct renesas_usb3;
@@ -521,6 +521,13 @@ static void usb3_disconnect(struct renesas_usb3 *usb3)
 	usb3_usb2_pullup(usb3, 0);
 	usb3_clear_bit(usb3, USB30_CON_B3_CONNECT, USB3_USB30_CON);
 	usb3_reset_epc(usb3);
+	usb3_disable_irq_1(usb3, USB_INT_1_B2_RSUM | USB_INT_1_B3_PLLWKUP |
+			   USB_INT_1_B3_LUPSUCS | USB_INT_1_B3_DISABLE |
+			   USB_INT_1_SPEED | USB_INT_1_B3_WRMRST |
+			   USB_INT_1_B3_HOTRST | USB_INT_1_B2_SPND |
+			   USB_INT_1_B2_L1SPND | USB_INT_1_B2_USBRST);
+	usb3_clear_bit(usb3, USB_COM_CON_SPD_MODE, USB3_USB_COM_CON);
+	usb3_init_epc_registers(usb3);
 
 	if (usb3->driver)
 		usb3->driver->disconnect(&usb3->gadget);
@@ -621,12 +628,15 @@ static void usb3_irq_epc_int_1_speed(struct renesas_usb3 *usb3)
 	switch (speed) {
 	case USB_STA_SPEED_SS:
 		usb3->gadget.speed = USB_SPEED_SUPER;
+		usb3->gadget.ep0->maxpacket = USB3_EP0_SS_MAX_PACKET_SIZE;
 		break;
 	case USB_STA_SPEED_HS:
 		usb3->gadget.speed = USB_SPEED_HIGH;
+		usb3->gadget.ep0->maxpacket = USB3_EP0_HSFS_MAX_PACKET_SIZE;
 		break;
 	case USB_STA_SPEED_FS:
 		usb3->gadget.speed = USB_SPEED_FULL;
+		usb3->gadget.ep0->maxpacket = USB3_EP0_HSFS_MAX_PACKET_SIZE;
 		break;
 	default:
 		usb3->gadget.speed = USB_SPEED_UNKNOWN;
@@ -685,21 +695,32 @@ static struct renesas_usb3_request *usb3_get_request(struct renesas_usb3_ep
 	return usb3_req;
 }
 
+static void __usb3_request_done(struct renesas_usb3_ep *usb3_ep,
+				struct renesas_usb3_request *usb3_req,
+				int status)
+{
+	struct renesas_usb3 *usb3 = usb3_ep_to_usb3(usb3_ep);
+
+	dev_dbg(usb3_to_dev(usb3), "giveback: ep%2d, %u, %u, %d\n",
+		usb3_ep->num, usb3_req->req.length, usb3_req->req.actual,
+		status);
+	usb3_req->req.status = status;
+	usb3_ep->started = false;
+	list_del_init(&usb3_req->queue);
+	spin_unlock(&usb3->lock);
+	usb_gadget_giveback_request(&usb3_ep->ep, &usb3_req->req);
+	spin_lock(&usb3->lock);
+}
+
 static void usb3_request_done(struct renesas_usb3_ep *usb3_ep,
 			      struct renesas_usb3_request *usb3_req, int status)
 {
 	struct renesas_usb3 *usb3 = usb3_ep_to_usb3(usb3_ep);
 	unsigned long flags;
 
-	dev_dbg(usb3_to_dev(usb3), "giveback: ep%2d, %u, %u, %d\n",
-		usb3_ep->num, usb3_req->req.length, usb3_req->req.actual,
-		status);
-	usb3_req->req.status = status;
 	spin_lock_irqsave(&usb3->lock, flags);
-	usb3_ep->started = false;
-	list_del_init(&usb3_req->queue);
+	__usb3_request_done(usb3_ep, usb3_req, status);
 	spin_unlock_irqrestore(&usb3->lock, flags);
-	usb_gadget_giveback_request(&usb3_ep->ep, &usb3_req->req);
 }
 
 static void usb3_irq_epc_pipe0_status_end(struct renesas_usb3 *usb3)
@@ -868,7 +889,7 @@ static int usb3_write_pipe(struct renesas_usb3_ep *usb3_ep,
 			usb3_ep->ep.maxpacket);
 	u8 *buf = usb3_req->req.buf + usb3_req->req.actual;
 	u32 tmp = 0;
-	bool is_last;
+	bool is_last = !len ? true : false;
 
 	if (usb3_wait_pipe_status(usb3_ep, PX_STA_BUFSTS) < 0)
 		return -EBUSY;
@@ -889,7 +910,8 @@ static int usb3_write_pipe(struct renesas_usb3_ep *usb3_ep,
 		usb3_write(usb3, tmp, fifo_reg);
 	}
 
-	is_last = usb3_is_transfer_complete(usb3_ep, usb3_req);
+	if (!is_last)
+		is_last = usb3_is_transfer_complete(usb3_ep, usb3_req);
 	/* Send the data */
 	usb3_set_px_con_send(usb3_ep, len, is_last);
 
@@ -980,7 +1002,8 @@ static void usb3_start_pipe0(struct renesas_usb3_ep *usb3_ep,
 		usb3_set_p0_con_for_ctrl_read_data(usb3);
 	} else {
 		usb3_clear_bit(usb3, P0_MOD_DIR, USB3_P0_MOD);
-		usb3_set_p0_con_for_ctrl_write_data(usb3);
+		if (usb3_req->req.length)
+			usb3_set_p0_con_for_ctrl_write_data(usb3);
 	}
 
 	usb3_p0_xfer(usb3_ep, usb3_req);
@@ -1401,7 +1424,13 @@ static void usb3_request_done_pipen(struct renesas_usb3 *usb3,
 				    struct renesas_usb3_request *usb3_req,
 				    int status)
 {
-	usb3_pn_stop(usb3);
+	unsigned long flags;
+
+	spin_lock_irqsave(&usb3->lock, flags);
+	if (usb3_pn_change(usb3, usb3_ep->num))
+		usb3_pn_stop(usb3);
+	spin_unlock_irqrestore(&usb3->lock, flags);
+
 	usb3_disable_pipe_irq(usb3, usb3_ep->num);
 	usb3_request_done(usb3_ep, usb3_req, status);
 
@@ -1430,9 +1459,14 @@ static void usb3_irq_epc_pipen_bfrdy(struct renesas_usb3 *usb3, int num)
 {
 	struct renesas_usb3_ep *usb3_ep = usb3_get_ep(usb3, num);
 	struct renesas_usb3_request *usb3_req = usb3_get_request(usb3_ep);
+	bool done = false;
 
 	if (!usb3_req)
 		return;
+
+	spin_lock(&usb3->lock);
+	if (usb3_pn_change(usb3, num))
+		goto out;
 
 	if (usb3_ep->dir_in) {
 		/* Do not stop the IN pipe here to detect LSTTR interrupt */
@@ -1440,20 +1474,31 @@ static void usb3_irq_epc_pipen_bfrdy(struct renesas_usb3 *usb3, int num)
 			usb3_clear_bit(usb3, PN_INT_BFRDY, USB3_PN_INT_ENA);
 	} else {
 		if (!usb3_read_pipe(usb3_ep, usb3_req, USB3_PN_READ))
-			usb3_request_done_pipen(usb3, usb3_ep, usb3_req, 0);
+			done = true;
 	}
+
+out:
+	/* need to unlock because usb3_request_done_pipen() locks it */
+	spin_unlock(&usb3->lock);
+
+	if (done)
+		usb3_request_done_pipen(usb3, usb3_ep, usb3_req, 0);
 }
 
 static void usb3_irq_epc_pipen(struct renesas_usb3 *usb3, int num)
 {
 	u32 pn_int_sta;
 
-	if (usb3_pn_change(usb3, num) < 0)
+	spin_lock(&usb3->lock);
+	if (usb3_pn_change(usb3, num) < 0) {
+		spin_unlock(&usb3->lock);
 		return;
+	}
 
 	pn_int_sta = usb3_read(usb3, USB3_PN_INT_STA);
 	pn_int_sta &= usb3_read(usb3, USB3_PN_INT_ENA);
 	usb3_write(usb3, pn_int_sta, USB3_PN_INT_STA);
+	spin_unlock(&usb3->lock);
 	if (pn_int_sta & PN_INT_LSTTR)
 		usb3_irq_epc_pipen_lsttr(usb3, num);
 	if (pn_int_sta & PN_INT_BFRDY)
@@ -1535,7 +1580,16 @@ static u32 usb3_calc_ramarea(int ram_size)
 static u32 usb3_calc_rammap_val(struct renesas_usb3_ep *usb3_ep,
 				const struct usb_endpoint_descriptor *desc)
 {
-	return usb3_ep->rammap_val | PN_RAMMAP_MPKT(usb_endpoint_maxp(desc));
+	int i;
+	const u32 max_packet_array[] = {8, 16, 32, 64, 512};
+	u32 mpkt = PN_RAMMAP_MPKT(1024);
+
+	for (i = 0; i < ARRAY_SIZE(max_packet_array); i++) {
+		if (usb_endpoint_maxp(desc) <= max_packet_array[i])
+			mpkt = PN_RAMMAP_MPKT(max_packet_array[i]);
+	}
+
+	return usb3_ep->rammap_val | mpkt;
 }
 
 static int usb3_enable_pipe_n(struct renesas_usb3_ep *usb3_ep,
@@ -1707,6 +1761,9 @@ static int renesas_usb3_start(struct usb_gadget *gadget,
 	/* hook up the driver */
 	usb3->driver = driver;
 
+	pm_runtime_enable(usb3_to_dev(usb3));
+	pm_runtime_get_sync(usb3_to_dev(usb3));
+
 	renesas_usb3_init_controller(usb3);
 
 	return 0;
@@ -1715,14 +1772,14 @@ static int renesas_usb3_start(struct usb_gadget *gadget,
 static int renesas_usb3_stop(struct usb_gadget *gadget)
 {
 	struct renesas_usb3 *usb3 = gadget_to_renesas_usb3(gadget);
-	unsigned long flags;
 
-	spin_lock_irqsave(&usb3->lock, flags);
 	usb3->softconnect = false;
 	usb3->gadget.speed = USB_SPEED_UNKNOWN;
 	usb3->driver = NULL;
 	renesas_usb3_stop_controller(usb3);
-	spin_unlock_irqrestore(&usb3->lock, flags);
+
+	pm_runtime_put(usb3_to_dev(usb3));
+	pm_runtime_disable(usb3_to_dev(usb3));
 
 	return 0;
 }
@@ -1760,9 +1817,6 @@ static const struct usb_gadget_ops renesas_usb3_gadget_ops = {
 static int renesas_usb3_remove(struct platform_device *pdev)
 {
 	struct renesas_usb3 *usb3 = platform_get_drvdata(pdev);
-
-	pm_runtime_put(&pdev->dev);
-	pm_runtime_disable(&pdev->dev);
 
 	usb_del_gadget_udc(&usb3->gadget);
 
@@ -1807,7 +1861,7 @@ static int renesas_usb3_init_ep(struct renesas_usb3 *usb3, struct device *dev,
 			/* for control pipe */
 			usb3->gadget.ep0 = &usb3_ep->ep;
 			usb_ep_set_maxpacket_limit(&usb3_ep->ep,
-						USB3_EP0_HSFS_MAX_PACKET_SIZE);
+						USB3_EP0_SS_MAX_PACKET_SIZE);
 			usb3_ep->ep.caps.type_control = true;
 			usb3_ep->ep.caps.dir_in = true;
 			usb3_ep->ep.caps.dir_out = true;
@@ -1947,9 +2001,6 @@ static int renesas_usb3_probe(struct platform_device *pdev)
 		goto err_add_udc;
 
 	usb3->workaround_for_vbus = priv->workaround_for_vbus;
-
-	pm_runtime_enable(&pdev->dev);
-	pm_runtime_get_sync(&pdev->dev);
 
 	dev_info(&pdev->dev, "probed\n");
 

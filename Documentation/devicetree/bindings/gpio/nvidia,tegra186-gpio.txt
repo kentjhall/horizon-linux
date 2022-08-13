@@ -62,6 +62,13 @@ configuration mechanism for this. By default, drivers should use register
 GPIO_${port}_INTERRUPT_STATUS_G1_0. Future revisions to the binding could
 define a property to configure this.
 
+Tegra186 has separate HW block called GTE block (GPIO Timestamping Engine),
+which can be used to capture the TSC timestamp based on gpio interrupts or
+events. Functionality of this block is also exposed via GPIO driver.
+We need to specify "use-timestamp" field in the GPIO DT block in order to
+enable this feature. Along with above boolean field, we also need to specify
+new register block "gte" which will be used to configure GTE.
+
 Required properties:
 - compatible
     Array of strings.
@@ -78,6 +85,7 @@ Required properties:
            appropriate when the OS is responsible for managing assignment of
            the physical aliases.
     - "security": Optional. Security configuration registers.
+    - "gte": Needed if one wants to use GTE for timestamping
     Users of this binding MUST look up entries in the reg property by name,
     using this reg-names property to do so.
 - reg
@@ -122,6 +130,8 @@ Required properties:
             - 4: Active high level-sensitive.
             - 8: Active low level-sensitive.
             Valid combinations are 1, 2, 3, 4, 8.
+- use-timestamp
+   If one wants to use the GTE block for timestamping.
 
 Example:
 
@@ -159,3 +169,22 @@ gpio@c2f0000 {
 	interrupt-controller;
 	#interrupt-cells = <2>;
 };
+
+With GTE enabled:
+
+gpio@c2f0000 {
+	compatible = "nvidia,tegra186-gpio-aon";
+	reg-names = "security", "gpio", "gte";
+	reg =
+		<0x0 0xc2f0000 0x0 0x1000>,
+		<0x0 0xc2f1000 0x0 0x1000>,
+		<0x0 0xc1e0000 0x0 0x10000>;
+	interrupts =
+		<0 60 IRQ_TYPE_LEVEL_HIGH>;
+	gpio-controller;
+	#gpio-cells = <2>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+	use-timestamp;
+};
+

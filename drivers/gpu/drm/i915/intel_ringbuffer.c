@@ -1153,14 +1153,6 @@ static int kbl_init_workarounds(struct intel_engine_cs *engine)
 		WA_SET_BIT_MASKED(HDC_CHICKEN0,
 				  HDC_FENCE_DEST_SLM_DISABLE);
 
-	/* GEN8_L3SQCREG4 has a dependency with WA batch so any new changes
-	 * involving this register should also be added to WA batch as required.
-	 */
-	if (IS_KBL_REVID(dev_priv, 0, KBL_REVID_E0))
-		/* WaDisableLSQCROPERFforOCL:kbl */
-		I915_WRITE(GEN8_L3SQCREG4, I915_READ(GEN8_L3SQCREG4) |
-			   GEN8_LQSC_RO_PERF_DIS);
-
 	/* WaToEnableHwFixForPushConstHWBug:kbl */
 	if (IS_KBL_REVID(dev_priv, KBL_REVID_C0, REVID_FOREVER))
 		WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN2,
@@ -1959,6 +1951,7 @@ void intel_ring_unpin(struct intel_ring *ring)
 static struct i915_vma *
 intel_ring_create_vma(struct drm_i915_private *dev_priv, int size)
 {
+	struct i915_address_space *vm = &dev_priv->ggtt.base;
 	struct drm_i915_gem_object *obj;
 	struct i915_vma *vma;
 
@@ -1968,10 +1961,14 @@ intel_ring_create_vma(struct drm_i915_private *dev_priv, int size)
 	if (IS_ERR(obj))
 		return ERR_CAST(obj);
 
-	/* mark ring buffers as read-only from GPU side by default */
-	obj->gt_ro = 1;
+	/*
+	 * Mark ring buffers as read-only from GPU side (so no stray overwrites)
+	 * if supported by the platform's GGTT.
+	 */
+	if (vm->has_read_only)
+		i915_gem_object_set_readonly(obj);
 
-	vma = i915_vma_create(obj, &dev_priv->ggtt.base, NULL);
+	vma = i915_vma_create(obj, vm, NULL);
 	if (IS_ERR(vma))
 		goto err;
 

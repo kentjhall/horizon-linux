@@ -34,6 +34,7 @@
 #include <linux/memblock.h>
 #include <linux/bootmem.h>
 #include <linux/compaction.h>
+#include <linux/rmap.h>
 
 #include <asm/tlbflush.h>
 
@@ -149,7 +150,7 @@ void mem_hotplug_done(void)
 /* add this memory to iomem resource */
 static struct resource *register_memory_resource(u64 start, u64 size)
 {
-	struct resource *res;
+	struct resource *res, *conflict;
 	res = kzalloc(sizeof(struct resource), GFP_KERNEL);
 	if (!res)
 		return ERR_PTR(-ENOMEM);
@@ -158,7 +159,13 @@ static struct resource *register_memory_resource(u64 start, u64 size)
 	res->start = start;
 	res->end = start + size - 1;
 	res->flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
-	if (request_resource(&iomem_resource, res) < 0) {
+	conflict =  request_resource_conflict(&iomem_resource, res);
+	if (conflict) {
+		if (conflict->desc == IORES_DESC_DEVICE_PRIVATE_MEMORY) {
+			pr_debug("Device unaddressable memory block "
+				 "memory hotplug at %#010llx !\n",
+				 (unsigned long long)start);
+		}
 		pr_debug("System RAM resource %pR cannot be added\n", res);
 		kfree(res);
 		return ERR_PTR(-EEXIST);
@@ -179,7 +186,7 @@ static void release_memory_resource(struct resource *res)
 void get_page_bootmem(unsigned long info,  struct page *page,
 		      unsigned long type)
 {
-	page->lru.next = (struct list_head *) type;
+	page->freelist = (void *)type;
 	SetPagePrivate(page);
 	set_page_private(page, info);
 	page_ref_inc(page);
@@ -189,11 +196,12 @@ void put_page_bootmem(struct page *page)
 {
 	unsigned long type;
 
-	type = (unsigned long) page->lru.next;
+	type = (unsigned long) page->freelist;
 	BUG_ON(type < MEMORY_HOTPLUG_MIN_BOOTMEM_TYPE ||
 	       type > MEMORY_HOTPLUG_MAX_BOOTMEM_TYPE);
 
 	if (page_ref_dec_return(page) == 1) {
+		page->freelist = NULL;
 		ClearPagePrivate(page);
 		set_page_private(page, 0);
 		INIT_LIST_HEAD(&page->lru);
@@ -1033,36 +1041,39 @@ static void node_states_set_node(int node, struct memory_notify *arg)
 	node_set_state(node, N_MEMORY);
 }
 
-int zone_can_shift(unsigned long pfn, unsigned long nr_pages,
-		   enum zone_type target)
+bool zone_can_shift(unsigned long pfn, unsigned long nr_pages,
+		   enum zone_type target, int *zone_shift)
 {
 	struct zone *zone = page_zone(pfn_to_page(pfn));
 	enum zone_type idx = zone_idx(zone);
 	int i;
 
+	*zone_shift = 0;
+
 	if (idx < target) {
 		/* pages must be at end of current zone */
 		if (pfn + nr_pages != zone_end_pfn(zone))
-			return 0;
+			return false;
 
 		/* no zones in use between current zone and target */
 		for (i = idx + 1; i < target; i++)
 			if (zone_is_initialized(zone - idx + i))
-				return 0;
+				return false;
 	}
 
 	if (target < idx) {
 		/* pages must be at beginning of current zone */
 		if (pfn != zone->zone_start_pfn)
-			return 0;
+			return false;
 
 		/* no zones in use between current zone and target */
 		for (i = target + 1; i < idx; i++)
 			if (zone_is_initialized(zone - idx + i))
-				return 0;
+				return false;
 	}
 
-	return target - idx;
+	*zone_shift = target - idx;
+	return true;
 }
 
 /* Must be protected by mem_hotplug_begin() */
@@ -1089,10 +1100,13 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages, int online_typ
 	    !can_online_high_movable(zone))
 		return -EINVAL;
 
-	if (online_type == MMOP_ONLINE_KERNEL)
-		zone_shift = zone_can_shift(pfn, nr_pages, ZONE_NORMAL);
-	else if (online_type == MMOP_ONLINE_MOVABLE)
-		zone_shift = zone_can_shift(pfn, nr_pages, ZONE_MOVABLE);
+	if (online_type == MMOP_ONLINE_KERNEL) {
+		if (!zone_can_shift(pfn, nr_pages, ZONE_NORMAL, &zone_shift))
+			return -EINVAL;
+	} else if (online_type == MMOP_ONLINE_MOVABLE) {
+		if (!zone_can_shift(pfn, nr_pages, ZONE_MOVABLE, &zone_shift))
+			return -EINVAL;
+	}
 
 	zone = move_pfn_range(zone_shift, pfn, pfn + nr_pages);
 	if (!zone)
@@ -1117,7 +1131,7 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages, int online_typ
 	mutex_lock(&zonelists_mutex);
 	if (!populated_zone(zone)) {
 		need_zonelists_rebuild = 1;
-		build_all_zonelists(NULL, zone);
+		build_all_zonelists(NULL, zone, true);
 	}
 
 	ret = walk_system_ram_range(pfn, nr_pages, &onlined_pages,
@@ -1138,7 +1152,7 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages, int online_typ
 	if (onlined_pages) {
 		node_states_set_node(nid, &arg);
 		if (need_zonelists_rebuild)
-			build_all_zonelists(NULL, NULL);
+			build_all_zonelists(NULL, NULL, true);
 		else
 			zone_pcp_update(zone);
 	}
@@ -1212,7 +1226,7 @@ static pg_data_t __ref *hotadd_new_pgdat(int nid, u64 start)
 	 * to access not-initialized zonelist, build here.
 	 */
 	mutex_lock(&zonelists_mutex);
-	build_all_zonelists(pgdat, NULL);
+	build_all_zonelists(pgdat, NULL, true);
 	mutex_unlock(&zonelists_mutex);
 
 	/*
@@ -1268,7 +1282,7 @@ int try_online_node(int nid)
 
 	if (pgdat->node_zonelists->_zonerefs->zone == NULL) {
 		mutex_lock(&zonelists_mutex);
-		build_all_zonelists(NULL, NULL);
+		build_all_zonelists(NULL, NULL, true);
 		mutex_unlock(&zonelists_mutex);
 	}
 
@@ -1332,7 +1346,12 @@ static int online_memory_block(struct memory_block *mem, void *arg)
 	return memory_block_change_state(mem, MEM_ONLINE, MEM_OFFLINE);
 }
 
-/* we are OK calling __meminit stuff here - we have CONFIG_MEMORY_HOTPLUG */
+/*
+ * NOTE: The caller must call lock_device_hotplug() to serialize hotplug
+ * and online/offline operations (triggered e.g. by sysfs).
+ *
+ * we are OK calling __meminit stuff here - we have CONFIG_MEMORY_HOTPLUG
+ */
 int __ref add_memory_resource(int nid, struct resource *res, bool online)
 {
 	u64 start, size;
@@ -1410,9 +1429,9 @@ out:
 	mem_hotplug_done();
 	return ret;
 }
-EXPORT_SYMBOL_GPL(add_memory_resource);
 
-int __ref add_memory(int nid, u64 start, u64 size)
+/* requires device_hotplug_lock, see add_memory_resource() */
+int __ref __add_memory(int nid, u64 start, u64 size)
 {
 	struct resource *res;
 	int ret;
@@ -1425,6 +1444,17 @@ int __ref add_memory(int nid, u64 start, u64 size)
 	if (ret < 0)
 		release_memory_resource(res);
 	return ret;
+}
+
+int add_memory(int nid, u64 start, u64 size)
+{
+	int rc;
+
+	lock_device_hotplug();
+	rc = __add_memory(nid, start, size);
+	unlock_device_hotplug();
+
+	return rc;
 }
 EXPORT_SYMBOL_GPL(add_memory);
 
@@ -1463,7 +1493,8 @@ static struct page *next_active_pageblock(struct page *page)
 bool is_mem_section_removable(unsigned long start_pfn, unsigned long nr_pages)
 {
 	struct page *page = pfn_to_page(start_pfn);
-	struct page *end_page = page + nr_pages;
+	unsigned long end_pfn = min(start_pfn + nr_pages, zone_end_pfn(page_zone(page)));
+	struct page *end_page = pfn_to_page(end_pfn);
 
 	/* Check the starting page of each pageblock within the range */
 	for (; page < end_page; page = next_active_pageblock(page)) {
@@ -1477,17 +1508,20 @@ bool is_mem_section_removable(unsigned long start_pfn, unsigned long nr_pages)
 }
 
 /*
- * Confirm all pages in a range [start, end) is belongs to the same zone.
+ * Confirm all pages in a range [start, end) belong to the same zone.
+ * When true, return its valid [start, end).
  */
-int test_pages_in_a_zone(unsigned long start_pfn, unsigned long end_pfn)
+int test_pages_in_a_zone(unsigned long start_pfn, unsigned long end_pfn,
+			 unsigned long *valid_start, unsigned long *valid_end)
 {
 	unsigned long pfn, sec_end_pfn;
+	unsigned long start, end;
 	struct zone *zone = NULL;
 	struct page *page;
 	int i;
-	for (pfn = start_pfn, sec_end_pfn = SECTION_ALIGN_UP(start_pfn);
+	for (pfn = start_pfn, sec_end_pfn = SECTION_ALIGN_UP(start_pfn + 1);
 	     pfn < end_pfn;
-	     pfn = sec_end_pfn + 1, sec_end_pfn += PAGES_PER_SECTION) {
+	     pfn = sec_end_pfn, sec_end_pfn += PAGES_PER_SECTION) {
 		/* Make sure the memory section is present first */
 		if (!present_section_nr(pfn_to_section_nr(pfn)))
 			continue;
@@ -1498,15 +1532,28 @@ int test_pages_in_a_zone(unsigned long start_pfn, unsigned long end_pfn)
 			while ((i < MAX_ORDER_NR_PAGES) &&
 				!pfn_valid_within(pfn + i))
 				i++;
-			if (i == MAX_ORDER_NR_PAGES)
+			if (i == MAX_ORDER_NR_PAGES || pfn + i >= end_pfn)
 				continue;
+			/* Check if we got outside of the zone */
+			if (zone && !zone_spans_pfn(zone, pfn + i))
+				return 0;
 			page = pfn_to_page(pfn + i);
 			if (zone && page_zone(page) != zone)
 				return 0;
+			if (!zone)
+				start = pfn + i;
 			zone = page_zone(page);
+			end = pfn + MAX_ORDER_NR_PAGES;
 		}
 	}
-	return 1;
+
+	if (zone) {
+		*valid_start = start;
+		*valid_end = min(end, end_pfn);
+		return 1;
+	} else {
+		return 0;
+	}
 }
 
 /*
@@ -1594,6 +1641,21 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
 			}
 			if (isolate_huge_page(page, &source))
 				move_pages -= 1 << compound_order(head);
+			continue;
+		}
+
+		/*
+		 * HWPoison pages have elevated reference counts so the migration would
+		 * fail on them. It also doesn't make any sense to migrate them in the
+		 * first place. Still try to unmap such a page in case it is still mapped
+		 * (e.g. current hwpoison implementation doesn't unmap KSM pages but keep
+		 * the unmap as the catch all safety net).
+		 */
+		if (PageHWPoison(page)) {
+			if (WARN_ON(PageLRU(page)))
+				isolate_lru_page(page);
+			if (page_mapped(page))
+				try_to_unmap(page, TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS);
 			continue;
 		}
 
@@ -1853,6 +1915,7 @@ static int __ref __offline_pages(unsigned long start_pfn,
 	long offlined_pages;
 	int ret, drain, retry_max, node;
 	unsigned long flags;
+	unsigned long valid_start, valid_end;
 	struct zone *zone;
 	struct memory_notify arg;
 
@@ -1863,10 +1926,10 @@ static int __ref __offline_pages(unsigned long start_pfn,
 		return -EINVAL;
 	/* This makes hotplug much easier...and readable.
 	   we assume this for now. .*/
-	if (!test_pages_in_a_zone(start_pfn, end_pfn))
+	if (!test_pages_in_a_zone(start_pfn, end_pfn, &valid_start, &valid_end))
 		return -EINVAL;
 
-	zone = page_zone(pfn_to_page(start_pfn));
+	zone = page_zone(pfn_to_page(valid_start));
 	node = zone_to_nid(zone);
 	nr_pages = end_pfn - start_pfn;
 
@@ -1959,7 +2022,7 @@ repeat:
 	if (!populated_zone(zone)) {
 		zone_pcp_reset(zone);
 		mutex_lock(&zonelists_mutex);
-		build_all_zonelists(NULL, NULL);
+		build_all_zonelists(NULL, NULL, true);
 		mutex_unlock(&zonelists_mutex);
 	} else
 		zone_pcp_update(zone);

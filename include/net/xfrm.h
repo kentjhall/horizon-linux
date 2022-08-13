@@ -155,6 +155,7 @@ struct xfrm_state {
 		int		header_len;
 		int		trailer_len;
 		u32		extra_flags;
+		u32		output_mark;
 	} props;
 
 	struct xfrm_lifetime_cfg lft;
@@ -284,10 +285,12 @@ struct xfrm_policy_afinfo {
 	struct dst_entry	*(*dst_lookup)(struct net *net,
 					       int tos, int oif,
 					       const xfrm_address_t *saddr,
-					       const xfrm_address_t *daddr);
+					       const xfrm_address_t *daddr,
+					       u32 mark);
 	int			(*get_saddr)(struct net *net, int oif,
 					     xfrm_address_t *saddr,
-					     xfrm_address_t *daddr);
+					     xfrm_address_t *daddr,
+					     u32 mark);
 	void			(*decode_session)(struct sk_buff *skb,
 						  struct flowi *fl,
 						  int reverse);
@@ -944,10 +947,6 @@ struct xfrm_dst {
 	struct flow_cache_object flo;
 	struct xfrm_policy *pols[XFRM_POLICY_TYPE_MAX];
 	int num_pols, num_xfrms;
-#ifdef CONFIG_XFRM_SUB_POLICY
-	struct flowi *origin;
-	struct xfrm_selector *partner;
-#endif
 	u32 xfrm_genid;
 	u32 policy_genid;
 	u32 route_mtu_cached;
@@ -963,12 +962,6 @@ static inline void xfrm_dst_destroy(struct xfrm_dst *xdst)
 	dst_release(xdst->route);
 	if (likely(xdst->u.dst.xfrm))
 		xfrm_state_put(xdst->u.dst.xfrm);
-#ifdef CONFIG_XFRM_SUB_POLICY
-	kfree(xdst->origin);
-	xdst->origin = NULL;
-	kfree(xdst->partner);
-	xdst->partner = NULL;
-#endif
 }
 #endif
 
@@ -1307,6 +1300,23 @@ static inline int xfrm_state_kern(const struct xfrm_state *x)
 	return atomic_read(&x->tunnel_users);
 }
 
+static inline bool xfrm_id_proto_valid(u8 proto)
+{
+	switch (proto) {
+	case IPPROTO_AH:
+	case IPPROTO_ESP:
+	case IPPROTO_COMP:
+#if IS_ENABLED(CONFIG_IPV6)
+	case IPPROTO_ROUTING:
+	case IPPROTO_DSTOPTS:
+#endif
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* IPSEC_PROTO_ANY only matches 3 IPsec protocols, 0 could match all. */
 static inline int xfrm_id_proto_match(u8 proto, u8 userproto)
 {
 	return (!userproto || proto == userproto ||
@@ -1719,21 +1729,17 @@ static inline int xfrm_replay_state_esn_len(struct xfrm_replay_state_esn *replay
 static inline int xfrm_replay_clone(struct xfrm_state *x,
 				     struct xfrm_state *orig)
 {
-	x->replay_esn = kzalloc(xfrm_replay_state_esn_len(orig->replay_esn),
+
+	x->replay_esn = kmemdup(orig->replay_esn,
+				xfrm_replay_state_esn_len(orig->replay_esn),
 				GFP_KERNEL);
 	if (!x->replay_esn)
 		return -ENOMEM;
-
-	x->replay_esn->bmp_len = orig->replay_esn->bmp_len;
-	x->replay_esn->replay_window = orig->replay_esn->replay_window;
-
-	x->preplay_esn = kmemdup(x->replay_esn,
-				 xfrm_replay_state_esn_len(x->replay_esn),
+	x->preplay_esn = kmemdup(orig->preplay_esn,
+				 xfrm_replay_state_esn_len(orig->preplay_esn),
 				 GFP_KERNEL);
-	if (!x->preplay_esn) {
-		kfree(x->replay_esn);
+	if (!x->preplay_esn)
 		return -ENOMEM;
-	}
 
 	return 0;
 }
@@ -1815,4 +1821,37 @@ static inline int xfrm_tunnel_check(struct sk_buff *skb, struct xfrm_state *x,
 
 	return 0;
 }
+
+extern const int xfrm_msg_min[XFRM_NR_MSGTYPES];
+extern const struct nla_policy xfrma_policy[XFRMA_MAX+1];
+
+struct xfrm_translator {
+	/* Allocate frag_list and put compat translation there */
+	int (*alloc_compat)(struct sk_buff *skb, const struct nlmsghdr *src);
+
+	/* Allocate nlmsg with 64-bit translaton of received 32-bit message */
+	struct nlmsghdr *(*rcv_msg_compat)(const struct nlmsghdr *nlh,
+			int maxtype, const struct nla_policy *policy);
+
+	/* Translate 32-bit user_policy from sockptr */
+	int (*xlate_user_policy_sockptr)(u8 **pdata32, int optlen);
+
+	struct module *owner;
+};
+
+#if IS_ENABLED(CONFIG_XFRM_USER_COMPAT)
+extern int xfrm_register_translator(struct xfrm_translator *xtr);
+extern int xfrm_unregister_translator(struct xfrm_translator *xtr);
+extern struct xfrm_translator *xfrm_get_translator(void);
+extern void xfrm_put_translator(struct xfrm_translator *xtr);
+#else
+static inline struct xfrm_translator *xfrm_get_translator(void)
+{
+	return NULL;
+}
+static inline void xfrm_put_translator(struct xfrm_translator *xtr)
+{
+}
+#endif
+
 #endif	/* _NET_XFRM_H */

@@ -1,0 +1,37 @@
+Tegra Fuse burn
+
+Fuse burn driver to burn chip fuses when device is unlocked.
+
+Required properties :
+- compatible : Each chip has different spare reg offset and length.
+  Must be one of these:
+  - For Tegra186, "nvidia,tegra186-efuse-burn",
+  - FOr Tegra194, "nvidia,tegra194-efuse-burn",
+  - FOr Tegra210, "nvidia,tegra210-efuse-burn",
+  - FOr Tegra210B01, "nvidia,tegra210b01-efuse-burn".
+- clocks : Handle for "clk_m" clock.
+- clock-names : is "clk_m".
+
+Optional properties :
+- nvidia,tz : Handle for thermal zone to get temperature values
+- nvidia,temp-range : min and max temp range where fuse burn is allowed
+- nvidia,redundant-aid-war : Some legacy kernel assume the AID fuse as
+  redundant and read the fuse value in redundant way, from address X and
+  address X+2, which should be address X and address X+1 instead. To align
+  the platform we release with legacy kernel and client, add the
+  "redundant-aid-war" for reading the same value as in the past. No longer
+  needed in 4.14 and future kernels.
+- thermal-zone : Adds shutdown limit check before burining fuse. should
+  be either 5 for PLLX or 6 for AO.
+
+Example:
+	efuse@3820000 {
+		compatible = "nvidia,tegra186-efuse";
+		efuse-burn {
+			compatible = "nvidia,tegra186-efuse-burn";
+			clocks = <&tegra_car TEGRA186_CLK_CLK_M>;
+			clock-names = "clk_m";
+			nvidia,tz = <&aotag>;
+			nvidia,temp-range = <4000 101000>;
+		};
+	};

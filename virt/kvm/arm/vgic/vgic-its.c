@@ -208,8 +208,8 @@ static int update_lpi_config(struct kvm *kvm, struct vgic_irq *irq,
 	u8 prop;
 	int ret;
 
-	ret = kvm_read_guest(kvm, propbase + irq->intid - GIC_LPI_OFFSET,
-			     &prop, 1);
+	ret = kvm_read_guest_lock(kvm, propbase + irq->intid - GIC_LPI_OFFSET,
+				  &prop, 1);
 
 	if (ret)
 		return ret;
@@ -322,6 +322,7 @@ static int its_sync_lpi_pending_table(struct kvm_vcpu *vcpu)
 	int ret = 0;
 	u32 *intids;
 	int nr_irqs, i;
+	u8 pendmask;
 
 	nr_irqs = vgic_copy_lpi_list(vcpu->kvm, &intids);
 	if (nr_irqs < 0)
@@ -329,7 +330,6 @@ static int its_sync_lpi_pending_table(struct kvm_vcpu *vcpu)
 
 	for (i = 0; i < nr_irqs; i++) {
 		int byte_offset, bit_nr;
-		u8 pendmask;
 
 		byte_offset = intids[i] / BITS_PER_BYTE;
 		bit_nr = intids[i] % BITS_PER_BYTE;
@@ -339,8 +339,9 @@ static int its_sync_lpi_pending_table(struct kvm_vcpu *vcpu)
 		 * this very same byte in the last iteration. Reuse that.
 		 */
 		if (byte_offset != last_byte_offset) {
-			ret = kvm_read_guest(vcpu->kvm, pendbase + byte_offset,
-					     &pendmask, 1);
+			ret = kvm_read_guest_lock(vcpu->kvm,
+						  pendbase + byte_offset,
+						  &pendmask, 1);
 			if (ret) {
 				kfree(intids);
 				return ret;
@@ -358,29 +359,6 @@ static int its_sync_lpi_pending_table(struct kvm_vcpu *vcpu)
 	kfree(intids);
 
 	return ret;
-}
-
-static unsigned long vgic_mmio_read_its_ctlr(struct kvm *vcpu,
-					     struct vgic_its *its,
-					     gpa_t addr, unsigned int len)
-{
-	u32 reg = 0;
-
-	mutex_lock(&its->cmd_lock);
-	if (its->creadr == its->cwriter)
-		reg |= GITS_CTLR_QUIESCENT;
-	if (its->enabled)
-		reg |= GITS_CTLR_ENABLE;
-	mutex_unlock(&its->cmd_lock);
-
-	return reg;
-}
-
-static void vgic_mmio_write_its_ctlr(struct kvm *kvm, struct vgic_its *its,
-				     gpa_t addr, unsigned int len,
-				     unsigned long val)
-{
-	its->enabled = !!(val & GITS_CTLR_ENABLE);
 }
 
 static unsigned long vgic_mmio_read_its_typer(struct kvm *kvm,
@@ -651,7 +629,7 @@ static bool vgic_its_check_id(struct vgic_its *its, u64 baser, int id)
 		return false;
 
 	/* Each 1st level entry is represented by a 64-bit value. */
-	if (kvm_read_guest(its->dev->kvm,
+	if (kvm_read_guest_lock(its->dev->kvm,
 			   BASER_ADDRESS(baser) + index * sizeof(indirect_ptr),
 			   &indirect_ptr, sizeof(indirect_ptr)))
 		return false;
@@ -687,6 +665,8 @@ static int vgic_its_alloc_collection(struct vgic_its *its,
 		return E_ITS_MAPC_COLLECTION_OOR;
 
 	collection = kzalloc(sizeof(*collection), GFP_KERNEL);
+	if (!collection)
+		return -ENOMEM;
 
 	collection->collection_id = coll_id;
 	collection->target_addr = COLLECTION_NOT_MAPPED;
@@ -1160,38 +1140,21 @@ static void vgic_mmio_write_its_cbaser(struct kvm *kvm, struct vgic_its *its,
 #define ITS_CMD_SIZE			32
 #define ITS_CMD_OFFSET(reg)		((reg) & GENMASK(19, 5))
 
-/*
- * By writing to CWRITER the guest announces new commands to be processed.
- * To avoid any races in the first place, we take the its_cmd lock, which
- * protects our ring buffer variables, so that there is only one user
- * per ITS handling commands at a given time.
- */
-static void vgic_mmio_write_its_cwriter(struct kvm *kvm, struct vgic_its *its,
-					gpa_t addr, unsigned int len,
-					unsigned long val)
+/* Must be called with the cmd_lock held. */
+static void vgic_its_process_commands(struct kvm *kvm, struct vgic_its *its)
 {
 	gpa_t cbaser;
 	u64 cmd_buf[4];
-	u32 reg;
 
-	if (!its)
+	/* Commands are only processed when the ITS is enabled. */
+	if (!its->enabled)
 		return;
 
-	mutex_lock(&its->cmd_lock);
-
-	reg = update_64bit_reg(its->cwriter, addr & 7, len, val);
-	reg = ITS_CMD_OFFSET(reg);
-	if (reg >= ITS_CMD_BUFFER_SIZE(its->cbaser)) {
-		mutex_unlock(&its->cmd_lock);
-		return;
-	}
-
-	its->cwriter = reg;
 	cbaser = CBASER_ADDRESS(its->cbaser);
 
 	while (its->cwriter != its->creadr) {
-		int ret = kvm_read_guest(kvm, cbaser + its->creadr,
-					 cmd_buf, ITS_CMD_SIZE);
+		int ret = kvm_read_guest_lock(kvm, cbaser + its->creadr,
+					      cmd_buf, ITS_CMD_SIZE);
 		/*
 		 * If kvm_read_guest() fails, this could be due to the guest
 		 * programming a bogus value in CBASER or something else going
@@ -1206,6 +1169,34 @@ static void vgic_mmio_write_its_cwriter(struct kvm *kvm, struct vgic_its *its,
 		if (its->creadr == ITS_CMD_BUFFER_SIZE(its->cbaser))
 			its->creadr = 0;
 	}
+}
+
+/*
+ * By writing to CWRITER the guest announces new commands to be processed.
+ * To avoid any races in the first place, we take the its_cmd lock, which
+ * protects our ring buffer variables, so that there is only one user
+ * per ITS handling commands at a given time.
+ */
+static void vgic_mmio_write_its_cwriter(struct kvm *kvm, struct vgic_its *its,
+					gpa_t addr, unsigned int len,
+					unsigned long val)
+{
+	u64 reg;
+
+	if (!its)
+		return;
+
+	mutex_lock(&its->cmd_lock);
+
+	reg = update_64bit_reg(its->cwriter, addr & 7, len, val);
+	reg = ITS_CMD_OFFSET(reg);
+	if (reg >= ITS_CMD_BUFFER_SIZE(its->cbaser)) {
+		mutex_unlock(&its->cmd_lock);
+		return;
+	}
+	its->cwriter = reg;
+
+	vgic_its_process_commands(kvm, its);
 
 	mutex_unlock(&its->cmd_lock);
 }
@@ -1284,6 +1275,39 @@ static void vgic_mmio_write_its_baser(struct kvm *kvm,
 	reg = vgic_sanitise_its_baser(reg);
 
 	*regptr = reg;
+}
+
+static unsigned long vgic_mmio_read_its_ctlr(struct kvm *vcpu,
+					     struct vgic_its *its,
+					     gpa_t addr, unsigned int len)
+{
+	u32 reg = 0;
+
+	mutex_lock(&its->cmd_lock);
+	if (its->creadr == its->cwriter)
+		reg |= GITS_CTLR_QUIESCENT;
+	if (its->enabled)
+		reg |= GITS_CTLR_ENABLE;
+	mutex_unlock(&its->cmd_lock);
+
+	return reg;
+}
+
+static void vgic_mmio_write_its_ctlr(struct kvm *kvm, struct vgic_its *its,
+				     gpa_t addr, unsigned int len,
+				     unsigned long val)
+{
+	mutex_lock(&its->cmd_lock);
+
+	its->enabled = !!(val & GITS_CTLR_ENABLE);
+
+	/*
+	 * Try to process any pending commands. This function bails out early
+	 * if the ITS is disabled or no commands have been queued.
+	 */
+	vgic_its_process_commands(kvm, its);
+
+	mutex_unlock(&its->cmd_lock);
 }
 
 #define REGISTER_ITS_DESC(off, rd, wr, length, acc)		\
@@ -1442,6 +1466,7 @@ static void vgic_its_destroy(struct kvm_device *kvm_dev)
 	mutex_unlock(&its->its_lock);
 
 	kfree(its);
+	kfree(kvm_dev);/* alloc by kvm_ioctl_create_device, free by .destroy */
 }
 
 static int vgic_its_has_attr(struct kvm_device *dev,

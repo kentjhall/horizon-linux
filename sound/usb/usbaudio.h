@@ -4,6 +4,7 @@
  *   (Tentative) USB Audio Driver for ALSA
  *
  *   Copyright (c) 2002 by Takashi Iwai <tiwai@suse.de>
+ *   Copyright (c) 2016-2017, NVIDIA CORPORATION.  All rights reserved.
  *
  *
  *   This program is free software; you can redistribute it and/or modify
@@ -37,7 +38,7 @@ struct snd_usb_audio {
 	struct usb_interface *pm_intf;
 	u32 usb_id;
 	struct mutex mutex;
-	unsigned int autosuspended:1;	
+	unsigned int system_suspend;
 	atomic_t active;
 	atomic_t shutdown;
 	atomic_t usage_count;
@@ -58,6 +59,7 @@ struct snd_usb_audio {
 	struct list_head mixer_list;	/* list of mixer interfaces */
 
 	int setup;			/* from the 'device_setup' module param */
+	int nrpacks;			/* from the 'nrpacks' module param */
 	bool autoclock;			/* from the 'autoclock' module param */
 
 	struct usb_host_interface *ctrl_intf;	/* the audio control interface */
@@ -65,6 +67,8 @@ struct snd_usb_audio {
 
 #define usb_audio_err(chip, fmt, args...) \
 	dev_err(&(chip)->dev->dev, fmt, ##args)
+#define usb_audio_err_ratelimited(chip, fmt, args...) \
+	dev_err_ratelimited(&(chip)->dev->dev, fmt, ##args)
 #define usb_audio_warn(chip, fmt, args...) \
 	dev_warn(&(chip)->dev->dev, fmt, ##args)
 #define usb_audio_info(chip, fmt, args...) \

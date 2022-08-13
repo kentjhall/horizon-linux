@@ -15,6 +15,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <linux/arm-smccc.h>
 #include <linux/linkage.h>
 
 #include <asm/alternative.h>
@@ -23,6 +24,30 @@
 #include <asm/kvm_arm.h>
 #include <asm/kvm_asm.h>
 #include <asm/kvm_mmu.h>
+
+.macro save_caller_saved_regs_vect
+	stp	x0, x1,   [sp, #-16]!
+	stp	x2, x3,   [sp, #-16]!
+	stp	x4, x5,   [sp, #-16]!
+	stp	x6, x7,   [sp, #-16]!
+	stp	x8, x9,   [sp, #-16]!
+	stp	x10, x11, [sp, #-16]!
+	stp	x12, x13, [sp, #-16]!
+	stp	x14, x15, [sp, #-16]!
+	stp	x16, x17, [sp, #-16]!
+.endm
+
+.macro restore_caller_saved_regs_vect
+	ldp	x16, x17, [sp], #16
+	ldp	x14, x15, [sp], #16
+	ldp	x12, x13, [sp], #16
+	ldp	x10, x11, [sp], #16
+	ldp	x8, x9,   [sp], #16
+	ldp	x6, x7,   [sp], #16
+	ldp	x4, x5,   [sp], #16
+	ldp	x2, x3,   [sp], #16
+	ldp	x0, x1,   [sp], #16
+.endm
 
 	.text
 	.pushsection	.hyp.text, "ax"
@@ -71,18 +96,14 @@ ENDPROC(__kvm_hyp_teardown)
 el1_sync:				// Guest trapped into EL2
 	stp	x0, x1, [sp, #-16]!
 
-alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
-	mrs	x1, esr_el2
-alternative_else
-	mrs	x1, esr_el1
-alternative_endif
-	lsr	x0, x1, #ESR_ELx_EC_SHIFT
-
+	mrs	x0, esr_el2
+	lsr	x0, x0, #ESR_ELx_EC_SHIFT
 	cmp	x0, #ESR_ELx_EC_HVC64
+	ccmp	x0, #ESR_ELx_EC_HVC32, #4, ne
 	b.ne	el1_trap
 
-	mrs	x1, vttbr_el2		// If vttbr is valid, the 64bit guest
-	cbnz	x1, el1_trap		// called HVC
+	mrs	x1, vttbr_el2		// If vttbr is valid, the guest
+	cbnz	x1, el1_hvc_guest	// called HVC
 
 	/* Here, we're pretty sure the host called HVC. */
 	ldp	x0, x1, [sp], #16
@@ -100,53 +121,111 @@ alternative_endif
 	do_el2_call
 
 2:	eret
+	dsb nsh
+	isb
+
+el1_hvc_guest:
+	/*
+	 * Fastest possible path for ARM_SMCCC_ARCH_WORKAROUND_1.
+	 * The workaround has already been applied on the host,
+	 * so let's quickly get back to the guest. We don't bother
+	 * restoring x1, as it can be clobbered anyway.
+	 */
+	ldr	x1, [sp]				// Guest's x0
+	eor	w1, w1, #ARM_SMCCC_ARCH_WORKAROUND_1
+	cbz	w1, wa_epilogue
+
+	/* ARM_SMCCC_ARCH_WORKAROUND_2 handling */
+	eor	w1, w1, #(ARM_SMCCC_ARCH_WORKAROUND_1 ^ \
+			  ARM_SMCCC_ARCH_WORKAROUND_2)
+	cbnz	w1, el1_trap
+
+#ifdef CONFIG_ARM64_SSBD
+alternative_cb	arm64_enable_wa2_handling
+	b	wa2_end
+alternative_cb_end
+	get_vcpu_ptr	x2, x0
+	ldr	x0, [x2, #VCPU_WORKAROUND_FLAGS]
+
+	// Sanitize the argument and update the guest flags
+	ldr	x1, [sp, #8]			// Guest's x1
+	clz	w1, w1				// Murphy's device:
+	lsr	w1, w1, #5			// w1 = !!w1 without using
+	eor	w1, w1, #1			// the flags...
+	bfi	x0, x1, #VCPU_WORKAROUND_2_FLAG_SHIFT, #1
+	str	x0, [x2, #VCPU_WORKAROUND_FLAGS]
+
+	/* Check that we actually need to perform the call */
+	hyp_ldr_this_cpu x0, arm64_ssbd_callback_required, x2
+	cbz	x0, wa2_end
+
+	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_2
+	smc	#0
+
+	/* Don't leak data from the SMC call */
+	mov	x3, xzr
+wa2_end:
+	mov	x2, xzr
+	mov	x1, xzr
+#endif
+
+wa_epilogue:
+	mov	x0, xzr
+	add	sp, sp, #16
+	eret
+	dsb nsh
+	isb
 
 el1_trap:
+	get_vcpu_ptr	x1, x0
+
+	mrs		x0, esr_el2
+	lsr		x0, x0, #ESR_ELx_EC_SHIFT
 	/*
 	 * x0: ESR_EC
+	 * x1: vcpu pointer
 	 */
 
 	/* Guest accessed VFP/SIMD registers, save host, restore Guest */
 	cmp	x0, #ESR_ELx_EC_FP_ASIMD
 	b.eq	__fpsimd_guest_restore
 
-	mrs	x1, tpidr_el2
 	mov	x0, #ARM_EXCEPTION_TRAP
 	b	__guest_exit
 
 el1_irq:
 	stp     x0, x1, [sp, #-16]!
-	mrs	x1, tpidr_el2
+	get_vcpu_ptr	x1, x0
 	mov	x0, #ARM_EXCEPTION_IRQ
 	b	__guest_exit
 
 el1_error:
 	stp     x0, x1, [sp, #-16]!
-	mrs	x1, tpidr_el2
+	get_vcpu_ptr	x1, x0
 	mov	x0, #ARM_EXCEPTION_EL1_SERROR
 	b	__guest_exit
 
-el2_error:
-	/*
-	 * Only two possibilities:
-	 * 1) Either we come from the exit path, having just unmasked
-	 *    PSTATE.A: change the return code to an EL2 fault, and
-	 *    carry on, as we're already in a sane state to handle it.
-	 * 2) Or we come from anywhere else, and that's a bug: we panic.
-	 *
-	 * For (1), x0 contains the original return code and x1 doesn't
-	 * contain anything meaningful at that stage. We can reuse them
-	 * as temp registers.
-	 * For (2), who cares?
-	 */
-	mrs	x0, elr_el2
-	adr	x1, abort_guest_exit_start
-	cmp	x0, x1
-	adr	x1, abort_guest_exit_end
-	ccmp	x0, x1, #4, ne
-	b.ne	__hyp_panic
-	mov	x0, #(1 << ARM_EXIT_WITH_SERROR_BIT)
+el2_sync:
+	save_caller_saved_regs_vect
+	stp     x29, x30, [sp, #-16]!
+	bl	kvm_unexpected_el2_exception
+	ldp     x29, x30, [sp], #16
+	restore_caller_saved_regs_vect
+
 	eret
+
+el2_error:
+	save_caller_saved_regs_vect
+	stp     x29, x30, [sp, #-16]!
+
+	bl	kvm_unexpected_el2_exception
+
+	ldp     x29, x30, [sp], #16
+	restore_caller_saved_regs_vect
+
+	eret
+	dsb nsh
+	isb
 
 ENTRY(__hyp_do_panic)
 	mov	lr, #(PSR_F_BIT | PSR_I_BIT | PSR_A_BIT | PSR_D_BIT |\
@@ -155,7 +234,14 @@ ENTRY(__hyp_do_panic)
 	ldr	lr, =panic
 	msr	elr_el2, lr
 	eret
+	dsb nsh
+	isb
 ENDPROC(__hyp_do_panic)
+
+ENTRY(__hyp_panic)
+	get_host_ctxt x0, x1
+	b	hyp_panic
+ENDPROC(__hyp_panic)
 
 .macro invalid_vector	label, target = __hyp_panic
 	.align	2
@@ -169,7 +255,6 @@ ENDPROC(\label)
 	invalid_vector	el2t_irq_invalid
 	invalid_vector	el2t_fiq_invalid
 	invalid_vector	el2t_error_invalid
-	invalid_vector	el2h_sync_invalid
 	invalid_vector	el2h_irq_invalid
 	invalid_vector	el2h_fiq_invalid
 	invalid_vector	el1_sync_invalid
@@ -186,7 +271,7 @@ ENTRY(__kvm_hyp_vector)
 	ventry	el2t_fiq_invalid		// FIQ EL2t
 	ventry	el2t_error_invalid		// Error EL2t
 
-	ventry	el2h_sync_invalid		// Synchronous EL2h
+	ventry	el2_sync			// Synchronous EL2h
 	ventry	el2h_irq_invalid		// IRQ EL2h
 	ventry	el2h_fiq_invalid		// FIQ EL2h
 	ventry	el2_error			// Error EL2h

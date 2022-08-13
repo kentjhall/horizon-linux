@@ -784,12 +784,16 @@ void iwl_mvm_fw_error_dump(struct iwl_mvm *mvm)
 			struct iwl_fw_error_dump_paging *paging;
 			struct page *pages =
 				mvm->fw_paging_db[i].fw_paging_block;
+			dma_addr_t addr = mvm->fw_paging_db[i].fw_paging_phys;
 
 			dump_data->type = cpu_to_le32(IWL_FW_ERROR_DUMP_PAGING);
 			dump_data->len = cpu_to_le32(sizeof(*paging) +
 						     PAGING_BLOCK_SIZE);
 			paging = (void *)dump_data->data;
 			paging->index = cpu_to_le32(i);
+			dma_sync_single_for_cpu(mvm->trans->dev, addr,
+						PAGING_BLOCK_SIZE,
+						DMA_BIDIRECTIONAL);
 			memcpy(paging->data, page_address(pages),
 			       PAGING_BLOCK_SIZE);
 			dump_data = iwl_fw_error_next_data(dump_data);
@@ -910,14 +914,6 @@ int iwl_mvm_fw_dbg_collect_trig(struct iwl_mvm *mvm,
 	return 0;
 }
 
-static inline void iwl_mvm_restart_early_start(struct iwl_mvm *mvm)
-{
-	if (mvm->cfg->device_family == IWL_DEVICE_FAMILY_7000)
-		iwl_clear_bits_prph(mvm->trans, MON_BUFF_SAMPLE_CTL, 0x100);
-	else
-		iwl_write_prph(mvm->trans, DBGC_IN_SAMPLE, 1);
-}
-
 int iwl_mvm_start_fw_dbg_conf(struct iwl_mvm *mvm, u8 conf_id)
 {
 	u8 *ptr;
@@ -931,10 +927,8 @@ int iwl_mvm_start_fw_dbg_conf(struct iwl_mvm *mvm, u8 conf_id)
 	/* EARLY START - firmware's configuration is hard coded */
 	if ((!mvm->fw->dbg_conf_tlv[conf_id] ||
 	     !mvm->fw->dbg_conf_tlv[conf_id]->num_of_hcmds) &&
-	    conf_id == FW_DBG_START_FROM_ALIVE) {
-		iwl_mvm_restart_early_start(mvm);
+	    conf_id == FW_DBG_START_FROM_ALIVE)
 		return 0;
-	}
 
 	if (!mvm->fw->dbg_conf_tlv[conf_id])
 		return -EINVAL;

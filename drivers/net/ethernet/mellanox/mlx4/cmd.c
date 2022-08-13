@@ -2304,6 +2304,17 @@ static int sync_toggles(struct mlx4_dev *dev)
 		rd_toggle = swab32(readl(&priv->mfunc.comm->slave_read));
 		if (wr_toggle == 0xffffffff || rd_toggle == 0xffffffff) {
 			/* PCI might be offline */
+
+			/* If device removal has been requested,
+			 * do not continue retrying.
+			 */
+			if (dev->persist->interface_state &
+			    MLX4_INTERFACE_STATE_NOWAIT) {
+				mlx4_warn(dev,
+					  "communication channel is offline\n");
+				return -EIO;
+			}
+
 			msleep(100);
 			wr_toggle = swab32(readl(&priv->mfunc.comm->
 					   slave_write));
@@ -2622,6 +2633,8 @@ int mlx4_cmd_use_events(struct mlx4_dev *dev)
 	if (!priv->cmd.context)
 		return -ENOMEM;
 
+	if (mlx4_is_mfunc(dev))
+		mutex_lock(&priv->cmd.slave_cmd_mutex);
 	down_write(&priv->cmd.switch_sem);
 	for (i = 0; i < priv->cmd.max_cmds; ++i) {
 		priv->cmd.context[i].token = i;
@@ -2647,6 +2660,8 @@ int mlx4_cmd_use_events(struct mlx4_dev *dev)
 	down(&priv->cmd.poll_sem);
 	priv->cmd.use_events = 1;
 	up_write(&priv->cmd.switch_sem);
+	if (mlx4_is_mfunc(dev))
+		mutex_unlock(&priv->cmd.slave_cmd_mutex);
 
 	return err;
 }
@@ -2659,6 +2674,8 @@ void mlx4_cmd_use_polling(struct mlx4_dev *dev)
 	struct mlx4_priv *priv = mlx4_priv(dev);
 	int i;
 
+	if (mlx4_is_mfunc(dev))
+		mutex_lock(&priv->cmd.slave_cmd_mutex);
 	down_write(&priv->cmd.switch_sem);
 	priv->cmd.use_events = 0;
 
@@ -2666,9 +2683,12 @@ void mlx4_cmd_use_polling(struct mlx4_dev *dev)
 		down(&priv->cmd.event_sem);
 
 	kfree(priv->cmd.context);
+	priv->cmd.context = NULL;
 
 	up(&priv->cmd.poll_sem);
 	up_write(&priv->cmd.switch_sem);
+	if (mlx4_is_mfunc(dev))
+		mutex_unlock(&priv->cmd.slave_cmd_mutex);
 }
 
 struct mlx4_cmd_mailbox *mlx4_alloc_cmd_mailbox(struct mlx4_dev *dev)

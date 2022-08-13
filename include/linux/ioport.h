@@ -130,6 +130,8 @@ enum {
 	IORES_DESC_ACPI_NV_STORAGE		= 3,
 	IORES_DESC_PERSISTENT_MEMORY		= 4,
 	IORES_DESC_PERSISTENT_MEMORY_LEGACY	= 5,
+	IORES_DESC_DEVICE_PRIVATE_MEMORY	= 6,
+	IORES_DESC_DEVICE_PUBLIC_MEMORY		= 7,
 };
 
 /* helpers to define resources */
@@ -187,6 +189,7 @@ extern int allocate_resource(struct resource *root, struct resource *new,
 						       resource_size_t),
 			     void *alignf_data);
 struct resource *lookup_resource(struct resource *root, resource_size_t start);
+struct resource *locate_resource(struct resource *root, resource_size_t addr);
 int adjust_resource(struct resource *res, resource_size_t start,
 		    resource_size_t size);
 resource_size_t resource_alignment(struct resource *res);

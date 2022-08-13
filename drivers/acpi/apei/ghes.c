@@ -203,40 +203,40 @@ static int ghes_estatus_pool_init(void)
 	return 0;
 }
 
-static void ghes_estatus_pool_free_chunk_page(struct gen_pool *pool,
+static void ghes_estatus_pool_free_chunk(struct gen_pool *pool,
 					      struct gen_pool_chunk *chunk,
 					      void *data)
 {
-	free_page(chunk->start_addr);
+	vfree((void *)chunk->start_addr);
 }
 
 static void ghes_estatus_pool_exit(void)
 {
 	gen_pool_for_each_chunk(ghes_estatus_pool,
-				ghes_estatus_pool_free_chunk_page, NULL);
+				ghes_estatus_pool_free_chunk, NULL);
 	gen_pool_destroy(ghes_estatus_pool);
 }
 
 static int ghes_estatus_pool_expand(unsigned long len)
 {
-	unsigned long i, pages, size, addr;
-	int ret;
+	unsigned long size, addr;
 
 	ghes_estatus_pool_size_request += PAGE_ALIGN(len);
 	size = gen_pool_size(ghes_estatus_pool);
 	if (size >= ghes_estatus_pool_size_request)
 		return 0;
-	pages = (ghes_estatus_pool_size_request - size) / PAGE_SIZE;
-	for (i = 0; i < pages; i++) {
-		addr = __get_free_page(GFP_KERNEL);
-		if (!addr)
-			return -ENOMEM;
-		ret = gen_pool_add(ghes_estatus_pool, addr, PAGE_SIZE, -1);
-		if (ret)
-			return ret;
-	}
 
-	return 0;
+	addr = (unsigned long)vmalloc(PAGE_ALIGN(len));
+	if (!addr)
+		return -ENOMEM;
+
+	/*
+	 * New allocation must be visible in all pgd before it can be found by
+	 * an NMI allocating from the pool.
+	 */
+	vmalloc_sync_mappings();
+
+	return gen_pool_add(ghes_estatus_pool, addr, PAGE_ALIGN(len), -1);
 }
 
 static struct ghes *ghes_new(struct acpi_hest_generic *generic)
@@ -852,6 +852,8 @@ static int ghes_notify_nmi(unsigned int cmd, struct pt_regs *regs)
 		if (ghes_read_estatus(ghes, 1)) {
 			ghes_clear_estatus(ghes);
 			continue;
+		} else {
+			ret = NMI_HANDLED;
 		}
 
 		sev = ghes_severity(ghes->estatus->error_severity);
@@ -863,12 +865,11 @@ static int ghes_notify_nmi(unsigned int cmd, struct pt_regs *regs)
 
 		__process_error(ghes);
 		ghes_clear_estatus(ghes);
-
-		ret = NMI_HANDLED;
 	}
 
 #ifdef CONFIG_ARCH_HAVE_NMI_SAFE_CMPXCHG
-	irq_work_queue(&ghes_proc_irq_work);
+	if (ret == NMI_HANDLED)
+		irq_work_queue(&ghes_proc_irq_work);
 #endif
 	atomic_dec(&ghes_in_nmi);
 	return ret;
@@ -1071,6 +1072,7 @@ static int ghes_remove(struct platform_device *ghes_dev)
 		if (list_empty(&ghes_sci))
 			unregister_acpi_hed_notifier(&ghes_notifier_sci);
 		mutex_unlock(&ghes_list_mutex);
+		synchronize_rcu();
 		break;
 	case ACPI_HEST_NOTIFY_NMI:
 		ghes_nmi_remove(ghes);

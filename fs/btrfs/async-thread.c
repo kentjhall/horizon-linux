@@ -86,6 +86,20 @@ btrfs_work_owner(struct btrfs_work *work)
 	return work->wq->fs_info;
 }
 
+bool btrfs_workqueue_normal_congested(struct btrfs_workqueue *wq)
+{
+	/*
+	 * We could compare wq->normal->pending with num_online_cpus()
+	 * to support "thresh == NO_THRESHOLD" case, but it requires
+	 * moving up atomic_inc/dec in thresh_queue/exec_hook. Let's
+	 * postpone it until someone needs the support of that case.
+	 */
+	if (wq->normal->thresh == NO_THRESHOLD)
+		return false;
+
+	return atomic_read(&wq->normal->pending) > wq->normal->thresh * 2;
+}
+
 BTRFS_WORK_HELPER(worker_helper);
 BTRFS_WORK_HELPER(delalloc_helper);
 BTRFS_WORK_HELPER(flush_delalloc_helper);
@@ -251,12 +265,15 @@ out:
 	}
 }
 
-static void run_ordered_work(struct __btrfs_workqueue *wq)
+static void run_ordered_work(struct __btrfs_workqueue *wq,
+			     struct btrfs_work *self)
 {
 	struct list_head *list = &wq->ordered_list;
 	struct btrfs_work *work;
 	spinlock_t *lock = &wq->list_lock;
 	unsigned long flags;
+	void *wtag;
+	bool free_self = false;
 
 	while (1) {
 		spin_lock_irqsave(lock, flags);
@@ -284,19 +301,53 @@ static void run_ordered_work(struct __btrfs_workqueue *wq)
 		list_del(&work->ordered_list);
 		spin_unlock_irqrestore(lock, flags);
 
-		/*
-		 * we don't want to call the ordered free functions
-		 * with the lock held though
-		 */
-		work->ordered_free(work);
-		trace_btrfs_all_work_done(work);
+		if (work == self) {
+			/*
+			 * This is the work item that the worker is currently
+			 * executing.
+			 *
+			 * The kernel workqueue code guarantees non-reentrancy
+			 * of work items. I.e., if a work item with the same
+			 * address and work function is queued twice, the second
+			 * execution is blocked until the first one finishes. A
+			 * work item may be freed and recycled with the same
+			 * work function; the workqueue code assumes that the
+			 * original work item cannot depend on the recycled work
+			 * item in that case (see find_worker_executing_work()).
+			 *
+			 * Note that the work of one Btrfs filesystem may depend
+			 * on the work of another Btrfs filesystem via, e.g., a
+			 * loop device. Therefore, we must not allow the current
+			 * work item to be recycled until we are really done,
+			 * otherwise we break the above assumption and can
+			 * deadlock.
+			 */
+			free_self = true;
+		} else {
+			/*
+			 * We don't want to call the ordered free functions with
+			 * the lock held though. Save the work as tag for the
+			 * trace event, because the callback could free the
+			 * structure.
+			 */
+			wtag = work;
+			work->ordered_free(work);
+			trace_btrfs_all_work_done(wq->fs_info, wtag);
+		}
 	}
 	spin_unlock_irqrestore(lock, flags);
+
+	if (free_self) {
+		wtag = self;
+		self->ordered_free(self);
+		trace_btrfs_all_work_done(wq->fs_info, wtag);
+	}
 }
 
 static void normal_work_helper(struct btrfs_work *work)
 {
 	struct __btrfs_workqueue *wq;
+	void *wtag;
 	int need_order = 0;
 
 	/*
@@ -310,16 +361,18 @@ static void normal_work_helper(struct btrfs_work *work)
 	if (work->ordered_func)
 		need_order = 1;
 	wq = work->wq;
+	/* Safe for tracepoints in case work gets freed by the callback */
+	wtag = work;
 
 	trace_btrfs_work_sched(work);
 	thresh_exec_hook(wq);
 	work->func(work);
 	if (need_order) {
 		set_bit(WORK_DONE_BIT, &work->flags);
-		run_ordered_work(wq);
+		run_ordered_work(wq, work);
 	}
 	if (!need_order)
-		trace_btrfs_all_work_done(work);
+		trace_btrfs_all_work_done(wq->fs_info, wtag);
 }
 
 void btrfs_init_work(struct btrfs_work *work, btrfs_work_func_t uniq_func,
@@ -393,4 +446,12 @@ void btrfs_workqueue_set_max(struct btrfs_workqueue *wq, int limit_active)
 void btrfs_set_work_high_priority(struct btrfs_work *work)
 {
 	set_bit(WORK_HIGH_PRIO_BIT, &work->flags);
+}
+
+void btrfs_flush_workqueue(struct btrfs_workqueue *wq)
+{
+	if (wq->high)
+		flush_workqueue(wq->high->normal_wq);
+
+	flush_workqueue(wq->normal->normal_wq);
 }

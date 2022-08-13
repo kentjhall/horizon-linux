@@ -172,10 +172,15 @@ static u32 rsnd_ssi_run_mods(struct rsnd_dai_stream *io)
 {
 	struct rsnd_mod *ssi_mod = rsnd_io_to_mod_ssi(io);
 	struct rsnd_mod *ssi_parent_mod = rsnd_io_to_mod_ssip(io);
+	u32 mods;
 
-	return rsnd_ssi_multi_slaves_runtime(io) |
-		1 << rsnd_mod_id(ssi_mod) |
-		1 << rsnd_mod_id(ssi_parent_mod);
+	mods = rsnd_ssi_multi_slaves_runtime(io) |
+		1 << rsnd_mod_id(ssi_mod);
+
+	if (ssi_parent_mod)
+		mods |= 1 << rsnd_mod_id(ssi_parent_mod);
+
+	return mods;
 }
 
 u32 rsnd_ssi_multi_slaves_runtime(struct rsnd_dai_stream *io)
@@ -226,6 +231,15 @@ static int rsnd_ssi_master_clk_start(struct rsnd_mod *mod,
 	 * Find best clock, and try to start ADG
 	 */
 	for (j = 0; j < ARRAY_SIZE(ssi_clk_mul_table); j++) {
+
+		/*
+		 * It will set SSIWSR.CONT here, but SSICR.CKDV = 000
+		 * with it is not allowed. (SSIWSR.WS_MODE with
+		 * SSICR.CKDV = 000 is not allowed either).
+		 * Skip it. See SSICR.CKDV
+		 */
+		if (j == 0)
+			continue;
 
 		/*
 		 * this driver is assuming that
@@ -538,6 +552,13 @@ static void __rsnd_ssi_interrupt(struct rsnd_mod *mod,
 		struct snd_pcm_runtime *runtime = rsnd_io_to_runtime(io);
 		u32 *buf = (u32 *)(runtime->dma_area +
 				   rsnd_dai_pointer_offset(io, 0));
+		int shift = 0;
+
+		switch (runtime->sample_bits) {
+		case 32:
+			shift = 8;
+			break;
+		}
 
 		/*
 		 * 8/16/32 data can be assesse to TDR/RDR register
@@ -545,9 +566,9 @@ static void __rsnd_ssi_interrupt(struct rsnd_mod *mod,
 		 * see rsnd_ssi_init()
 		 */
 		if (rsnd_io_is_play(io))
-			rsnd_mod_write(mod, SSITDR, *buf);
+			rsnd_mod_write(mod, SSITDR, (*buf) << shift);
 		else
-			*buf = rsnd_mod_read(mod, SSIRDR);
+			*buf = (rsnd_mod_read(mod, SSIRDR) >> shift);
 
 		elapsed = rsnd_dai_pointer_update(io, sizeof(*buf));
 	}
@@ -694,8 +715,13 @@ static int rsnd_ssi_dma_remove(struct rsnd_mod *mod,
 			       struct rsnd_priv *priv)
 {
 	struct rsnd_ssi *ssi = rsnd_mod_to_ssi(mod);
+	struct rsnd_mod *pure_ssi_mod = rsnd_io_to_mod_ssi(io);
 	struct device *dev = rsnd_priv_to_dev(priv);
 	int irq = ssi->irq;
+
+	/* Do nothing if non SSI (= SSI parent, multi SSI) mod */
+	if (pure_ssi_mod != mod)
+		return 0;
 
 	/* PIO will request IRQ again */
 	devm_free_irq(dev, irq, mod);

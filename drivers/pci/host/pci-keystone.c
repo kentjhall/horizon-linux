@@ -43,6 +43,7 @@
 #define PCIE_RC_K2HK		0xb008
 #define PCIE_RC_K2E		0xb009
 #define PCIE_RC_K2L		0xb00a
+#define PCIE_RC_K2G		0xb00b
 
 #define to_keystone_pcie(x)	container_of(x, struct keystone_pcie, pp)
 
@@ -56,6 +57,8 @@ static void quirk_limit_mrrs(struct pci_dev *dev)
 		{ PCI_DEVICE(PCI_VENDOR_ID_TI, PCIE_RC_K2E),
 		 .class = PCI_CLASS_BRIDGE_PCI << 8, .class_mask = ~0, },
 		{ PCI_DEVICE(PCI_VENDOR_ID_TI, PCIE_RC_K2L),
+		 .class = PCI_CLASS_BRIDGE_PCI << 8, .class_mask = ~0, },
+		{ PCI_DEVICE(PCI_VENDOR_ID_TI, PCIE_RC_K2G),
 		 .class = PCI_CLASS_BRIDGE_PCI << 8, .class_mask = ~0, },
 		{ 0, },
 	};
@@ -181,7 +184,7 @@ static int ks_pcie_get_irq_controller_info(struct keystone_pcie *ks_pcie,
 	}
 
 	/* interrupt controller is in a child node */
-	*np_temp = of_find_node_by_name(np_pcie, controller);
+	*np_temp = of_get_child_by_name(np_pcie, controller);
 	if (!(*np_temp)) {
 		dev_err(dev, "Node for %s is absent\n", controller);
 		return -EINVAL;
@@ -190,6 +193,7 @@ static int ks_pcie_get_irq_controller_info(struct keystone_pcie *ks_pcie,
 	temp = of_irq_count(*np_temp);
 	if (!temp) {
 		dev_err(dev, "No IRQ entries in %s\n", controller);
+		of_node_put(*np_temp);
 		return -EINVAL;
 	}
 
@@ -206,6 +210,8 @@ static int ks_pcie_get_irq_controller_info(struct keystone_pcie *ks_pcie,
 		if (!host_irqs[temp])
 			break;
 	}
+
+	of_node_put(*np_temp);
 
 	if (temp) {
 		*num_irqs = temp;

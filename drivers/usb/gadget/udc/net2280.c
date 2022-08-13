@@ -870,9 +870,6 @@ static void start_queue(struct net2280_ep *ep, u32 dmactl, u32 td_dma)
 	(void) readl(&ep->dev->pci->pcimstctl);
 
 	writel(BIT(DMA_START), &dma->dmastat);
-
-	if (!ep->is_in)
-		stop_out_naking(ep);
 }
 
 static void start_dma(struct net2280_ep *ep, struct net2280_request *req)
@@ -911,6 +908,7 @@ static void start_dma(struct net2280_ep *ep, struct net2280_request *req)
 			writel(BIT(DMA_START), &dma->dmastat);
 			return;
 		}
+		stop_out_naking(ep);
 	}
 
 	tmp = dmactl_default;
@@ -1146,15 +1144,15 @@ static int scan_dma_completions(struct net2280_ep *ep)
 	 */
 	while (!list_empty(&ep->queue)) {
 		struct net2280_request	*req;
-		u32			tmp;
+		u32 req_dma_count;
 
 		req = list_entry(ep->queue.next,
 				struct net2280_request, queue);
 		if (!req->valid)
 			break;
 		rmb();
-		tmp = le32_to_cpup(&req->td->dmacount);
-		if ((tmp & BIT(VALID_BIT)) != 0)
+		req_dma_count = le32_to_cpup(&req->td->dmacount);
+		if ((req_dma_count & BIT(VALID_BIT)) != 0)
 			break;
 
 		/* SHORT_PACKET_TRANSFERRED_INTERRUPT handles "usb-short"
@@ -1163,40 +1161,41 @@ static int scan_dma_completions(struct net2280_ep *ep)
 		 */
 		if (unlikely(req->td->dmadesc == 0)) {
 			/* paranoia */
-			tmp = readl(&ep->dma->dmacount);
-			if (tmp & DMA_BYTE_COUNT_MASK)
+			u32 const ep_dmacount = readl(&ep->dma->dmacount);
+
+			if (ep_dmacount & DMA_BYTE_COUNT_MASK)
 				break;
 			/* single transfer mode */
-			dma_done(ep, req, tmp, 0);
+			dma_done(ep, req, req_dma_count, 0);
 			num_completed++;
 			break;
 		} else if (!ep->is_in &&
 			   (req->req.length % ep->ep.maxpacket) &&
 			   !(ep->dev->quirks & PLX_PCIE)) {
 
-			tmp = readl(&ep->regs->ep_stat);
+			u32 const ep_stat = readl(&ep->regs->ep_stat);
 			/* AVOID TROUBLE HERE by not issuing short reads from
 			 * your gadget driver.  That helps avoids errata 0121,
 			 * 0122, and 0124; not all cases trigger the warning.
 			 */
-			if ((tmp & BIT(NAK_OUT_PACKETS)) == 0) {
+			if ((ep_stat & BIT(NAK_OUT_PACKETS)) == 0) {
 				ep_warn(ep->dev, "%s lost packet sync!\n",
 						ep->ep.name);
 				req->req.status = -EOVERFLOW;
 			} else {
-				tmp = readl(&ep->regs->ep_avail);
-				if (tmp) {
+				u32 const ep_avail = readl(&ep->regs->ep_avail);
+				if (ep_avail) {
 					/* fifo gets flushed later */
 					ep->out_overflow = 1;
 					ep_dbg(ep->dev,
 						"%s dma, discard %d len %d\n",
-						ep->ep.name, tmp,
+						ep->ep.name, ep_avail,
 						req->req.length);
 					req->req.status = -EOVERFLOW;
 				}
 			}
 		}
-		dma_done(ep, req, tmp, 0);
+		dma_done(ep, req, req_dma_count, 0);
 		num_completed++;
 	}
 
@@ -1278,9 +1277,9 @@ static int net2280_dequeue(struct usb_ep *_ep, struct usb_request *_req)
 			break;
 	}
 	if (&req->req != _req) {
+		ep->stopped = stopped;
 		spin_unlock_irqrestore(&ep->dev->lock, flags);
-		dev_err(&ep->dev->pdev->dev, "%s: Request mismatch\n",
-								__func__);
+		ep_dbg(ep->dev, "%s: Request mismatch\n", __func__);
 		return -EINVAL;
 	}
 
@@ -1548,10 +1547,13 @@ static int net2280_pullup(struct usb_gadget *_gadget, int is_on)
 		writel(tmp | BIT(USB_DETECT_ENABLE), &dev->usb->usbctl);
 	} else {
 		writel(tmp & ~BIT(USB_DETECT_ENABLE), &dev->usb->usbctl);
-		stop_activity(dev, dev->driver);
+		stop_activity(dev, NULL);
 	}
 
 	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (!is_on && dev->driver)
+		dev->driver->disconnect(&dev->gadget);
 
 	return 0;
 }
@@ -3415,6 +3417,7 @@ __acquires(dev->lock)
 	tmp = BIT(SUSPEND_REQUEST_CHANGE_INTERRUPT);
 	if (stat & tmp) {
 		writel(tmp, &dev->regs->irqstat1);
+		spin_unlock(&dev->lock);
 		if (stat & BIT(SUSPEND_REQUEST_INTERRUPT)) {
 			if (dev->driver->suspend)
 				dev->driver->suspend(&dev->gadget);
@@ -3425,6 +3428,7 @@ __acquires(dev->lock)
 				dev->driver->resume(&dev->gadget);
 			/* at high speed, note erratum 0133 */
 		}
+		spin_lock(&dev->lock);
 		stat &= ~tmp;
 	}
 
@@ -3781,8 +3785,10 @@ static int net2280_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	return 0;
 
 done:
-	if (dev)
+	if (dev) {
 		net2280_remove(pdev);
+		kfree(dev);
+	}
 	return retval;
 }
 

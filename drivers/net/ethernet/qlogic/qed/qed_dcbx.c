@@ -677,9 +677,9 @@ qed_dcbx_get_local_lldp_params(struct qed_hwfn *p_hwfn,
 	p_local = &p_hwfn->p_dcbx_info->lldp_local[LLDP_NEAREST_BRIDGE];
 
 	memcpy(params->lldp_local.local_chassis_id, p_local->local_chassis_id,
-	       ARRAY_SIZE(p_local->local_chassis_id));
+	       sizeof(p_local->local_chassis_id));
 	memcpy(params->lldp_local.local_port_id, p_local->local_port_id,
-	       ARRAY_SIZE(p_local->local_port_id));
+	       sizeof(p_local->local_port_id));
 }
 
 static void
@@ -692,9 +692,9 @@ qed_dcbx_get_remote_lldp_params(struct qed_hwfn *p_hwfn,
 	p_remote = &p_hwfn->p_dcbx_info->lldp_remote[LLDP_NEAREST_BRIDGE];
 
 	memcpy(params->lldp_remote.peer_chassis_id, p_remote->peer_chassis_id,
-	       ARRAY_SIZE(p_remote->peer_chassis_id));
+	       sizeof(p_remote->peer_chassis_id));
 	memcpy(params->lldp_remote.peer_port_id, p_remote->peer_port_id,
-	       ARRAY_SIZE(p_remote->peer_port_id));
+	       sizeof(p_remote->peer_port_id));
 }
 
 static int
@@ -1222,7 +1222,7 @@ static struct qed_dcbx_get *qed_dcbnl_get_dcbx(struct qed_hwfn *hwfn,
 {
 	struct qed_dcbx_get *dcbx_info;
 
-	dcbx_info = kzalloc(sizeof(*dcbx_info), GFP_KERNEL);
+	dcbx_info = kmalloc(sizeof(*dcbx_info), GFP_ATOMIC);
 	if (!dcbx_info)
 		return NULL;
 

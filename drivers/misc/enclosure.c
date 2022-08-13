@@ -148,7 +148,7 @@ enclosure_register(struct device *dev, const char *name, int components,
 	for (i = 0; i < components; i++) {
 		edev->component[i].number = -1;
 		edev->component[i].slot = -1;
-		edev->component[i].power_status = 1;
+		edev->component[i].power_status = -1;
 	}
 
 	mutex_lock(&container_list_lock);
@@ -375,6 +375,7 @@ int enclosure_add_device(struct enclosure_device *edev, int component,
 			 struct device *dev)
 {
 	struct enclosure_component *cdev;
+	int err;
 
 	if (!edev || component >= edev->components)
 		return -EINVAL;
@@ -384,12 +385,17 @@ int enclosure_add_device(struct enclosure_device *edev, int component,
 	if (cdev->dev == dev)
 		return -EEXIST;
 
-	if (cdev->dev)
+	if (cdev->dev) {
 		enclosure_remove_links(cdev);
-
-	put_device(cdev->dev);
+		put_device(cdev->dev);
+	}
 	cdev->dev = get_device(dev);
-	return enclosure_add_links(cdev);
+	err = enclosure_add_links(cdev);
+	if (err) {
+		put_device(cdev->dev);
+		cdev->dev = NULL;
+	}
+	return err;
 }
 EXPORT_SYMBOL_GPL(enclosure_add_device);
 
@@ -413,10 +419,9 @@ int enclosure_remove_device(struct enclosure_device *edev, struct device *dev)
 		cdev = &edev->component[i];
 		if (cdev->dev == dev) {
 			enclosure_remove_links(cdev);
-			device_del(&cdev->cdev);
 			put_device(dev);
 			cdev->dev = NULL;
-			return device_add(&cdev->cdev);
+			return 0;
 		}
 	}
 	return -ENODEV;
@@ -594,6 +599,11 @@ static ssize_t get_component_power_status(struct device *cdev,
 
 	if (edev->cb->get_power_status)
 		edev->cb->get_power_status(edev, ecomp);
+
+	/* If still uninitialized, the callback failed or does not exist. */
+	if (ecomp->power_status == -1)
+		return (edev->cb->get_power_status) ? -EIO : -ENOTTY;
+
 	return snprintf(buf, 40, "%s\n", ecomp->power_status ? "on" : "off");
 }
 

@@ -37,6 +37,9 @@ struct device;
 struct dma_buf;
 struct dma_buf_attachment;
 
+#define DMABUF_CAN_DEFER_UNMAP		BIT(0)
+#define DMABUF_SKIP_CACHE_SYNC		BIT(1)
+
 /**
  * struct dma_buf_ops - operations possible on struct dma_buf
  * @attach: [optional] allows different devices to 'attach' themselves to the
@@ -54,7 +57,7 @@ struct dma_buf_attachment;
  * @release: release this buffer; to be called after the last dma_buf_put.
  * @begin_cpu_access: [optional] called before cpu access to invalidate cpu
  * 		      caches and allocate backing storage (if not yet done)
- * 		      respectively pin the object into memory.
+ * 		      respectively pin the objet into memory.
  * @end_cpu_access: [optional] called after cpu access to flush caches.
  * @kmap_atomic: maps a page from the buffer into kernel address
  * 		 space, users may not block until the subsequent unmap call.
@@ -93,8 +96,10 @@ struct dma_buf_ops {
 	/* after final dma_buf_put() */
 	void (*release)(struct dma_buf *);
 
-	int (*begin_cpu_access)(struct dma_buf *, enum dma_data_direction);
-	int (*end_cpu_access)(struct dma_buf *, enum dma_data_direction);
+	int (*begin_cpu_access)(struct dma_buf *, size_t, size_t,
+				enum dma_data_direction);
+	void (*end_cpu_access)(struct dma_buf *, size_t, size_t,
+			       enum dma_data_direction);
 	void *(*kmap_atomic)(struct dma_buf *, unsigned long);
 	void (*kunmap_atomic)(struct dma_buf *, unsigned long, void *);
 	void *(*kmap)(struct dma_buf *, unsigned long);
@@ -104,6 +109,10 @@ struct dma_buf_ops {
 
 	void *(*vmap)(struct dma_buf *);
 	void (*vunmap)(struct dma_buf *, void *vaddr);
+
+	void *(*get_drvdata)(struct dma_buf *, struct device *);
+	int (*set_drvdata)(struct dma_buf *, struct device *, void *priv,
+			   void (*)(void *));
 };
 
 /**
@@ -134,10 +143,16 @@ struct dma_buf {
 	unsigned vmapping_counter;
 	void *vmap_ptr;
 	const char *exp_name;
+	unsigned long flags;
 	struct module *owner;
 	struct list_head list_node;
 	void *priv;
 	struct reservation_object *resv;
+
+	/* dma-buf stashing is optimized for host1x context device. Adding flag
+	 * to find out whether dma_buf is attached to any context device or not.
+	 */
+	bool context_dev;
 
 	/* poll support */
 	wait_queue_head_t poll;
@@ -165,7 +180,13 @@ struct dma_buf_attachment {
 	struct dma_buf *dmabuf;
 	struct device *dev;
 	struct list_head node;
+
+	/* Adding list node for device attachments. */
+	struct list_head dev_node;
 	void *priv;
+	struct sg_table *sg_table;
+	atomic_t ref;
+	atomic_t maps;
 };
 
 /**
@@ -187,6 +208,7 @@ struct dma_buf_export_info {
 	const struct dma_buf_ops *ops;
 	size_t size;
 	int flags;
+	int exp_flags;
 	struct reservation_object *resv;
 	void *priv;
 };
@@ -225,14 +247,20 @@ int dma_buf_fd(struct dma_buf *dmabuf, int flags);
 struct dma_buf *dma_buf_get(int fd);
 void dma_buf_put(struct dma_buf *dmabuf);
 
+void dma_buf_release_stash(struct device *dev);
+
+int dma_buf_set_drvdata(struct dma_buf *, struct device *,
+			void *, void (*destroy)(void *));
+void *dma_buf_get_drvdata(struct dma_buf *, struct device *);
+
 struct sg_table *dma_buf_map_attachment(struct dma_buf_attachment *,
 					enum dma_data_direction);
 void dma_buf_unmap_attachment(struct dma_buf_attachment *, struct sg_table *,
 				enum dma_data_direction);
-int dma_buf_begin_cpu_access(struct dma_buf *dma_buf,
+int dma_buf_begin_cpu_access(struct dma_buf *dma_buf, size_t start, size_t len,
 			     enum dma_data_direction dir);
-int dma_buf_end_cpu_access(struct dma_buf *dma_buf,
-			   enum dma_data_direction dir);
+void dma_buf_end_cpu_access(struct dma_buf *dma_buf, size_t start, size_t len,
+			    enum dma_data_direction dir);
 void *dma_buf_kmap_atomic(struct dma_buf *, unsigned long);
 void dma_buf_kunmap_atomic(struct dma_buf *, unsigned long, void *);
 void *dma_buf_kmap(struct dma_buf *, unsigned long);
@@ -242,4 +270,5 @@ int dma_buf_mmap(struct dma_buf *, struct vm_area_struct *,
 		 unsigned long);
 void *dma_buf_vmap(struct dma_buf *);
 void dma_buf_vunmap(struct dma_buf *, void *vaddr);
+extern int dma_buf_disable_lazy_unmapping(struct device *device);
 #endif /* __DMA_BUF_H__ */

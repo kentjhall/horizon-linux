@@ -1,0 +1,59 @@
+MAXIM MAX16984 CDP PHY binding
+============================================
+
+This binding describes a MAX16984 device that is used to provide CDP (charging
+downstream port) support on Tegra USB host mode port, on Tegra platform.
+
+Required properties (controller (parent) node):
+- compatible : Should be "maxim,max16984-tegra186-cdp-phy" for tegra186 platforms,
+               should be "maxim,max16984-tegra210-cdp-phy" for tegra210 platforms.
+- #phy-cells : Should be 1
+
+Optional properties (controller (parent) node) for tegra186 platforms:
+- max,cdp-port0-cd0-gpio : GPIO phandle for UTMI port 0 CD0 pin
+- max,cdp-port0-cd1-gpio : GPIO phandle for UTMI port 0 CD1 pin
+- max,cdp-port1-cd0-gpio : GPIO phandle for UTMI port 1 CD0 pin
+- max,cdp-port1-cd1-gpio : GPIO phandle for UTMI port 1 CD1 pin
+- max,cdp-port2-cd0-gpio : GPIO phandle for UTMI port 2 CD0 pin
+- max,cdp-port2-cd1-gpio : GPIO phandle for UTMI port 2 CD1 pin
+
+Optional properties (controller (parent) node) for tegra210 platforms:
+- max,cdp-port0-cd0-gpio : GPIO phandle for UTMI port 0 CD0 pin
+- max,cdp-port0-cd1-gpio : GPIO phandle for UTMI port 0 CD1 pin
+- max,cdp-port1-cd0-gpio : GPIO phandle for UTMI port 1 CD0 pin
+- max,cdp-port1-cd1-gpio : GPIO phandle for UTMI port 1 CD1 pin
+- max,cdp-port2-cd0-gpio : GPIO phandle for UTMI port 2 CD0 pin
+- max,cdp-port2-cd1-gpio : GPIO phandle for UTMI port 2 CD1 pin
+- max,cdp-port3-cd0-gpio : GPIO phandle for UTMI port 3 CD0 pin
+- max,cdp-port3-cd1-gpio : GPIO phandle for UTMI port 3 CD1 pin
+
+Note that CD1 pin are not used by now. CD0 gpio should be specified for a port
+to actually provide the CDP function, or it's equivalent to no-op.
+
+Example:
+
+	tegra_ext_cdp: max16984-cdp {
+		compatible = "maxim,max16984-tegra186-cdp-phy";
+        #phy-cells = <1>;
+        max,cdp-port0-cd0-gpio = <&tegra_gpio TEGRA_GPIO(J, 7) GPIO_ACTIVE_HIGH>;
+        max,cdp-port2-cd0-gpio = <&tegra_gpio TEGRA_GPIO(K, 0) GPIO_ACTIVE_HIGH>;
+	};
+
+Specifying phy control of devices
+=================================
+
+USB host controller device nodes can specify this phy as "cdp-0", "cdp-1",
+"cdp-2" or "cdp-3" PHYs for UTMI port 0, 1, 2 or 3.
+
+Example:
+
+
+	xhci@3530000 {
+		...
+		phys	  = ...
+                    <&tegra_ext_cdp 0>,
+                    <&tegra_ext_cdp 2>;
+		phy-names = ...
+                    "cdp-0", "cdp-2";
+		...
+	};

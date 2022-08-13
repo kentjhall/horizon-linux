@@ -12,13 +12,11 @@ int snd_usb_endpoint_set_params(struct snd_usb_endpoint *ep,
 				snd_pcm_format_t pcm_format,
 				unsigned int channels,
 				unsigned int period_bytes,
-				unsigned int period_frames,
-				unsigned int buffer_periods,
 				unsigned int rate,
 				struct audioformat *fmt,
 				struct snd_usb_endpoint *sync_ep);
 
-int  snd_usb_endpoint_start(struct snd_usb_endpoint *ep, bool can_sleep);
+int  snd_usb_endpoint_start(struct snd_usb_endpoint *ep);
 void snd_usb_endpoint_stop(struct snd_usb_endpoint *ep);
 void snd_usb_endpoint_sync_pending_stop(struct snd_usb_endpoint *ep);
 int  snd_usb_endpoint_activate(struct snd_usb_endpoint *ep);

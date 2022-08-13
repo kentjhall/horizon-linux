@@ -1,0 +1,14 @@
+* NXP PCA9629A Stepper motor controller
+
+Required properties:
+- compatible: must be "stepper_pca"
+- reg: I2C slave address of the controller.
+
+Example:
+
+        i2c@c240000 {
+                compatible = "stepper_pca";
+                reg = <0x21>;
+		status = "okay";
+        };
+

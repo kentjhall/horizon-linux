@@ -1,6 +1,8 @@
 /*
  * Driver for USB Mass Storage compliant devices
  *
+ * Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
+ *
  * Current development and maintenance by:
  *   (c) 1999-2003 Matthew Dharm (mdharm-usb@one-eyed-alien.net)
  *
@@ -1106,6 +1108,10 @@ void usb_stor_disconnect(struct usb_interface *intf)
 {
 	struct us_data *us = usb_get_intfdata(intf);
 
+	/* Device has been removed */
+	if (!us)
+		return;
+
 	quiesce_and_remove_host(us);
 	release_everything(us);
 }
@@ -1164,6 +1170,36 @@ static int storage_probe(struct usb_interface *intf,
 	return result;
 }
 
+#ifdef CONFIG_PM
+static int usb_storage_suspend(struct device *dev)
+{
+	pm_runtime_disable(dev);
+
+	return 0;
+}
+
+static int usb_storage_resume(struct device *dev)
+{
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+
+	return 0;
+}
+
+static void usb_storage_shutdown(struct device *dev)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+
+	/* Logically disconnect device on shutdown */
+	usb_stor_disconnect(intf);
+}
+
+static const struct dev_pm_ops usb_storage_pm_ops = {
+	.suspend = usb_storage_suspend,
+	.resume = usb_storage_resume,
+};
+#endif
+
 static struct usb_driver usb_storage_driver = {
 	.name =		DRV_NAME,
 	.probe =	storage_probe,
@@ -1176,6 +1212,10 @@ static struct usb_driver usb_storage_driver = {
 	.id_table =	usb_storage_usb_ids,
 	.supports_autosuspend = 1,
 	.soft_unbind =	1,
+#ifdef CONFIG_PM
+	.drvwrap.driver.pm = &usb_storage_pm_ops,
+#endif
+	.drvwrap.driver.shutdown = usb_storage_shutdown,
 };
 
 module_usb_stor_driver(usb_storage_driver, usb_stor_host_template, DRV_NAME);

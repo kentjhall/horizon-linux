@@ -4,6 +4,9 @@
 
 # Each configuration option enables a list of files.
 
+GCOV_PROFILE := y
+
+ccflags-y += -Werror
 wm97xx-ts-y := wm97xx-core.o
 
 obj-$(CONFIG_TOUCHSCREEN_PROPERTIES)	+= of_touchscreen.o

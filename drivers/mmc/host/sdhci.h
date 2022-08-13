@@ -4,6 +4,7 @@
  * Header file for Host Controller registers and I/O accessors.
  *
  *  Copyright (C) 2005-2008 Pierre Ossman, All Rights Reserved.
+ *  Copyright (c) 2012-2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -33,6 +34,9 @@
 #define SDHCI_BLOCK_COUNT	0x06
 
 #define SDHCI_ARGUMENT		0x08
+#define SDHCI_ARGUMENT_CMDQ_TASKID_SHIFT	16
+#define SDHCI_ARGUMENT_CMDQ_TM_OPCODE_ALL	0x1 /* Discard entire queue */
+#define SDHCI_ARGUMENT_CMDQ_TM_OPCODE_TASK	0x2 /* Discard Task */
 
 #define SDHCI_TRANSFER_MODE	0x0C
 #define  SDHCI_TRNS_DMA		0x01
@@ -84,6 +88,7 @@
 #define   SDHCI_CTRL_ADMA1	0x08
 #define   SDHCI_CTRL_ADMA32	0x10
 #define   SDHCI_CTRL_ADMA64	0x18
+#define   SDHCI_CTRL_ADMA3_CQE	0x18
 #define   SDHCI_CTRL_8BITBUS	0x20
 #define  SDHCI_CTRL_CDTEST_INS	0x40
 #define  SDHCI_CTRL_CDTEST_EN	0x80
@@ -132,6 +137,7 @@
 #define  SDHCI_INT_CARD_REMOVE	0x00000080
 #define  SDHCI_INT_CARD_INT	0x00000100
 #define  SDHCI_INT_RETUNE	0x00001000
+#define  SDHCI_INT_CMDQ		0x00004000
 #define  SDHCI_INT_ERROR	0x00008000
 #define  SDHCI_INT_TIMEOUT	0x00010000
 #define  SDHCI_INT_CRC		0x00020000
@@ -154,6 +160,8 @@
 		SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC | \
 		SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR | \
 		SDHCI_INT_BLK_GAP)
+
+#define SDHCI_INT_CMDQ_EN	(0x1 << 14)
 #define SDHCI_INT_ALL_MASK	((unsigned int)-1)
 
 #define SDHCI_ACMD12_ERR	0x3C
@@ -174,6 +182,8 @@
 #define   SDHCI_CTRL_DRV_TYPE_D		0x0030
 #define  SDHCI_CTRL_EXEC_TUNING		0x0040
 #define  SDHCI_CTRL_TUNED_CLK		0x0080
+#define  SDHCI_HOST_VERSION_4_EN	0x1000
+#define  SDHCI_ADDRESSING_64BIT_EN	0x2000
 #define  SDHCI_CTRL_PRESET_VAL_ENABLE	0x8000
 
 #define SDHCI_CAPABILITIES	0x40
@@ -260,6 +270,9 @@
 #define   SDHCI_SPEC_100	0
 #define   SDHCI_SPEC_200	1
 #define   SDHCI_SPEC_300	2
+#define   SDHCI_SPEC_400	3
+#define   SDHCI_SPEC_410	4
+#define   SDHCI_SPEC_420	5
 
 /*
  * End of controller registers.
@@ -268,11 +281,15 @@
 #define SDHCI_MAX_DIV_SPEC_200	256
 #define SDHCI_MAX_DIV_SPEC_300	2046
 
+/* Time (in milli sec) interval to run auto calibration */
+#define SDHCI_PERIODIC_CALIB_TIMEOUT	100
+
 /*
  * Host SDMA buffer boundary. Valid values from 4K to 512K in powers of 2.
  */
 #define SDHCI_DEFAULT_BOUNDARY_SIZE  (512 * 1024)
 #define SDHCI_DEFAULT_BOUNDARY_ARG   (ilog2(SDHCI_DEFAULT_BOUNDARY_SIZE) - 12)
+#define SDHCI_DEFAULT_BLK_SIZE   512
 
 /* ADMA2 32-bit DMA descriptor size */
 #define SDHCI_ADMA2_32_DESC_SZ	8
@@ -297,6 +314,12 @@ struct sdhci_adma2_32_desc {
 
 /* ADMA2 64-bit DMA descriptor size */
 #define SDHCI_ADMA2_64_DESC_SZ	12
+
+/* ADMA2 64-bit Addressing DMA descriptor size */
+#define SDHCI_ADMA2_64_ADDR_DESC_SZ	16
+
+/* ADMA2 64-bit DMA alignment */
+#define SDHCI_ADMA2_64_ALIGN	8
 
 /*
  * ADMA2 64-bit descriptor. Note 12-byte descriptor can't always be 8-byte
@@ -425,6 +448,16 @@ struct sdhci_host {
 #define SDHCI_QUIRK2_ACMD23_BROKEN			(1<<14)
 /* Broken Clock divider zero in controller */
 #define SDHCI_QUIRK2_CLOCK_DIV_ZERO_BROKEN		(1<<15)
+#define SDHCI_QUIRK2_USE_64BIT_ADDR		(1<<16)
+/* Issue CMD and DATA reset together */
+#define SDHCI_QUIRK2_ISSUE_CMD_DAT_RESET_TOGETHER	(1<<17)
+/* Select SDR104 UHS mode for SDR50 */
+#define SDHCI_QUIRK2_SEL_SDR104_UHS_MODE_IN_SDR50	(1<<18)
+/* Turn off/on card clock before sending/after tuning command */
+#define SDHCI_QUIRK2_NON_STD_TUN_CARD_CLOCK		(1<<19)
+/* Controller doesn't calculate max_busy_timeout */
+#define SDHCI_QUIRK2_NO_CALC_MAX_BUSY_TO		(1<<20)
+#define SDHCI_QUIRK2_PERIODIC_CALIBRATION		(1<<21)
 
 	int irq;		/* Device IRQ */
 	void __iomem *ioaddr;	/* Mapped address */
@@ -449,6 +482,7 @@ struct sdhci_host {
 #define SDHCI_REQ_USE_DMA	(1<<2)	/* Use DMA for this req. */
 #define SDHCI_DEVICE_DEAD	(1<<3)	/* Device unresponsive */
 #define SDHCI_SDR50_NEEDS_TUNING (1<<4)	/* SDR50 needs tuning */
+#define SDHCI_SDR104_NEEDS_TUNING (1<<5)/* SDR104 needs tuning */
 #define SDHCI_AUTO_CMD12	(1<<6)	/* Auto CMD12 support */
 #define SDHCI_AUTO_CMD23	(1<<7)	/* Auto CMD23 support */
 #define SDHCI_PV_ENABLED	(1<<8)	/* Preset value enabled */
@@ -458,6 +492,7 @@ struct sdhci_host {
 #define SDHCI_SIGNALING_330	(1<<14)	/* Host is capable of 3.3V signaling */
 #define SDHCI_SIGNALING_180	(1<<15)	/* Host is capable of 1.8V signaling */
 #define SDHCI_SIGNALING_120	(1<<16)	/* Host is capable of 1.2V signaling */
+#define SDHCI_FORCE_PIO_MODE	(1<<17)	/* Force host to use PIO mode */
 
 	unsigned int version;	/* SDHCI spec. version */
 
@@ -492,6 +527,8 @@ struct sdhci_host {
 
 	dma_addr_t adma_addr;	/* Mapped ADMA descr. table */
 	dma_addr_t align_addr;	/* Mapped bounce buffer */
+	unsigned int align_sz;	/* ADMA alignment */
+	unsigned int align_mask;	/* ADMA alignment mask */
 
 	unsigned int desc_sz;	/* ADMA descriptor size */
 
@@ -503,7 +540,7 @@ struct sdhci_host {
 	u32 caps;		/* CAPABILITY_0 */
 	u32 caps1;		/* CAPABILITY_1 */
 	bool read_caps;		/* Capability flags have been read */
-
+	u32 caps_timing_orig;	/* older timing capabilities */
 	unsigned int            ocr_avail_sdio;	/* OCR bit masks */
 	unsigned int            ocr_avail_sd;
 	unsigned int            ocr_avail_mmc;
@@ -521,9 +558,12 @@ struct sdhci_host {
 
 	unsigned int		tuning_count;	/* Timer count for re-tuning */
 	unsigned int		tuning_mode;	/* Re-tuning mode supported by host */
+	struct cmdq_host	*cq_host;
 #define SDHCI_TUNING_MODE_1	0
 #define SDHCI_TUNING_MODE_2	1
 #define SDHCI_TUNING_MODE_3	2
+	ktime_t timestamp;
+	bool is_calib_done;
 
 	unsigned long private[0] ____cacheline_aligned;
 };
@@ -564,6 +604,26 @@ struct sdhci_ops {
 					 struct mmc_card *card,
 					 unsigned int max_dtr, int host_drv,
 					 int card_drv, int *drv_type);
+	int	(*get_max_tuning_loop_counter)(struct sdhci_host *host);
+	bool	(*skip_retuning)(struct sdhci_host *host);
+	void	(*post_tuning)(struct sdhci_host *host);
+	void	(*voltage_switch_pre)(struct sdhci_host *host,
+		int signal_voltage);
+	void	(*voltage_switch_post)(struct sdhci_host *host,
+		int signal_voltage);
+	void	(*hs400_enhanced_strobe)(struct sdhci_host *host, bool enable);
+	void	(*post_init)(struct sdhci_host *host);
+	int	(*suspend)(struct sdhci_host *host);
+	int	(*resume)(struct sdhci_host *host);
+	void	(*complete)(struct sdhci_host *host);
+	int	(*runtime_suspend)(struct sdhci_host *host);
+	int	(*runtime_resume)(struct sdhci_host *host);
+	void	(*platform_resume)(struct sdhci_host *host);
+	void	(*dump_vendor_regs)(struct sdhci_host *host);
+	void	(*pre_regulator_config)(struct sdhci_host *sdhci, int vdd,
+			bool flag);
+	void	(*voltage_switch_req)(struct sdhci_host *sdhci, bool req);
+	void	(*pad_autocalib)(struct sdhci_host *host);
 };
 
 #ifdef CONFIG_MMC_SDHCI_IO_ACCESSORS
@@ -682,6 +742,7 @@ static inline bool sdhci_sdio_irq_enabled(struct sdhci_host *host)
 u16 sdhci_calc_clk(struct sdhci_host *host, unsigned int clock,
 		   unsigned int *actual_clock);
 void sdhci_set_clock(struct sdhci_host *host, unsigned int clock);
+void sdhci_set_card_clock(struct sdhci_host *host, bool enable);
 void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
 		     unsigned short vdd);
 void sdhci_set_power_noreg(struct sdhci_host *host, unsigned char mode,

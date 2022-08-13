@@ -5,7 +5,7 @@ config PCI_DRA7XX
 	bool "TI DRA7xx PCIe controller"
 	depends on OF && HAS_IOMEM && TI_PIPE3
 	depends on PCI_MSI_IRQ_DOMAIN
-	select PCIE_DW
+	select PCIE_K49_DW
 	help
 	 Enables support for the PCIe controller in the DRA7xx SoC.  There
 	 are two instances of PCIe controller in DRA7xx.  This controller can
@@ -37,10 +37,10 @@ config PCIE_XILINX_NWL
 	 or End Point. The current option selection will only
 	 support root port enabling.
 
-config PCIE_DW_PLAT
+config PCIE_K49_DW_PLAT
 	bool "Platform bus based DesignWare PCIe Controller"
 	depends on PCI_MSI_IRQ_DOMAIN
-	select PCIE_DW
+	select PCIE_K49_DW
 	---help---
 	 This selects the DesignWare PCIe controller support. Select this if
 	 you have a PCIe controller on Platform bus.
@@ -49,7 +49,7 @@ config PCIE_DW_PLAT
 
 	 If unsure, say N.
 
-config PCIE_DW
+config PCIE_K49_DW
 	bool
 	depends on PCI_MSI_IRQ_DOMAIN
 
@@ -58,18 +58,18 @@ config PCI_EXYNOS
 	depends on SOC_EXYNOS5440
 	depends on PCI_MSI_IRQ_DOMAIN
 	select PCIEPORTBUS
-	select PCIE_DW
+	select PCIE_K49_DW
 
 config PCI_IMX6
 	bool "Freescale i.MX6 PCIe controller"
 	depends on SOC_IMX6Q
 	depends on PCI_MSI_IRQ_DOMAIN
 	select PCIEPORTBUS
-	select PCIE_DW
+	select PCIE_K49_DW
 
 config PCI_TEGRA
-	bool "NVIDIA Tegra PCIe controller"
-	depends on ARCH_TEGRA && !ARM64
+	tristate "NVIDIA Tegra PCIe controller"
+	depends on ARCH_TEGRA
 	help
 	  Say Y here if you want support for the PCIe host controller found
 	  on NVIDIA Tegra SoCs.
@@ -108,7 +108,7 @@ config PCIE_SPEAR13XX
 	depends on ARCH_SPEAR13XX
 	depends on PCI_MSI_IRQ_DOMAIN
 	select PCIEPORTBUS
-	select PCIE_DW
+	select PCIE_K49_DW
 	help
 	  Say Y here if you want PCIe support on SPEAr13XX SoCs.
 
@@ -116,7 +116,7 @@ config PCI_KEYSTONE
 	bool "TI Keystone PCIe controller"
 	depends on ARCH_KEYSTONE
 	depends on PCI_MSI_IRQ_DOMAIN
-	select PCIE_DW
+	select PCIE_K49_DW
 	select PCIEPORTBUS
 	help
 	  Say Y here if you want to enable PCI controller support on Keystone
@@ -154,7 +154,7 @@ config PCI_LAYERSCAPE
 	bool "Freescale Layerscape PCIe controller"
 	depends on OF && (ARM || ARCH_LAYERSCAPE)
 	depends on PCI_MSI_IRQ_DOMAIN
-	select PCIE_DW
+	select PCIE_K49_DW
 	select MFD_SYSCON
 	help
 	  Say Y here if you want PCIe controller support on Layerscape SoCs.
@@ -222,7 +222,7 @@ config PCI_HISI
 	bool "HiSilicon Hip05 and Hip06 SoCs PCIe controllers"
 	depends on PCI_MSI_IRQ_DOMAIN
 	select PCIEPORTBUS
-	select PCIE_DW
+	select PCIE_K49_DW
 	help
 	  Say Y here if you want PCIe controller support on HiSilicon
 	  Hip05 and Hip06 SoCs
@@ -231,7 +231,7 @@ config PCIE_QCOM
 	bool "Qualcomm PCIe controller"
 	depends on ARCH_QCOM && OF
 	depends on PCI_MSI_IRQ_DOMAIN
-	select PCIE_DW
+	select PCIE_K49_DW
 	select PCIEPORTBUS
 	help
 	  Say Y here to enable PCIe controller support on Qualcomm SoCs. The
@@ -256,7 +256,7 @@ config PCIE_ARMADA_8K
 	bool "Marvell Armada-8K PCIe controller"
 	depends on ARCH_MVEBU
 	depends on PCI_MSI_IRQ_DOMAIN
-	select PCIE_DW
+	select PCIE_K49_DW
 	select PCIEPORTBUS
 	help
 	  Say Y here if you want to enable PCIe controller support on
@@ -268,7 +268,7 @@ config PCIE_ARTPEC6
 	bool "Axis ARTPEC-6 PCIe controller"
 	depends on MACH_ARTPEC6
 	depends on PCI_MSI_IRQ_DOMAIN
-	select PCIE_DW
+	select PCIE_K49_DW
 	select PCIEPORTBUS
 	help
 	  Say Y here to enable PCIe controller support on Axis ARTPEC-6

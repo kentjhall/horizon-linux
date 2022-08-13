@@ -1,0 +1,21 @@
+* THine - THL3504/3502 24-Channel LED Driver
+
+THL3504 - LED driver with 24 channel constant current sink outputs.
+THL3502 - LED driver with 24 channel open drain outputs.
+The controllers generate 256 step PWM that can be used to
+control the brightness of LEDs. It supports LVDS I2C or SPI.
+But the driver supports SPI based control which works without LVDS.
+
+Required properties:
+	- compatible:"thine350x"
+	- reg:  SPI CS index
+	- dev_address: Controller's internal address. Useful when multiple controllers are connected in series.
+	- init_brightness: Initial brightness value to be set for the LEDs during boot.(Range 0 - 255)
+Example:
+
+leds: leds@6 {
+	compatible = "thine350x";
+	reg = <0>;
+	dev_address = <0>;
+	init_brightness = <255>;
+}

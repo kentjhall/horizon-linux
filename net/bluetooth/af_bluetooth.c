@@ -106,10 +106,39 @@ void bt_sock_unregister(int proto)
 }
 EXPORT_SYMBOL(bt_sock_unregister);
 
+#ifdef CONFIG_PARANOID_NETWORK
+static inline int current_has_bt_admin(void)
+{
+	return !current_euid();
+}
+
+static inline int current_has_bt(void)
+{
+	return current_has_bt_admin();
+}
+# else
+static inline int current_has_bt_admin(void)
+{
+	return 1;
+}
+
+static inline int current_has_bt(void)
+{
+	return 1;
+}
+#endif
+
 static int bt_sock_create(struct net *net, struct socket *sock, int proto,
 			  int kern)
 {
 	int err;
+
+	if (proto == BTPROTO_RFCOMM || proto == BTPROTO_SCO ||
+			proto == BTPROTO_L2CAP) {
+		if (!current_has_bt())
+			return -EPERM;
+	} else if (!current_has_bt_admin())
+		return -EPERM;
 
 	if (net != &init_net)
 		return -EAFNOSUPPORT;
@@ -163,6 +192,9 @@ void bt_accept_enqueue(struct sock *parent, struct sock *sk)
 }
 EXPORT_SYMBOL(bt_accept_enqueue);
 
+/* Calling function must hold the sk lock.
+ * bt_sk(sk)->parent must be non-NULL meaning sk is in the parent list.
+ */
 void bt_accept_unlink(struct sock *sk)
 {
 	BT_DBG("sk %p state %d", sk, sk->sk_state);
@@ -181,10 +213,31 @@ struct sock *bt_accept_dequeue(struct sock *parent, struct socket *newsock)
 
 	BT_DBG("parent %p", parent);
 
+restart:
 	list_for_each_entry_safe(s, n, &bt_sk(parent)->accept_q, accept_q) {
 		sk = (struct sock *)s;
 
+		/* Prevent early freeing of sk due to unlink and sock_kill */
+		sock_hold(sk);
 		lock_sock(sk);
+
+		/* Check sk has not already been unlinked via
+		 * bt_accept_unlink() due to serialisation caused by sk locking
+		 */
+		if (!bt_sk(sk)->parent) {
+			BT_DBG("sk %p, already unlinked", sk);
+			release_sock(sk);
+			sock_put(sk);
+
+			/* Restart the loop as sk is no longer in the list
+			 * and also avoid a potential infinite loop because
+			 * list_for_each_entry_safe() is not thread safe.
+			 */
+			goto restart;
+		}
+
+		/* sk is safely in the parent list so reduce reference count */
+		sock_put(sk);
 
 		/* FIXME: Is this check still needed */
 		if (sk->sk_state == BT_CLOSED) {

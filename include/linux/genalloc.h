@@ -32,6 +32,7 @@
 
 #include <linux/types.h>
 #include <linux/spinlock_types.h>
+#include <linux/atomic.h>
 
 struct device;
 struct device_node;
@@ -49,7 +50,8 @@ typedef unsigned long (*genpool_algo_t)(unsigned long *map,
 			unsigned long size,
 			unsigned long start,
 			unsigned int nr,
-			void *data, struct gen_pool *pool);
+			void *data, struct gen_pool *pool,
+			unsigned long start_addr);
 
 /*
  *  General purpose special memory pool descriptor.
@@ -70,7 +72,7 @@ struct gen_pool {
  */
 struct gen_pool_chunk {
 	struct list_head next_chunk;	/* next chunk in pool */
-	atomic_t avail;
+	atomic_long_t avail;
 	phys_addr_t phys_addr;		/* physical starting address of memory chunk */
 	unsigned long start_addr;	/* start address of memory chunk */
 	unsigned long end_addr;		/* end address of memory chunk (inclusive) */
@@ -129,24 +131,24 @@ extern void gen_pool_set_algo(struct gen_pool *pool, genpool_algo_t algo,
 
 extern unsigned long gen_pool_first_fit(unsigned long *map, unsigned long size,
 		unsigned long start, unsigned int nr, void *data,
-		struct gen_pool *pool);
+		struct gen_pool *pool, unsigned long start_addr);
 
 extern unsigned long gen_pool_fixed_alloc(unsigned long *map,
 		unsigned long size, unsigned long start, unsigned int nr,
-		void *data, struct gen_pool *pool);
+		void *data, struct gen_pool *pool, unsigned long start_addr);
 
 extern unsigned long gen_pool_first_fit_align(unsigned long *map,
 		unsigned long size, unsigned long start, unsigned int nr,
-		void *data, struct gen_pool *pool);
+		void *data, struct gen_pool *pool, unsigned long start_addr);
 
 
 extern unsigned long gen_pool_first_fit_order_align(unsigned long *map,
 		unsigned long size, unsigned long start, unsigned int nr,
-		void *data, struct gen_pool *pool);
+		void *data, struct gen_pool *pool, unsigned long start_addr);
 
 extern unsigned long gen_pool_best_fit(unsigned long *map, unsigned long size,
 		unsigned long start, unsigned int nr, void *data,
-		struct gen_pool *pool);
+		struct gen_pool *pool, unsigned long start_addr);
 
 
 extern struct gen_pool *devm_gen_pool_create(struct device *dev,

@@ -702,10 +702,18 @@ static int mlx4_ib_demux_mad(struct ib_device *ibdev, u8 port,
 
 	/* If a grh is present, we demux according to it */
 	if (wc->wc_flags & IB_WC_GRH) {
-		slave = mlx4_ib_find_real_gid(ibdev, port, grh->dgid.global.interface_id);
-		if (slave < 0) {
-			mlx4_ib_warn(ibdev, "failed matching grh\n");
-			return -ENOENT;
+		if (grh->dgid.global.interface_id ==
+			cpu_to_be64(IB_SA_WELL_KNOWN_GUID) &&
+		    grh->dgid.global.subnet_prefix == cpu_to_be64(
+			atomic64_read(&dev->sriov.demux[port - 1].subnet_prefix))) {
+			slave = 0;
+		} else {
+			slave = mlx4_ib_find_real_gid(ibdev, port,
+						      grh->dgid.global.interface_id);
+			if (slave < 0) {
+				mlx4_ib_warn(ibdev, "failed matching grh\n");
+				return -ENOENT;
+			}
 		}
 	}
 	/* Class-specific handling */
@@ -1268,6 +1276,18 @@ static void mlx4_ib_tunnel_comp_handler(struct ib_cq *cq, void *arg)
 	spin_unlock_irqrestore(&dev->sriov.going_down_lock, flags);
 }
 
+static void mlx4_ib_wire_comp_handler(struct ib_cq *cq, void *arg)
+{
+	unsigned long flags;
+	struct mlx4_ib_demux_pv_ctx *ctx = cq->cq_context;
+	struct mlx4_ib_dev *dev = to_mdev(ctx->ib_dev);
+
+	spin_lock_irqsave(&dev->sriov.going_down_lock, flags);
+	if (!dev->sriov.is_going_down && ctx->state == DEMUX_PV_STATE_ACTIVE)
+		queue_work(ctx->wi_wq, &ctx->work);
+	spin_unlock_irqrestore(&dev->sriov.going_down_lock, flags);
+}
+
 static int mlx4_ib_post_pv_qp_buf(struct mlx4_ib_demux_pv_ctx *ctx,
 				  struct mlx4_ib_demux_pv_qp *tun_qp,
 				  int index)
@@ -1635,8 +1655,6 @@ tx_err:
 				    tx_buf_size, DMA_TO_DEVICE);
 		kfree(tun_qp->tx_ring[i].buf.addr);
 	}
-	kfree(tun_qp->tx_ring);
-	tun_qp->tx_ring = NULL;
 	i = MLX4_NUM_TUNNEL_BUFS;
 err:
 	while (i > 0) {
@@ -1645,6 +1663,8 @@ err:
 				    rx_buf_size, DMA_FROM_DEVICE);
 		kfree(tun_qp->ring[i].addr);
 	}
+	kfree(tun_qp->tx_ring);
+	tun_qp->tx_ring = NULL;
 	kfree(tun_qp->ring);
 	tun_qp->ring = NULL;
 	return -ENOMEM;
@@ -1889,7 +1909,6 @@ static void mlx4_ib_sqp_comp_worker(struct work_struct *work)
 					       "buf:%lld\n", wc.wr_id);
 				break;
 			default:
-				BUG_ON(1);
 				break;
 			}
 		} else  {
@@ -1971,7 +1990,8 @@ static int create_pv_resources(struct ib_device *ibdev, int slave, int port,
 		cq_size *= 2;
 
 	cq_attr.cqe = cq_size;
-	ctx->cq = ib_create_cq(ctx->ib_dev, mlx4_ib_tunnel_comp_handler,
+	ctx->cq = ib_create_cq(ctx->ib_dev,
+			       create_tun ? mlx4_ib_tunnel_comp_handler : mlx4_ib_wire_comp_handler,
 			       NULL, ctx, &cq_attr);
 	if (IS_ERR(ctx->cq)) {
 		ret = PTR_ERR(ctx->cq);
@@ -2008,6 +2028,7 @@ static int create_pv_resources(struct ib_device *ibdev, int slave, int port,
 		INIT_WORK(&ctx->work, mlx4_ib_sqp_comp_worker);
 
 	ctx->wq = to_mdev(ibdev)->sriov.demux[port - 1].wq;
+	ctx->wi_wq = to_mdev(ibdev)->sriov.demux[port - 1].wi_wq;
 
 	ret = ib_req_notify_cq(ctx->cq, IB_CQ_NEXT_COMP);
 	if (ret) {
@@ -2151,7 +2172,7 @@ static int mlx4_ib_alloc_demux_ctx(struct mlx4_ib_dev *dev,
 		goto err_mcg;
 	}
 
-	snprintf(name, sizeof name, "mlx4_ibt%d", port);
+	snprintf(name, sizeof(name), "mlx4_ibt%d", port);
 	ctx->wq = alloc_ordered_workqueue(name, WQ_MEM_RECLAIM);
 	if (!ctx->wq) {
 		pr_err("Failed to create tunnelling WQ for port %d\n", port);
@@ -2159,7 +2180,15 @@ static int mlx4_ib_alloc_demux_ctx(struct mlx4_ib_dev *dev,
 		goto err_wq;
 	}
 
-	snprintf(name, sizeof name, "mlx4_ibud%d", port);
+	snprintf(name, sizeof(name), "mlx4_ibwi%d", port);
+	ctx->wi_wq = alloc_ordered_workqueue(name, WQ_MEM_RECLAIM);
+	if (!ctx->wi_wq) {
+		pr_err("Failed to create wire WQ for port %d\n", port);
+		ret = -ENOMEM;
+		goto err_wiwq;
+	}
+
+	snprintf(name, sizeof(name), "mlx4_ibud%d", port);
 	ctx->ud_wq = alloc_ordered_workqueue(name, WQ_MEM_RECLAIM);
 	if (!ctx->ud_wq) {
 		pr_err("Failed to create up/down WQ for port %d\n", port);
@@ -2170,6 +2199,10 @@ static int mlx4_ib_alloc_demux_ctx(struct mlx4_ib_dev *dev,
 	return 0;
 
 err_udwq:
+	destroy_workqueue(ctx->wi_wq);
+	ctx->wi_wq = NULL;
+
+err_wiwq:
 	destroy_workqueue(ctx->wq);
 	ctx->wq = NULL;
 
@@ -2217,12 +2250,14 @@ static void mlx4_ib_free_demux_ctx(struct mlx4_ib_demux_ctx *ctx)
 				ctx->tun[i]->state = DEMUX_PV_STATE_DOWNING;
 		}
 		flush_workqueue(ctx->wq);
+		flush_workqueue(ctx->wi_wq);
 		for (i = 0; i < dev->dev->caps.sqp_demux; i++) {
 			destroy_pv_resources(dev, i, ctx->port, ctx->tun[i], 0);
 			free_pv_object(dev, i, ctx->port);
 		}
 		kfree(ctx->tun);
 		destroy_workqueue(ctx->ud_wq);
+		destroy_workqueue(ctx->wi_wq);
 		destroy_workqueue(ctx->wq);
 	}
 }

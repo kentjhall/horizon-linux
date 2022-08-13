@@ -18,6 +18,7 @@
 
 	compatible = "ti,dra7xx";
 	interrupt-parent = <&crossbar_mpu>;
+	chosen { };
 
 	aliases {
 		i2c0 = &i2c1;
@@ -122,6 +123,7 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges = <0x0 0x0 0x0 0xc0000000>;
+		dma-ranges = <0x80000000 0x0 0x80000000 0x80000000>;
 		ti,hwmods = "l3_main_1", "l3_main_2";
 		reg = <0x0 0x44000000 0x0 0x1000000>,
 		      <0x0 0x45000000 0x0 0x1000>;
@@ -281,6 +283,8 @@
 				device_type = "pci";
 				ranges = <0x81000000 0 0          0x03000 0 0x00010000
 					  0x82000000 0 0x20013000 0x13000 0 0xffed000>;
+				dma-ranges = <0x02000000 0x0 0x00000000 0x00000000 0x1 0x00000000>;
+				bus-range = <0x00 0xff>;
 				#interrupt-cells = <1>;
 				num-lanes = <1>;
 				linux,pci-domain = <0>;
@@ -317,6 +321,8 @@
 				device_type = "pci";
 				ranges = <0x81000000 0 0          0x03000 0 0x00010000
 					  0x82000000 0 0x30013000 0x13000 0 0xffed000>;
+				dma-ranges = <0x02000000 0x0 0x00000000 0x00000000 0x1 0x00000000>;
+				bus-range = <0x00 0xff>;
 				#interrupt-cells = <1>;
 				num-lanes = <1>;
 				linux,pci-domain = <1>;
@@ -1376,6 +1382,7 @@
 			phy-names = "sata-phy";
 			clocks = <&sata_ref_clk>;
 			ti,hwmods = "sata";
+			ports-implemented = <0x1>;
 		};
 
 		rtc: rtc@48838000 {
@@ -1766,7 +1773,7 @@
 			};
 		};
 
-		dcan1: can@481cc000 {
+		dcan1: can@4ae3c000 {
 			compatible = "ti,dra7-d_can";
 			ti,hwmods = "dcan1";
 			reg = <0x4ae3c000 0x2000>;
@@ -1776,7 +1783,7 @@
 			status = "disabled";
 		};
 
-		dcan2: can@481d0000 {
+		dcan2: can@48480000 {
 			compatible = "ti,dra7-d_can";
 			ti,hwmods = "dcan2";
 			reg = <0x48480000 0x2000>;

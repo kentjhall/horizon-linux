@@ -243,6 +243,8 @@ static int get_scrub_rate(struct mem_ctl_info *mci)
 
 		if (pvt->model == 0x60)
 			amd64_read_pci_cfg(pvt->F2, F15H_M60H_SCRCTRL, &scrubval);
+		else
+			amd64_read_pci_cfg(pvt->F3, SCRCTRL, &scrubval);
 	} else
 		amd64_read_pci_cfg(pvt->F3, SCRCTRL, &scrubval);
 
@@ -2719,7 +2721,7 @@ static struct amd64_family_type *per_family_init(struct amd64_pvt *pvt)
 	struct amd64_family_type *fam_type = NULL;
 
 	pvt->ext_model  = boot_cpu_data.x86_model >> 4;
-	pvt->stepping	= boot_cpu_data.x86_mask;
+	pvt->stepping	= boot_cpu_data.x86_stepping;
 	pvt->model	= boot_cpu_data.x86_model;
 	pvt->fam	= boot_cpu_data.x86;
 
@@ -2984,8 +2986,11 @@ static int __init amd64_edac_init(void)
 	int err = -ENODEV;
 	int i;
 
+	if (!x86_match_cpu(amd64_cpuids))
+		return -ENODEV;
+
 	if (amd_cache_northbridges() < 0)
-		goto err_ret;
+		return -ENODEV;
 
 	opstate_init();
 
@@ -2998,14 +3003,16 @@ static int __init amd64_edac_init(void)
 	if (!msrs)
 		goto err_free;
 
-	for (i = 0; i < amd_nb_num(); i++)
-		if (probe_one_instance(i)) {
+	for (i = 0; i < amd_nb_num(); i++) {
+		err = probe_one_instance(i);
+		if (err) {
 			/* unwind properly */
 			while (--i >= 0)
 				remove_one_instance(i);
 
 			goto err_pci;
 		}
+	}
 
 	setup_pci_device();
 
@@ -3025,7 +3032,6 @@ err_free:
 	kfree(ecc_stngs);
 	ecc_stngs = NULL;
 
-err_ret:
 	return err;
 }
 

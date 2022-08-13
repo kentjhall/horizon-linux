@@ -148,8 +148,13 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
 	 *	connect() to INADDR_ANY means loopback (BSD'ism).
 	 */
 
-	if (ipv6_addr_any(&usin->sin6_addr))
-		usin->sin6_addr.s6_addr[15] = 0x1;
+	if (ipv6_addr_any(&usin->sin6_addr)) {
+		if (ipv6_addr_v4mapped(&sk->sk_v6_rcv_saddr))
+			ipv6_addr_set_v4mapped(htonl(INADDR_LOOPBACK),
+					       &usin->sin6_addr);
+		else
+			usin->sin6_addr = in6addr_loopback;
+	}
 
 	addr_type = ipv6_addr_type(&usin->sin6_addr);
 
@@ -188,7 +193,7 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
 	 *	TCP over IPv4
 	 */
 
-	if (addr_type == IPV6_ADDR_MAPPED) {
+	if (addr_type & IPV6_ADDR_MAPPED) {
 		u32 exthdrlen = icsk->icsk_ext_hdr_len;
 		struct sockaddr_in sin;
 
@@ -233,13 +238,14 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
 	fl6.flowi6_mark = sk->sk_mark;
 	fl6.fl6_dport = usin->sin6_port;
 	fl6.fl6_sport = inet->inet_sport;
+	fl6.flowi6_uid = sk->sk_uid;
 
 	opt = rcu_dereference_protected(np->opt, lockdep_sock_is_held(sk));
 	final_p = fl6_update_dst(&fl6, opt, &final);
 
 	security_sk_classify_flow(sk, flowi6_to_flowi(&fl6));
 
-	dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
+	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl6, final_p);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto failure;
@@ -284,6 +290,11 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
 							     inet->inet_sport,
 							     inet->inet_dport);
 
+	if (tcp_fastopen_defer_connect(sk, &err))
+		return err;
+	if (err)
+		goto late_failure;
+
 	err = tcp_connect(sk);
 	if (err)
 		goto late_failure;
@@ -292,7 +303,6 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
 
 late_failure:
 	tcp_set_state(sk, TCP_CLOSE);
-	__sk_dst_reset(sk);
 failure:
 	inet->inet_dport = 0;
 	sk->sk_route_caps = 0;
@@ -375,10 +385,12 @@ static void tcp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 	np = inet6_sk(sk);
 
 	if (type == NDISC_REDIRECT) {
-		struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
+		if (!sock_owned_by_user(sk)) {
+			struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
 
-		if (dst)
-			dst->ops->redirect(dst, sk, skb);
+			if (dst)
+				dst->ops->redirect(dst, sk, skb);
+		}
 		goto out;
 	}
 
@@ -467,7 +479,7 @@ static int tcp_v6_send_synack(const struct sock *sk, struct dst_entry *dst,
 		opt = ireq->ipv6_opt;
 		if (!opt)
 			opt = rcu_dereference(np->opt);
-		err = ip6_xmit(sk, skb, fl6, opt, np->tclass);
+		err = ip6_xmit(sk, skb, fl6, sk->sk_mark, opt, np->tclass);
 		rcu_read_unlock();
 		err = net_xmit_eval(err);
 	}
@@ -828,16 +840,17 @@ static void tcp_v6_send_response(const struct sock *sk, struct sk_buff *skb, u32
 	fl6.flowi6_mark = IP6_REPLY_MARK(net, skb->mark);
 	fl6.fl6_dport = t1->dest;
 	fl6.fl6_sport = t1->source;
+	fl6.flowi6_uid = sock_net_uid(net, sk && sk_fullsock(sk) ? sk : NULL);
 	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
 
 	/* Pass a socket to ip6_dst_lookup either it is for RST
 	 * Underlying function will use this to retrieve the network
 	 * namespace
 	 */
-	dst = ip6_dst_lookup_flow(ctl_sk, &fl6, NULL);
+	dst = ip6_dst_lookup_flow(sock_net(ctl_sk), ctl_sk, &fl6, NULL);
 	if (!IS_ERR(dst)) {
 		skb_dst_set(buff, dst);
-		ip6_xmit(ctl_sk, buff, &fl6, NULL, tclass);
+		ip6_xmit(ctl_sk, buff, &fl6, fl6.flowi6_mark, NULL, tclass);
 		TCP_INC_STATS(net, TCP_MIB_OUTSEGS);
 		if (rst)
 			TCP_INC_STATS(net, TCP_MIB_OUTRSTS);
@@ -955,7 +968,7 @@ static void tcp_v6_reqsk_send_ack(const struct sock *sk, struct sk_buff *skb,
 			tcp_rsk(req)->rcv_nxt,
 			req->rsk_rcv_wnd >> inet_rsk(req)->rcv_wscale,
 			tcp_time_stamp, req->ts_recent, sk->sk_bound_dev_if,
-			tcp_v6_md5_do_lookup(sk, &ipv6_hdr(skb)->daddr),
+			tcp_v6_md5_do_lookup(sk, &ipv6_hdr(skb)->saddr),
 			0, 0);
 }
 
@@ -985,6 +998,16 @@ static int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
 drop:
 	tcp_listendrop(sk);
 	return 0; /* don't send reset */
+}
+
+static void tcp_v6_restore_cb(struct sk_buff *skb)
+{
+	/* We need to move header back to the beginning if xfrm6_policy_check()
+	 * and tcp_v6_fill_cb() are going to be called again.
+	 * ip6_datagram_recv_specific_ctl() also expects IP6CB to be there.
+	 */
+	memmove(IP6CB(skb), &TCP_SKB_CB(skb)->header.h6,
+		sizeof(struct inet6_skb_parm));
 }
 
 static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *skb,
@@ -1034,15 +1057,16 @@ static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *
 		newtp->af_specific = &tcp_sock_ipv6_mapped_specific;
 #endif
 
+		newnp->ipv6_mc_list = NULL;
 		newnp->ipv6_ac_list = NULL;
 		newnp->ipv6_fl_list = NULL;
 		newnp->pktoptions  = NULL;
 		newnp->opt	   = NULL;
-		newnp->mcast_oif   = tcp_v6_iif(skb);
-		newnp->mcast_hops  = ipv6_hdr(skb)->hop_limit;
-		newnp->rcv_flowinfo = ip6_flowinfo(ipv6_hdr(skb));
+		newnp->mcast_oif   = inet_iif(skb);
+		newnp->mcast_hops  = ip_hdr(skb)->ttl;
+		newnp->rcv_flowinfo = 0;
 		if (np->repflow)
-			newnp->flow_label = ip6_flowlabel(ipv6_hdr(skb));
+			newnp->flow_label = 0;
 
 		/*
 		 * No need to charge this sock to the relevant IPv6 refcnt debug socks count
@@ -1103,6 +1127,7 @@ static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *
 	   First: no IPv4 options.
 	 */
 	newinet->inet_opt = NULL;
+	newnp->ipv6_mc_list = NULL;
 	newnp->ipv6_ac_list = NULL;
 	newnp->ipv6_fl_list = NULL;
 
@@ -1178,8 +1203,10 @@ static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *
 						      sk_gfp_mask(sk, GFP_ATOMIC));
 			consume_skb(ireq->pktopts);
 			ireq->pktopts = NULL;
-			if (newnp->pktoptions)
+			if (newnp->pktoptions) {
+				tcp_v6_restore_cb(newnp->pktoptions);
 				skb_set_owner_r(newnp->pktoptions, newsk);
+			}
 		}
 	}
 
@@ -1192,16 +1219,6 @@ out_nonewsk:
 out:
 	tcp_listendrop(sk);
 	return NULL;
-}
-
-static void tcp_v6_restore_cb(struct sk_buff *skb)
-{
-	/* We need to move header back to the beginning if xfrm6_policy_check()
-	 * and tcp_v6_fill_cb() are going to be called again.
-	 * ip6_datagram_recv_specific_ctl() also expects IP6CB to be there.
-	 */
-	memmove(IP6CB(skb), &TCP_SKB_CB(skb)->header.h6,
-		sizeof(struct inet6_skb_parm));
 }
 
 /* The socket must have it's spinlock held when we get
@@ -1228,9 +1245,6 @@ static int tcp_v6_do_rcv(struct sock *sk, struct sk_buff *skb)
 
 	if (skb->protocol == htons(ETH_P_IP))
 		return tcp_v4_do_rcv(sk, skb);
-
-	if (tcp_filter(sk, skb))
-		goto discard;
 
 	/*
 	 *	socket locking is here for SMP purposes as backlog rcv
@@ -1422,13 +1436,19 @@ process:
 			reqsk_put(req);
 			goto discard_it;
 		}
+		if (tcp_checksum_complete(skb)) {
+			reqsk_put(req);
+			goto csum_error;
+		}
 		if (unlikely(sk->sk_state != TCP_LISTEN)) {
 			inet_csk_reqsk_queue_drop_and_put(sk, req);
 			goto lookup;
 		}
 		sock_hold(sk);
 		refcounted = true;
-		nsk = tcp_check_req(sk, skb, req, false);
+		nsk = NULL;
+		if (!tcp_filter(sk, skb))
+			nsk = tcp_check_req(sk, skb, req, false);
 		if (!nsk) {
 			reqsk_put(req);
 			goto discard_and_relse;

@@ -144,7 +144,7 @@ int stk_camera_write_reg(struct stk_camera *dev, u16 index, u8 value)
 		return 0;
 }
 
-int stk_camera_read_reg(struct stk_camera *dev, u16 index, int *value)
+int stk_camera_read_reg(struct stk_camera *dev, u16 index, u8 *value)
 {
 	struct usb_device *udev = dev->udev;
 	unsigned char *buf;
@@ -163,17 +163,22 @@ int stk_camera_read_reg(struct stk_camera *dev, u16 index, int *value)
 			sizeof(u8),
 			500);
 	if (ret >= 0)
-		memcpy(value, buf, sizeof(u8));
+		*value = *buf;
 
 	kfree(buf);
-	return ret;
+
+	if (ret < 0)
+		return ret;
+	else
+		return 0;
 }
 
 static int stk_start_stream(struct stk_camera *dev)
 {
-	int value;
+	u8 value;
 	int i, ret;
-	int value_116, value_117;
+	u8 value_116, value_117;
+
 
 	if (!is_present(dev))
 		return -ENODEV;
@@ -213,7 +218,7 @@ static int stk_start_stream(struct stk_camera *dev)
 
 static int stk_stop_stream(struct stk_camera *dev)
 {
-	int value;
+	u8 value;
 	int i;
 	if (is_present(dev)) {
 		stk_camera_read_reg(dev, 0x0100, &value);
@@ -646,8 +651,7 @@ static int v4l_stk_release(struct file *fp)
 		dev->owner = NULL;
 	}
 
-	if (is_present(dev))
-		usb_autopm_put_interface(dev->interface);
+	usb_autopm_put_interface(dev->interface);
 	mutex_unlock(&dev->lock);
 	return v4l2_fh_release(fp);
 }

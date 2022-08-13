@@ -104,7 +104,7 @@ static int ir_nec_decode(struct rc_dev *dev, struct ir_raw_event ev)
 		if (!ev.pulse)
 			break;
 
-		if (!eq_margin(ev.duration, NEC_BIT_PULSE, NEC_UNIT / 2))
+		if (!eq_margin(ev.duration, NEC_BIT_PULSE, NEC_UNIT))
 			break;
 
 		data->state = STATE_BIT_SPACE;
@@ -126,9 +126,9 @@ static int ir_nec_decode(struct rc_dev *dev, struct ir_raw_event ev)
 			data->necx_repeat = false;
 
 		data->bits <<= 1;
-		if (eq_margin(ev.duration, NEC_BIT_1_SPACE, NEC_UNIT / 2))
+		if (eq_margin(ev.duration, NEC_BIT_1_SPACE, NEC_UNIT))
 			data->bits |= 1;
-		else if (!eq_margin(ev.duration, NEC_BIT_0_SPACE, NEC_UNIT / 2))
+		else if (!eq_margin(ev.duration, NEC_BIT_0_SPACE, NEC_UNIT))
 			break;
 		data->count++;
 
@@ -143,17 +143,7 @@ static int ir_nec_decode(struct rc_dev *dev, struct ir_raw_event ev)
 		if (!ev.pulse)
 			break;
 
-		if (!eq_margin(ev.duration, NEC_TRAILER_PULSE, NEC_UNIT / 2))
-			break;
-
-		data->state = STATE_TRAILER_SPACE;
-		return 0;
-
-	case STATE_TRAILER_SPACE:
-		if (ev.pulse)
-			break;
-
-		if (!geq_margin(ev.duration, NEC_TRAILER_SPACE, NEC_UNIT / 2))
+		if (!eq_margin(ev.duration, NEC_TRAILER_PULSE, NEC_UNIT))
 			break;
 
 		address     = bitrev8((data->bits >> 24) & 0xff);

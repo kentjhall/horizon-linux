@@ -604,6 +604,14 @@ static int zr364xx_read_video_callback(struct zr364xx_camera *cam,
 	ptr = pdest = frm->lpvbits;
 
 	if (frm->ulState == ZR364XX_READ_IDLE) {
+		if (purb->actual_length < 128) {
+			/* header incomplete */
+			dev_info(&cam->udev->dev,
+				 "%s: buffer (%d bytes) too small to hold jpeg header. Discarding.\n",
+				 __func__, purb->actual_length);
+			return -EINVAL;
+		}
+
 		frm->ulState = ZR364XX_READ_FRAME;
 		frm->cur_size = 0;
 
@@ -703,7 +711,8 @@ static int zr364xx_vidioc_querycap(struct file *file, void *priv,
 	struct zr364xx_camera *cam = video_drvdata(file);
 
 	strlcpy(cap->driver, DRIVER_DESC, sizeof(cap->driver));
-	strlcpy(cap->card, cam->udev->product, sizeof(cap->card));
+	if (cam->udev->product)
+		strlcpy(cap->card, cam->udev->product, sizeof(cap->card));
 	strlcpy(cap->bus_info, dev_name(&cam->udev->dev),
 		sizeof(cap->bus_info));
 	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE |

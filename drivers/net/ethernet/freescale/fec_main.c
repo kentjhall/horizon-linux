@@ -172,10 +172,12 @@ MODULE_PARM_DESC(macaddr, "FEC Ethernet MAC address");
 #endif /* CONFIG_M5272 */
 
 /* The FEC stores dest/src/type/vlan, data, and checksum for receive packets.
+ *
+ * 2048 byte skbufs are allocated. However, alignment requirements
+ * varies between FEC variants. Worst case is 64, so round down by 64.
  */
-#define PKT_MAXBUF_SIZE		1522
+#define PKT_MAXBUF_SIZE		(round_down(2048 - 64, 64))
 #define PKT_MINBUF_SIZE		64
-#define PKT_MAXBLR_SIZE		1536
 
 /* FEC receive acceleration */
 #define FEC_RACC_IPDIS		(1 << 1)
@@ -813,6 +815,12 @@ static void fec_enet_bd_init(struct net_device *dev)
 		for (i = 0; i < txq->bd.ring_size; i++) {
 			/* Initialize the BD for every fragment in the page. */
 			bdp->cbd_sc = cpu_to_fec16(0);
+			if (bdp->cbd_bufaddr &&
+			    !IS_TSO_HEADER(txq, fec32_to_cpu(bdp->cbd_bufaddr)))
+				dma_unmap_single(&fep->pdev->dev,
+						 fec32_to_cpu(bdp->cbd_bufaddr),
+						 fec16_to_cpu(bdp->cbd_datlen),
+						 DMA_TO_DEVICE);
 			if (txq->tx_skbuff[i]) {
 				dev_kfree_skb_any(txq->tx_skbuff[i]);
 				txq->tx_skbuff[i] = NULL;
@@ -847,7 +855,7 @@ static void fec_enet_enable_ring(struct net_device *ndev)
 	for (i = 0; i < fep->num_rx_queues; i++) {
 		rxq = fep->rx_queue[i];
 		writel(rxq->bd.dma, fep->hwp + FEC_R_DES_START(i));
-		writel(PKT_MAXBLR_SIZE, fep->hwp + FEC_R_BUFF_SIZE(i));
+		writel(PKT_MAXBUF_SIZE, fep->hwp + FEC_R_BUFF_SIZE(i));
 
 		/* enable DMA1/2 */
 		if (i)
@@ -1144,7 +1152,7 @@ static void fec_enet_timeout_work(struct work_struct *work)
 		napi_disable(&fep->napi);
 		netif_tx_lock_bh(ndev);
 		fec_restart(ndev);
-		netif_wake_queue(ndev);
+		netif_tx_wake_all_queues(ndev);
 		netif_tx_unlock_bh(ndev);
 		napi_enable(&fep->napi);
 	}
@@ -1259,7 +1267,7 @@ skb_done:
 
 		/* Since we have freed up a buffer, the ring is no longer full
 		 */
-		if (netif_queue_stopped(ndev)) {
+		if (netif_tx_queue_stopped(nq)) {
 			entries_free = fec_enet_get_free_txdesc_num(txq);
 			if (entries_free >= txq->tx_wake_threshold)
 				netif_tx_wake_queue(nq);
@@ -1677,10 +1685,10 @@ static void fec_get_mac(struct net_device *ndev)
 	 */
 	if (!is_valid_ether_addr(iap)) {
 		/* Report it and use a random ethernet address instead */
-		netdev_err(ndev, "Invalid MAC address: %pM\n", iap);
+		dev_err(&fep->pdev->dev, "Invalid MAC address: %pM\n", iap);
 		eth_hw_addr_random(ndev);
-		netdev_info(ndev, "Using random MAC address: %pM\n",
-			    ndev->dev_addr);
+		dev_info(&fep->pdev->dev, "Using random MAC address: %pM\n",
+			 ndev->dev_addr);
 		return;
 	}
 
@@ -1736,7 +1744,7 @@ static void fec_enet_adjust_link(struct net_device *ndev)
 			napi_disable(&fep->napi);
 			netif_tx_lock_bh(ndev);
 			fec_restart(ndev);
-			netif_wake_queue(ndev);
+			netif_tx_wake_all_queues(ndev);
 			netif_tx_unlock_bh(ndev);
 			napi_enable(&fep->napi);
 		}
@@ -2239,7 +2247,7 @@ static int fec_enet_set_pauseparam(struct net_device *ndev,
 		napi_disable(&fep->napi);
 		netif_tx_lock_bh(ndev);
 		fec_restart(ndev);
-		netif_wake_queue(ndev);
+		netif_tx_wake_all_queues(ndev);
 		netif_tx_unlock_bh(ndev);
 		napi_enable(&fep->napi);
 	}
@@ -2363,6 +2371,10 @@ static int fec_enet_get_sset_count(struct net_device *dev, int sset)
 static inline void fec_enet_update_ethtool_stats(struct net_device *dev)
 {
 }
+
+static inline void fec_enet_clear_ethtool_stats(struct net_device *dev)
+{
+}
 #endif /* !defined(CONFIG_M5272) */
 
 static int fec_enet_nway_reset(struct net_device *dev)
@@ -2458,15 +2470,15 @@ fec_enet_set_coalesce(struct net_device *ndev, struct ethtool_coalesce *ec)
 		return -EINVAL;
 	}
 
-	cycle = fec_enet_us_to_itr_clock(ndev, fep->rx_time_itr);
+	cycle = fec_enet_us_to_itr_clock(ndev, ec->rx_coalesce_usecs);
 	if (cycle > 0xFFFF) {
 		pr_err("Rx coalesced usec exceed hardware limitation\n");
 		return -EINVAL;
 	}
 
-	cycle = fec_enet_us_to_itr_clock(ndev, fep->tx_time_itr);
+	cycle = fec_enet_us_to_itr_clock(ndev, ec->tx_coalesce_usecs);
 	if (cycle > 0xFFFF) {
-		pr_err("Rx coalesced usec exceed hardware limitation\n");
+		pr_err("Tx coalesced usec exceed hardware limitation\n");
 		return -EINVAL;
 	}
 
@@ -2923,6 +2935,7 @@ static void set_multicast_list(struct net_device *ndev)
 	struct netdev_hw_addr *ha;
 	unsigned int i, bit, data, crc, tmp;
 	unsigned char hash;
+	unsigned int hash_high = 0, hash_low = 0;
 
 	if (ndev->flags & IFF_PROMISC) {
 		tmp = readl(fep->hwp + FEC_R_CNTRL);
@@ -2945,11 +2958,7 @@ static void set_multicast_list(struct net_device *ndev)
 		return;
 	}
 
-	/* Clear filter and add the addresses in hash register
-	 */
-	writel(0, fep->hwp + FEC_GRP_HASH_TABLE_HIGH);
-	writel(0, fep->hwp + FEC_GRP_HASH_TABLE_LOW);
-
+	/* Add the addresses in hash register */
 	netdev_for_each_mc_addr(ha, ndev) {
 		/* calculate crc32 value of mac address */
 		crc = 0xffffffff;
@@ -2967,16 +2976,14 @@ static void set_multicast_list(struct net_device *ndev)
 		 */
 		hash = (crc >> (32 - FEC_HASH_BITS)) & 0x3f;
 
-		if (hash > 31) {
-			tmp = readl(fep->hwp + FEC_GRP_HASH_TABLE_HIGH);
-			tmp |= 1 << (hash - 32);
-			writel(tmp, fep->hwp + FEC_GRP_HASH_TABLE_HIGH);
-		} else {
-			tmp = readl(fep->hwp + FEC_GRP_HASH_TABLE_LOW);
-			tmp |= 1 << hash;
-			writel(tmp, fep->hwp + FEC_GRP_HASH_TABLE_LOW);
-		}
+		if (hash > 31)
+			hash_high |= 1 << (hash - 32);
+		else
+			hash_low |= 1 << hash;
 	}
+
+	writel(hash_high, fep->hwp + FEC_GRP_HASH_TABLE_HIGH);
+	writel(hash_low, fep->hwp + FEC_GRP_HASH_TABLE_LOW);
 }
 
 /* Set a MAC change in hardware. */
@@ -3206,7 +3213,7 @@ static int fec_enet_init(struct net_device *ndev)
 }
 
 #ifdef CONFIG_OF
-static void fec_reset_phy(struct platform_device *pdev)
+static int fec_reset_phy(struct platform_device *pdev)
 {
 	int err, phy_reset;
 	bool active_high = false;
@@ -3214,7 +3221,7 @@ static void fec_reset_phy(struct platform_device *pdev)
 	struct device_node *np = pdev->dev.of_node;
 
 	if (!np)
-		return;
+		return 0;
 
 	of_property_read_u32(np, "phy-reset-duration", &msec);
 	/* A sane reset duration should not be longer than 1s */
@@ -3222,8 +3229,10 @@ static void fec_reset_phy(struct platform_device *pdev)
 		msec = 1;
 
 	phy_reset = of_get_named_gpio(np, "phy-reset-gpios", 0);
-	if (!gpio_is_valid(phy_reset))
-		return;
+	if (phy_reset == -EPROBE_DEFER)
+		return phy_reset;
+	else if (!gpio_is_valid(phy_reset))
+		return 0;
 
 	active_high = of_property_read_bool(np, "phy-reset-active-high");
 
@@ -3232,7 +3241,7 @@ static void fec_reset_phy(struct platform_device *pdev)
 			"phy-reset");
 	if (err) {
 		dev_err(&pdev->dev, "failed to get phy-reset-gpios: %d\n", err);
-		return;
+		return err;
 	}
 
 	if (msec > 20)
@@ -3241,14 +3250,17 @@ static void fec_reset_phy(struct platform_device *pdev)
 		usleep_range(msec * 1000, msec * 1000 + 1000);
 
 	gpio_set_value_cansleep(phy_reset, !active_high);
+
+	return 0;
 }
 #else /* CONFIG_OF */
-static void fec_reset_phy(struct platform_device *pdev)
+static int fec_reset_phy(struct platform_device *pdev)
 {
 	/*
 	 * In case of platform probe, the reset has been done
 	 * by machine code.
 	 */
+	return 0;
 }
 #endif /* CONFIG_OF */
 
@@ -3419,6 +3431,7 @@ fec_probe(struct platform_device *pdev)
 		if (ret) {
 			dev_err(&pdev->dev,
 				"Failed to enable phy regulator: %d\n", ret);
+			clk_disable_unprepare(fep->clk_ipg);
 			goto failed_regulator;
 		}
 	} else {
@@ -3431,7 +3444,9 @@ fec_probe(struct platform_device *pdev)
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
 
-	fec_reset_phy(pdev);
+	ret = fec_reset_phy(pdev);
+	if (ret)
+		goto failed_reset;
 
 	if (fep->bufdesc_ex)
 		fec_ptp_init(pdev);
@@ -3490,10 +3505,12 @@ failed_mii_init:
 failed_irq:
 failed_init:
 	fec_ptp_stop(pdev);
+failed_reset:
+	pm_runtime_put_noidle(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
 	if (fep->reg_phy)
 		regulator_disable(fep->reg_phy);
 failed_regulator:
-	clk_disable_unprepare(fep->clk_ipg);
 failed_clk_ipg:
 	fec_enet_clk_enable(ndev, false);
 failed_clk:
@@ -3513,6 +3530,11 @@ fec_drv_remove(struct platform_device *pdev)
 	struct net_device *ndev = platform_get_drvdata(pdev);
 	struct fec_enet_private *fep = netdev_priv(ndev);
 	struct device_node *np = pdev->dev.of_node;
+	int ret;
+
+	ret = pm_runtime_get_sync(&pdev->dev);
+	if (ret < 0)
+		return ret;
 
 	cancel_work_sync(&fep->tx_timeout_work);
 	fec_ptp_stop(pdev);
@@ -3520,10 +3542,16 @@ fec_drv_remove(struct platform_device *pdev)
 	fec_enet_mii_remove(fep);
 	if (fep->reg_phy)
 		regulator_disable(fep->reg_phy);
+
 	if (of_phy_is_fixed_link(np))
 		of_phy_deregister_fixed_link(np);
 	of_node_put(fep->phy_node);
 	free_netdev(ndev);
+
+	clk_disable_unprepare(fep->clk_ahb);
+	clk_disable_unprepare(fep->clk_ipg);
+	pm_runtime_put_noidle(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
 
 	return 0;
 }

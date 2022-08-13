@@ -32,7 +32,7 @@ config POWER_RESET_AT91_RESET
 
 config POWER_RESET_AT91_SAMA5D2_SHDWC
 	tristate "Atmel AT91 SAMA5D2-Compatible shutdown controller driver"
-	depends on ARCH_AT91 || COMPILE_TEST
+	depends on ARCH_AT91
 	default SOC_SAMA5
 	help
 	  This driver supports the alternate shutdown controller for some Atmel
@@ -88,6 +88,14 @@ config POWER_RESET_HISI
 	depends on ARCH_HISI
 	help
 	  Reboot support for Hisilicon boards.
+
+config POWER_OFF_MAX77620
+	bool "MAX77620 power-off-reset driver"
+	depends on MFD_MAX77620
+	select SYSTEM_PMIC
+	help
+	  This driver supports turning off and resetting board through MAX77620
+	  PMIC.
 
 config POWER_RESET_IMX
 	bool "IMX6 power-off driver"
@@ -207,6 +215,9 @@ config SYSCON_REBOOT_MODE
 	  get reboot mode arguments and store it in SYSCON mapped
 	  register, then the bootloader can read it to take different
 	  action according to the mode.
+
+config SYSTEM_PMIC
+	bool "System PMIC reset ot power off"
 
 endif
 

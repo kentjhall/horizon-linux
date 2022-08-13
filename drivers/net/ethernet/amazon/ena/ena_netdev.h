@@ -100,7 +100,7 @@
 /* Number of queues to check for missing queues per timer service */
 #define ENA_MONITORED_TX_QUEUES	4
 /* Max timeout packets before device reset */
-#define MAX_NUM_OF_TIMEOUTED_PACKETS 32
+#define MAX_NUM_OF_TIMEOUTED_PACKETS 128
 
 #define ENA_TX_RING_IDX_NEXT(idx, ring_size) (((idx) + 1) & ((ring_size) - 1))
 
@@ -110,15 +110,17 @@
 
 #define ENA_IO_TXQ_IDX(q)	(2 * (q))
 #define ENA_IO_RXQ_IDX(q)	(2 * (q) + 1)
+#define ENA_IO_TXQ_IDX_TO_COMBINED_IDX(q)	((q) / 2)
+#define ENA_IO_RXQ_IDX_TO_COMBINED_IDX(q)	(((q) - 1) / 2)
 
 #define ENA_MGMNT_IRQ_IDX		0
 #define ENA_IO_IRQ_FIRST_IDX		1
 #define ENA_IO_IRQ_IDX(q)		(ENA_IO_IRQ_FIRST_IDX + (q))
 
 /* ENA device should send keep alive msg every 1 sec.
- * We wait for 3 sec just to be on the safe side.
+ * We wait for 6 sec just to be on the safe side.
  */
-#define ENA_DEVICE_KALIVE_TIMEOUT	(3 * HZ)
+#define ENA_DEVICE_KALIVE_TIMEOUT	(6 * HZ)
 
 #define ENA_MMIO_DISABLE_REG_READ	BIT(0)
 
@@ -320,5 +322,16 @@ void ena_dump_stats_to_dmesg(struct ena_adapter *adapter);
 void ena_dump_stats_to_buf(struct ena_adapter *adapter, u8 *buf);
 
 int ena_get_sset_count(struct net_device *netdev, int sset);
+
+/* The ENA buffer length fields is 16 bit long. So when PAGE_SIZE == 64kB the
+ * driver passas 0.
+ * Since the max packet size the ENA handles is ~9kB limit the buffer length to
+ * 16kB.
+ */
+#if PAGE_SIZE > SZ_16K
+#define ENA_PAGE_SIZE SZ_16K
+#else
+#define ENA_PAGE_SIZE PAGE_SIZE
+#endif
 
 #endif /* !(ENA_H) */

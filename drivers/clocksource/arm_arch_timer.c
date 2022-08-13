@@ -29,6 +29,7 @@
 
 #include <asm/arch_timer.h>
 #include <asm/virt.h>
+#include <asm/trace_clock.h>
 
 #include <clocksource/arm_arch_timer.h>
 
@@ -81,6 +82,7 @@ static struct clock_event_device __percpu *arch_timer_evt;
 static enum ppi_nr arch_timer_uses_ppi = VIRT_PPI;
 static bool arch_timer_c3stop;
 static bool arch_timer_mem_use_virtual;
+static bool arch_counter_suspend_stop;
 
 static bool evtstrm_enable = IS_ENABLED(CONFIG_ARM_ARCH_TIMER_EVTSTREAM);
 
@@ -425,15 +427,24 @@ static void arch_timer_evtstrm_enable(int divider)
 
 static void arch_timer_configure_evtstream(void)
 {
-	int evt_stream_div, pos;
+	int evt_stream_div, lsb;
 
-	/* Find the closest power of two to the divisor */
-	evt_stream_div = arch_timer_rate / ARCH_TIMER_EVT_STREAM_FREQ;
-	pos = fls(evt_stream_div);
-	if (pos > 1 && !(evt_stream_div & (1 << (pos - 2))))
-		pos--;
+	/*
+	 * As the event stream can at most be generated at half the frequency
+	 * of the counter, use half the frequency when computing the divider.
+	 */
+	evt_stream_div = arch_timer_rate / ARCH_TIMER_EVT_STREAM_FREQ / 2;
+
+	/*
+	 * Find the closest power of two to the divisor. If the adjacent bit
+	 * of lsb (last set bit, starts from 0) is set, then we use (lsb + 1).
+	 */
+	lsb = fls(evt_stream_div) - 1;
+	if (lsb > 0 && (evt_stream_div & BIT(lsb - 1)))
+		lsb++;
+
 	/* enable event stream */
-	arch_timer_evtstrm_enable(min(pos, 15));
+	arch_timer_evtstrm_enable(max(0, min(lsb, 15)));
 }
 
 static void arch_counter_set_user_access(void)
@@ -448,7 +459,10 @@ static void arch_counter_set_user_access(void)
 			| ARCH_TIMER_USR_PCT_ACCESS_EN);
 
 	/* Enable user access to the virtual counter */
-	cntkctl |= ARCH_TIMER_USR_VCT_ACCESS_EN;
+	if (IS_ENABLED(CONFIG_ARM_ARCH_TIMER_VCT_ACCESS))
+		cntkctl |= ARCH_TIMER_USR_VCT_ACCESS_EN;
+	else
+		cntkctl &= ~ARCH_TIMER_USR_VCT_ACCESS_EN;
 
 	arch_timer_set_cntkctl(cntkctl);
 }
@@ -571,12 +585,17 @@ static cycle_t arch_counter_read_cc(const struct cyclecounter *cc)
 	return arch_timer_read_counter();
 }
 
+u64 trace_arm64_tsc()
+{
+	return arch_timer_read_counter();
+}
+
 static struct clocksource clocksource_counter = {
 	.name	= "arch_sys_counter",
 	.rating	= 400,
 	.read	= arch_counter_read,
 	.mask	= CLOCKSOURCE_MASK(56),
-	.flags	= CLOCK_SOURCE_IS_CONTINUOUS | CLOCK_SOURCE_SUSPEND_NONSTOP,
+	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
 };
 
 static struct cyclecounter cyclecounter = {
@@ -616,6 +635,8 @@ static void __init arch_counter_register(unsigned type)
 		arch_timer_read_counter = arch_counter_get_cntvct_mem;
 	}
 
+	if (!arch_counter_suspend_stop)
+		clocksource_counter.flags |= CLOCK_SOURCE_SUSPEND_NONSTOP;
 	start_count = arch_timer_read_counter();
 	clocksource_register_hz(&clocksource_counter, arch_timer_rate);
 	cyclecounter.mult = clocksource_counter.mult;
@@ -705,7 +726,8 @@ static int __init arch_timer_register(void)
 	case PHYS_NONSECURE_PPI:
 		err = request_percpu_irq(ppi, arch_timer_handler_phys,
 					 "arch_timer", arch_timer_evt);
-		if (!err && arch_timer_ppi[PHYS_NONSECURE_PPI]) {
+		if (!err && arch_timer_ppi[PHYS_NONSECURE_PPI] &&
+				IS_ENABLED(CONFIG_ARM)) {
 			ppi = arch_timer_ppi[PHYS_NONSECURE_PPI];
 			err = request_percpu_irq(ppi, arch_timer_handler_phys,
 						 "arch_timer", arch_timer_evt);
@@ -849,9 +871,14 @@ static int __init arch_timer_init(void)
 			arch_timer_uses_ppi = HYP_PPI;
 			has_ppi = !!arch_timer_ppi[HYP_PPI];
 		} else {
-			arch_timer_uses_ppi = PHYS_SECURE_PPI;
-			has_ppi = (!!arch_timer_ppi[PHYS_SECURE_PPI] ||
+			if (IS_ENABLED(CONFIG_ARM64)) {
+				arch_timer_uses_ppi = PHYS_NONSECURE_PPI;
+				has_ppi = !!arch_timer_ppi[PHYS_NONSECURE_PPI];
+			} else {
+				arch_timer_uses_ppi = PHYS_SECURE_PPI;
+				has_ppi = (!!arch_timer_ppi[PHYS_SECURE_PPI] ||
 				   !!arch_timer_ppi[PHYS_NONSECURE_PPI]);
+			}
 		}
 
 		if (!has_ppi) {
@@ -906,6 +933,10 @@ static int __init arch_timer_of_init(struct device_node *np)
 	if (IS_ENABLED(CONFIG_ARM) &&
 	    of_property_read_bool(np, "arm,cpu-registers-not-fw-configured"))
 		arch_timer_uses_ppi = PHYS_SECURE_PPI;
+
+	/* On some systems, the counter stops ticking when in suspend. */
+	arch_counter_suspend_stop = of_property_read_bool(np,
+							 "arm,no-tick-in-suspend");
 
 	return arch_timer_init();
 }

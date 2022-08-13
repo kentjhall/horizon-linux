@@ -1995,6 +1995,7 @@ static struct tegra_function tegra20_functions[] = {
 		.tri_bank = 0,					\
 		.tri_bit = tri_b,				\
 		.parked_bit = -1,				\
+		.pad_bit = -1,					\
 		.einput_bit = -1,				\
 		.odrain_bit = -1,				\
 		.lock_bit = -1,					\
@@ -2015,6 +2016,7 @@ static struct tegra_function tegra20_functions[] = {
 		.pupd_bit = pupd_b,				\
 		.drv_reg = -1,					\
 		.parked_bit = -1,				\
+		.pad_bit = -1,					\
 	}
 
 /* Pin groups for drive strength registers (configurable version) */
@@ -2031,6 +2033,7 @@ static struct tegra_function tegra20_functions[] = {
 		.drv_reg = ((r) - PINGROUP_REG_A),		\
 		.drv_bank = 3,					\
 		.parked_bit = -1,				\
+		.pad_bit = -1,					\
 		.hsm_bit = hsm_b,				\
 		.schmitt_bit = schmitt_b,			\
 		.lpmd_bit = lpmd_b,				\

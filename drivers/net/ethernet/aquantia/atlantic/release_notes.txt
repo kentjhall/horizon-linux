@@ -1,0 +1,340 @@
+Release: 2.0.19
+Date: 15/09/2018
+tag: v2.0.19
+================================
+* ATLDRV-625 Bad RSS behaviour on Large fragmented UDP packets
+* ATLDRV-622 Need to disable flow control in MAC when it is disabled by the driver
+
+Release: 2.0.18
+Date: 06/09/2018
+tag: v2.0.18
+================================
+* ATLDRV-546 Linux: Fix old kernel builds
+* ATLDRV-575 SMMU fault after device unbind
+
+Release: 2.0.17
+Date: 03/08/2018
+tag: v2.0.17
+================================
+* ATLDRV-314 Multicast packets never get filtered on linux
+* ATLDRV-536 Fix bugs that found smatch
+* ATLDRV-540 upstream: syncup 08/2018
+
+Release: 2.0.16
+Date: 27/07/2018
+tag: v2.0.16
+================================
+* ATLDRV-384 Reduce link-up time to 1sec for SE FW
+  - Link interrupt handling now allows faster link event detection
+  - Special mode for fast init sequence.
+    Disabled by default, enable with AQ_CFG_FAST_START in aq_cfg.h
+* Minor codestyle fixes
+
+Release: 2.0.15
+Date: 29/06/2018
+tag: v2.0.15
+================================
+* RM3118: Add Phy Int/Ext loopbacks to ethtool.
+  NOTICE:
+  - All loopback modes should be enabled only when interface is UP.
+  - DMANetworkLoopback mode may not function as expected.
+
+Release: 2.0.14
+Date: 27/06/2018
+tag: v2.0.14
+================================
+* RM3132: KVM/macvlan bridge was not functional
+* RM3118: Add loopback to ethtool.
+  README with priv-flags sections.
+  Only System level loopback is functional for now.
+
+Release: 2.0.12
+Date: 29/05/2018
+tag: v2.0.12
+================================
+* RM2921 Configure WOL to enable magic by default
+* netdev 4.17 styling syncup
+
+Release: 2.0.11
+Date: 18/05/2018
+tag: v2.0.11
+================================
+* cable len and chip temperature are now implemented via hwmon (sensors API)
+* Performance: Reset page offset when found that full page reuse is possible
+
+Release: 2.0.10.0
+Date: 03/05/2018
+tag: v2.0.10
+================================
+* RM2691: Kernel 2.x support (experimental)
+* RM2692: Linux DKMS packaging
+* RM2698: ethtool negotiate restart should be implemented
+* RM2736: ethtool ring size dynamic change
+* RM2734: EEE settings are lost after link down/up
+* RM2765: Linux driver must support WOL from shutdown
+* RM2697: WoL works in wrong way with FW3.x DW
+* RM2693: Pause frame (flow control) configuration should be done via ethtool
+* RH-1542881 Declare vlan_features bits:
+  http://gitlab.rdc.aquantia.com/drv/Linux/merge_requests/62
+* Leftover bugfixes (msi isr)
+  http://gitlab.rdc.aquantia.com/drv/Linux/merge_requests/61
+
+Release: 2.0.9.0
+Date: 18/04/2018
+tag: v2.0.9
+================================
+* RM2738: Fix RHEL7.5 incompatibility
+
+Release: 2.0.8.0
+Date: 11/04/2018
+tag: v2.0.8
+================================
+* 199177: ASUS XG-C100C 10G Network Adapter no longer working since 4.16
+  FW 1.5.44 and reset sequence collision
+  https://bugzilla.kernel.org/show_bug.cgi?id=199177
+  http://gitlab.rdc.aquantia.com/drv/Linux/merge_requests/54
+
+Release: 2.0.7.0
+Date: 05/04/2018
+tag: v2.0.7
+================================
+* RM2544 Need to make EEE feature configurable with ethtool
+* RM2676 net: aquantia: take care when shutdown on already stopped device
+* RM2667 Disable Dirty Wake on shutdown and suspend
+* (misc) netdev comments 4.16 rc6
+* readme updates on installation
+
+Release: 2.0.6.0
+Date: 15/03/2018
+tag: v2.0.6
+================================
+* RM2574 Post fix (R.Volkov found)
+* Shutdown pci callback closes the link (Synology NAS issues)
+* Introduce rx refill threshold parameter: aq_rx_refill_thres
+
+Release: 2.0.5.0
+Date: 06/03/2018
+tag: v2.0.5
+================================
+* RM2574 B1 hardware never indicates mailbox ready
+* RM2573 Flow control must be enabled by deffault
+* RM2543 Linux driver must set link_drop bit when interface is down
+* Buffer flip&reuse implementation
+  http://gitlab.rdc.aquantia.com/drv/Linux/merge_requests/41
+
+Release: 2.0.4.0
+Date: 16/02/2018
+tag: v2.0.4
+================================
+* RM2508 Indication of the WOL state does not work correctly
+* RM2520 WOL in 2.0.3.0 Linux driver dosn't work with B0 cards
+* RM2512 No traffic on FW 1.5.58 with 2x Linux driver
+* Wrong MTU size checks (< Min or > Max) are now working again on linuxes < 4.10
+* Fix compilation on linux 3.16
+* Reset sequence fix: RBL secure chip reset sequence have to reset SPI
+* RM2536 allow Live MAC change
+* napi_alloc_skb improves performance on high packet rates
+
+Release: 2.0.3.0
+Date: 29/01/2018
+tag: v2.0.3
+================================
+* netdev syncup
+* RM2209: WOL feature (magic packet only)
+* Cable length and temp diagnostics data in sysfs
+* RM2370 Errors are appear during uninstalation linux driver
+
+Upstream Release: 2.0.2.1-kern
+kernel: 4.16
+================================
+d28e9d1 net: aquantia: driver version bump
+fd8221f net: aquantia: Implement pci shutdown callback
+a1c1d63 net: aquantia: Allow live mac address changes
+33a3d54 net: aquantia: Add aq_tx_clean_budget and valid budget handling logic
+002594f net: aquantia: Change inefficient wait loop on fw data reads
+b8d7ecb net: aquantia: Fix a regression with reset on old firmware
+c0a6a02 net: aquantia: Fix hardware reset when SPI may rarely hangup
+
+Release 2.0.2.0
+Upstream: 2.0.2-kern
+tag: v2.0.2
+25/01/2018 f/w 1.x, 2.9.x, 3.x or above
+================================
+* netdev syncup: Do not reset curr_stats on each up/down
+* netdev syncup: typo Octects
+* RM2420:Wrong felicity IDs and link speeds reported
+
+Release 2.0.1.0
+tag: v2.0.1
+30/11/2017 f/w 1.x, 2.9.x, 3.x or above
+================================
+*RM2267:Statistics mistakes and errors
+*RM2128:... PCI errors and NMI
+
+Release 2.0.0.0
+tag: v2.0.0
+17/11/2017 f/w 1.x, 2.9.x, 3.x or above
+================================
++ Reset sequence implemented
+* MAC address readout fixed
+
+Release 2.0.0.0-alpha2
+tag: v2.0.0-alpha2
+11/11/2017 f/w 3.0.3 or above
+================================
+* kernel 3.x build fixed
+
+Release 2.0.0.0-alpha1
+tag: v2.0.0-alpha1
+10/11/2017 f/w 3.0.3 or above
+================================
++ Initial support for both 1.x, 2.x and 3.x FW
+* 64bit wide statistics in ethtool
+! Full reset sequence is not yet implemented
+! Link status is polled, no isr usage yet
+
+
+
+
+
+
+Release 1.6.12.0 master 10_09-2017 f/w 1.5.14 or above
+=============
++QNAP requesting ethtool -c option (#2053)
+*Statistics never gets zeroed upon interface down/up (#2015)
+*Non optimal Interrupt Moderation Rates default settings makes udp very slow (#2041)
+
+Release 1.6.11.0 master 09_25-2017 f/w 1.5.14 or above
+=============
+*Link state is up right after link up command execution for 2 seconds then link goes down (#2033)
+*Netnext mainline syncup
+
+Release 1.6.10.0 master 09_20-2017 f/w 1.5.14 or above
+=============
+*Invalid queue state management causes Tx/Rx to die (#1941)
+*kernel mainline driver does not support jumbo frames (#1985)
+
+Release 1.6.9.0 rel-dev-1.6.9 08_11-2017 f/w 1.5.14 or above
+=============
+*MSM counters are not reset after driver is unloaded/loaded. (#1619).
+*Kernel panic/memory corruption on multicast > 32 (#1864).
+*Incorrect Interrupt moderation values assignment in linux driver (#1918).
+*Fix for enabling incorrect interrupt vectors count on Puma 7 Intel SoC (with Linux Kernel 3.10).
+*Removed unuseful spinlocks from datapath.
+*Minor fixes.
+
+Release 1.6.8.0 rel-dev 07_05-2017 f/w 1.5.14 or above
+=============
+*Fix for RX datapath initialization.
+*Minor fixes.
+
+Release 1.6.7.0 rel-dev 05_05-2017 f/w 1.5.14 or above
+=============
+*Synced with linux sources tree.
+*Support for GRO
+*Fixed Ethtool -S crash
+*Support for kernels >= 3.10
+*Minor fixes.
+
+Release 1.6.2.0 rel-kernel-arm 03_16-2017 f/w 1.5.14 or above
+=============
+*Synced with linux sources tree.
+*Fixed checksumm offloads for IPv6.
+*Added support for ARM.
+*Support for kernels 4.4, 4.8, 4.9
+*Minor fixes.
+
+Release 1.5.345.0 rel-kernel-b0-v3 01_19-2017 f/w 1.5.14 or above
+=============
+*Linux upstream fixes
+*Add fw version checking
+*Fix pm-resume crash.
+
+Release 1.5.335.0 rel-kernel-b0-v3 01_09-2017 f/w 1.5.14 or above
+=============
+*Linux upstream fixes
+
+Release 1.5.324.0 dev-pb-b0-cln-2 12_17-2016 f/w 1.5.14 or above
+=============
+*hibernate fix
+*Minor fixes and code cleanup
+
+Release 1.5.300.0 dev-pb-b0-cln 12_06-2016 f/w 1.5.14 or above
+=============
+*d109 pid support
+*Minor fixes and code cleanup
+
+
+Release 1.5.248.3 dev-pb-b0-clean 11-30-2016 f/w 1.5.14 or above
+=============
+* fix change link speed while NIC down.
+
+Release 1.5.247.3 dev-pb-b0-clean 11-30-2016 f/w 1.5.14 or above
+=============
+* fix netif status
+
+Release 1.5.246.3 dev-pb-b0-clean 11-29-2016 f/w 1.5.14 or above
+=============
++Felicity PID support
+*Updated TX/RX throttling params
+*Minor fixes and code cleanup
+
+Release 1.5.245.3 dev-pb-b0-clean 11-23-2016 f/w 1.5.14 or above
+=============
++CSO error workaround (Bug #701)
++ifconfig filter support (promisc/multicast/broadcast/allmulti)
++Minor fixes and code cleanup
+
+
+Release 1.5.244.3 dev-pb-b0-clean 11-19-2016 f/w 1.5.14 or above
+============
+* Fix #701 workaround 
+
+Release 1.5.243.3 dev-pb-b0-clean 11-16-2016 f/w 1.5.14 or above
+============
++improved ethtool statistics
+
+Release 1.5.239.3 dev-pb-b0-clean 11-11-2016 f/w 1.5.14 or above
+============
++NAPI compliance fix
++Hot unplug fix
++Minor fixes and code cleanup
+
+
+
+Release 1.5.210.3 dev-pb-b0-clean 11-03-2016 f/w 1.5.14 or above
+============
++Fixed Jumbo frames.
++RSS fixes (new hash key, print RSS settings via ethtool)
++Minor fixes and code cleanup
+
+Release 1.5.203.3 dev-pb-b0-clean 10-31-2016 f/w 1.5.14 or above
+=============
++Support SuseServer 12.1
++Fixed kernel panic on CentOS 7.
+
+
+Release 1.5.201.3 dev-pb-b0-clean 10-29-2016 f/w 1.5.14 or above
+=============
++Support Centos
++Minor fixes and code cleanup
+
+Release 1.5.200.3 dev-pb-b0-clean 10-29-2016 f/w 1.5.10 or above
+=============
++Support new VID/PID.
++Fixed and tested the driver for B0 on FPGA.
++Support LRO for B0 on FPGA.
++Fixed link status detect.
+
+Known issues:
+- Build failed on Centos
+
+
+Release 1.5.100.3 10-22-2016 f/w 1.4 or above
+=============
++ Ethtool statistics
+* Debian 6 kernel build
+* A0/B0 support
+
+Know issues:
+- Link status hardcoded always '1G connected'

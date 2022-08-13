@@ -19,6 +19,7 @@
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/clk.h>
+#include <linux/reset.h>
 
 #include "8250.h"
 
@@ -59,6 +60,7 @@ static int of_platform_serial_setup(struct platform_device *ofdev,
 {
 	struct resource resource;
 	struct device_node *np = ofdev->dev.of_node;
+	struct reset_control *rstc;
 	u32 clk, spd, prop;
 	int ret;
 
@@ -66,11 +68,19 @@ static int of_platform_serial_setup(struct platform_device *ofdev,
 	if (of_property_read_u32(np, "clock-frequency", &clk)) {
 
 		/* Get clk rate through clk driver if present */
-		info->clk = devm_clk_get(&ofdev->dev, NULL);
+		info->clk = devm_clk_get(&ofdev->dev, "serial");
 		if (IS_ERR(info->clk)) {
 			dev_warn(&ofdev->dev,
 				"clk or clock-frequency not defined\n");
 			return PTR_ERR(info->clk);
+		}
+
+		rstc = devm_reset_control_get(&ofdev->dev, "serial");
+		if (IS_ERR(rstc)) {
+			ret = PTR_ERR(rstc);
+			dev_dbg(&ofdev->dev, "reset ctrl not found:%d\n", ret);
+		} else {
+			reset_control_reset(rstc);
 		}
 
 		ret = clk_prepare_enable(info->clk);
@@ -96,6 +106,10 @@ static int of_platform_serial_setup(struct platform_device *ofdev,
 	/* Check for shifted address mapping */
 	if (of_property_read_u32(np, "reg-offset", &prop) == 0)
 		port->mapbase += prop;
+
+	/* Compatibility with the deprecated pxa driver and 8250_pxa drivers. */
+	if (of_device_is_compatible(np, "mrvl,mmp-uart"))
+		port->regshift = 2;
 
 	/* Check for registers offset within the devices address range */
 	if (of_property_read_u32(np, "reg-shift", &prop) == 0)

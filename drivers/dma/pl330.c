@@ -448,6 +448,9 @@ struct dma_pl330_chan {
 
 	/* for cyclic capability */
 	bool cyclic;
+
+	/* for runtime pm tracking */
+	bool active;
 };
 
 struct pl330_dmac {
@@ -1017,6 +1020,7 @@ static void _stop(struct pl330_thread *thrd)
 {
 	void __iomem *regs = thrd->dmac->base;
 	u8 insn[6] = {0, 0, 0, 0, 0, 0};
+	u32 inten = readl(regs + INTEN);
 
 	if (_state(thrd) == PL330_STATE_FAULT_COMPLETING)
 		UNTIL(thrd, PL330_STATE_FAULTING | PL330_STATE_KILLING);
@@ -1029,10 +1033,13 @@ static void _stop(struct pl330_thread *thrd)
 
 	_emit_KILL(0, insn);
 
-	/* Stop generating interrupts for SEV */
-	writel(readl(regs + INTEN) & ~(1 << thrd->ev), regs + INTEN);
-
 	_execute_DBGINSN(thrd, insn, is_manager(thrd));
+
+	/* clear the event */
+	if (inten & (1 << thrd->ev))
+		writel(1 << thrd->ev, regs + INTCLR);
+	/* Stop generating interrupts for SEV */
+	writel(inten & ~(1 << thrd->ev), regs + INTEN);
 }
 
 /* Start doing req 'idx' of thread 'thrd' */
@@ -1567,7 +1574,7 @@ static void pl330_dotask(unsigned long data)
 /* Returns 1 if state was updated, 0 otherwise */
 static int pl330_update(struct pl330_dmac *pl330)
 {
-	struct dma_pl330_desc *descdone, *tmp;
+	struct dma_pl330_desc *descdone;
 	unsigned long flags;
 	void __iomem *regs;
 	u32 val;
@@ -1645,7 +1652,9 @@ static int pl330_update(struct pl330_dmac *pl330)
 	}
 
 	/* Now that we are in no hurry, do the callbacks */
-	list_for_each_entry_safe(descdone, tmp, &pl330->req_done, rqd) {
+	while (!list_empty(&pl330->req_done)) {
+		descdone = list_first_entry(&pl330->req_done,
+					    struct dma_pl330_desc, rqd);
 		list_del(&descdone->rqd);
 		spin_unlock_irqrestore(&pl330->lock, flags);
 		dma_pl330_rqcb(descdone, PL330_ERR_NONE);
@@ -1691,15 +1700,12 @@ static bool _chan_ns(const struct pl330_dmac *pl330, int i)
 static struct pl330_thread *pl330_request_channel(struct pl330_dmac *pl330)
 {
 	struct pl330_thread *thrd = NULL;
-	unsigned long flags;
 	int chans, i;
 
 	if (pl330->state == DYING)
 		return NULL;
 
 	chans = pl330->pcfg.num_chan;
-
-	spin_lock_irqsave(&pl330->lock, flags);
 
 	for (i = 0; i < chans; i++) {
 		thrd = &pl330->channels[i];
@@ -1718,8 +1724,6 @@ static struct pl330_thread *pl330_request_channel(struct pl330_dmac *pl330)
 		thrd = NULL;
 	}
 
-	spin_unlock_irqrestore(&pl330->lock, flags);
-
 	return thrd;
 }
 
@@ -1737,7 +1741,6 @@ static inline void _free_event(struct pl330_thread *thrd, int ev)
 static void pl330_release_channel(struct pl330_thread *thrd)
 {
 	struct pl330_dmac *pl330;
-	unsigned long flags;
 
 	if (!thrd || thrd->free)
 		return;
@@ -1749,10 +1752,8 @@ static void pl330_release_channel(struct pl330_thread *thrd)
 
 	pl330 = thrd->dmac;
 
-	spin_lock_irqsave(&pl330->lock, flags);
 	_free_event(thrd, thrd->ev);
 	thrd->free = true;
-	spin_unlock_irqrestore(&pl330->lock, flags);
 }
 
 /* Initialize the structure for PL330 configuration, that can be used
@@ -2031,6 +2032,7 @@ static void pl330_tasklet(unsigned long data)
 		_stop(pch->thread);
 		spin_unlock(&pch->thread->dmac->lock);
 		power_down = true;
+		pch->active = false;
 	} else {
 		/* Make sure the PL330 Channel thread is active */
 		spin_lock(&pch->thread->dmac->lock);
@@ -2050,6 +2052,7 @@ static void pl330_tasklet(unsigned long data)
 			desc->status = PREP;
 			list_move_tail(&desc->node, &pch->work_list);
 			if (power_down) {
+				pch->active = true;
 				spin_lock(&pch->thread->dmac->lock);
 				_start(pch->thread);
 				spin_unlock(&pch->thread->dmac->lock);
@@ -2115,20 +2118,20 @@ static int pl330_alloc_chan_resources(struct dma_chan *chan)
 	struct pl330_dmac *pl330 = pch->dmac;
 	unsigned long flags;
 
-	spin_lock_irqsave(&pch->lock, flags);
+	spin_lock_irqsave(&pl330->lock, flags);
 
 	dma_cookie_init(chan);
 	pch->cyclic = false;
 
 	pch->thread = pl330_request_channel(pl330);
 	if (!pch->thread) {
-		spin_unlock_irqrestore(&pch->lock, flags);
+		spin_unlock_irqrestore(&pl330->lock, flags);
 		return -ENOMEM;
 	}
 
 	tasklet_init(&pch->task, pl330_tasklet, (unsigned long) pch);
 
-	spin_unlock_irqrestore(&pch->lock, flags);
+	spin_unlock_irqrestore(&pl330->lock, flags);
 
 	return 1;
 }
@@ -2164,16 +2167,20 @@ static int pl330_terminate_all(struct dma_chan *chan)
 	unsigned long flags;
 	struct pl330_dmac *pl330 = pch->dmac;
 	LIST_HEAD(list);
+	bool power_down = false;
 
 	pm_runtime_get_sync(pl330->ddma.dev);
 	spin_lock_irqsave(&pch->lock, flags);
+
 	spin_lock(&pl330->lock);
 	_stop(pch->thread);
-	spin_unlock(&pl330->lock);
-
 	pch->thread->req[0].desc = NULL;
 	pch->thread->req[1].desc = NULL;
 	pch->thread->req_running = -1;
+	spin_unlock(&pl330->lock);
+
+	power_down = pch->active;
+	pch->active = false;
 
 	/* Mark all desc done */
 	list_for_each_entry(desc, &pch->submitted_list, node) {
@@ -2191,6 +2198,8 @@ static int pl330_terminate_all(struct dma_chan *chan)
 	list_splice_tail_init(&pch->completed_list, &pl330->desc_pool);
 	spin_unlock_irqrestore(&pch->lock, flags);
 	pm_runtime_mark_last_busy(pl330->ddma.dev);
+	if (power_down)
+		pm_runtime_put_autosuspend(pl330->ddma.dev);
 	pm_runtime_put_autosuspend(pl330->ddma.dev);
 
 	return 0;
@@ -2226,12 +2235,13 @@ static int pl330_pause(struct dma_chan *chan)
 static void pl330_free_chan_resources(struct dma_chan *chan)
 {
 	struct dma_pl330_chan *pch = to_pchan(chan);
+	struct pl330_dmac *pl330 = pch->dmac;
 	unsigned long flags;
 
 	tasklet_kill(&pch->task);
 
 	pm_runtime_get_sync(pch->dmac->ddma.dev);
-	spin_lock_irqsave(&pch->lock, flags);
+	spin_lock_irqsave(&pl330->lock, flags);
 
 	pl330_release_channel(pch->thread);
 	pch->thread = NULL;
@@ -2239,7 +2249,7 @@ static void pl330_free_chan_resources(struct dma_chan *chan)
 	if (pch->cyclic)
 		list_splice_tail_init(&pch->work_list, &pch->dmac->desc_pool);
 
-	spin_unlock_irqrestore(&pch->lock, flags);
+	spin_unlock_irqrestore(&pl330->lock, flags);
 	pm_runtime_mark_last_busy(pch->dmac->ddma.dev);
 	pm_runtime_put_autosuspend(pch->dmac->ddma.dev);
 }
@@ -2350,6 +2360,7 @@ static void pl330_issue_pending(struct dma_chan *chan)
 		 * updated on work_list emptiness status.
 		 */
 		WARN_ON(list_empty(&pch->submitted_list));
+		pch->active = true;
 		pm_runtime_get_sync(pch->dmac->ddma.dev);
 	}
 	list_splice_tail_init(&pch->submitted_list, &pch->work_list);
@@ -2666,14 +2677,14 @@ pl330_prep_dma_memcpy(struct dma_chan *chan, dma_addr_t dst,
 	while (burst != (1 << desc->rqcfg.brst_size))
 		desc->rqcfg.brst_size++;
 
+	desc->rqcfg.brst_len = get_burst_len(desc, len);
 	/*
 	 * If burst size is smaller than bus width then make sure we only
 	 * transfer one at a time to avoid a burst stradling an MFIFO entry.
 	 */
-	if (desc->rqcfg.brst_size * 8 < pl330->pcfg.data_bus_width)
+	if (burst * 8 < pl330->pcfg.data_bus_width)
 		desc->rqcfg.brst_len = 1;
 
-	desc->rqcfg.brst_len = get_burst_len(desc, len);
 	desc->bytes_requested = len;
 
 	desc->txd.flags = flags;
@@ -2945,7 +2956,7 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 	pd->src_addr_widths = PL330_DMA_BUSWIDTHS;
 	pd->dst_addr_widths = PL330_DMA_BUSWIDTHS;
 	pd->directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
-	pd->residue_granularity = DMA_RESIDUE_GRANULARITY_SEGMENT;
+	pd->residue_granularity = DMA_RESIDUE_GRANULARITY_BURST;
 	pd->max_burst = ((pl330->quirks & PL330_QUIRK_BROKEN_NO_FLUSHP) ?
 			 1 : PL330_MAX_BURST);
 

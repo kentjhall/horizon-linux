@@ -329,7 +329,11 @@ static void *nt_init_name(void *buf, Elf64_Word type, void *desc, int d_len,
 
 static inline void *nt_init(void *buf, Elf64_Word type, void *desc, int d_len)
 {
-	return nt_init_name(buf, type, desc, d_len, KEXEC_CORE_NOTE_NAME);
+	const char *note_name = "LINUX";
+
+	if (type == NT_PRPSINFO || type == NT_PRSTATUS || type == NT_PRFPREG)
+		note_name = KEXEC_CORE_NOTE_NAME;
+	return nt_init_name(buf, type, desc, d_len, note_name);
 }
 
 /*
@@ -397,11 +401,13 @@ static void *get_vmcoreinfo_old(unsigned long *size)
 	if (copy_oldmem_kernel(nt_name, addr + sizeof(note),
 			       sizeof(nt_name) - 1))
 		return NULL;
-	if (strcmp(nt_name, "VMCOREINFO") != 0)
+	if (strcmp(nt_name, VMCOREINFO_NOTE_NAME) != 0)
 		return NULL;
 	vmcoreinfo = kzalloc_panic(note.n_descsz);
-	if (copy_oldmem_kernel(vmcoreinfo, addr + 24, note.n_descsz))
+	if (copy_oldmem_kernel(vmcoreinfo, addr + 24, note.n_descsz)) {
+		kfree(vmcoreinfo);
 		return NULL;
+	}
 	*size = note.n_descsz;
 	return vmcoreinfo;
 }
@@ -411,15 +417,34 @@ static void *get_vmcoreinfo_old(unsigned long *size)
  */
 static void *nt_vmcoreinfo(void *ptr)
 {
+	const char *name = VMCOREINFO_NOTE_NAME;
 	unsigned long size;
 	void *vmcoreinfo;
 
 	vmcoreinfo = os_info_old_entry(OS_INFO_VMCOREINFO, &size);
-	if (!vmcoreinfo)
-		vmcoreinfo = get_vmcoreinfo_old(&size);
+	if (vmcoreinfo)
+		return nt_init_name(ptr, 0, vmcoreinfo, size, name);
+
+	vmcoreinfo = get_vmcoreinfo_old(&size);
 	if (!vmcoreinfo)
 		return ptr;
-	return nt_init_name(ptr, 0, vmcoreinfo, size, "VMCOREINFO");
+	ptr = nt_init_name(ptr, 0, vmcoreinfo, size, name);
+	kfree(vmcoreinfo);
+	return ptr;
+}
+
+/*
+ * Initialize final note (needed for /proc/vmcore code)
+ */
+static void *nt_final(void *ptr)
+{
+	Elf64_Nhdr *note;
+
+	note = (Elf64_Nhdr *) ptr;
+	note->n_namesz = 0;
+	note->n_descsz = 0;
+	note->n_type = 0;
+	return PTR_ADD(ptr, sizeof(Elf64_Nhdr));
 }
 
 /*
@@ -509,6 +534,7 @@ static void *notes_init(Elf64_Phdr *phdr, void *ptr, u64 notes_offset)
 		if (sa->prefix != 0)
 			ptr = fill_cpu_elf_notes(ptr, cpu++, sa);
 	ptr = nt_vmcoreinfo(ptr);
+	ptr = nt_final(ptr);
 	memset(phdr, 0, sizeof(*phdr));
 	phdr->p_type = PT_NOTE;
 	phdr->p_offset = notes_offset;

@@ -10,22 +10,22 @@ config REGMAP
 	bool
 
 config REGMAP_AC97
-	tristate
+	bool
 
 config REGMAP_I2C
-	tristate
+	bool
 	depends on I2C
 
 config REGMAP_SPI
-	tristate
+	bool
 	depends on SPI
 
 config REGMAP_SPMI
-	tristate
+	bool
 	depends on SPMI
 
 config REGMAP_MMIO
-	tristate
+	bool
 
 config REGMAP_IRQ
 	bool

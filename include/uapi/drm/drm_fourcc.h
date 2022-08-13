@@ -154,12 +154,16 @@ extern "C" {
 
 /* Vendor Ids: */
 #define DRM_FORMAT_MOD_NONE           0
+#define DRM_FORMAT_MOD_VENDOR_NONE    0
 #define DRM_FORMAT_MOD_VENDOR_INTEL   0x01
 #define DRM_FORMAT_MOD_VENDOR_AMD     0x02
-#define DRM_FORMAT_MOD_VENDOR_NV      0x03
+#define DRM_FORMAT_MOD_VENDOR_NVIDIA  0x03
 #define DRM_FORMAT_MOD_VENDOR_SAMSUNG 0x04
 #define DRM_FORMAT_MOD_VENDOR_QCOM    0x05
 /* add more to the end as needed */
+
+/* For backward compatibility */
+#define DRM_FORMAT_MOD_VENDOR_NV      0x03
 
 #define fourcc_mod_code(vendor, val) \
 	((((__u64)DRM_FORMAT_MOD_VENDOR_## vendor) << 56) | (val & 0x00ffffffffffffffULL))
@@ -232,6 +236,149 @@ extern "C" {
  * For more information: see https://linuxtv.org/downloads/v4l-dvb-apis/re32.html
  */
 #define DRM_FORMAT_MOD_SAMSUNG_64_32_TILE	fourcc_mod_code(SAMSUNG, 1)
+
+/*
+ * Generalized Block Linear layout, used by desktop GPUs starting with NV50/G80,
+ * and Tegra GPUs starting with Tegra K1.
+ *
+ * Pixels are arranged in Groups of Bytes (GOBs).  GOB size and layout varies
+ * based on the architecture generation.  GOBs themselves are then arranged in
+ * 3D blocks, with the block dimensions (in terms of GOBs) always being a power
+ * of two, and hence expressible as their log2 equivalent (E.g., "2" represents
+ * a block depth or height of "4").
+ *
+ * Chapter 20 "Pixel Memory Formats" of the Tegra X1 TRM describes this format
+ * in full detail.
+ *
+ *       Macro
+ * Bits  Param Description
+ * ----  ----- -----------------------------------------------------------------
+ *
+ *  3:0  h     log2(height) of each block, in GOBs.  Placed here for
+ *             compatibility with the existing
+ *             DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK()-based modifiers.
+ *
+ *  4:4  -     Must be 1, to indicate block-linear layout.  Necessary for
+ *             compatibility with the existing
+ *             DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK()-based modifiers.
+ *
+ *  8:5  -     Reserved (To support 3D-surfaces with variable log2(depth) block
+ *             size).  Must be zero.
+ *
+ *             Note there is no log2(width) parameter.  Some portions of the
+ *             hardware support a block width of two gobs, but it is impractical
+ *             to use due to lack of support elsewhere, and has no known
+ *             benefits.
+ *
+ * 11:9  -     Reserved (To support 2D-array textures with variable array stride
+ *             in blocks, specified via log2(tile width in blocks)).  Must be
+ *             zero.
+ *
+ * 19:12 k     Page Kind.  This value directly maps to a field in the page
+ *             tables of all GPUs >= NV50.  It affects the exact layout of bits
+ *             in memory and can be derived from the tuple
+ *
+ *               (format, GPU model, compression type, samples per pixel)
+ *
+ *             Where compression type is defined below.  If GPU model were
+ *             implied by the format modifier, format, or memory buffer, page
+ *             kind would not need to be included in the modifier itself, but
+ *             since the modifier should define the layout of the associated
+ *             memory buffer independent from any device or other context, it
+ *             must be included here.
+ *
+ * 21:20 g     GOB Height and Page Kind Generation.  The height of a GOB changed
+ *             starting with Fermi GPUs.  Additionally, the mapping between page
+ *             kind and bit layout has changed at various points.
+ *
+ *               0 = Gob Height 8, Fermi - Volta, Tegra K1+ Page Kind mapping
+ *               1 = Gob Height 4, G80 - GT2XX Page Kind mapping
+ *               2 = Gob Height 8, Turing+ Page Kind mapping
+ *               3 = Reserved for future use.
+ *
+ * 22:22 s     Sector layout.  On Tegra GPUs prior to Xavier, there is a further
+ *             bit remapping step that occurs at an even lower level than the
+ *             page kind and block linear swizzles.  This causes the layout of
+ *             surfaces mapped in those SOC's GPUs to be incompatible with the
+ *             equivalent mapping on other GPUs in the same system.
+ *
+ *               0 = Tegra K1 - Tegra Parker/TX2 Layout.
+ *               1 = Desktop GPU and Tegra Xavier+ Layout
+ *
+ * 25:23 c     Lossless Framebuffer Compression type.
+ *
+ *               0 = none
+ *               1 = ROP/3D, layout 1, exact compression format implied by Page
+ *                   Kind field
+ *               2 = ROP/3D, layout 2, exact compression format implied by Page
+ *                   Kind field
+ *               3 = CDE horizontal
+ *               4 = CDE vertical
+ *               5 = Reserved for future use
+ *               6 = Reserved for future use
+ *               7 = Reserved for future use
+ *
+ * 55:25 -     Reserved for future use.  Must be zero.
+ */
+#define DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c, s, g, k, h) \
+	fourcc_mod_code(NVIDIA, (0x10 | \
+				 ((h) & 0xf) | \
+				 (((k) & 0xff) << 12) | \
+				 (((g) & 0x3) << 20) | \
+				 (((s) & 0x1) << 22) | \
+				 (((c) & 0x7) << 23)))
+
+/* To grandfather in prior block linear format modifiers to the above layout,
+ * the page kind "0", which corresponds to "pitch/linear" and hence is unusable
+ * with block-linear layouts, is remapped within drivers to the value 0xfe,
+ * which corresponds to the "generic" kind used for simple single-sample
+ * uncompressed color formats on Fermi - Volta GPUs.
+ */
+static inline __u64
+drm_fourcc_canonicalize_nvidia_format_mod(__u64 modifier)
+{
+	if (!(modifier & 0x10) || (modifier & (0xff << 12)))
+		return modifier;
+	else
+		return modifier | (0xfe << 12);
+}
+
+/*
+ * 16Bx2 Block Linear layout, used by Tegra K1 and later
+ *
+ * Pixels are arranged in 64x8 Groups Of Bytes (GOBs). GOBs are then stacked
+ * vertically by a power of 2 (1 to 32 GOBs) to form a block.
+ *
+ * Within a GOB, data is ordered as 16B x 2 lines sectors laid in Z-shape.
+ *
+ * Parameter 'v' is the log2 encoding of the number of GOBs stacked vertically.
+ * Valid values are:
+ *
+ * 0 == ONE_GOB
+ * 1 == TWO_GOBS
+ * 2 == FOUR_GOBS
+ * 3 == EIGHT_GOBS
+ * 4 == SIXTEEN_GOBS
+ * 5 == THIRTYTWO_GOBS
+ *
+ * Chapter 20 "Pixel Memory Formats" of the Tegra X1 TRM describes this format
+ * in full detail.
+ */
+#define DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(v) \
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 0, 0, 0, (v))
+
+#define DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK_ONE_GOB \
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(0)
+#define DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK_TWO_GOB \
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(1)
+#define DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK_FOUR_GOB \
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(2)
+#define DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK_EIGHT_GOB \
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(3)
+#define DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK_SIXTEEN_GOB \
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(4)
+#define DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK_THIRTYTWO_GOB \
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(5)
 
 #if defined(__cplusplus)
 }

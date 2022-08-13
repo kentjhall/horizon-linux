@@ -51,8 +51,10 @@ extern struct inet_hashinfo tcp_hashinfo;
 extern struct percpu_counter tcp_orphan_count;
 void tcp_time_wait(struct sock *sk, int state, int timeo);
 
-#define MAX_TCP_HEADER	(128 + MAX_HEADER)
+#define MAX_TCP_HEADER	L1_CACHE_ALIGN(128 + MAX_HEADER)
 #define MAX_TCP_OPTION_SPACE 40
+#define TCP_MIN_SND_MSS		48
+#define TCP_MIN_GSO_SIZE	(TCP_MIN_SND_MSS - MAX_TCP_OPTION_SPACE)
 
 /*
  * Never offer a window over 32767 without using window scaling. Some
@@ -271,6 +273,7 @@ extern int sysctl_tcp_autocorking;
 extern int sysctl_tcp_invalid_ratelimit;
 extern int sysctl_tcp_pacing_ss_ratio;
 extern int sysctl_tcp_pacing_ca_ratio;
+extern int sysctl_tcp_default_init_rwnd;
 
 extern atomic_long_t tcp_memory_allocated;
 extern struct percpu_counter tcp_sockets_allocated;
@@ -363,6 +366,7 @@ ssize_t tcp_splice_read(struct socket *sk, loff_t *ppos,
 			struct pipe_inode_info *pipe, size_t len,
 			unsigned int flags);
 
+void tcp_enter_quickack_mode(struct sock *sk, unsigned int max_quickacks);
 static inline void tcp_dec_quickack_mode(struct sock *sk,
 					 const unsigned int pkts)
 {
@@ -491,19 +495,27 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb);
  */
 static inline void tcp_synq_overflow(const struct sock *sk)
 {
-	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
+	unsigned long last_overflow = READ_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp);
 	unsigned long now = jiffies;
 
-	if (time_after(now, last_overflow + HZ))
-		tcp_sk(sk)->rx_opt.ts_recent_stamp = now;
+	if (!time_between32(now, last_overflow, last_overflow + HZ))
+		WRITE_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp, now);
 }
 
 /* syncookies: no recent synqueue overflow on this listening socket? */
 static inline bool tcp_synq_no_recent_overflow(const struct sock *sk)
 {
-	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
+	unsigned long last_overflow = READ_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp);
 
-	return time_after(jiffies, last_overflow + TCP_SYNCOOKIE_VALID);
+	/* If last_overflow <= jiffies <= last_overflow + TCP_SYNCOOKIE_VALID,
+	 * then we're under synflood. However, we have to use
+	 * 'last_overflow - HZ' as lower bound. That's because a concurrent
+	 * tcp_synq_overflow() could update .ts_recent_stamp after we read
+	 * jiffies but before we store .ts_recent_stamp into last_overflow,
+	 * which could lead to rejecting a valid syncookie.
+	 */
+	return !time_between32(jiffies, last_overflow - HZ,
+			       last_overflow + TCP_SYNCOOKIE_VALID);
 }
 
 static inline u32 tcp_cookie_time(void)
@@ -553,6 +565,7 @@ void tcp_send_fin(struct sock *sk);
 void tcp_send_active_reset(struct sock *sk, gfp_t priority);
 int tcp_send_synack(struct sock *);
 void tcp_push_one(struct sock *, unsigned int mss_now);
+void __tcp_send_ack(struct sock *sk, u32 rcv_nxt);
 void tcp_send_ack(struct sock *sk);
 void tcp_send_delayed_ack(struct sock *sk);
 void tcp_send_loss_probe(struct sock *sk);
@@ -848,8 +861,6 @@ enum tcp_ca_event {
 	CA_EVENT_LOSS,		/* loss timeout */
 	CA_EVENT_ECN_NO_CE,	/* ECT set, but not CE marked */
 	CA_EVENT_ECN_IS_CE,	/* received CE marked IP packet */
-	CA_EVENT_DELAYED_ACK,	/* Delayed ack is sent */
-	CA_EVENT_NON_DELAYED_ACK,
 };
 
 /* Information about inbound ACK, passed to cong_ops->in_ack_event() */
@@ -1001,7 +1012,7 @@ void tcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb);
 void tcp_rate_skb_delivered(struct sock *sk, struct sk_buff *skb,
 			    struct rate_sample *rs);
 void tcp_rate_gen(struct sock *sk, u32 delivered, u32 lost,
-		  struct skb_mstamp *now, struct rate_sample *rs);
+		  bool is_sack_reneg, struct skb_mstamp *now, struct rate_sample *rs);
 void tcp_rate_check_app_limited(struct sock *sk);
 
 /* These functions determine how the current flow behaves in respect of SACK
@@ -1265,9 +1276,11 @@ void tcp_select_initial_window(int __space, __u32 mss, __u32 *rcv_wnd,
 
 static inline int tcp_win_from_space(int space)
 {
-	return sysctl_tcp_adv_win_scale<=0 ?
-		(space>>(-sysctl_tcp_adv_win_scale)) :
-		space - (space>>sysctl_tcp_adv_win_scale);
+	int tcp_adv_win_scale = sysctl_tcp_adv_win_scale;
+
+	return tcp_adv_win_scale <= 0 ?
+		(space>>(-tcp_adv_win_scale)) :
+		space - (space>>tcp_adv_win_scale);
 }
 
 /* Note: caller must be prepared to deal with negative returns */
@@ -1506,7 +1519,15 @@ struct sock *tcp_try_fastopen(struct sock *sk, struct sk_buff *skb,
 			      struct tcp_fastopen_cookie *foc,
 			      struct dst_entry *dst);
 void tcp_fastopen_init_key_once(bool publish);
+bool tcp_fastopen_cookie_check(struct sock *sk, u16 *mss,
+			     struct tcp_fastopen_cookie *cookie);
+bool tcp_fastopen_defer_connect(struct sock *sk, int *err);
 #define TCP_FASTOPEN_KEY_LENGTH 16
+
+static inline void tcp_init_send_head(struct sock *sk)
+{
+	sk->sk_send_head = NULL;
+}
 
 /* Fastopen key context */
 struct tcp_fastopen_context {
@@ -1515,6 +1536,8 @@ struct tcp_fastopen_context {
 	struct rcu_head		rcu;
 };
 
+static inline void tcp_init_send_head(struct sock *sk);
+
 /* write queue abstraction */
 static inline void tcp_write_queue_purge(struct sock *sk)
 {
@@ -1522,8 +1545,11 @@ static inline void tcp_write_queue_purge(struct sock *sk)
 
 	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL)
 		sk_wmem_free_skb(sk, skb);
+	tcp_init_send_head(sk);
 	sk_mem_reclaim(sk);
 	tcp_clear_all_retrans_hints(tcp_sk(sk));
+	tcp_init_send_head(sk);
+	inet_csk(sk)->icsk_backoff = 0;
 }
 
 static inline struct sk_buff *tcp_write_queue_head(const struct sock *sk)
@@ -1584,9 +1610,25 @@ static inline void tcp_check_send_head(struct sock *sk, struct sk_buff *skb_unli
 		tcp_sk(sk)->highest_sack = NULL;
 }
 
-static inline void tcp_init_send_head(struct sock *sk)
+static inline struct sk_buff *tcp_rtx_queue_head(const struct sock *sk)
 {
-	sk->sk_send_head = NULL;
+	struct sk_buff *skb = tcp_write_queue_head(sk);
+
+	if (skb == tcp_send_head(sk))
+		skb = NULL;
+
+	return skb;
+}
+
+static inline struct sk_buff *tcp_rtx_queue_tail(const struct sock *sk)
+{
+	struct sk_buff *skb = tcp_send_head(sk);
+
+	/* empty retransmit queue, for example due to zero window */
+	if (skb == tcp_write_queue_head(sk))
+		return NULL;
+
+	return skb ? tcp_write_queue_prev(sk, skb) : tcp_write_queue_tail(sk);
 }
 
 static inline void __tcp_add_write_queue_tail(struct sock *sk, struct sk_buff *skb)
@@ -1681,12 +1723,12 @@ static inline void tcp_highest_sack_reset(struct sock *sk)
 	tcp_sk(sk)->highest_sack = tcp_write_queue_head(sk);
 }
 
-/* Called when old skb is about to be deleted (to be combined with new skb) */
-static inline void tcp_highest_sack_combine(struct sock *sk,
+/* Called when old skb is about to be deleted and replaced by new skb */
+static inline void tcp_highest_sack_replace(struct sock *sk,
 					    struct sk_buff *old,
 					    struct sk_buff *new)
 {
-	if (tcp_sk(sk)->sacked_out && (old == tcp_sk(sk)->highest_sack))
+	if (old == tcp_highest_sack(sk))
 		tcp_sk(sk)->highest_sack = new;
 }
 

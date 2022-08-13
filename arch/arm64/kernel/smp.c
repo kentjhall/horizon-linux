@@ -37,6 +37,7 @@
 #include <linux/completion.h>
 #include <linux/of.h>
 #include <linux/irq_work.h>
+#include <linux/irqdomain.h>
 
 #include <asm/alternative.h>
 #include <asm/atomic.h>
@@ -58,6 +59,9 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/ipi.h>
 
+DEFINE_PER_CPU_READ_MOSTLY(int, cpu_number);
+EXPORT_PER_CPU_SYMBOL(cpu_number);
+
 /*
  * as from 2.5, kernels no longer have an init_tasks structure
  * so we need some other way of telling a new secondary core
@@ -73,8 +77,12 @@ enum ipi_msg_type {
 	IPI_CPU_STOP,
 	IPI_TIMER,
 	IPI_IRQ_WORK,
-	IPI_WAKEUP
+	IPI_WAKEUP,
+	IPI_CUSTOM_FIRST,
+	IPI_CUSTOM_LAST = 15,
 };
+
+struct irq_domain *ipi_custom_irq_domain;
 
 #ifdef CONFIG_ARM64_VHE
 
@@ -129,6 +137,13 @@ static inline int op_cpu_kill(unsigned int cpu)
  */
 static int boot_secondary(unsigned int cpu, struct task_struct *idle)
 {
+	/*
+	 * Force failure if trying to boot secondary CPU while using
+	 * non-shared TLBI
+	 */
+#ifdef CONFIG_ARM64_NON_SHARED_TLBI
+	BUG();
+#endif
 	if (cpu_ops[cpu]->cpu_boot)
 		return cpu_ops[cpu]->cpu_boot(cpu);
 
@@ -136,6 +151,7 @@ static int boot_secondary(unsigned int cpu, struct task_struct *idle)
 }
 
 static DECLARE_COMPLETION(cpu_running);
+bool va52mismatch __ro_after_init;
 
 int __cpu_up(unsigned int cpu, struct task_struct *idle)
 {
@@ -146,6 +162,7 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 	 * We need to tell the secondary core where to find its stack and the
 	 * page tables.
 	 */
+	secondary_data.task = idle;
 	secondary_data.stack = task_stack_page(idle) + THREAD_START_SP;
 	update_cpu_boot_status(CPU_MMU_OFF);
 	__flush_dcache_area(&secondary_data, sizeof(secondary_data));
@@ -160,16 +177,22 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 		 * time out.
 		 */
 		wait_for_completion_timeout(&cpu_running,
-					    msecs_to_jiffies(1000));
+					    msecs_to_jiffies(10000));
 
 		if (!cpu_online(cpu)) {
 			pr_crit("CPU%u: failed to come online\n", cpu);
+
+			if (IS_ENABLED(CONFIG_ARM64_52BIT_VA) && va52mismatch)
+				pr_crit("CPU%u: does not support 52-bit VAs\n", cpu);
+
 			ret = -EIO;
 		}
 	} else {
 		pr_err("CPU%u: failed to boot: %d\n", cpu, ret);
+		return ret;
 	}
 
+	secondary_data.task = NULL;
 	secondary_data.stack = NULL;
 	status = READ_ONCE(secondary_data.status);
 	if (ret && status) {
@@ -205,10 +228,13 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
  * This is the secondary CPU boot entry.  We're using this CPUs
  * idle thread stack, but a set of temporary page tables.
  */
-asmlinkage void secondary_start_kernel(void)
+asmlinkage notrace void secondary_start_kernel(void)
 {
 	struct mm_struct *mm = &init_mm;
-	unsigned int cpu = smp_processor_id();
+	unsigned int cpu;
+
+	cpu = task_cpu(current);
+	set_my_cpu_offset(per_cpu_offset(cpu));
 
 	/*
 	 * All kernel threads share the same mm context; grab a
@@ -216,8 +242,6 @@ asmlinkage void secondary_start_kernel(void)
 	 */
 	atomic_inc(&mm->mm_count);
 	current->active_mm = mm;
-
-	set_my_cpu_offset(per_cpu_offset(smp_processor_id()));
 
 	/*
 	 * TTBR0 is only used for the identity mapping at this stage. Make it
@@ -602,6 +626,10 @@ static void __init of_parse_and_init_cpus(void)
 	while ((dn = of_find_node_by_type(dn, "cpu"))) {
 		u64 hwid = of_get_cpu_mpidr(dn);
 
+		/* Check to see if the cpu is disabled */
+		if (!of_device_is_available(dn))
+			goto next;
+
 		if (hwid == INVALID_HWID)
 			goto next;
 
@@ -717,6 +745,8 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 	 * secondaries from the bootloader.
 	 */
 	for_each_possible_cpu(cpu) {
+
+		per_cpu(cpu_number, cpu) = cpu;
 
 		if (cpu == smp_processor_id())
 			continue;
@@ -874,7 +904,12 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 #endif
 
 	default:
-		pr_crit("CPU%u: Unknown IPI message 0x%x\n", cpu, ipinr);
+		if (ipi_custom_irq_domain &&
+		    ipinr >= IPI_CUSTOM_FIRST && ipinr <= IPI_CUSTOM_LAST)
+			handle_domain_irq(ipi_custom_irq_domain, ipinr, regs);
+		else
+			pr_crit("CPU%u: Unknown IPI message 0x%x\n",
+				cpu, ipinr);
 		break;
 	}
 
@@ -882,6 +917,85 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 		trace_ipi_exit_rcuidle(ipi_types[ipinr]);
 	set_irq_regs(old_regs);
 }
+
+static void custom_ipi_enable(struct irq_data *data)
+{
+	/*
+	 * Always trigger a new ipi on enable. This only works for clients
+	 * that then clear the ipi before unmasking interrupts.
+	 */
+	smp_cross_call(cpumask_of(smp_processor_id()), data->hwirq);
+}
+
+static void custom_ipi_disable(struct irq_data *data)
+{
+}
+
+static struct irq_chip custom_ipi_chip = {
+	.name			= "CustomIPI",
+	.irq_enable		= custom_ipi_enable,
+	.irq_disable		= custom_ipi_disable,
+};
+
+static void handle_custom_ipi_irq(struct irq_desc *desc)
+{
+	if (!desc->action) {
+		pr_crit("CPU%u: Unknown IPI message 0x%x, no custom handler\n",
+			smp_processor_id(), irq_desc_get_irq(desc));
+		return;
+	}
+
+	if (!cpumask_test_cpu(smp_processor_id(), desc->percpu_enabled))
+		return; /* IPIs may not be maskable in hardware */
+
+	handle_percpu_devid_irq(desc);
+}
+
+static int custom_ipi_domain_map(struct irq_domain *d, unsigned int irq,
+				 irq_hw_number_t hw)
+{
+	if (hw < IPI_CUSTOM_FIRST || hw > IPI_CUSTOM_LAST) {
+		pr_err("hwirq-%u is not in supported range for CustomIPI IRQ domain\n",
+		       (uint)hw);
+		return -EINVAL;
+	}
+
+	irq_set_percpu_devid(irq);
+	irq_set_chip_and_handler(irq, &custom_ipi_chip, handle_custom_ipi_irq);
+	irq_set_status_flags(irq, IRQ_NOAUTOEN);
+
+	return 0;
+}
+
+static const struct irq_domain_ops custom_ipi_domain_ops = {
+	.map = custom_ipi_domain_map,
+};
+
+static int __init smp_custom_ipi_init(void)
+{
+	struct device_node *np;
+
+	np = of_find_compatible_node(NULL, NULL, "android,CustomIPI");
+	if (np) {
+		/*
+		 * Register linear irq doman to cover the whole IPI range
+		 * even though we are only using part of it. Proper IRQ
+		 * range check will be done by an implementation of mapping
+		 * routine.
+		 */
+		pr_info("Initilizing CustomIPI irq domain\n");
+		ipi_custom_irq_domain =
+			irq_domain_add_linear(np,
+					      IPI_CUSTOM_LAST + 1,
+					      &custom_ipi_domain_ops,
+					      NULL);
+		WARN_ON(!ipi_custom_irq_domain);
+		return 0;
+	}
+
+	return 0;
+}
+core_initcall(smp_custom_ipi_init);
 
 void smp_send_reschedule(int cpu)
 {
@@ -895,11 +1009,22 @@ void tick_broadcast(const struct cpumask *mask)
 }
 #endif
 
+/*
+ * The number of CPUs online, not counting this CPU (which may not be
+ * fully online and so not counted in num_online_cpus()).
+ */
+static inline unsigned int num_other_online_cpus(void)
+{
+	unsigned int this_cpu_online = cpu_online(smp_processor_id());
+
+	return num_online_cpus() - this_cpu_online;
+}
+
 void smp_send_stop(void)
 {
 	unsigned long timeout;
 
-	if (num_online_cpus() > 1) {
+	if (num_other_online_cpus()) {
 		cpumask_t mask;
 
 		cpumask_copy(&mask, cpu_online_mask);
@@ -913,10 +1038,10 @@ void smp_send_stop(void)
 
 	/* Wait up to one second for other CPUs to stop */
 	timeout = USEC_PER_SEC;
-	while (num_online_cpus() > 1 && timeout--)
+	while (num_other_online_cpus() && timeout--)
 		udelay(1);
 
-	if (num_online_cpus() > 1)
+	if (num_other_online_cpus())
 		pr_warning("SMP: failed to stop secondary CPUs %*pbl\n",
 			   cpumask_pr_args(cpu_online_mask));
 }
@@ -934,7 +1059,7 @@ static bool have_cpu_die(void)
 #ifdef CONFIG_HOTPLUG_CPU
 	int any_cpu = raw_smp_processor_id();
 
-	if (cpu_ops[any_cpu]->cpu_die)
+	if (cpu_ops[any_cpu] && cpu_ops[any_cpu]->cpu_die)
 		return true;
 #endif
 	return false;

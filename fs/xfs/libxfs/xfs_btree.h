@@ -268,7 +268,8 @@ typedef struct xfs_btree_cur
 			short		forksize;	/* fork's inode space */
 			char		whichfork;	/* data or attr fork */
 			char		flags;		/* flags */
-#define	XFS_BTCUR_BPRV_WASDEL	1			/* was delayed */
+#define	XFS_BTCUR_BPRV_WASDEL		(1<<0)		/* was delayed */
+#define	XFS_BTCUR_BPRV_INVALID_OWNER	(1<<1)		/* for ext swap */
 		} b;
 	}		bc_private;	/* per-btree type data */
 } xfs_btree_cur_t;
@@ -491,7 +492,7 @@ static inline int xfs_btree_get_level(struct xfs_btree_block *block)
 #define	XFS_FILBLKS_MAX(a,b)	max_t(xfs_filblks_t, (a), (b))
 
 #define	XFS_FSB_SANITY_CHECK(mp,fsb)	\
-	(XFS_FSB_TO_AGNO(mp, fsb) < mp->m_sb.sb_agcount && \
+	(fsb && XFS_FSB_TO_AGNO(mp, fsb) < mp->m_sb.sb_agcount && \
 		XFS_FSB_TO_AGBNO(mp, fsb) < mp->m_sb.sb_agblocks)
 
 /*

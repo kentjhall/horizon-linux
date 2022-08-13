@@ -105,10 +105,7 @@ static inline void get_mbigen_type_reg(irq_hw_number_t hwirq,
 static inline void get_mbigen_clear_reg(irq_hw_number_t hwirq,
 					u32 *mask, u32 *addr)
 {
-	unsigned int ofst;
-
-	hwirq -= RESERVED_IRQ_PER_MBIGEN_CHIP;
-	ofst = hwirq / 32 * 4;
+	unsigned int ofst = (hwirq / 32) * 4;
 
 	*mask = 1 << (hwirq % 32);
 	*addr = ofst + REG_MBIGEN_CLEAR_OFFSET;
@@ -163,6 +160,9 @@ static void mbigen_write_msg(struct msi_desc *desc, struct msi_msg *msg)
 	void __iomem *base = d->chip_data;
 	u32 val;
 
+	if (!msg->address_lo && !msg->address_hi)
+		return;
+ 
 	base += get_mbigen_vec_reg(d->hwirq);
 	val = readl_relaxed(base);
 

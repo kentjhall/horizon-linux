@@ -1,6 +1,25 @@
+ifeq ($(KERNEL_OVERLAYS),)
+KERNEL_OVERLAYS :=
+KERNEL_OVERLAYS += $(CURDIR)/../nvidia
+KERNEL_OVERLAYS += $(CURDIR)/../nvgpu
+KERNEL_OVERLAYS += $(CURDIR)/../nvgpu-next
+KERNEL_OVERLAYS += $(CURDIR)/../nvidia-t23x
+else
+override KERNEL_OVERLAYS := $(subst :, ,$(KERNEL_OVERLAYS))
+endif
+override KERNEL_OVERLAYS := $(abspath $(KERNEL_OVERLAYS))
+export KERNEL_OVERLAYS
+
+define set_srctree_overlay
+  overlay_name := $(lastword $(subst /, ,$(overlay)))
+  srctree.$(overlay_name) := $(overlay)
+  export srctree.$(overlay_name)
+endef
+$(foreach overlay,$(KERNEL_OVERLAYS),$(eval $(value set_srctree_overlay)))
+
 VERSION = 4
 PATCHLEVEL = 9
-SUBLEVEL = 0
+SUBLEVEL = 253
 EXTRAVERSION =
 NAME = Roaring Lionus
 
@@ -87,10 +106,12 @@ endif
 ifneq ($(filter 4.%,$(MAKE_VERSION)),)	# make-4
 ifneq ($(filter %s ,$(firstword x$(MAKEFLAGS))),)
   quiet=silent_
+  tools_silent=s
 endif
 else					# make-3.8x
 ifneq ($(filter s% -s%,$(MAKEFLAGS)),)
   quiet=silent_
+  tools_silent=-s
 endif
 endif
 
@@ -216,6 +237,7 @@ src		:= $(srctree)
 obj		:= $(objtree)
 
 VPATH		:= $(srctree)$(if $(KBUILD_EXTMOD),:$(KBUILD_EXTMOD))
+VPATH		+= $(foreach overlay,$(KERNEL_OVERLAYS),:$(overlay))
 
 export srctree objtree VPATH
 
@@ -301,13 +323,8 @@ CONFIG_SHELL := $(shell if [ -x "$$BASH" ]; then echo $$BASH; \
 
 HOSTCC       = gcc
 HOSTCXX      = g++
-HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O2 -fomit-frame-pointer -std=gnu89
+HOSTCFLAGS   := -Wall -Wmissing-prototypes -Wstrict-prototypes -O2 -fomit-frame-pointer -std=gnu89
 HOSTCXXFLAGS = -O2
-
-ifeq ($(shell $(HOSTCC) -v 2>&1 | grep -c "clang version"), 1)
-HOSTCFLAGS  += -Wno-unused-value -Wno-unused-parameter \
-		-Wno-missing-field-initializers -fno-delete-null-pointer-checks
-endif
 
 # Decide whether to build built-in, modular, or both.
 # Normally, just do built-in.
@@ -316,12 +333,8 @@ KBUILD_MODULES :=
 KBUILD_BUILTIN := 1
 
 # If we have only "make modules", don't compile built-in objects.
-# When we're building modules with modversions, we need to consider
-# the built-in objects during the descend as well, in order to
-# make sure the checksums are up to date before we record them.
-
 ifeq ($(MAKECMDGOALS),modules)
-  KBUILD_BUILTIN := $(if $(CONFIG_MODVERSIONS),1)
+  KBUILD_BUILTIN :=
 endif
 
 # If we have "make <whatever> modules", compile modules
@@ -346,6 +359,7 @@ include scripts/Kbuild.include
 # Make variables (CC, etc...)
 AS		= $(CROSS_COMPILE)as
 LD		= $(CROSS_COMPILE)ld
+LDGOLD		= $(CROSS_COMPILE)ld.gold
 CC		= $(CROSS_COMPILE)gcc
 CPP		= $(CC) -E
 AR		= $(CROSS_COMPILE)ar
@@ -356,7 +370,7 @@ OBJDUMP		= $(CROSS_COMPILE)objdump
 AWK		= awk
 GENKSYMS	= scripts/genksyms/genksyms
 INSTALLKERNEL  := installkernel
-DEPMOD		= /sbin/depmod
+DEPMOD		= depmod
 PERL		= perl
 PYTHON		= python
 CHECK		= sparse
@@ -370,9 +384,6 @@ LDFLAGS_MODULE  =
 CFLAGS_KERNEL	=
 AFLAGS_KERNEL	=
 LDFLAGS_vmlinux =
-CFLAGS_GCOV	= -fprofile-arcs -ftest-coverage -fno-tree-loop-im -Wno-maybe-uninitialized
-CFLAGS_KCOV	:= $(call cc-option,-fsanitize-coverage=trace-pc,)
-
 
 # Use USERINCLUDE when you must reference the UAPI directories only.
 USERINCLUDE    := \
@@ -393,21 +404,20 @@ LINUXINCLUDE    := \
 
 LINUXINCLUDE	+= $(filter-out $(LINUXINCLUDE),$(USERINCLUDE))
 
-KBUILD_CPPFLAGS := -D__KERNEL__
-
+KBUILD_AFLAGS   := -D__ASSEMBLY__
 KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
-		   -fno-strict-aliasing -fno-common \
+		   -fno-strict-aliasing -fno-common -fshort-wchar \
 		   -Werror-implicit-function-declaration \
 		   -Wno-format-security \
-		   -std=gnu89 $(call cc-option,-fno-PIE)
-
-
+		   -std=gnu89
+KBUILD_CPPFLAGS := -D__KERNEL__
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
-KBUILD_AFLAGS   := -D__ASSEMBLY__ $(call cc-option,-fno-PIE)
 KBUILD_AFLAGS_MODULE  := -DMODULE
 KBUILD_CFLAGS_MODULE  := -DMODULE
 KBUILD_LDFLAGS_MODULE := -T $(srctree)/scripts/module-common.lds
+GCC_PLUGINS_CFLAGS :=
+CLANG_FLAGS :=
 
 # Read KERNELRELEASE from include/config/kernel.release (if it exists)
 KERNELRELEASE = $(shell cat include/config/kernel.release 2> /dev/null)
@@ -420,7 +430,8 @@ export MAKE AWK GENKSYMS INSTALLKERNEL PERL PYTHON UTS_MACHINE
 export HOSTCXX HOSTCXXFLAGS LDFLAGS_MODULE CHECK CHECKFLAGS
 
 export KBUILD_CPPFLAGS NOSTDINC_FLAGS LINUXINCLUDE OBJCOPYFLAGS LDFLAGS
-export KBUILD_CFLAGS CFLAGS_KERNEL CFLAGS_MODULE CFLAGS_GCOV CFLAGS_KCOV CFLAGS_KASAN CFLAGS_UBSAN
+export KBUILD_CFLAGS CFLAGS_KERNEL CFLAGS_MODULE
+export CFLAGS_KASAN CFLAGS_KASAN_NOSANITIZE CFLAGS_UBSAN
 export KBUILD_AFLAGS AFLAGS_KERNEL AFLAGS_MODULE
 export KBUILD_AFLAGS_MODULE KBUILD_CFLAGS_MODULE KBUILD_LDFLAGS_MODULE
 export KBUILD_AFLAGS_KERNEL KBUILD_CFLAGS_KERNEL
@@ -510,6 +521,24 @@ ifneq ($(filter install,$(MAKECMDGOALS)),)
 	        mixed-targets := 1
         endif
 endif
+
+ifeq ($(cc-name),clang)
+ifneq ($(CROSS_COMPILE),)
+CLANG_TRIPLE    ?= $(CROSS_COMPILE)
+CLANG_FLAGS	+= --target=$(notdir $(CLANG_TRIPLE:%-=%))
+GCC_TOOLCHAIN_DIR := $(dir $(shell which $(CROSS_COMPILE)elfedit))
+CLANG_FLAGS	+= --prefix=$(GCC_TOOLCHAIN_DIR)$(notdir $(CROSS_COMPILE))
+GCC_TOOLCHAIN	:= $(realpath $(GCC_TOOLCHAIN_DIR)/..)
+endif
+ifneq ($(GCC_TOOLCHAIN),)
+CLANG_FLAGS	+= --gcc-toolchain=$(GCC_TOOLCHAIN)
+endif
+CLANG_FLAGS	+= -no-integrated-as
+CLANG_FLAGS	+= -Werror=unknown-warning-option
+KBUILD_CFLAGS	+= $(CLANG_FLAGS)
+KBUILD_AFLAGS	+= $(CLANG_FLAGS)
+endif
+
 
 ifeq ($(mixed-targets),1)
 # ===========================================================================
@@ -620,6 +649,26 @@ endif
 # Defaults to vmlinux, but the arch makefile usually adds further targets
 all: vmlinux
 
+KBUILD_CFLAGS	+= $(call cc-option,-fno-PIE)
+KBUILD_AFLAGS	+= $(call cc-option,-fno-PIE)
+CFLAGS_GCOV	:= -fprofile-arcs -ftest-coverage -fno-tree-loop-im $(call cc-disable-warning,maybe-uninitialized,)
+CFLAGS_KCOV	:= $(call cc-option,-fsanitize-coverage=trace-pc,)
+export CFLAGS_GCOV CFLAGS_KCOV
+
+# Make toolchain changes before including arch/$(SRCARCH)/Makefile to ensure
+# ar/cc/ld-* macros return correct values.
+ifdef CONFIG_LTO_CLANG
+# use GNU gold with LLVMgold for LTO linking, and LD for vmlinux_link
+LDFINAL_vmlinux := $(LD)
+LD		:= $(LDGOLD)
+LDFLAGS		+= -plugin LLVMgold.so
+# use llvm-ar for building symbol tables from IR files, and llvm-dis instead
+# of objdump for processing symbol versions and exports
+LLVM_AR		:= llvm-ar
+LLVM_DIS	:= llvm-dis
+export LLVM_AR LLVM_DIS
+endif
+
 # The arch Makefile can set ARCH_{CPP,A,C}FLAGS to override the default
 # values of the respective KBUILD_* variables
 ARCH_CPPFLAGS :=
@@ -629,27 +678,81 @@ include arch/$(SRCARCH)/Makefile
 
 KBUILD_CFLAGS	+= $(call cc-option,-fno-delete-null-pointer-checks,)
 KBUILD_CFLAGS	+= $(call cc-disable-warning,frame-address,)
+KBUILD_CFLAGS	+= $(call cc-disable-warning, format-truncation)
+KBUILD_CFLAGS	+= $(call cc-disable-warning, format-overflow)
+KBUILD_CFLAGS	+= $(call cc-disable-warning, int-in-bool-context)
+KBUILD_CFLAGS	+= $(call cc-disable-warning, address-of-packed-member)
+KBUILD_CFLAGS	+= $(call cc-disable-warning, attribute-alias)
+KBUILD_CFLAGS   += $(call cc-disable-warning, address-of-packed-member)
+KBUILD_CFLAGS   += $(call cc-disable-warning, packed-not-aligned)
 
 ifdef CONFIG_LD_DEAD_CODE_DATA_ELIMINATION
 KBUILD_CFLAGS	+= $(call cc-option,-ffunction-sections,)
 KBUILD_CFLAGS	+= $(call cc-option,-fdata-sections,)
 endif
 
+ifdef CONFIG_LTO_CLANG
+lto-clang-flags	:= -flto -fvisibility=hidden
+
+# allow disabling only clang LTO where needed
+DISABLE_LTO_CLANG := -fno-lto -fvisibility=default
+export DISABLE_LTO_CLANG
+endif
+
+ifdef CONFIG_LTO
+lto-flags	:= $(lto-clang-flags)
+KBUILD_CFLAGS	+= $(lto-flags)
+
+DISABLE_LTO	:= $(DISABLE_LTO_CLANG)
+export DISABLE_LTO
+
+# LDFINAL_vmlinux and LDFLAGS_FINAL_vmlinux can be set to override
+# the linker and flags for vmlinux_link.
+export LDFINAL_vmlinux LDFLAGS_FINAL_vmlinux
+endif
+
+ifdef CONFIG_CFI_CLANG
+cfi-clang-flags	+= -fsanitize=cfi
+DISABLE_CFI_CLANG := -fno-sanitize=cfi
+ifdef CONFIG_MODULES
+cfi-clang-flags	+= -fsanitize-cfi-cross-dso
+DISABLE_CFI_CLANG += -fno-sanitize-cfi-cross-dso
+endif
+ifdef CONFIG_CFI_PERMISSIVE
+cfi-clang-flags	+= -fsanitize-recover=cfi -fno-sanitize-trap=cfi
+endif
+
+# also disable CFI when LTO is disabled
+DISABLE_LTO_CLANG += $(DISABLE_CFI_CLANG)
+# allow disabling only clang CFI where needed
+export DISABLE_CFI_CLANG
+endif
+
+ifdef CONFIG_CFI
+# cfi-flags are re-tested in prepare-compiler-check
+cfi-flags	:= $(cfi-clang-flags)
+KBUILD_CFLAGS	+= $(cfi-flags)
+
+DISABLE_CFI	:= $(DISABLE_CFI_CLANG)
+DISABLE_LTO	+= $(DISABLE_CFI)
+export DISABLE_CFI
+endif
+
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
-KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized,)
-else
-ifdef CONFIG_PROFILE_ALL_BRANCHES
-KBUILD_CFLAGS	+= -O2 $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_CFLAGS   += -Os
 else
 KBUILD_CFLAGS   += -O2
 endif
-endif
-
-KBUILD_CFLAGS += $(call cc-ifversion, -lt, 0409, \
-			$(call cc-disable-warning,maybe-uninitialized,))
 
 # Tell gcc to never replace conditional load with a non-conditional one
 KBUILD_CFLAGS	+= $(call cc-option,--param=allow-store-data-races=0)
+KBUILD_CFLAGS	+= $(call cc-option,-fno-allow-store-data-races)
+
+# check for 'asm goto'
+ifeq ($(shell $(CONFIG_SHELL) $(srctree)/scripts/gcc-goto.sh $(CC) $(KBUILD_CFLAGS)), y)
+	KBUILD_CFLAGS += -DCC_HAVE_ASM_GOTO
+	KBUILD_AFLAGS += -DCC_HAVE_ASM_GOTO
+endif
 
 include scripts/Makefile.gcc-plugins
 
@@ -691,10 +794,9 @@ KBUILD_CFLAGS += $(stackp-flag)
 
 ifeq ($(cc-name),clang)
 KBUILD_CPPFLAGS += $(call cc-option,-Qunused-arguments,)
-KBUILD_CPPFLAGS += $(call cc-option,-Wno-unknown-warning-option,)
-KBUILD_CFLAGS += $(call cc-disable-warning, unused-variable)
 KBUILD_CFLAGS += $(call cc-disable-warning, format-invalid-specifier)
 KBUILD_CFLAGS += $(call cc-disable-warning, gnu)
+KBUILD_CFLAGS += $(call cc-disable-warning, duplicate-decl-specifier)
 # Quiet clang warning: comparison of unsigned expression < 0 is always false
 KBUILD_CFLAGS += $(call cc-disable-warning, tautological-compare)
 # CLANG uses a _MergedGlobals as optimization, but this breaks modpost, as the
@@ -705,11 +807,11 @@ KBUILD_CFLAGS += $(call cc-option, -fcatch-undefined-behavior)
 else
 
 # These warnings generated too much noise in a regular build.
-# Use make W=1 to enable them (see scripts/Makefile.build)
+# Use make W=1 to enable them (see scripts/Makefile.extrawarn)
 KBUILD_CFLAGS += $(call cc-disable-warning, unused-but-set-variable)
-KBUILD_CFLAGS += $(call cc-disable-warning, unused-const-variable)
 endif
 
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-const-variable)
 ifdef CONFIG_FRAME_POINTER
 KBUILD_CFLAGS	+= -fno-omit-frame-pointer -fno-optimize-sibling-calls
 else
@@ -775,8 +877,34 @@ KBUILD_CFLAGS += $(call cc-option,-Wdeclaration-after-statement,)
 # disable pointer signed / unsigned warnings in gcc 4.0
 KBUILD_CFLAGS += $(call cc-disable-warning, pointer-sign)
 
+# disable stringop warnings in gcc 8+
+KBUILD_CFLAGS += $(call cc-disable-warning, stringop-truncation)
+
+# We'll want to enable this eventually, but it's not going away for 5.7 at least
+KBUILD_CFLAGS += $(call cc-disable-warning, zero-length-bounds)
+KBUILD_CFLAGS += $(call cc-disable-warning, array-bounds)
+KBUILD_CFLAGS += $(call cc-disable-warning, stringop-overflow)
+
+# Another good warning that we'll want to enable eventually
+KBUILD_CFLAGS += $(call cc-disable-warning, restrict)
+
+# Enabled with W=2, disabled by default as noisy
+KBUILD_CFLAGS += $(call cc-disable-warning, maybe-uninitialized)
+
 # disable invalid "can't wrap" optimizations for signed / pointers
 KBUILD_CFLAGS	+= $(call cc-option,-fno-strict-overflow)
+
+# clang sets -fmerge-all-constants by default as optimization, but this
+# is non-conforming behavior for C and in fact breaks the kernel, so we
+# need to disable it here generally.
+KBUILD_CFLAGS	+= $(call cc-option,-fno-merge-all-constants)
+
+# for gcc -fno-merge-all-constants disables everything, but it is fine
+# to have actual conforming behavior enabled.
+KBUILD_CFLAGS	+= $(call cc-option,-fmerge-constants)
+
+# Make sure -fstack-check isn't enabled (like gentoo apparently did)
+KBUILD_CFLAGS  += $(call cc-option,-fno-stack-check,)
 
 # conserve stack if available
 KBUILD_CFLAGS   += $(call cc-option,-fconserve-stack)
@@ -793,14 +921,20 @@ KBUILD_CFLAGS   += $(call cc-option,-Werror=date-time)
 # enforce correct pointer usage
 KBUILD_CFLAGS   += $(call cc-option,-Werror=incompatible-pointer-types)
 
+# Require designated initializers for all marked structures
+KBUILD_CFLAGS   += $(call cc-option,-Werror=designated-init)
+
+# change __FILE__ to the relative path from the srctree
+KBUILD_CFLAGS	+= $(call cc-option,-fmacro-prefix-map=$(srctree)/=)
+
+# ensure -fcf-protection is disabled when using retpoline as it is
+# incompatible with -mindirect-branch=thunk-extern
+ifdef CONFIG_RETPOLINE
+KBUILD_CFLAGS += $(call cc-option,-fcf-protection=none)
+endif
+
 # use the deterministic mode of AR if available
 KBUILD_ARFLAGS := $(call ar-option,D)
-
-# check for 'asm goto'
-ifeq ($(shell $(CONFIG_SHELL) $(srctree)/scripts/gcc-goto.sh $(CC)), y)
-	KBUILD_CFLAGS += -DCC_HAVE_ASM_GOTO
-	KBUILD_AFLAGS += -DCC_HAVE_ASM_GOTO
-endif
 
 include scripts/Makefile.kasan
 include scripts/Makefile.extrawarn
@@ -1060,6 +1194,22 @@ prepare-objtool: $(objtool_target)
 # CC_STACKPROTECTOR_STRONG! Why did it build with _REGULAR?!")
 PHONY += prepare-compiler-check
 prepare-compiler-check: FORCE
+# Make sure we're using a supported toolchain with LTO_CLANG
+ifdef CONFIG_LTO_CLANG
+  ifneq ($(call clang-ifversion, -ge, 0500, y), y)
+	@echo Cannot use CONFIG_LTO_CLANG: requires clang 5.0 or later >&2 && exit 1
+  endif
+  ifneq ($(call gold-ifversion, -ge, 112000000, y), y)
+	@echo Cannot use CONFIG_LTO_CLANG: requires GNU gold 1.12 or later >&2 && exit 1
+  endif
+endif
+# Make sure compiler supports LTO flags
+ifdef lto-flags
+  ifeq ($(call cc-option, $(lto-flags)),)
+	@echo Cannot use CONFIG_LTO: $(lto-flags) not supported by compiler \
+		>&2 && exit 1
+  endif
+endif
 # Make sure compiler supports requested stack protector flag.
 ifdef stackp-name
   ifeq ($(call cc-option, $(stackp-flag)),)
@@ -1074,6 +1224,11 @@ ifdef stackp-check
                   $(stackp-flag) available but compiler is broken >&2 && exit 1
   endif
 endif
+ifdef cfi-flags
+  ifeq ($(call cc-option, $(cfi-flags)),)
+	@echo Cannot use CONFIG_CFI: $(cfi-flags) not supported by compiler >&2 && exit 1
+  endif
+endif
 	@:
 
 # Generate some files
@@ -1083,12 +1238,17 @@ endif
 # needs to be updated, so this check is forced on all builds
 
 uts_len := 64
+ifneq (,$(BUILD_NUMBER))
+	UTS_RELEASE=$(KERNELRELEASE)-ab$(BUILD_NUMBER)
+else
+	UTS_RELEASE=$(KERNELRELEASE)
+endif
 define filechk_utsrelease.h
-	if [ `echo -n "$(KERNELRELEASE)" | wc -c ` -gt $(uts_len) ]; then \
-	  echo '"$(KERNELRELEASE)" exceeds $(uts_len) characters' >&2;    \
-	  exit 1;                                                         \
-	fi;                                                               \
-	(echo \#define UTS_RELEASE \"$(KERNELRELEASE)\";)
+	if [ `echo -n "$(UTS_RELEASE)" | wc -c ` -gt $(uts_len) ]; then \
+	  echo '"$(UTS_RELEASE)" exceeds $(uts_len) characters' >&2;    \
+	  exit 1;                                                       \
+	fi;                                                             \
+	(echo \#define UTS_RELEASE \"$(UTS_RELEASE)\";)
 endef
 
 define filechk_version.h
@@ -1123,10 +1283,10 @@ firmware_install:
 # Kernel headers
 
 #Default location for installed headers
-export INSTALL_HDR_PATH = $(objtree)/usr
+export INSTALL_HDR_PATH ?= $(objtree)/usr
 
-# If we do an all arch process set dst to asm-$(hdr-arch)
-hdr-dst = $(if $(KBUILD_HEADERS), dst=include/asm-$(hdr-arch), dst=include/asm)
+# If we do an all arch process set dst to include/arch-$(hdr-arch)
+hdr-dst = $(if $(KBUILD_HEADERS), dst=include/arch-$(hdr-arch), dst=include)
 
 PHONY += archheaders
 archheaders:
@@ -1146,8 +1306,8 @@ PHONY += headers_install
 headers_install: __headers
 	$(if $(wildcard $(srctree)/arch/$(hdr-arch)/include/uapi/asm/Kbuild),, \
 	  $(error Headers not exportable for the $(SRCARCH) architecture))
-	$(Q)$(MAKE) $(hdr-inst)=include/uapi
-	$(Q)$(MAKE) $(hdr-inst)=arch/$(hdr-arch)/include/uapi/asm $(hdr-dst)
+	$(Q)$(MAKE) $(hdr-inst)=include/uapi dst=include
+	$(Q)$(MAKE) $(hdr-inst)=arch/$(hdr-arch)/include/uapi $(hdr-dst)
 
 PHONY += headers_check_all
 headers_check_all: headers_install_all
@@ -1155,8 +1315,8 @@ headers_check_all: headers_install_all
 
 PHONY += headers_check
 headers_check: headers_install
-	$(Q)$(MAKE) $(hdr-inst)=include/uapi HDRCHECK=1
-	$(Q)$(MAKE) $(hdr-inst)=arch/$(hdr-arch)/include/uapi/asm $(hdr-dst) HDRCHECK=1
+	$(Q)$(MAKE) $(hdr-inst)=include/uapi dst=include HDRCHECK=1
+	$(Q)$(MAKE) $(hdr-inst)=arch/$(hdr-arch)/include/uapi $(hdr-dst) HDRCHECK=1
 
 # ---------------------------------------------------------------------------
 # Kernel selftest
@@ -1184,6 +1344,13 @@ ifdef CONFIG_MODULES
 # By default, build modules as well
 
 all: modules
+
+# When we're building modules with modversions, we need to consider
+# the built-in objects during the descend as well, in order to
+# make sure the checksums are up to date before we record them.
+ifdef CONFIG_MODVERSIONS
+  KBUILD_BUILTIN := 1
+endif
 
 # Build modules
 #
@@ -1359,6 +1526,8 @@ help:
 	@echo  '                    (default: $$(INSTALL_MOD_PATH)/lib/firmware)'
 	@echo  '  dir/            - Build all files in dir and below'
 	@echo  '  dir/file.[ois]  - Build specified target only'
+	@echo  '  dir/file.ll     - Build the LLVM assembly file'
+	@echo  '                    (requires compiler support for LLVM assembly generation)'
 	@echo  '  dir/file.lst    - Build specified mixed source/assembly target only'
 	@echo  '                    (requires a recent binutils and recent build (System.map))'
 	@echo  '  dir/file.ko     - Build module including final link'
@@ -1472,9 +1641,6 @@ else # KBUILD_EXTMOD
 
 # We are always building modules
 KBUILD_MODULES := 1
-PHONY += crmodverdir
-crmodverdir:
-	$(cmd_crmodverdir)
 
 PHONY += $(objtree)/Module.symvers
 $(objtree)/Module.symvers:
@@ -1486,7 +1652,7 @@ $(objtree)/Module.symvers:
 
 module-dirs := $(addprefix _module_,$(KBUILD_EXTMOD))
 PHONY += $(module-dirs) modules
-$(module-dirs): crmodverdir $(objtree)/Module.symvers
+$(module-dirs): prepare $(objtree)/Module.symvers
 	$(Q)$(MAKE) $(build)=$(patsubst _module_%,%,$@)
 
 modules: $(module-dirs)
@@ -1527,7 +1693,8 @@ help:
 
 # Dummies...
 PHONY += prepare scripts
-prepare: ;
+prepare:
+	$(cmd_crmodverdir)
 scripts: ;
 endif # KBUILD_EXTMOD
 
@@ -1543,7 +1710,9 @@ clean: $(clean-dirs)
 		-o -name '*.symtypes' -o -name 'modules.order' \
 		-o -name modules.builtin -o -name '.tmp_*.o.*' \
 		-o -name '*.c.[012]*.*' \
-		-o -name '*.gcno' \) -type f -print | xargs rm -f
+		-o -name '*.ll' \
+		-o -name '*.gcno' \
+		-o -name '*.*.symversions' \) -type f -print | xargs rm -f
 
 # Generate tags for editors
 # ---------------------------------------------------------------------------
@@ -1607,11 +1776,11 @@ image_name:
 # Clear a bunch of variables before executing the submake
 tools/: FORCE
 	$(Q)mkdir -p $(objtree)/tools
-	$(Q)$(MAKE) LDFLAGS= MAKEFLAGS="$(filter --j% -j,$(MAKEFLAGS))" O=$(shell cd $(objtree) && /bin/pwd) subdir=tools -C $(src)/tools/
+	$(Q)$(MAKE) LDFLAGS= MAKEFLAGS="$(tools_silent) $(filter --j% -j,$(MAKEFLAGS))" O=$(shell cd $(objtree) && /bin/pwd) subdir=tools -C $(src)/tools/
 
 tools/%: FORCE
 	$(Q)mkdir -p $(objtree)/tools
-	$(Q)$(MAKE) LDFLAGS= MAKEFLAGS="$(filter --j% -j,$(MAKEFLAGS))" O=$(shell cd $(objtree) && /bin/pwd) subdir=tools -C $(src)/tools/ $*
+	$(Q)$(MAKE) LDFLAGS= MAKEFLAGS="$(tools_silent) $(filter --j% -j,$(MAKEFLAGS))" O=$(shell cd $(objtree) && /bin/pwd) subdir=tools -C $(src)/tools/ $*
 
 # Single targets
 # ---------------------------------------------------------------------------
@@ -1646,20 +1815,19 @@ endif
 	$(Q)$(MAKE) $(build)=$(build-dir) $(target-dir)$(notdir $@)
 %.symtypes: %.c prepare scripts FORCE
 	$(Q)$(MAKE) $(build)=$(build-dir) $(target-dir)$(notdir $@)
+%.ll: %.c prepare scripts FORCE
+	$(Q)$(MAKE) $(build)=$(build-dir) $(target-dir)$(notdir $@)
 
 # Modules
 /: prepare scripts FORCE
-	$(cmd_crmodverdir)
 	$(Q)$(MAKE) KBUILD_MODULES=$(if $(CONFIG_MODULES),1) \
 	$(build)=$(build-dir)
 # Make sure the latest headers are built for Documentation
 Documentation/ samples/: headers_install
 %/: prepare scripts FORCE
-	$(cmd_crmodverdir)
 	$(Q)$(MAKE) KBUILD_MODULES=$(if $(CONFIG_MODULES),1) \
 	$(build)=$(build-dir)
 %.ko: prepare scripts FORCE
-	$(cmd_crmodverdir)
 	$(Q)$(MAKE) KBUILD_MODULES=$(if $(CONFIG_MODULES),1)   \
 	$(build)=$(build-dir) $(@:.ko=.o)
 	$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.modpost

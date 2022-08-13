@@ -173,6 +173,9 @@ static int vc4_v3d_runtime_resume(struct device *dev)
 	struct vc4_dev *vc4 = v3d->vc4;
 
 	vc4_v3d_init_hw(vc4->dev);
+
+	/* We disabled the IRQ as part of vc4_irq_uninstall in suspend. */
+	enable_irq(vc4->dev->irq);
 	vc4_irq_postinstall(vc4->dev);
 
 	return 0;
@@ -222,6 +225,8 @@ static int vc4_v3d_bind(struct device *dev, struct device *master, void *data)
 		return ret;
 	}
 
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_set_autosuspend_delay(dev, 40); /* a little over 2 frames. */
 	pm_runtime_enable(dev);
 
 	return 0;

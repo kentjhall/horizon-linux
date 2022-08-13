@@ -157,6 +157,39 @@ data_flush             Enable data flushing before checkpoint in order to
 mode=%s                Control block allocation mode which supports "adaptive"
                        and "lfs". In "lfs" mode, there should be no random
                        writes towards main area.
+io_bits=%u             Set the bit size of write IO requests. It should be set
+                       with "mode=lfs".
+usrquota               Enable plain user disk quota accounting.
+grpquota               Enable plain group disk quota accounting.
+prjquota               Enable plain project quota accounting.
+usrjquota=<file>       Appoint specified file and type during mount, so that quota
+grpjquota=<file>       information can be properly updated during recovery flow,
+prjjquota=<file>       <quota file>: must be in root directory;
+jqfmt=<quota type>     <quota type>: [vfsold,vfsv0,vfsv1].
+offusrjquota           Turn off user journelled quota.
+offgrpjquota           Turn off group journelled quota.
+offprjjquota           Turn off project journelled quota.
+quota                  Enable plain user disk quota accounting.
+noquota                Disable all plain disk quota option.
+whint_mode=%s          Control which write hints are passed down to block
+                       layer. This supports "off", "user-based", and
+                       "fs-based".  In "off" mode (default), f2fs does not pass
+                       down hints. In "user-based" mode, f2fs tries to pass
+                       down hints given by users. And in "fs-based" mode, f2fs
+                       passes down hints with its policy.
+alloc_mode=%s          Adjust block allocation policy, which supports "reuse"
+                       and "default".
+fsync_mode=%s          Control the policy of fsync. Currently supports "posix",
+                       "strict", and "nobarrier". In "posix" mode, which is
+                       default, fsync will follow POSIX semantics and does a
+                       light operation to improve the filesystem performance.
+                       In "strict" mode, fsync will be heavy and behaves in line
+                       with xfs, ext4 and btrfs, where xfstest generic/342 will
+                       pass, but the performance will regress. "nobarrier" is
+                       based on "posix", but doesn't issue flush command for
+                       non-atomic files likewise "nobarrier" mount option.
+test_dummy_encryption  Enable dummy encryption, which provides a fake fscrypt
+                       context. The fake fscrypt context is used by xfstests.
 
 ================================================================================
 DEBUGFS ENTRIES
@@ -201,6 +234,15 @@ Files in /sys/fs/f2fs/<devname>
                               (default) will disable this option. Setting
                               gc_idle = 1 will select the Cost Benefit approach
                               & setting gc_idle = 2 will select the greedy approach.
+
+ gc_urgent                    This parameter controls triggering background GCs
+                              urgently or not. Setting gc_urgent = 0 [default]
+                              makes back to default behavior, while if it is set
+                              to 1, background thread starts to do GC by given
+                              gc_urgent_sleep_time interval.
+
+ gc_urgent_sleep_time         This parameter controls sleep time for gc_urgent.
+                              500 ms is set by default. See above gc_urgent.
 
  reclaim_segments             This parameter controls the number of prefree
                               segments to be reclaimed. If the number of prefree

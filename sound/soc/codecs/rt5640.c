@@ -3,7 +3,7 @@
  *
  * Copyright 2011 Realtek Semiconductor Corp.
  * Author: Johnny Hsu <johnnyhsu@realtek.com>
- * Copyright (c) 2013, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2013-2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -26,6 +26,7 @@
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
+#include <sound/jack.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/initval.h>
@@ -58,6 +59,12 @@ static const struct reg_sequence init_list[] = {
 	{RT5640_PR_BASE + 0x20,	0x6110},
 	{RT5640_PR_BASE + 0x21,	0xe0e0},
 	{RT5640_PR_BASE + 0x23,	0x1804},
+};
+
+static const struct reg_sequence irq_jd_init_list[] = {
+	{RT5640_GPIO_CTRL1,	0x8400},/* set GPIO1 to IRQ */
+	{RT5640_GPIO_CTRL3,	0x0004},/* set GPIO1 output */
+	{RT5640_IRQ_CTRL1,	0x8000},/* enable JD IRQ and set active low */
 };
 
 static const struct reg_default rt5640_reg[] = {
@@ -1669,6 +1676,34 @@ static const struct snd_soc_dapm_route rt5639_specific_dapm_routes[] = {
 	{"IF2 DAC R", NULL, "DAC R2 Power"},
 };
 
+/**
+ * manage_dapm_pin - enable or disable dapm pin
+ * @codec: SoC audio codec device.
+ * @pin_name: dapm widget name
+ * @enable: enable when true, disable otherwise
+ *
+ */
+
+static void manage_dapm_pin(struct snd_soc_codec *codec, const char *pin_name,
+	bool enable)
+{
+	char prefixed_ctl[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
+	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
+
+	if (!codec->component.name_prefix) {
+		snprintf(prefixed_ctl, sizeof(prefixed_ctl), "%s",
+			pin_name);
+	} else {
+		snprintf(prefixed_ctl, sizeof(prefixed_ctl), "%s %s",
+			codec->component.name_prefix, pin_name);
+	}
+
+	if (enable)
+		snd_soc_dapm_force_enable_pin(dapm, prefixed_ctl);
+	else
+		snd_soc_dapm_disable_pin(dapm, prefixed_ctl);
+}
+
 static int get_sdp_info(struct snd_soc_codec *codec, int dai_id)
 {
 	int ret = 0, val;
@@ -1687,6 +1722,8 @@ static int get_sdp_info(struct snd_soc_codec *codec, int dai_id)
 			break;
 		case RT5640_IF_113:
 			ret |= RT5640_U_IF1;
+			ret |= RT5640_U_IF2;
+			break;
 		case RT5640_IF_312:
 		case RT5640_IF_213:
 			ret |= RT5640_U_IF2;
@@ -1702,6 +1739,8 @@ static int get_sdp_info(struct snd_soc_codec *codec, int dai_id)
 			break;
 		case RT5640_IF_223:
 			ret |= RT5640_U_IF1;
+			ret |= RT5640_U_IF2;
+			break;
 		case RT5640_IF_123:
 		case RT5640_IF_321:
 			ret |= RT5640_U_IF2;
@@ -2144,6 +2183,16 @@ static int rt5640_probe(struct snd_soc_codec *codec)
 			ARRAY_SIZE(rt5640_specific_dapm_routes));
 		break;
 	case RT5640_ID_5639:
+		/* Enable JD2 Function for Extra JD Status */
+		snd_soc_update_bits(codec, RT5640_DUMMY1, 0x3b01, 0x3b01);
+		snd_soc_write(codec, RT5640_DUMMY2, 0x4140);
+		if (rt5640->sel_jd_source >= 0)
+			snd_soc_update_bits(codec, RT5640_JD_CTRL,
+				RT5640_JD_MASK,
+				rt5640->sel_jd_source << RT5640_JD_SFT);
+		else
+			snd_soc_write(codec, RT5640_JD_CTRL, 0x6000);
+
 		snd_soc_dapm_new_controls(dapm,
 			rt5639_specific_dapm_widgets,
 			ARRAY_SIZE(rt5639_specific_dapm_widgets));
@@ -2204,6 +2253,170 @@ static int rt5640_resume(struct snd_soc_codec *codec)
 #define rt5640_suspend NULL
 #define rt5640_resume NULL
 #endif
+
+int rt5640_irq_jd_reg_init(struct snd_soc_codec *codec)
+{
+	int ret;
+
+	struct rt5640_priv *rt5640 = snd_soc_codec_get_drvdata(codec);
+
+	ret = regmap_register_patch(rt5640->regmap, irq_jd_init_list,
+				    ARRAY_SIZE(irq_jd_init_list));
+	if (ret != 0)
+		dev_warn(codec->dev, "Failed to apply regmap patch: %d\n", ret);
+
+	return 0;
+}
+EXPORT_SYMBOL(rt5640_irq_jd_reg_init);
+
+/**
+ * rt5640_headset_detect - Detect headset.
+ * @codec: SoC audio codec device.
+ * @jack_insert: Jack insert or not.
+ *
+ * Detect whether is headset or not when jack inserted.
+ *
+ * Returns detect status.
+ */
+int rt5640_headset_detect(struct snd_soc_codec *codec,
+	struct snd_soc_jack *jack, int jack_insert)
+{
+	int jack_type = 0;
+	int sclk_src = RT5640_SCLK_S_MCLK;
+	int i, headphone = 0, headset = 0, previous_state = RT5640_NO_JACK;
+	bool hp_detected = false;
+	struct rt5640_priv *rt5640 = snd_soc_codec_get_drvdata(codec);
+	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
+
+	if (jack_insert) {
+		if (snd_soc_read(codec, RT5640_INT_IRQ_ST) & 0x10)
+			return RT5640_NO_JACK;
+		manage_dapm_pin(codec, "MICBIAS1", true);
+		manage_dapm_pin(codec, "LDO2", true);
+		snd_soc_dapm_sync(dapm);
+
+		if (snd_soc_codec_get_bias_level(codec) == SND_SOC_BIAS_OFF) {
+			snd_soc_write(codec, RT5640_PWR_ANLG1, 0xa814);
+			snd_soc_write(codec, RT5640_MICBIAS, 0x3810);
+			snd_soc_write(codec, RT5640_DUMMY1, 0x3b01);
+			snd_soc_update_bits(codec, RT5640_GLB_CLK,
+				RT5640_SCLK_SRC_MASK,
+				0x3 << RT5640_SCLK_SRC_SFT);
+		}
+		snd_soc_update_bits(codec, RT5640_PWR_ANLG1,
+			RT5640_PWR_LDO2, RT5640_PWR_LDO2);
+		snd_soc_update_bits(codec, RT5640_PWR_ANLG2,
+			RT5640_PWR_MB1, RT5640_PWR_MB1);
+		snd_soc_update_bits(codec, RT5640_MICBIAS,
+			RT5640_MIC1_OVCD_MASK | RT5640_MIC1_OVTH_MASK |
+			RT5640_PWR_CLK25M_MASK | RT5640_PWR_MB_MASK,
+			RT5640_MIC1_OVCD_EN | RT5640_MIC1_OVTH_600UA |
+			RT5640_PWR_MB_PD | RT5640_PWR_CLK25M_PU);
+		snd_soc_update_bits(codec, 0x15, 0x0300, 0x0300);
+		snd_soc_update_bits(codec, RT5640_DUMMY1,
+			0x1, 0x1);
+		msleep(500);
+
+		dev_info(codec->dev, "%s RT5640_PWR_ANLG1(0x%x) = 0x%x\n",
+			__func__, RT5640_PWR_ANLG1,
+			snd_soc_read(codec, RT5640_PWR_ANLG1));
+		dev_info(codec->dev, "%s RT5640_IRQ_CTRL2(0x%x) = 0x%x\n",
+			__func__, RT5640_IRQ_CTRL2,
+			snd_soc_read(codec, RT5640_IRQ_CTRL2));
+
+		for (i = 0; i < 450; i++) {
+			if (snd_soc_read(codec, RT5640_IRQ_CTRL2) & 0x8) {
+				if (previous_state == RT5640_HEADPHO_DET) {
+					headphone++;
+				} else {
+					headphone = 0;
+					previous_state = RT5640_HEADPHO_DET;
+				}
+			} else {
+				if (previous_state == RT5640_HEADSET_DET) {
+					headset++;
+				} else {
+					headset = 0;
+					previous_state = RT5640_HEADSET_DET;
+				}
+			}
+
+			if (headphone == 50) {
+				jack_type = RT5640_HEADPHO_DET;
+				hp_detected = true;
+				break;
+			}
+
+			if (headset == 50) {
+				jack_type = RT5640_HEADSET_DET;
+				hp_detected = true;
+				break;
+			}
+
+			mdelay(1);
+		}
+
+		if (!hp_detected) {
+			headphone = 0;
+			headset = 0;
+
+			for (i = 0; i < 50; i++) {
+				if (snd_soc_read(codec, RT5640_IRQ_CTRL2) & 0x8)
+					headphone++;
+				else
+					headset++;
+
+				mdelay(1);
+			}
+
+			if (headset >= headphone)
+				jack_type = RT5640_HEADSET_DET;
+			else
+				jack_type = RT5640_HEADPHO_DET;
+		}
+
+		snd_soc_update_bits(codec, RT5640_IRQ_CTRL2,
+			RT5640_MB1_OC_CLR, 0);
+
+		switch (rt5640->sysclk_src) {
+		case RT5640_SCLK_S_MCLK:
+			sclk_src = RT5640_SCLK_S_MCLK;
+			break;
+		case RT5640_SCLK_S_PLL1:
+			sclk_src = RT5640_SCLK_S_PLL1;
+			break;
+		case RT5640_SCLK_S_RCCLK:
+			sclk_src = RT5640_SCLK_S_RCCLK;
+			break;
+		default:
+			dev_err(codec->dev, "Invalid clock id (%d)\n",
+				rt5640->sysclk_src);
+			break;
+		}
+		snd_soc_update_bits(codec, RT5640_GLB_CLK,
+			RT5640_SCLK_SRC_MASK, sclk_src);
+		if (jack_type == RT5640_HEADPHO_DET) {
+			manage_dapm_pin(codec, "MICBIAS1", false);
+			manage_dapm_pin(codec, "LDO2", false);
+			snd_soc_dapm_sync(dapm);
+		}
+	} else {
+		snd_soc_update_bits(codec, RT5640_MICBIAS,
+			RT5640_MIC1_OVCD_MASK,
+			RT5640_MIC1_OVCD_DIS);
+
+		manage_dapm_pin(codec, "MICBIAS1", false);
+		manage_dapm_pin(codec, "LDO2", false);
+		snd_soc_dapm_sync(dapm);
+
+		jack_type = RT5640_NO_JACK;
+	}
+	dev_info(codec->dev, "%s jack_type = %d\n", __func__, jack_type);
+
+	return jack_type;
+}
+EXPORT_SYMBOL_GPL(rt5640_headset_detect);
+
 
 #define RT5640_STEREO_RATES SNDRV_PCM_RATE_8000_96000
 #define RT5640_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE | \
@@ -2328,6 +2541,10 @@ static int rt5640_parse_dt(struct rt5640_priv *rt5640, struct device_node *np)
 
 	rt5640->pdata.ldo1_en = of_get_named_gpio(np,
 					"realtek,ldo1-en-gpios", 0);
+
+	if (of_property_read_s32(np, "sel_jd_source", &rt5640->sel_jd_source))
+		rt5640->sel_jd_source = -1;
+
 	/*
 	 * LDO1_EN is optional (it may be statically tied on the board).
 	 * -ENOENT means that the property doesn't exist, i.e. there is no

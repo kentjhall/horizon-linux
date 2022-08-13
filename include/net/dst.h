@@ -107,10 +107,16 @@ struct dst_entry {
 	};
 };
 
+struct dst_metrics {
+	u32		metrics[RTAX_MAX];
+	atomic_t	refcnt;
+} __aligned(4);		/* Low pointer bits contain DST_METRICS_FLAGS */
+extern const struct dst_metrics dst_default_metrics;
+
 u32 *dst_cow_metrics_generic(struct dst_entry *dst, unsigned long old);
-extern const u32 dst_default_metrics[];
 
 #define DST_METRICS_READ_ONLY		0x1UL
+#define DST_METRICS_REFCOUNTED		0x2UL
 #define DST_METRICS_FLAGS		0x3UL
 #define __DST_METRICS_PTR(Y)	\
 	((u32 *)((Y) & ~DST_METRICS_FLAGS))
@@ -473,7 +479,15 @@ static inline struct neighbour *dst_neigh_lookup(const struct dst_entry *dst, co
 static inline struct neighbour *dst_neigh_lookup_skb(const struct dst_entry *dst,
 						     struct sk_buff *skb)
 {
-	struct neighbour *n =  dst->ops->neigh_lookup(dst, skb, NULL);
+	struct neighbour *n = NULL;
+
+	/* The packets from tunnel devices (eg bareudp) may have only
+	 * metadata in the dst pointer of skb. Hence a pointer check of
+	 * neigh_lookup is needed.
+	 */
+	if (dst->ops->neigh_lookup)
+		n = dst->ops->neigh_lookup(dst, skb, NULL);
+
 	return IS_ERR(n) ? NULL : n;
 }
 

@@ -1,0 +1,18 @@
+* NXP PCA953x I2C GPIO multiplexer
+
+Required properties:
+ - compatible: Has to contain one of the following:
+	nxp,pca9570
+- #gpio-cells : Should be two. The first cell is the pin number and the 
+  second cell is used to specify optional parameters (currently unused).
+- gpio-controller : Marks the device node as a GPIO controller.
+
+Example:
+	i2c@7000d000 {
+		gpio@48 {
+			compatible = "nxp,9570";
+			reg = <0x48>;
+			#gpio-cells = <2>;
+			gpio-controller;
+		};
+	};

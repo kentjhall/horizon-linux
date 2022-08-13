@@ -102,6 +102,23 @@
 
 #define VIVID_CID_SDR_CAP_FM_DEVIATION	(VIVID_CID_VIVID_BASE + 110)
 
+#define VIVID_CID_COARSE_TIME		(VIVID_CID_VIVID_BASE + 120)
+#define VIVID_CID_COARSE_TIME_SHORT	(VIVID_CID_VIVID_BASE + 121)
+#define VIVID_CID_FRAME_LENGTH		(VIVID_CID_VIVID_BASE + 122)
+#define VIVID_CID_GROUP_HOLD		(VIVID_CID_VIVID_BASE + 123)
+#define VIVID_CID_HDR_EN		(VIVID_CID_VIVID_BASE + 124)
+#define VIVID_CID_SENSOR_SIGNAL_PROPERTIES (VIVID_CID_VIVID_BASE + 125)
+#define VIVID_CID_SENSOR_IMAGE_PROPERTIES (VIVID_CID_VIVID_BASE + 126)
+#define VIVID_CID_SENSOR_CONTROL_PROPERTIES (VIVID_CID_VIVID_BASE + 127)
+#define VIVID_CID_SENSOR_DV_TIMINGS (VIVID_CID_VIVID_BASE + 128)
+/**
+ * This is temporary with the current v4l2 infrastructure
+ * currently discussing with upstream maintainers our proposals and
+ * better approaches to resolve this
+ */
+#define VIVID_CID_SENSOR_MODES		(VIVID_CID_VIVID_BASE + 129)
+#define VIVID_CID_FOCUS_ABSOLUTE	(VIVID_CID_VIVID_BASE + 130)
+
 /* General User Controls */
 
 static int vivid_user_gen_s_ctrl(struct v4l2_ctrl *ctrl)
@@ -279,7 +296,6 @@ static const struct v4l2_ctrl_config vivid_ctrl_clear_fb = {
 	.name = "Clear Framebuffer",
 	.type = V4L2_CTRL_TYPE_BUTTON,
 };
-
 
 /* Video User Controls */
 
@@ -475,12 +491,192 @@ static int vivid_vid_cap_s_ctrl(struct v4l2_ctrl *ctrl)
 		if (dev->edid_blocks > dev->edid_max_blocks)
 			dev->edid_blocks = dev->edid_max_blocks;
 		break;
+	case VIVID_CID_FRAME_LENGTH:
+		vivid_update_timeperframe(dev, ctrl->val);
+		break;
 	}
+	return 0;
+}
+
+int vivid_update_sensorprops(struct vivid_dev *dev)
+{
+	struct v4l2_ctrl *ctrl_signalprops = dev->ctrl_signalprops;
+	struct v4l2_ctrl *ctrl_imageprops = dev->ctrl_imageprops;
+	struct v4l2_ctrl *ctrl_controlprops = dev->ctrl_controlprops;
+	struct v4l2_ctrl *ctrl_dvtimings = dev->ctrl_dvtimings;
+	struct sensor_mode_properties *modes = dev->sensor_props.sensor_modes;
+	u32 i;
+
+	for (i = 0; i < dev->sensor_props.num_modes; i++) {
+		void *ptr = NULL;
+		u32 size = sizeof(struct sensor_signal_properties);
+
+		ptr = ctrl_signalprops->p_new.p + (i * size);
+		memcpy(ptr, &modes[i].signal_properties, size);
+
+		size = sizeof(struct sensor_image_properties);
+		ptr = ctrl_imageprops->p_new.p + (i * size);
+		memcpy(ptr, &modes[i].image_properties, size);
+
+		size = sizeof(struct sensor_control_properties);
+		ptr = ctrl_controlprops->p_new.p + (i * size);
+		memcpy(ptr, &modes[i].control_properties, size);
+
+		size = sizeof(struct sensor_dv_timings);
+		ptr = ctrl_dvtimings->p_new.p + (i * size);
+		memcpy(ptr, &modes[i].dv_timings, size);
+	}
+	ctrl_signalprops->p_cur.p = ctrl_signalprops->p_new.p;
+	ctrl_imageprops->p_cur.p = ctrl_imageprops->p_new.p;
+	ctrl_controlprops->p_cur.p = ctrl_controlprops->p_new.p;
+	ctrl_dvtimings->p_cur.p = ctrl_dvtimings->p_new.p;
+
 	return 0;
 }
 
 static const struct v4l2_ctrl_ops vivid_vid_cap_ctrl_ops = {
 	.s_ctrl = vivid_vid_cap_s_ctrl,
+};
+
+#define MIN_FRAME_LENGTH	0x0
+#define MAX_FRAME_LENGTH	0x7FFF
+#define DEF_FRAME_LENGTH	0x07C0
+#define MIN_EXPOSURE_COARSE	0x0002
+#define MAX_EXPOSURE_COARSE	0x7FF8
+#define DEF_EXPOSURE_COARSE	0x07B8
+
+static const struct v4l2_ctrl_config vivid_ctrl_framelength = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_FRAME_LENGTH,
+	.name = "Frame Length",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.flags = V4L2_CTRL_FLAG_SLIDER,
+	.min = MIN_FRAME_LENGTH,
+	.max = MAX_FRAME_LENGTH,
+	.def = DEF_FRAME_LENGTH,
+	.step = 1,
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_coarsetime = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_COARSE_TIME,
+	.name = "Coarse Time",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.flags = V4L2_CTRL_FLAG_SLIDER,
+	.min = MIN_EXPOSURE_COARSE,
+	.max = MAX_EXPOSURE_COARSE,
+	.def = DEF_EXPOSURE_COARSE,
+	.step = 1,
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_coarsetime_short = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_COARSE_TIME_SHORT,
+	.name = "Coarse Time Short",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.flags = V4L2_CTRL_FLAG_SLIDER,
+	.min = MIN_EXPOSURE_COARSE,
+	.max = MAX_EXPOSURE_COARSE,
+	.def = DEF_EXPOSURE_COARSE,
+	.step = 1,
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_grouphold = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_GROUP_HOLD,
+	.name = "Group Hold",
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.min = 0,
+	.max = 1,
+	.def = 0,
+	.step = 1,
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_hdrenable = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_HDR_EN,
+	.name = "HDR enable",
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.min = 0,
+	.max = 1,
+	.def = 0,
+	.step = 1,
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_sensor_modes = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_SENSOR_MODES,
+	.name = "Sensor Modes",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.flags = V4L2_CTRL_FLAG_READ_ONLY,
+	.min = 0,
+	.max = MAX_NUM_SENSOR_MODES,
+	.def = MAX_NUM_SENSOR_MODES,
+	.step = 1,
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_signalprops = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_SENSOR_SIGNAL_PROPERTIES,
+	.name = "Sensor Signal Properties",
+	.type = V4L2_CTRL_TYPE_U32,
+	.flags = V4L2_CTRL_FLAG_HAS_PAYLOAD,
+	.min = 0,
+	.max = 0xFFFFFFFF,
+	.step = 1,
+	.def = 0,
+	.dims = { MAX_NUM_SENSOR_MODES, SENSOR_SIGNAL_PROPERTIES_CID_SIZE },
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_imageprops = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_SENSOR_IMAGE_PROPERTIES,
+	.name = "Sensor Image Properties",
+	.type = V4L2_CTRL_TYPE_U32,
+	.flags = V4L2_CTRL_FLAG_HAS_PAYLOAD,
+	.min = 0,
+	.max = 0xFFFFFFFF,
+	.step = 1,
+	.def = 0,
+	.dims = { MAX_NUM_SENSOR_MODES, SENSOR_IMAGE_PROPERTIES_CID_SIZE },
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_controlprops = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_SENSOR_CONTROL_PROPERTIES,
+	.name = "Sensor Control Properties",
+	.type = V4L2_CTRL_TYPE_U32,
+	.flags = V4L2_CTRL_FLAG_HAS_PAYLOAD,
+	.min = 0,
+	.max = 0xFFFFFFFF,
+	.step = 1,
+	.def = 0,
+	.dims = { MAX_NUM_SENSOR_MODES, SENSOR_CONTROL_PROPERTIES_CID_SIZE },
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_dvtimings = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_SENSOR_DV_TIMINGS,
+	.name = "Sensor DV Timings",
+	.type = V4L2_CTRL_TYPE_U32,
+	.flags = V4L2_CTRL_FLAG_HAS_PAYLOAD,
+	.min = 0,
+	.max = 0xFFFFFFFF,
+	.step = 1,
+	.def = 0,
+	.dims = { MAX_NUM_SENSOR_MODES, SENSOR_DV_TIMINGS_CID_SIZE },
+};
+
+static const struct v4l2_ctrl_config vivid_ctrl_focus_absolute = {
+	.ops = &vivid_vid_cap_ctrl_ops,
+	.id = VIVID_CID_FOCUS_ABSOLUTE,
+	.name = "Focus Absolute",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.flags = V4L2_CTRL_FLAG_SLIDER,
+	.min = 0,
+	.max = 1024,
+	.def = 0,
+	.step = 1,
 };
 
 static const char * const vivid_ctrl_hor_movement_strings[] = {
@@ -1167,6 +1363,7 @@ static int vivid_radio_rx_s_ctrl(struct v4l2_ctrl *ctrl)
 		v4l2_ctrl_activate(dev->radio_rx_rds_ta, dev->radio_rx_rds_controls);
 		v4l2_ctrl_activate(dev->radio_rx_rds_tp, dev->radio_rx_rds_controls);
 		v4l2_ctrl_activate(dev->radio_rx_rds_ms, dev->radio_rx_rds_controls);
+		dev->radio_rx_dev.device_caps = dev->radio_rx_caps;
 		break;
 	case V4L2_CID_RDS_RECEPTION:
 		dev->radio_rx_rds_enabled = ctrl->val;
@@ -1241,6 +1438,7 @@ static int vivid_radio_tx_s_ctrl(struct v4l2_ctrl *ctrl)
 		dev->radio_tx_caps &= ~V4L2_CAP_READWRITE;
 		if (!dev->radio_tx_rds_controls)
 			dev->radio_tx_caps |= V4L2_CAP_READWRITE;
+		dev->radio_tx_dev.device_caps = dev->radio_tx_caps;
 		break;
 	case V4L2_CID_RDS_TX_PTY:
 		if (dev->radio_rx_rds_controls)
@@ -1400,7 +1598,7 @@ int vivid_create_controls(struct vivid_dev *dev, bool show_ccs_cap,
 		dev->autogain = v4l2_ctrl_new_std(hdl_user_vid, &vivid_user_vid_ctrl_ops,
 			V4L2_CID_AUTOGAIN, 0, 1, 1, 1);
 		dev->gain = v4l2_ctrl_new_std(hdl_user_vid, &vivid_user_vid_ctrl_ops,
-			V4L2_CID_GAIN, 0, 255, 1, 100);
+			V4L2_CID_GAIN, 1, 256, 1, 100);
 		dev->alpha = v4l2_ctrl_new_std(hdl_user_vid, &vivid_user_vid_ctrl_ops,
 			V4L2_CID_ALPHA_COMPONENT, 0, 255, 1, 0);
 	}
@@ -1456,6 +1654,24 @@ int vivid_create_controls(struct vivid_dev *dev, bool show_ccs_cap,
 		v4l2_ctrl_new_custom(hdl_vid_cap, &vivid_ctrl_ycbcr_enc, NULL);
 		v4l2_ctrl_new_custom(hdl_vid_cap, &vivid_ctrl_quantization, NULL);
 		v4l2_ctrl_new_custom(hdl_vid_cap, &vivid_ctrl_alpha_mode, NULL);
+		dev->framelength = v4l2_ctrl_new_custom(hdl_vid_cap,
+			&vivid_ctrl_framelength, NULL);
+		v4l2_ctrl_new_custom(hdl_vid_cap, &vivid_ctrl_coarsetime, NULL);
+		v4l2_ctrl_new_custom(hdl_vid_cap,
+			&vivid_ctrl_coarsetime_short, NULL);
+		v4l2_ctrl_new_custom(hdl_vid_cap, &vivid_ctrl_grouphold, NULL);
+		v4l2_ctrl_new_custom(hdl_vid_cap, &vivid_ctrl_hdrenable, NULL);
+		v4l2_ctrl_new_custom(hdl_vid_cap, &vivid_ctrl_focus_absolute, NULL);
+		dev->ctrl_signalprops = v4l2_ctrl_new_custom(hdl_vid_cap,
+			&vivid_ctrl_signalprops, NULL);
+		dev->ctrl_imageprops = v4l2_ctrl_new_custom(hdl_vid_cap,
+			&vivid_ctrl_imageprops, NULL);
+		dev->ctrl_controlprops = v4l2_ctrl_new_custom(hdl_vid_cap,
+			&vivid_ctrl_controlprops, NULL);
+		dev->ctrl_dvtimings = v4l2_ctrl_new_custom(hdl_vid_cap,
+			&vivid_ctrl_dvtimings, NULL);
+		dev->ctrl_sensormodes = v4l2_ctrl_new_custom(hdl_vid_cap,
+			&vivid_ctrl_sensor_modes, NULL);
 	}
 
 	if (dev->has_vid_out && show_ccs_out) {

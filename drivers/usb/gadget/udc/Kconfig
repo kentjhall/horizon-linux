@@ -389,6 +389,17 @@ config USB_GADGET_XILINX
 	  dynamically linked module called "udc-xilinx" and force all
 	  gadget drivers to also be dynamically linked.
 
+config USB_TEGRA_XUDC
+	tristate "NVIDIA Superspeed USB 3.0 Device Controller"
+	depends on ARCH_TEGRA
+	default n
+	help
+	 Enables TEGRA USB 3.0 device mode controller driver.
+
+	 Say "y" to link the driver statically, or "m" to build a
+	 dynamically linked module called "tegra_xudc" and force all
+	 gadget drivers to also be dynamically linked.
+
 #
 # LAST -- dummy/emulated controller
 #
@@ -417,5 +428,12 @@ config USB_DUMMY_HCD
 
 # NOTE:  Please keep dummy_hcd LAST so that "real hardware" appears
 # first and will be selected by default.
+
+config USB_TEGRA_CD
+	bool "TEGRA USB charger detection"
+	depends on ARCH_TEGRA
+	default n
+	help
+	  Say y to enable tegra charger detection driver.
 
 endmenu

@@ -699,9 +699,9 @@ static s32 igb_update_flash_i210(struct e1000_hw *hw)
 
 	ret_val = igb_pool_flash_update_done_i210(hw);
 	if (ret_val)
-		hw_dbg("Flash update complete\n");
-	else
 		hw_dbg("Flash update time out\n");
+	else
+		hw_dbg("Flash update complete\n");
 
 out:
 	return ret_val;
@@ -862,6 +862,7 @@ s32 igb_pll_workaround_i210(struct e1000_hw *hw)
 		nvm_word = E1000_INVM_DEFAULT_AL;
 	tmp_nvm = nvm_word | E1000_INVM_PLL_WO_VAL;
 	igb_write_phy_reg_82580(hw, I347AT4_PAGE_SELECT, E1000_PHY_PLL_FREQ_PAGE);
+	phy_word = E1000_PHY_PLL_UNCONF;
 	for (i = 0; i < E1000_MAX_PLL_TRIES; i++) {
 		/* check current state directly from internal PHY */
 		igb_read_phy_reg_82580(hw, E1000_PHY_PLL_FREQ_REG, &phy_word);

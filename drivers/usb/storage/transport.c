@@ -12,6 +12,8 @@
  * Initial work by:
  *   (c) 1999 Michael Gee (michael@linuxspecific.com)
  *
+ * Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+ *
  * This driver is based on the 'USB Mass Storage Class' document. This
  * describes in detail the protocol used to communicate with such
  * devices.  Clearly, the designers had SCSI and ATAPI commands in
@@ -64,6 +66,7 @@
 #include <linux/blkdev.h>
 #include "../../scsi/sd.h"
 
+#define MSC_BULK_XFER_TIMEOUT	(msecs_to_jiffies(USB_CTRL_SET_TIMEOUT))
 
 /***********************************************************************
  * Data transfer routines
@@ -408,7 +411,7 @@ int usb_stor_bulk_transfer_buf(struct us_data *us, unsigned int pipe,
 	/* fill and submit the URB */
 	usb_fill_bulk_urb(us->current_urb, us->pusb_dev, pipe, buf, length,
 		      usb_stor_blocking_completion, NULL);
-	result = usb_stor_msg_common(us, 0);
+	result = usb_stor_msg_common(us, MSC_BULK_XFER_TIMEOUT);
 
 	/* store the actual length of the data transferred */
 	if (act_len)
@@ -417,6 +420,15 @@ int usb_stor_bulk_transfer_buf(struct us_data *us, unsigned int pipe,
 			us->current_urb->actual_length);
 }
 EXPORT_SYMBOL_GPL(usb_stor_bulk_transfer_buf);
+
+
+static void usb_stor_bulk_transfer_timeout(unsigned long data)
+{
+	struct us_data *us = (struct us_data *)data;
+
+	usb_stor_dbg(us, "Timeout -- cancelling sg request\n");
+	usb_sg_cancel(&us->current_sg);
+}
 
 /*
  * Transfer a scatter-gather list via bulk transfer
@@ -428,6 +440,7 @@ static int usb_stor_bulk_transfer_sglist(struct us_data *us, unsigned int pipe,
 		struct scatterlist *sg, int num_sg, unsigned int length,
 		unsigned int *act_len)
 {
+	struct timer_list timeout;
 	int result;
 
 	/* don't submit s-g requests during abort processing */
@@ -460,8 +473,13 @@ static int usb_stor_bulk_transfer_sglist(struct us_data *us, unsigned int pipe,
 	}
 
 	/* wait for the completion of the transfer */
+	setup_timer(&timeout, usb_stor_bulk_transfer_timeout,
+		(unsigned long)us);
+	mod_timer(&timeout, jiffies +
+		MSC_BULK_XFER_TIMEOUT * us->current_sg.entries);
 	usb_sg_wait(&us->current_sg);
 	clear_bit(US_FLIDX_SG_ACTIVE, &us->dflags);
+	del_timer(&timeout);
 
 	result = us->current_sg.status;
 	if (act_len)
@@ -834,13 +852,25 @@ Retry_Sense:
 			if (result == USB_STOR_TRANSPORT_GOOD) {
 				srb->result = SAM_STAT_GOOD;
 				srb->sense_buffer[0] = 0x0;
+			}
+
+			/*
+			 * ATA-passthru commands use sense data to report
+			 * the command completion status, and often devices
+			 * return Check Condition status when nothing is
+			 * wrong.
+			 */
+			else if (srb->cmnd[0] == ATA_16 ||
+					srb->cmnd[0] == ATA_12) {
+				/* leave the data alone */
+			}
 
 			/*
 			 * If there was a problem, report an unspecified
 			 * hardware error to prevent the higher layers from
 			 * entering an infinite retry loop.
 			 */
-			} else {
+			else {
 				srb->result = DID_ERROR << 16;
 				if ((sshdr.response_code & 0x72) == 0x72)
 					srb->sense_buffer[1] = HARDWARE_ERROR;

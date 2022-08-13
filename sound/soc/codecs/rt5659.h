@@ -1771,6 +1771,7 @@ enum {
 	RT5659_PLL1_S_BCLK2,
 	RT5659_PLL1_S_BCLK3,
 	RT5659_PLL1_S_BCLK4,
+	RT5659_PLL1_S_INVALID,
 };
 
 enum {
@@ -1792,6 +1793,7 @@ struct rt5659_priv {
 	struct snd_soc_codec *codec;
 	struct rt5659_platform_data pdata;
 	struct regmap *regmap;
+	struct i2c_client *i2c;
 	struct gpio_desc *gpiod_ldo1_en;
 	struct gpio_desc *gpiod_reset;
 	struct snd_soc_jack *hs_jack;
@@ -1811,9 +1813,19 @@ struct rt5659_priv {
 
 	int jack_type;
 
+	/* for intel HD header */
+	bool hp_state;
+	bool mic_state;
+
 };
 
 int rt5659_set_jack_detect(struct snd_soc_codec *codec,
 	struct snd_soc_jack *hs_jack);
+
+void rt565x_parse_codec_pll_source(struct platform_device *pdev,
+	int *pll_source_id, bool *is_mclk_enabled);
+
+int rt565x_manage_codec_sysclk(struct snd_soc_pcm_stream *dai_params,
+	struct snd_soc_dai *dai, int pll_source_id);
 
 #endif /* __RT5659_H__ */

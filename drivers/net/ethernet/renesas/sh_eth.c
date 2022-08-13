@@ -574,6 +574,7 @@ static struct sh_eth_cpu_data r8a7740_data = {
 	.rpadir_value   = 2 << 16,
 	.no_trimd	= 1,
 	.no_ade		= 1,
+	.hw_crc		= 1,
 	.tsu		= 1,
 	.select_mii	= 1,
 	.shift_rd0	= 1,
@@ -802,7 +803,7 @@ static struct sh_eth_cpu_data sh7734_data = {
 
 	.ecsr_value	= ECSR_ICD | ECSR_MPD,
 	.ecsipr_value	= ECSIPR_LCHNGIP | ECSIPR_ICDIP | ECSIPR_MPDIP,
-	.eesipr_value	= DMAC_M_RFRMER | DMAC_M_ECI | 0x003fffff,
+	.eesipr_value	= DMAC_M_RFRMER | DMAC_M_ECI | 0x003f07ff,
 
 	.tx_check	= EESR_TC1 | EESR_FTC,
 	.eesr_err_check	= EESR_TWB1 | EESR_TWB | EESR_TABT | EESR_RABT |
@@ -819,6 +820,7 @@ static struct sh_eth_cpu_data sh7734_data = {
 	.tsu		= 1,
 	.hw_crc		= 1,
 	.select_mii	= 1,
+	.shift_rd0	= 1,
 };
 
 /* SH7763 */
@@ -831,7 +833,7 @@ static struct sh_eth_cpu_data sh7763_data = {
 
 	.ecsr_value	= ECSR_ICD | ECSR_MPD,
 	.ecsipr_value	= ECSIPR_LCHNGIP | ECSIPR_ICDIP | ECSIPR_MPDIP,
-	.eesipr_value	= DMAC_M_RFRMER | DMAC_M_ECI | 0x003fffff,
+	.eesipr_value	= DMAC_M_RFRMER | DMAC_M_ECI | 0x003f07ff,
 
 	.tx_check	= EESR_TC1 | EESR_FTC,
 	.eesr_err_check	= EESR_TWB1 | EESR_TWB | EESR_TABT | EESR_RABT |
@@ -1059,11 +1061,69 @@ static struct mdiobb_ops bb_ops = {
 	.get_mdio_data = sh_get_mdio,
 };
 
+/* free Tx skb function */
+static int sh_eth_tx_free(struct net_device *ndev, bool sent_only)
+{
+	struct sh_eth_private *mdp = netdev_priv(ndev);
+	struct sh_eth_txdesc *txdesc;
+	int free_num = 0;
+	int entry;
+	bool sent;
+
+	for (; mdp->cur_tx - mdp->dirty_tx > 0; mdp->dirty_tx++) {
+		entry = mdp->dirty_tx % mdp->num_tx_ring;
+		txdesc = &mdp->tx_ring[entry];
+		sent = !(txdesc->status & cpu_to_le32(TD_TACT));
+		if (sent_only && !sent)
+			break;
+		/* TACT bit must be checked before all the following reads */
+		dma_rmb();
+		netif_info(mdp, tx_done, ndev,
+			   "tx entry %d status 0x%08x\n",
+			   entry, le32_to_cpu(txdesc->status));
+		/* Free the original skb. */
+		if (mdp->tx_skbuff[entry]) {
+			dma_unmap_single(&ndev->dev, le32_to_cpu(txdesc->addr),
+					 le32_to_cpu(txdesc->len) >> 16,
+					 DMA_TO_DEVICE);
+			dev_kfree_skb_irq(mdp->tx_skbuff[entry]);
+			mdp->tx_skbuff[entry] = NULL;
+			free_num++;
+		}
+		txdesc->status = cpu_to_le32(TD_TFP);
+		if (entry >= mdp->num_tx_ring - 1)
+			txdesc->status |= cpu_to_le32(TD_TDLE);
+
+		if (sent) {
+			ndev->stats.tx_packets++;
+			ndev->stats.tx_bytes += le32_to_cpu(txdesc->len) >> 16;
+		}
+	}
+	return free_num;
+}
+
 /* free skb and descriptor buffer */
 static void sh_eth_ring_free(struct net_device *ndev)
 {
 	struct sh_eth_private *mdp = netdev_priv(ndev);
 	int ringsize, i;
+
+	if (mdp->rx_ring) {
+		for (i = 0; i < mdp->num_rx_ring; i++) {
+			if (mdp->rx_skbuff[i]) {
+				struct sh_eth_rxdesc *rxdesc = &mdp->rx_ring[i];
+
+				dma_unmap_single(&ndev->dev,
+						 le32_to_cpu(rxdesc->addr),
+						 ALIGN(mdp->rx_buf_sz, 32),
+						 DMA_FROM_DEVICE);
+			}
+		}
+		ringsize = sizeof(struct sh_eth_rxdesc) * mdp->num_rx_ring;
+		dma_free_coherent(NULL, ringsize, mdp->rx_ring,
+				  mdp->rx_desc_dma);
+		mdp->rx_ring = NULL;
+	}
 
 	/* Free Rx skb ringbuffer */
 	if (mdp->rx_skbuff) {
@@ -1073,27 +1133,18 @@ static void sh_eth_ring_free(struct net_device *ndev)
 	kfree(mdp->rx_skbuff);
 	mdp->rx_skbuff = NULL;
 
-	/* Free Tx skb ringbuffer */
-	if (mdp->tx_skbuff) {
-		for (i = 0; i < mdp->num_tx_ring; i++)
-			dev_kfree_skb(mdp->tx_skbuff[i]);
-	}
-	kfree(mdp->tx_skbuff);
-	mdp->tx_skbuff = NULL;
-
-	if (mdp->rx_ring) {
-		ringsize = sizeof(struct sh_eth_rxdesc) * mdp->num_rx_ring;
-		dma_free_coherent(NULL, ringsize, mdp->rx_ring,
-				  mdp->rx_desc_dma);
-		mdp->rx_ring = NULL;
-	}
-
 	if (mdp->tx_ring) {
+		sh_eth_tx_free(ndev, false);
+
 		ringsize = sizeof(struct sh_eth_txdesc) * mdp->num_tx_ring;
 		dma_free_coherent(NULL, ringsize, mdp->tx_ring,
 				  mdp->tx_desc_dma);
 		mdp->tx_ring = NULL;
 	}
+
+	/* Free Tx skb ringbuffer */
+	kfree(mdp->tx_skbuff);
+	mdp->tx_skbuff = NULL;
 }
 
 /* format skb and descriptor buffer */
@@ -1337,45 +1388,12 @@ static void sh_eth_dev_exit(struct net_device *ndev)
 	sh_eth_get_stats(ndev);
 	sh_eth_reset(ndev);
 
+	/* Set the RMII mode again if required */
+	if (mdp->cd->rmiimode)
+		sh_eth_write(ndev, 0x1, RMIIMODE);
+
 	/* Set MAC address again */
 	update_mac_address(ndev);
-}
-
-/* free Tx skb function */
-static int sh_eth_txfree(struct net_device *ndev)
-{
-	struct sh_eth_private *mdp = netdev_priv(ndev);
-	struct sh_eth_txdesc *txdesc;
-	int free_num = 0;
-	int entry;
-
-	for (; mdp->cur_tx - mdp->dirty_tx > 0; mdp->dirty_tx++) {
-		entry = mdp->dirty_tx % mdp->num_tx_ring;
-		txdesc = &mdp->tx_ring[entry];
-		if (txdesc->status & cpu_to_le32(TD_TACT))
-			break;
-		/* TACT bit must be checked before all the following reads */
-		dma_rmb();
-		netif_info(mdp, tx_done, ndev,
-			   "tx entry %d status 0x%08x\n",
-			   entry, le32_to_cpu(txdesc->status));
-		/* Free the original skb. */
-		if (mdp->tx_skbuff[entry]) {
-			dma_unmap_single(&ndev->dev, le32_to_cpu(txdesc->addr),
-					 le32_to_cpu(txdesc->len) >> 16,
-					 DMA_TO_DEVICE);
-			dev_kfree_skb_irq(mdp->tx_skbuff[entry]);
-			mdp->tx_skbuff[entry] = NULL;
-			free_num++;
-		}
-		txdesc->status = cpu_to_le32(TD_TFP);
-		if (entry >= mdp->num_tx_ring - 1)
-			txdesc->status |= cpu_to_le32(TD_TDLE);
-
-		ndev->stats.tx_packets++;
-		ndev->stats.tx_bytes += le32_to_cpu(txdesc->len) >> 16;
-	}
-	return free_num;
 }
 
 /* Packet receive function */
@@ -1620,7 +1638,7 @@ ignore_link:
 			   intr_status, mdp->cur_tx, mdp->dirty_tx,
 			   (u32)ndev->state, edtrr);
 		/* dirty buffer free */
-		sh_eth_txfree(ndev);
+		sh_eth_tx_free(ndev, true);
 
 		/* SH7712 BUG */
 		if (edtrr ^ sh_eth_get_edtrr_trns(mdp)) {
@@ -1679,7 +1697,7 @@ static irqreturn_t sh_eth_interrupt(int irq, void *netdev)
 		/* Clear Tx interrupts */
 		sh_eth_write(ndev, intr_status & cd->tx_check, EESR);
 
-		sh_eth_txfree(ndev);
+		sh_eth_tx_free(ndev, true);
 		netif_wake_queue(ndev);
 	}
 
@@ -1729,7 +1747,14 @@ static void sh_eth_adjust_link(struct net_device *ndev)
 {
 	struct sh_eth_private *mdp = netdev_priv(ndev);
 	struct phy_device *phydev = ndev->phydev;
+	unsigned long flags;
 	int new_state = 0;
+
+	spin_lock_irqsave(&mdp->lock, flags);
+
+	/* Disable TX and RX right over here, if E-MAC change is ignored */
+	if (mdp->cd->no_psr || mdp->no_ether_link)
+		sh_eth_rcv_snd_disable(ndev);
 
 	if (phydev->link) {
 		if (phydev->duplex != mdp->duplex) {
@@ -1749,17 +1774,20 @@ static void sh_eth_adjust_link(struct net_device *ndev)
 			sh_eth_modify(ndev, ECMR, ECMR_TXF, 0);
 			new_state = 1;
 			mdp->link = phydev->link;
-			if (mdp->cd->no_psr || mdp->no_ether_link)
-				sh_eth_rcv_snd_enable(ndev);
 		}
 	} else if (mdp->link) {
 		new_state = 1;
 		mdp->link = 0;
 		mdp->speed = 0;
 		mdp->duplex = -1;
-		if (mdp->cd->no_psr || mdp->no_ether_link)
-			sh_eth_rcv_snd_disable(ndev);
 	}
+
+	/* Enable TX and RX right over here, if E-MAC change is ignored */
+	if ((mdp->cd->no_psr || mdp->no_ether_link) && phydev->link)
+		sh_eth_rcv_snd_enable(ndev);
+
+	mmiowb();
+	spin_unlock_irqrestore(&mdp->lock, flags);
 
 	if (new_state && netif_msg_link(mdp))
 		phy_print_status(phydev);
@@ -1842,39 +1870,10 @@ static int sh_eth_get_link_ksettings(struct net_device *ndev,
 static int sh_eth_set_link_ksettings(struct net_device *ndev,
 				     const struct ethtool_link_ksettings *cmd)
 {
-	struct sh_eth_private *mdp = netdev_priv(ndev);
-	unsigned long flags;
-	int ret;
-
 	if (!ndev->phydev)
 		return -ENODEV;
 
-	spin_lock_irqsave(&mdp->lock, flags);
-
-	/* disable tx and rx */
-	sh_eth_rcv_snd_disable(ndev);
-
-	ret = phy_ethtool_ksettings_set(ndev->phydev, cmd);
-	if (ret)
-		goto error_exit;
-
-	if (cmd->base.duplex == DUPLEX_FULL)
-		mdp->duplex = 1;
-	else
-		mdp->duplex = 0;
-
-	if (mdp->cd->set_duplex)
-		mdp->cd->set_duplex(ndev);
-
-error_exit:
-	mdelay(1);
-
-	/* enable tx and rx */
-	sh_eth_rcv_snd_enable(ndev);
-
-	spin_unlock_irqrestore(&mdp->lock, flags);
-
-	return ret;
+	return phy_ethtool_ksettings_set(ndev->phydev, cmd);
 }
 
 /* If it is ever necessary to increase SH_ETH_REG_DUMP_MAX_REGS, the
@@ -2065,18 +2064,10 @@ static void sh_eth_get_regs(struct net_device *ndev, struct ethtool_regs *regs,
 
 static int sh_eth_nway_reset(struct net_device *ndev)
 {
-	struct sh_eth_private *mdp = netdev_priv(ndev);
-	unsigned long flags;
-	int ret;
-
 	if (!ndev->phydev)
 		return -ENODEV;
 
-	spin_lock_irqsave(&mdp->lock, flags);
-	ret = phy_start_aneg(ndev->phydev);
-	spin_unlock_irqrestore(&mdp->lock, flags);
-
-	return ret;
+	return phy_start_aneg(ndev->phydev);
 }
 
 static u32 sh_eth_get_msglevel(struct net_device *ndev)
@@ -2307,7 +2298,7 @@ static int sh_eth_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	spin_lock_irqsave(&mdp->lock, flags);
 	if ((mdp->cur_tx - mdp->dirty_tx) >= (mdp->num_tx_ring - 4)) {
-		if (!sh_eth_txfree(ndev)) {
+		if (!sh_eth_tx_free(ndev, true)) {
 			netif_warn(mdp, tx_queued, ndev, "TxFD exhausted.\n");
 			netif_stop_queue(ndev);
 			spin_unlock_irqrestore(&mdp->lock, flags);
@@ -2938,12 +2929,16 @@ static struct sh_eth_plat_data *sh_eth_parse_dt(struct device *dev)
 	struct device_node *np = dev->of_node;
 	struct sh_eth_plat_data *pdata;
 	const char *mac_addr;
+	int ret;
 
 	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
 	if (!pdata)
 		return NULL;
 
-	pdata->phy_interface = of_get_phy_mode(np);
+	ret = of_get_phy_mode(np);
+	if (ret < 0)
+		return NULL;
+	pdata->phy_interface = ret;
 
 	mac_addr = of_get_mac_address(np);
 	if (mac_addr)
@@ -3073,18 +3068,37 @@ static int sh_eth_drv_probe(struct platform_device *pdev)
 	/* ioremap the TSU registers */
 	if (mdp->cd->tsu) {
 		struct resource *rtsu;
+
 		rtsu = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-		mdp->tsu_addr = devm_ioremap_resource(&pdev->dev, rtsu);
-		if (IS_ERR(mdp->tsu_addr)) {
-			ret = PTR_ERR(mdp->tsu_addr);
+		if (!rtsu) {
+			dev_err(&pdev->dev, "no TSU resource\n");
+			ret = -ENODEV;
+			goto out_release;
+		}
+		/* We can only request the  TSU region  for the first port
+		 * of the two  sharing this TSU for the probe to succeed...
+		 */
+		if (devno % 2 == 0 &&
+		    !devm_request_mem_region(&pdev->dev, rtsu->start,
+					     resource_size(rtsu),
+					     dev_name(&pdev->dev))) {
+			dev_err(&pdev->dev, "can't request TSU resource.\n");
+			ret = -EBUSY;
+			goto out_release;
+		}
+		mdp->tsu_addr = devm_ioremap(&pdev->dev, rtsu->start,
+					     resource_size(rtsu));
+		if (!mdp->tsu_addr) {
+			dev_err(&pdev->dev, "TSU region ioremap() failed.\n");
+			ret = -ENOMEM;
 			goto out_release;
 		}
 		mdp->port = devno % 2;
 		ndev->features = NETIF_F_HW_VLAN_CTAG_FILTER;
 	}
 
-	/* initialize first or needed device */
-	if (!devno || pd->needs_init) {
+	/* Need to init only the first port of the two sharing a TSU */
+	if (devno % 2 == 0) {
 		if (mdp->cd->chip_reset)
 			mdp->cd->chip_reset(ndev);
 
@@ -3100,7 +3114,7 @@ static int sh_eth_drv_probe(struct platform_device *pdev)
 	/* MDIO bus init */
 	ret = sh_mdio_init(mdp, pd);
 	if (ret) {
-		dev_err(&ndev->dev, "failed to initialise MDIO\n");
+		dev_err(&pdev->dev, "failed to initialise MDIO\n");
 		goto out_release;
 	}
 

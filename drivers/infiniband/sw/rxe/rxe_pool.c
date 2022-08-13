@@ -274,6 +274,7 @@ static u32 alloc_index(struct rxe_pool *pool)
 	if (index >= range)
 		index = find_first_zero_bit(pool->table, range);
 
+	WARN_ON_ONCE(index >= range);
 	set_bit(index, pool->table);
 	pool->last = index;
 	return index + pool->min_index;
@@ -401,21 +402,25 @@ void *rxe_alloc(struct rxe_pool *pool)
 
 	kref_get(&pool->rxe->ref_cnt);
 
-	if (atomic_inc_return(&pool->num_elem) > pool->max_elem) {
-		atomic_dec(&pool->num_elem);
-		rxe_dev_put(pool->rxe);
-		rxe_pool_put(pool);
-		return NULL;
-	}
+	if (atomic_inc_return(&pool->num_elem) > pool->max_elem)
+		goto out_put_pool;
 
 	elem = kmem_cache_zalloc(pool_cache(pool),
 				 (pool->flags & RXE_POOL_ATOMIC) ?
 				 GFP_ATOMIC : GFP_KERNEL);
+	if (!elem)
+		goto out_put_pool;
 
 	elem->pool = pool;
 	kref_init(&elem->ref_cnt);
 
 	return elem;
+
+out_put_pool:
+	atomic_dec(&pool->num_elem);
+	rxe_dev_put(pool->rxe);
+	rxe_pool_put(pool);
+	return NULL;
 }
 
 void rxe_elem_release(struct kref *kref)

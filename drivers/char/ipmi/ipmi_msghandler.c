@@ -2646,7 +2646,9 @@ get_guid(ipmi_smi_t intf)
 	if (rv)
 		/* Send failed, no GUID available. */
 		intf->bmc->guid_set = 0;
-	wait_event(intf->waitq, intf->bmc->guid_set != 2);
+	else
+		wait_event(intf->waitq, intf->bmc->guid_set != 2);
+
 	intf->null_user_handler = NULL;
 }
 
@@ -3877,6 +3879,9 @@ static void smi_recv_tasklet(unsigned long val)
 	 * because the lower layer is allowed to hold locks while calling
 	 * message delivery.
 	 */
+
+	rcu_read_lock();
+
 	if (!run_to_completion)
 		spin_lock_irqsave(&intf->xmit_msgs_lock, flags);
 	if (intf->curr_msg == NULL && !intf->in_shutdown) {
@@ -3898,6 +3903,8 @@ static void smi_recv_tasklet(unsigned long val)
 		spin_unlock_irqrestore(&intf->xmit_msgs_lock, flags);
 	if (newmsg)
 		intf->handlers->sender(intf->send_info, newmsg);
+
+	rcu_read_unlock();
 
 	handle_new_recv_msgs(intf);
 }
@@ -4024,7 +4031,8 @@ smi_from_recv_msg(ipmi_smi_t intf, struct ipmi_recv_msg *recv_msg,
 }
 
 static void check_msg_timeout(ipmi_smi_t intf, struct seq_table *ent,
-			      struct list_head *timeouts, long timeout_period,
+			      struct list_head *timeouts,
+			      unsigned long timeout_period,
 			      int slot, unsigned long *flags,
 			      unsigned int *waiting_msgs)
 {
@@ -4037,8 +4045,8 @@ static void check_msg_timeout(ipmi_smi_t intf, struct seq_table *ent,
 	if (!ent->inuse)
 		return;
 
-	ent->timeout -= timeout_period;
-	if (ent->timeout > 0) {
+	if (timeout_period < ent->timeout) {
+		ent->timeout -= timeout_period;
 		(*waiting_msgs)++;
 		return;
 	}
@@ -4104,7 +4112,8 @@ static void check_msg_timeout(ipmi_smi_t intf, struct seq_table *ent,
 	}
 }
 
-static unsigned int ipmi_timeout_handler(ipmi_smi_t intf, long timeout_period)
+static unsigned int ipmi_timeout_handler(ipmi_smi_t intf,
+					 unsigned long timeout_period)
 {
 	struct list_head     timeouts;
 	struct ipmi_recv_msg *msg, *msg2;

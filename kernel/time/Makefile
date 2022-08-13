@@ -1,3 +1,5 @@
+GCOV_PROFILE := y
+
 obj-y += time.o timer.o hrtimer.o itimer.o posix-timers.o posix-cpu-timers.o
 obj-y += timekeeping.o ntp.o clocksource.o jiffies.o timer_list.o
 obj-y += timeconv.o timecounter.o posix-clock.o alarmtimer.o

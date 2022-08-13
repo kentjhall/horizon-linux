@@ -94,10 +94,10 @@ __setup("noexec32=", nonx32_setup);
  */
 void sync_global_pgds(unsigned long start, unsigned long end, int removed)
 {
-	unsigned long address;
+	unsigned long addr;
 
-	for (address = start; address <= end; address += PGDIR_SIZE) {
-		const pgd_t *pgd_ref = pgd_offset_k(address);
+	for (addr = start; addr <= end; addr = ALIGN(addr + 1, PGDIR_SIZE)) {
+		const pgd_t *pgd_ref = pgd_offset_k(addr);
 		struct page *page;
 
 		/*
@@ -113,7 +113,7 @@ void sync_global_pgds(unsigned long start, unsigned long end, int removed)
 			pgd_t *pgd;
 			spinlock_t *pgt_lock;
 
-			pgd = (pgd_t *)page_address(page) + pgd_index(address);
+			pgd = (pgd_t *)page_address(page) + pgd_index(addr);
 			/* the pgt_lock only for Xen */
 			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
 			spin_lock(pgt_lock);
@@ -324,6 +324,16 @@ void __init cleanup_highmap(void)
 			continue;
 		if (vaddr < (unsigned long) _text || vaddr > end)
 			set_pmd(pmd, __pmd(0));
+		else if (kaiser_enabled) {
+			/*
+			 * level2_kernel_pgt is initialized with _PAGE_GLOBAL:
+			 * clear that now.  This is not important, so long as
+			 * CR4.PGE remains clear, but it removes an anomaly.
+			 * Physical mapping setup below avoids _PAGE_GLOBAL
+			 * by use of massage_pgprot() inside pfn_pte() etc.
+			 */
+			set_pmd(pmd, pmd_clear_flags(*pmd, _PAGE_GLOBAL));
+		}
 	}
 }
 
@@ -636,7 +646,7 @@ void __init paging_init(void)
  * After memory hotplug the variables max_pfn, max_low_pfn and high_memory need
  * updating.
  */
-static void  update_end_of_memory_vars(u64 start, u64 size)
+static void update_end_of_memory_vars(u64 start, u64 size)
 {
 	unsigned long end_pfn = PFN_UP(start + size);
 
@@ -647,20 +657,17 @@ static void  update_end_of_memory_vars(u64 start, u64 size)
 	}
 }
 
-/*
- * Memory is added always to NORMAL zone. This means you will never get
- * additional DMA/DMA32 memory.
- */
-int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+int add_pages(int nid, unsigned long start_pfn,
+	      unsigned long nr_pages, bool for_device)
 {
+	unsigned long start = start_pfn << PAGE_SHIFT;
+	unsigned long size = nr_pages << PAGE_SHIFT;
 	struct pglist_data *pgdat = NODE_DATA(nid);
-	struct zone *zone = pgdat->node_zones +
-		zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
-	unsigned long start_pfn = start >> PAGE_SHIFT;
-	unsigned long nr_pages = size >> PAGE_SHIFT;
+	struct zone *zone;
 	int ret;
 
-	init_memory_mapping(start, start + size);
+	zone = pgdat->node_zones + zone_for_memory(nid, start, size,
+						   ZONE_NORMAL, for_device);
 
 	ret = __add_pages(nid, zone, start_pfn, nr_pages);
 	WARN_ON_ONCE(ret);
@@ -669,6 +676,20 @@ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
 	update_end_of_memory_vars(start, size);
 
 	return ret;
+}
+
+/*
+ * Memory is added always to NORMAL zone. This means you will never get
+ * additional DMA/DMA32 memory.
+ */
+int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+{
+	unsigned long start_pfn = start >> PAGE_SHIFT;
+	unsigned long nr_pages = size >> PAGE_SHIFT;
+
+	init_memory_mapping(start, start + size);
+
+	return add_pages(nid, start_pfn, nr_pages, for_device);
 }
 EXPORT_SYMBOL_GPL(arch_add_memory);
 
@@ -689,7 +710,7 @@ static void __meminit free_pagetable(struct page *page, int order)
 	if (PageReserved(page)) {
 		__ClearPageReserved(page);
 
-		magic = (unsigned long)page->lru.next;
+		magic = (unsigned long)page->freelist;
 		if (magic == SECTION_INFO || magic == MIX_SECTION_INFO) {
 			while (nr_pages--)
 				put_page_bootmem(page++);
@@ -1004,8 +1025,7 @@ void __init mem_init(void)
 	after_bootmem = 1;
 
 	/* Register memory areas for /proc/kcore */
-	kclist_add(&kcore_vsyscall, (void *)VSYSCALL_ADDR,
-			 PAGE_SIZE, KCORE_OTHER);
+	kclist_add(&kcore_vsyscall, (void *)VSYSCALL_ADDR, PAGE_SIZE, KCORE_USER);
 
 	mem_init_print_info(NULL);
 }

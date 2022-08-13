@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2013, Kenneth MacKay
  * All rights reserved.
+ * Copyright (c) 2017, NVIDIA Corporation. All Rights Reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -28,17 +29,78 @@
 #include <linux/slab.h>
 #include <linux/swab.h>
 #include <linux/fips.h>
-#include <crypto/ecdh.h>
 
 #include "ecc.h"
-#include "ecc_curve_defs.h"
 
 typedef struct {
 	u64 m_low;
 	u64 m_high;
 } uint128_t;
 
-static inline const struct ecc_curve *ecc_get_curve(unsigned int curve_id)
+/* NIST P-192 */
+static u64 nist_p192_g_x[] = { 0xF4FF0AFD82FF1012ull, 0x7CBF20EB43A18800ull,
+				0x188DA80EB03090F6ull };
+static u64 nist_p192_g_y[] = { 0x73F977A11E794811ull, 0x631011ED6B24CDD5ull,
+				0x07192B95FFC8DA78ull };
+static u64 nist_p192_p[] = { 0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFEull,
+				0xFFFFFFFFFFFFFFFFull };
+static u64 nist_p192_n[] = { 0x146BC9B1B4D22831ull, 0xFFFFFFFF99DEF836ull,
+				0xFFFFFFFFFFFFFFFFull };
+static struct ecc_curve nist_p192 = {
+	.name = "nist_192",
+	.g = {
+		.x = nist_p192_g_x,
+		.y = nist_p192_g_y,
+		.ndigits = 3,
+	},
+	.p = nist_p192_p,
+	.n = nist_p192_n
+};
+
+/* NIST P-256 */
+static u64 nist_p256_g_x[] = { 0xF4A13945D898C296ull, 0x77037D812DEB33A0ull,
+				0xF8BCE6E563A440F2ull, 0x6B17D1F2E12C4247ull };
+static u64 nist_p256_g_y[] = { 0xCBB6406837BF51F5ull, 0x2BCE33576B315ECEull,
+				0x8EE7EB4A7C0F9E16ull, 0x4FE342E2FE1A7F9Bull };
+static u64 nist_p256_p[] = { 0xFFFFFFFFFFFFFFFFull, 0x00000000FFFFFFFFull,
+				0x0000000000000000ull, 0xFFFFFFFF00000001ull };
+static u64 nist_p256_n[] = { 0xF3B9CAC2FC632551ull, 0xBCE6FAADA7179E84ull,
+				0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFF00000000ull };
+static struct ecc_curve nist_p256 = {
+	.name = "nist_256",
+	.g = {
+		.x = nist_p256_g_x,
+		.y = nist_p256_g_y,
+		.ndigits = 4,
+	},
+	.p = nist_p256_p,
+	.n = nist_p256_n
+};
+
+/* BrainPool P-256 */
+static u64 bp_p256_g_x[] = { 0x3A4453BD9ACE3262ull, 0xB9DE27E1E3BD23C2ull,
+				0x2C4B482FFC81B7AFull, 0x8BD2AEB9CB7E57CBull };
+
+static u64 bp_p256_g_y[] = { 0x5C1D54C72F046997ull, 0xC27745132DED8E54ull,
+				0x97F8461A14611DC9ull, 0x547EF835C3DAC4FDull };
+
+static u64 bp_p256_p[] = { 0x2013481D1F6E5377ull, 0x6E3BF623D5262028ull,
+				0x3E660A909D838D72ull, 0xA9FB57DBA1EEA9BCull };
+
+static u64 bp_p256_n[] = { 0x901E0E82974856A7ull, 0x8C397AA3B561A6F7ull,
+				0x3E660A909D838D71ull, 0xA9FB57DBA1EEA9BCull };
+
+static struct ecc_curve bpcurve_p256 = {
+	.name = "brainpool_256",
+	.g = {
+		.x = bp_p256_g_x,
+		.y = bp_p256_g_y,
+	},
+	.p = bp_p256_p,
+	.n = bp_p256_n,
+};
+
+const struct ecc_curve *ecc_get_curve(unsigned int curve_id)
 {
 	switch (curve_id) {
 	/* In FIPS mode only allow P256 and higher */
@@ -46,10 +108,13 @@ static inline const struct ecc_curve *ecc_get_curve(unsigned int curve_id)
 		return fips_enabled ? NULL : &nist_p192;
 	case ECC_CURVE_NIST_P256:
 		return &nist_p256;
+	case ECC_CURVE_BRAINPOOL_P256:
+		return &bpcurve_p256;
 	default:
 		return NULL;
 	}
 }
+EXPORT_SYMBOL_GPL(ecc_get_curve);
 
 static u64 *ecc_alloc_digits_space(unsigned int ndigits)
 {
@@ -66,7 +131,7 @@ static void ecc_free_digits_space(u64 *space)
 	kzfree(space);
 }
 
-static struct ecc_point *ecc_alloc_point(unsigned int ndigits)
+struct ecc_point *ecc_alloc_point(unsigned int ndigits)
 {
 	struct ecc_point *p = kmalloc(sizeof(*p), GFP_KERNEL);
 
@@ -91,8 +156,9 @@ err_alloc_x:
 	kfree(p);
 	return NULL;
 }
+EXPORT_SYMBOL_GPL(ecc_alloc_point);
 
-static void ecc_free_point(struct ecc_point *p)
+void ecc_free_point(struct ecc_point *p)
 {
 	if (!p)
 		return;
@@ -101,17 +167,19 @@ static void ecc_free_point(struct ecc_point *p)
 	kzfree(p->y);
 	kzfree(p);
 }
+EXPORT_SYMBOL_GPL(ecc_free_point);
 
-static void vli_clear(u64 *vli, unsigned int ndigits)
+void vli_clear(u64 *vli, unsigned int ndigits)
 {
 	int i;
 
 	for (i = 0; i < ndigits; i++)
 		vli[i] = 0;
 }
+EXPORT_SYMBOL_GPL(vli_clear);
 
 /* Returns true if vli == 0, false otherwise. */
-static bool vli_is_zero(const u64 *vli, unsigned int ndigits)
+bool vli_is_zero(const u64 *vli, unsigned int ndigits)
 {
 	int i;
 
@@ -122,15 +190,17 @@ static bool vli_is_zero(const u64 *vli, unsigned int ndigits)
 
 	return true;
 }
+EXPORT_SYMBOL_GPL(vli_is_zero);
 
 /* Returns nonzero if bit bit of vli is set. */
-static u64 vli_test_bit(const u64 *vli, unsigned int bit)
+u64 vli_test_bit(const u64 *vli, unsigned int bit)
 {
 	return (vli[bit / 64] & ((u64)1 << (bit % 64)));
 }
+EXPORT_SYMBOL_GPL(vli_test_bit);
 
 /* Counts the number of 64-bit "digits" in vli. */
-static unsigned int vli_num_digits(const u64 *vli, unsigned int ndigits)
+unsigned int vli_num_digits(const u64 *vli, unsigned int ndigits)
 {
 	int i;
 
@@ -142,9 +212,10 @@ static unsigned int vli_num_digits(const u64 *vli, unsigned int ndigits)
 
 	return (i + 1);
 }
+EXPORT_SYMBOL_GPL(vli_num_digits);
 
 /* Counts the number of bits required for vli. */
-static unsigned int vli_num_bits(const u64 *vli, unsigned int ndigits)
+unsigned int vli_num_bits(const u64 *vli, unsigned int ndigits)
 {
 	unsigned int i, num_digits;
 	u64 digit;
@@ -159,18 +230,58 @@ static unsigned int vli_num_bits(const u64 *vli, unsigned int ndigits)
 
 	return ((num_digits - 1) * 64 + i);
 }
+EXPORT_SYMBOL_GPL(vli_num_bits);
 
 /* Sets dest = src. */
-static void vli_set(u64 *dest, const u64 *src, unsigned int ndigits)
+void vli_set(u64 *dest, const u64 *src, unsigned int ndigits)
 {
 	int i;
 
 	for (i = 0; i < ndigits; i++)
 		dest[i] = src[i];
 }
+EXPORT_SYMBOL_GPL(vli_set);
+
+/* Copy from vli to buf.
+ * For buffers smaller than vli: copy only LSB nbytes from vli.
+ * For buffers larger than vli : fill up remaining buf with zeroes.
+ */
+void vli_copy_to_buf(u8 *dst_buf, unsigned int buf_len,
+		     const u64 *src_vli, unsigned int ndigits)
+{
+	unsigned int nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
+	u8 *vli = (u8 *)src_vli;
+	int i;
+
+	for (i = 0; i < buf_len && i < nbytes; i++)
+		dst_buf[i] = vli[i];
+
+	for (; i < buf_len; i++)
+		dst_buf[i] = 0;
+}
+EXPORT_SYMBOL_GPL(vli_copy_to_buf);
+
+/* Copy from buffer to vli.
+ * For buffers smaller than vli: fill up remaining vli with zeroes.
+ * For buffers larger than vli : copy only LSB nbytes to vli.
+ */
+void vli_copy_from_buf(u64 *dst_vli, unsigned int ndigits,
+		       const u8 *src_buf, unsigned int buf_len)
+{
+	unsigned int nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
+	u8 *vli = (u8 *)dst_vli;
+	int i;
+
+	for (i = 0; i < buf_len && i < nbytes; i++)
+		vli[i] = src_buf[i];
+
+	for (; i < nbytes; i++)
+		vli[i] = 0;
+}
+EXPORT_SYMBOL_GPL(vli_copy_from_buf);
 
 /* Returns sign of left - right. */
-static int vli_cmp(const u64 *left, const u64 *right, unsigned int ndigits)
+int vli_cmp(const u64 *left, const u64 *right, unsigned int ndigits)
 {
 	int i;
 
@@ -183,12 +294,13 @@ static int vli_cmp(const u64 *left, const u64 *right, unsigned int ndigits)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(vli_cmp);
 
 /* Computes result = in << c, returning carry. Can modify in place
  * (if result == in). 0 < shift < 64.
  */
-static u64 vli_lshift(u64 *result, const u64 *in, unsigned int shift,
-		      unsigned int ndigits)
+u64 vli_lshift(u64 *result, const u64 *in, unsigned int shift,
+	       unsigned int ndigits)
 {
 	u64 carry = 0;
 	int i;
@@ -202,9 +314,10 @@ static u64 vli_lshift(u64 *result, const u64 *in, unsigned int shift,
 
 	return carry;
 }
+EXPORT_SYMBOL_GPL(vli_lshift);
 
 /* Computes vli = vli >> 1. */
-static void vli_rshift1(u64 *vli, unsigned int ndigits)
+void vli_rshift1(u64 *vli, unsigned int ndigits)
 {
 	u64 *end = vli;
 	u64 carry = 0;
@@ -217,10 +330,11 @@ static void vli_rshift1(u64 *vli, unsigned int ndigits)
 		carry = temp << 63;
 	}
 }
+EXPORT_SYMBOL_GPL(vli_rshift1);
 
 /* Computes result = left + right, returning carry. Can modify in place. */
-static u64 vli_add(u64 *result, const u64 *left, const u64 *right,
-		   unsigned int ndigits)
+u64 vli_add(u64 *result, const u64 *left, const u64 *right,
+	    unsigned int ndigits)
 {
 	u64 carry = 0;
 	int i;
@@ -237,10 +351,11 @@ static u64 vli_add(u64 *result, const u64 *left, const u64 *right,
 
 	return carry;
 }
+EXPORT_SYMBOL_GPL(vli_add);
 
 /* Computes result = left - right, returning borrow. Can modify in place. */
-static u64 vli_sub(u64 *result, const u64 *left, const u64 *right,
-		   unsigned int ndigits)
+u64 vli_sub(u64 *result, const u64 *left, const u64 *right,
+	    unsigned int ndigits)
 {
 	u64 borrow = 0;
 	int i;
@@ -257,6 +372,7 @@ static u64 vli_sub(u64 *result, const u64 *left, const u64 *right,
 
 	return borrow;
 }
+EXPORT_SYMBOL_GPL(vli_sub);
 
 static uint128_t mul_64_64(u64 left, u64 right)
 {
@@ -293,8 +409,8 @@ static uint128_t add_128_128(uint128_t a, uint128_t b)
 	return result;
 }
 
-static void vli_mult(u64 *result, const u64 *left, const u64 *right,
-		     unsigned int ndigits)
+void vli_mult(u64 *result, const u64 *left, const u64 *right,
+	      unsigned int ndigits)
 {
 	uint128_t r01 = { 0, 0 };
 	u64 r2 = 0;
@@ -328,8 +444,9 @@ static void vli_mult(u64 *result, const u64 *left, const u64 *right,
 
 	result[ndigits * 2 - 1] = r01.m_low;
 }
+EXPORT_SYMBOL_GPL(vli_mult);
 
-static void vli_square(u64 *result, const u64 *left, unsigned int ndigits)
+void vli_square(u64 *result, const u64 *left, unsigned int ndigits)
 {
 	uint128_t r01 = { 0, 0 };
 	u64 r2 = 0;
@@ -367,12 +484,13 @@ static void vli_square(u64 *result, const u64 *left, unsigned int ndigits)
 
 	result[ndigits * 2 - 1] = r01.m_low;
 }
+EXPORT_SYMBOL_GPL(vli_square);
 
 /* Computes result = (left + right) % mod.
  * Assumes that left < mod and right < mod, result != mod.
  */
-static void vli_mod_add(u64 *result, const u64 *left, const u64 *right,
-			const u64 *mod, unsigned int ndigits)
+void vli_mod_add(u64 *result, const u64 *left, const u64 *right,
+		 const u64 *mod, unsigned int ndigits)
 {
 	u64 carry;
 
@@ -384,12 +502,13 @@ static void vli_mod_add(u64 *result, const u64 *left, const u64 *right,
 	if (carry || vli_cmp(result, mod, ndigits) >= 0)
 		vli_sub(result, result, mod, ndigits);
 }
+EXPORT_SYMBOL_GPL(vli_mod_add);
 
 /* Computes result = (left - right) % mod.
  * Assumes that left < mod and right < mod, result != mod.
  */
-static void vli_mod_sub(u64 *result, const u64 *left, const u64 *right,
-			const u64 *mod, unsigned int ndigits)
+void vli_mod_sub(u64 *result, const u64 *left, const u64 *right,
+		 const u64 *mod, unsigned int ndigits)
 {
 	u64 borrow = vli_sub(result, left, right, ndigits);
 
@@ -400,6 +519,87 @@ static void vli_mod_sub(u64 *result, const u64 *left, const u64 *right,
 	if (borrow)
 		vli_add(result, result, mod, ndigits);
 }
+EXPORT_SYMBOL_GPL(vli_mod_sub);
+
+/* Computes result = input % mod.
+ * Assumes that input < mod, result != mod.
+ */
+void vli_mod(u64 *result, const u64 *input, const u64 *mod,
+	     unsigned int ndigits)
+{
+	if (vli_cmp(input, mod, ndigits) >= 0)
+		vli_sub(result, input, mod, ndigits);
+	else
+		vli_set(result, input, ndigits);
+}
+EXPORT_SYMBOL_GPL(vli_mod);
+
+/* Print vli in big-endian format.
+ * The bytes are printed in hex.
+ */
+void vli_print(char *vli_name, const u64 *vli, unsigned int ndigits)
+{
+	int nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
+	int buf_size = 2 * ECC_MAX_DIGIT_BYTES + 1;
+	unsigned char *c, buf[buf_size];
+	int i, j;
+
+	c = (unsigned char *)vli;
+
+	for (i = nbytes - 1, j = 0; i >= 0 && j+1 < buf_size; i--, j += 2)
+		snprintf(&buf[j], 3, "%02x", *(c + i));
+
+	buf[j] = '\0';
+
+	pr_info("%20s(BigEnd)=%s\n", vli_name, buf);
+}
+EXPORT_SYMBOL_GPL(vli_print);
+
+/* Computes result = (left * right) % mod.
+ * Assumes that left < mod and right < mod, result != mod.
+ * Uses:
+ *	(a * b) % m = ((a % m) * (b % m)) % m
+ *	(a * b) % m = (a + a + ... + a) % m = b modular additions of (a % m)
+ */
+void vli_mod_mult(u64 *result, const u64 *left, const u64 *right,
+		  const u64 *mod, unsigned int ndigits)
+{
+	u64 t1[ndigits], mm[ndigits];
+	u64 aa[ndigits], bb[ndigits];
+
+	vli_clear(result, ndigits);
+	vli_set(aa, left, ndigits);
+	vli_set(bb, right, ndigits);
+	vli_set(mm, mod, ndigits);
+
+	/* aa = aa % mm */
+	vli_mod(aa, aa, mm, ndigits);
+
+	/* bb = bb % mm */
+	vli_mod(bb, bb, mm, ndigits);
+
+	while (!vli_is_zero(bb, ndigits)) {
+
+		/* if bb is odd i.e. 0th bit set then add
+		 * aa i.e. result = (result + aa) % mm
+		 */
+		if (vli_test_bit(bb, 0))
+			vli_mod_add(result, result, aa, mm, ndigits);
+
+		/* bb = bb / 2 = bb >> 1 */
+		vli_rshift1(bb, ndigits);
+
+		/* aa = (aa * 2) % mm */
+		vli_sub(t1, mm, aa, ndigits);
+		if (vli_cmp(aa, t1, ndigits) == -1)
+			/* if aa < t1 then aa = aa * 2 = aa << 1*/
+			vli_lshift(aa, aa, 1, ndigits);
+		else
+			/* if aa >= t1 then aa = aa - t1 */
+			vli_sub(aa, aa, t1, ndigits);
+	}
+}
+EXPORT_SYMBOL_GPL(vli_mod_mult);
 
 /* Computes p_result = p_product % curve_p.
  * See algorithm 5 and 6 from
@@ -511,8 +711,8 @@ static void vli_mmod_fast_256(u64 *result, const u64 *product,
 /* Computes result = product % curve_prime
  *  from http://www.nsa.gov/ia/_files/nist-routines.pdf
 */
-static bool vli_mmod_fast(u64 *result, u64 *product,
-			  const u64 *curve_prime, unsigned int ndigits)
+bool vli_mmod_fast(u64 *result, u64 *product,
+		   const u64 *curve_prime, unsigned int ndigits)
 {
 	u64 tmp[2 * ndigits];
 
@@ -530,34 +730,37 @@ static bool vli_mmod_fast(u64 *result, u64 *product,
 
 	return true;
 }
+EXPORT_SYMBOL_GPL(vli_mmod_fast);
 
 /* Computes result = (left * right) % curve_prime. */
-static void vli_mod_mult_fast(u64 *result, const u64 *left, const u64 *right,
-			      const u64 *curve_prime, unsigned int ndigits)
+void vli_mod_mult_fast(u64 *result, const u64 *left, const u64 *right,
+		       const u64 *curve_prime, unsigned int ndigits)
 {
 	u64 product[2 * ndigits];
 
 	vli_mult(product, left, right, ndigits);
 	vli_mmod_fast(result, product, curve_prime, ndigits);
 }
+EXPORT_SYMBOL_GPL(vli_mod_mult_fast);
 
 /* Computes result = left^2 % curve_prime. */
-static void vli_mod_square_fast(u64 *result, const u64 *left,
-				const u64 *curve_prime, unsigned int ndigits)
+void vli_mod_square_fast(u64 *result, const u64 *left,
+			 const u64 *curve_prime, unsigned int ndigits)
 {
 	u64 product[2 * ndigits];
 
 	vli_square(product, left, ndigits);
 	vli_mmod_fast(result, product, curve_prime, ndigits);
 }
+EXPORT_SYMBOL_GPL(vli_mod_square_fast);
 
 #define EVEN(vli) (!(vli[0] & 1))
 /* Computes result = (1 / p_input) % mod. All VLIs are the same size.
  * See "From Euclid's GCD to Montgomery Multiplication to the Great Divide"
  * https://labs.oracle.com/techrep/2001/smli_tr-2001-95.pdf
  */
-static void vli_mod_inv(u64 *result, const u64 *input, const u64 *mod,
-			unsigned int ndigits)
+void vli_mod_inv(u64 *result, const u64 *input, const u64 *mod,
+		 unsigned int ndigits)
 {
 	u64 a[ndigits], b[ndigits];
 	u64 u[ndigits], v[ndigits];
@@ -629,23 +832,25 @@ static void vli_mod_inv(u64 *result, const u64 *input, const u64 *mod,
 
 	vli_set(result, u, ndigits);
 }
+EXPORT_SYMBOL_GPL(vli_mod_inv);
 
 /* ------ Point operations ------ */
 
 /* Returns true if p_point is the point at infinity, false otherwise. */
-static bool ecc_point_is_zero(const struct ecc_point *point)
+bool ecc_point_is_zero(const struct ecc_point *point)
 {
 	return (vli_is_zero(point->x, point->ndigits) &&
 		vli_is_zero(point->y, point->ndigits));
 }
+EXPORT_SYMBOL_GPL(ecc_point_is_zero);
 
 /* Point multiplication algorithm using Montgomery's ladder with co-Z
  * coordinates. From http://eprint.iacr.org/2011/338.pdf
  */
 
 /* Double in place */
-static void ecc_point_double_jacobian(u64 *x1, u64 *y1, u64 *z1,
-				      u64 *curve_prime, unsigned int ndigits)
+void ecc_point_double_jacobian(u64 *x1, u64 *y1, u64 *z1,
+			       u64 *curve_prime, unsigned int ndigits)
 {
 	/* t1 = x, t2 = y, t3 = z */
 	u64 t4[ndigits];
@@ -705,6 +910,7 @@ static void ecc_point_double_jacobian(u64 *x1, u64 *y1, u64 *z1,
 	vli_set(z1, y1, ndigits);
 	vli_set(y1, t4, ndigits);
 }
+EXPORT_SYMBOL_GPL(ecc_point_double_jacobian);
 
 /* Modify (x1, y1) => (x1 * z^2, y1 * z^3) */
 static void apply_z(u64 *x1, u64 *y1, u64 *z, u64 *curve_prime,
@@ -839,10 +1045,66 @@ static void xycz_add_c(u64 *x1, u64 *y1, u64 *x2, u64 *y2, u64 *curve_prime,
 	vli_set(x1, t7, ndigits);
 }
 
-static void ecc_point_mult(struct ecc_point *result,
-			   const struct ecc_point *point, const u64 *scalar,
-			   u64 *initial_z, u64 *curve_prime,
-			   unsigned int ndigits)
+/* Point addition.
+ * Add 2 distinct points on elliptic curve to get a new point.
+ *
+ * P = (x1,y1)and Q = (x2, y2) then P + Q = (x3,y3) where
+ * x3 = ((y2-y1)/(x2-x1))^2 - x1 - x2
+ * y3 = ((y2-y1)/(x2-x1))(x1-x3) - y1
+ *
+ * Q => P + Q
+ */
+void ecc_point_add(u64 *x1, u64 *y1, u64 *x2, u64 *y2, u64 *curve_prime,
+		   unsigned int ndigits)
+{
+	/* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+	u64 t5[ndigits];
+	u64 t6[ndigits];
+	u64 t7[ndigits];
+
+	/* t6 = x2 - x1 */
+	vli_mod_sub(t6, x2, x1, curve_prime, ndigits);
+	/* t6 = (x2 - x1)^2 = A */
+	vli_mod_square_fast(t6, t6, curve_prime, ndigits);
+	vli_mod_inv(t7, t6, curve_prime, ndigits);
+	/* t5 = x2 - x1 */
+	vli_mod_sub(t5, x2, x1, curve_prime, ndigits);
+	/* t5 = (x2 - x1)^2 = A */
+	vli_mod_square_fast(t5, t5, curve_prime, ndigits);
+	/* t1 = x1*A = B = x1*(x2-x1)^2*/
+	vli_mod_mult_fast(x1, x1, t5, curve_prime, ndigits);
+	/* t3 = x2*A = C = x2*(x2-x1)^2*/
+	vli_mod_mult_fast(x2, x2, t5, curve_prime, ndigits);
+	/* t4 = y2 - y1 */
+	vli_mod_sub(y2, y2, y1, curve_prime, ndigits);
+	/* t5 = (y2 - y1)^2 = D */
+	vli_mod_square_fast(t5, y2, curve_prime, ndigits);
+
+	/* t5 = D - B = (y2 - y1)^2 - x1*(x2-x1)^2 */
+	vli_mod_sub(t5, t5, x1, curve_prime, ndigits);
+	/* t5 = D - B - C = x3 = (y2 - y1)^2 - x1*(x2-x1)^2 - x2*(x2-x1)^2*/
+	vli_mod_sub(t5, t5, x2, curve_prime, ndigits);
+
+	/* t3 = C - B = x2*(x2-x1)^2 - x1*(x2-x1)^2 */
+	vli_mod_sub(x2, x2, x1, curve_prime, ndigits);
+	/* t2 = y1*(C - B) = y1*(x2*(x2-x1)^2 - x1*(x2-x1)^2)*/
+	vli_mod_mult_fast(y1, y1, x2, curve_prime, ndigits);
+	/* t3 = B - x3 = x1*(x2-x1)^2 - x3*/
+	vli_mod_sub(x2, x1, t5, curve_prime, ndigits);
+	/* t4 = (y2 - y1)*(B - x3)  = (y2 - y1)*(x1*(x2-x1)^2 - x3)*/
+	vli_mod_mult_fast(y2, y2, x2, curve_prime, ndigits);
+	/* t4 = y3 = ((y2 - y1)*(x1*(x2-x1)^2 - x3)) - y1*/
+	vli_mod_sub(y2, y2, y1, curve_prime, ndigits);
+
+	vli_mod_mult_fast(t5, t5, t7,  curve_prime, ndigits);
+	vli_set(x2, t5, ndigits);
+}
+EXPORT_SYMBOL_GPL(ecc_point_add);
+
+void ecc_point_mult(struct ecc_point *result,
+		    const struct ecc_point *point, const u64 *scalar,
+		    u64 *initial_z, u64 *curve_prime,
+		    unsigned int ndigits)
 {
 	/* R0 and R1 */
 	u64 rx[2][ndigits];
@@ -893,15 +1155,17 @@ static void ecc_point_mult(struct ecc_point *result,
 	vli_set(result->x, rx[0], ndigits);
 	vli_set(result->y, ry[0], ndigits);
 }
+EXPORT_SYMBOL_GPL(ecc_point_mult);
 
-static inline void ecc_swap_digits(const u64 *in, u64 *out,
-				   unsigned int ndigits)
+void ecc_swap_digits(const u64 *in, u64 *out, unsigned int ndigits)
 {
+	const __be64 *src = (__force __be64 *)in;
 	int i;
 
 	for (i = 0; i < ndigits; i++)
-		out[i] = __swab64(in[ndigits - 1 - i]);
+		out[i] = be64_to_cpu(src[ndigits - 1 - i]);
 }
+EXPORT_SYMBOL_GPL(ecc_swap_digits);
 
 int ecc_is_key_valid(unsigned int curve_id, unsigned int ndigits,
 		     const u8 *private_key, unsigned int private_key_len)
@@ -926,93 +1190,26 @@ int ecc_is_key_valid(unsigned int curve_id, unsigned int ndigits,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(ecc_is_key_valid);
 
-int ecdh_make_pub_key(unsigned int curve_id, unsigned int ndigits,
-		      const u8 *private_key, unsigned int private_key_len,
-		      u8 *public_key, unsigned int public_key_len)
+int ecc_is_pub_key_valid(unsigned int curve_id, unsigned int ndigits,
+			 const u8 *pub_key, unsigned int pub_key_len)
 {
-	int ret = 0;
-	struct ecc_point *pk;
-	u64 priv[ndigits];
-	unsigned int nbytes;
 	const struct ecc_curve *curve = ecc_get_curve(curve_id);
+	int nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
+	struct ecc_point p;
 
-	if (!private_key || !curve) {
-		ret = -EINVAL;
-		goto out;
-	}
+	if (!pub_key || pub_key_len != 2 * nbytes)
+		return -EINVAL;
 
-	ecc_swap_digits((const u64 *)private_key, priv, ndigits);
+	p.x = (u64 *)pub_key;
+	p.y = (u64 *)(pub_key + ECC_MAX_DIGIT_BYTES);
+	p.ndigits = ndigits;
 
-	pk = ecc_alloc_point(ndigits);
-	if (!pk) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (vli_cmp(curve->p, p.x, ndigits) != 1 ||
+	    vli_cmp(curve->p, p.y, ndigits) != 1)
+		return -EINVAL;
 
-	ecc_point_mult(pk, &curve->g, priv, NULL, curve->p, ndigits);
-	if (ecc_point_is_zero(pk)) {
-		ret = -EAGAIN;
-		goto err_free_point;
-	}
-
-	nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
-	ecc_swap_digits(pk->x, (u64 *)public_key, ndigits);
-	ecc_swap_digits(pk->y, (u64 *)&public_key[nbytes], ndigits);
-
-err_free_point:
-	ecc_free_point(pk);
-out:
-	return ret;
+	return 0;
 }
-
-int crypto_ecdh_shared_secret(unsigned int curve_id, unsigned int ndigits,
-		       const u8 *private_key, unsigned int private_key_len,
-		       const u8 *public_key, unsigned int public_key_len,
-		       u8 *secret, unsigned int secret_len)
-{
-	int ret = 0;
-	struct ecc_point *product, *pk;
-	u64 priv[ndigits];
-	u64 rand_z[ndigits];
-	unsigned int nbytes;
-	const struct ecc_curve *curve = ecc_get_curve(curve_id);
-
-	if (!private_key || !public_key || !curve) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
-
-	get_random_bytes(rand_z, nbytes);
-
-	pk = ecc_alloc_point(ndigits);
-	if (!pk) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	product = ecc_alloc_point(ndigits);
-	if (!product) {
-		ret = -ENOMEM;
-		goto err_alloc_product;
-	}
-
-	ecc_swap_digits((const u64 *)public_key, pk->x, ndigits);
-	ecc_swap_digits((const u64 *)&public_key[nbytes], pk->y, ndigits);
-	ecc_swap_digits((const u64 *)private_key, priv, ndigits);
-
-	ecc_point_mult(product, pk, priv, rand_z, curve->p, ndigits);
-
-	ecc_swap_digits(product->x, (u64 *)secret, ndigits);
-
-	if (ecc_point_is_zero(product))
-		ret = -EFAULT;
-
-	ecc_free_point(product);
-err_alloc_product:
-	ecc_free_point(pk);
-out:
-	return ret;
-}
+EXPORT_SYMBOL_GPL(ecc_is_pub_key_valid);

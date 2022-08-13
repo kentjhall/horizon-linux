@@ -112,6 +112,19 @@ config MTD_SST25L
 	  Set up your spi devices with the right board-specific platform data,
 	  if you want to specify device partitioning.
 
+config MTD_QSPI_FLASH
+	tristate "Support Quad SPI Flash chips (S25FL512S,MT25QL512AB)"
+	depends on SPI_MASTER && QSPI_TEGRA
+	depends on MTD_OF_PARTS
+	help
+	  This enables access to Quad SPI flash chips, used for program
+	  and data storage.
+
+	  It includes support for Spansion S25FL512 and Micron MT25QL512AB
+	  QSPI flashes. It provides support for Normal/Fast/Dual Output/
+	  Quad Output/Dual IO/Quad IO/DDR Fast/DDR Dual IO/DDR Quad IO read,
+	  Page Program/Quad Page program write, sector and bulk erase modes.
+
 config MTD_BCM47XXSFLASH
 	tristate "Support for serial flash on BCMA bus"
 	depends on BCMA_SFLASH && (MIPS || ARM)
@@ -196,7 +209,7 @@ comment "Disk-On-Chip Device Drivers"
 config MTD_DOCG3
 	tristate "M-Systems Disk-On-Chip G3"
 	select BCH
-	select BCH_CONST_PARAMS
+	select BCH_CONST_PARAMS if !MTD_NAND_BCH
 	select BITREVERSE
 	---help---
 	  This provides an MTD device driver for the M-Systems DiskOnChip

@@ -11,6 +11,7 @@ enum alarmtimer_type {
 	ALARM_BOOTTIME,
 
 	ALARM_NUMTYPE,
+	ALARM_UNDEFINED
 };
 
 enum alarmtimer_restart {

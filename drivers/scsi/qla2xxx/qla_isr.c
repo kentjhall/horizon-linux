@@ -272,7 +272,8 @@ qla2x00_mbx_completion(scsi_qla_host_t *vha, uint16_t mb0)
 	struct device_reg_2xxx __iomem *reg = &ha->iobase->isp;
 
 	/* Read all mbox registers? */
-	mboxes = (1 << ha->mbx_count) - 1;
+	WARN_ON_ONCE(ha->mbx_count > 32);
+	mboxes = (1ULL << ha->mbx_count) - 1;
 	if (!ha->mcp)
 		ql_dbg(ql_dbg_async, vha, 0x5001, "MBX pointer ERROR.\n");
 	else
@@ -972,8 +973,6 @@ global_port_update:
 			ql_dbg(ql_dbg_async, vha, 0x5011,
 			    "Asynchronous PORT UPDATE ignored %04x/%04x/%04x.\n",
 			    mb[1], mb[2], mb[3]);
-
-			qlt_async_event(mb[0], vha, mb);
 			break;
 		}
 
@@ -994,8 +993,6 @@ global_port_update:
 		set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
 		set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
 		set_bit(VP_CONFIG_OK, &vha->vp_flags);
-
-		qlt_async_event(mb[0], vha, mb);
 		break;
 
 	case MBA_RSCN_UPDATE:		/* State Change Registration */
@@ -2487,6 +2484,10 @@ qla2x00_error_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, sts_entry_t *pkt)
 	if (pkt->entry_status & RF_BUSY)
 		res = DID_BUS_BUSY << 16;
 
+	if (pkt->entry_type == NOTIFY_ACK_TYPE &&
+	    pkt->handle == QLA_TGT_SKIP_HANDLE)
+		return;
+
 	sp = qla2x00_get_sp_from_handle(vha, func, req, pkt);
 	if (sp) {
 		sp->done(ha, sp, res);
@@ -2512,7 +2513,8 @@ qla24xx_mbx_completion(scsi_qla_host_t *vha, uint16_t mb0)
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 
 	/* Read all mbox registers? */
-	mboxes = (1 << ha->mbx_count) - 1;
+	WARN_ON_ONCE(ha->mbx_count > 32);
+	mboxes = (1ULL << ha->mbx_count) - 1;
 	if (!ha->mcp)
 		ql_dbg(ql_dbg_async, vha, 0x504e, "MBX pointer ERROR.\n");
 	else
@@ -3083,7 +3085,7 @@ qla24xx_enable_msix(struct qla_hw_data *ha, struct rsp_que *rsp)
 		ql_log(ql_log_fatal, vha, 0x00c8,
 		    "Failed to allocate memory for ha->msix_entries.\n");
 		ret = -ENOMEM;
-		goto msix_out;
+		goto free_irqs;
 	}
 	ha->flags.msix_enabled = 1;
 
@@ -3171,6 +3173,10 @@ msix_register_fail:
 msix_out:
 	kfree(entries);
 	return ret;
+
+free_irqs:
+	pci_free_irq_vectors(ha->pdev);
+	goto msix_out;
 }
 
 int

@@ -54,7 +54,7 @@
 
 int qedr_query_pkey(struct ib_device *ibdev, u8 port, u16 index, u16 *pkey)
 {
-	if (index > QEDR_ROCE_PKEY_TABLE_LEN)
+	if (index >= QEDR_ROCE_PKEY_TABLE_LEN)
 		return -EINVAL;
 
 	*pkey = QEDR_ROCE_PKEY_DEFAULT;
@@ -471,8 +471,6 @@ struct ib_pd *qedr_alloc_pd(struct ib_device *ibdev,
 			    struct ib_ucontext *context, struct ib_udata *udata)
 {
 	struct qedr_dev *dev = get_qedr_dev(ibdev);
-	struct qedr_ucontext *uctx = NULL;
-	struct qedr_alloc_pd_uresp uresp;
 	struct qedr_pd *pd;
 	u16 pd_id;
 	int rc;
@@ -489,21 +487,33 @@ struct ib_pd *qedr_alloc_pd(struct ib_device *ibdev,
 	if (!pd)
 		return ERR_PTR(-ENOMEM);
 
-	dev->ops->rdma_alloc_pd(dev->rdma_ctx, &pd_id);
+	rc = dev->ops->rdma_alloc_pd(dev->rdma_ctx, &pd_id);
+	if (rc)
+		goto err;
 
-	uresp.pd_id = pd_id;
 	pd->pd_id = pd_id;
 
 	if (udata && context) {
+		struct qedr_alloc_pd_uresp uresp;
+
+		uresp.pd_id = pd_id;
+
 		rc = ib_copy_to_udata(udata, &uresp, sizeof(uresp));
-		if (rc)
+		if (rc) {
 			DP_ERR(dev, "copy error pd_id=0x%x.\n", pd_id);
-		uctx = get_qedr_ucontext(context);
-		uctx->pd = pd;
-		pd->uctx = uctx;
+			dev->ops->rdma_dealloc_pd(dev->rdma_ctx, pd_id);
+			goto err;
+		}
+
+		pd->uctx = get_qedr_ucontext(context);
+		pd->uctx->pd = pd;
 	}
 
 	return &pd->ibpd;
+
+err:
+	kfree(pd);
+	return ERR_PTR(rc);
 }
 
 int qedr_dealloc_pd(struct ib_pd *ibpd)
@@ -1643,7 +1653,7 @@ static int qedr_update_qp_state(struct qedr_dev *dev,
 	int status = 0;
 
 	if (new_state == qp->state)
-		return 1;
+		return 0;
 
 	switch (qp->state) {
 	case QED_ROCE_QP_STATE_RESET:
@@ -1719,6 +1729,14 @@ static int qedr_update_qp_state(struct qedr_dev *dev,
 		/* ERR->XXX */
 		switch (new_state) {
 		case QED_ROCE_QP_STATE_RESET:
+			if ((qp->rq.prod != qp->rq.cons) ||
+			    (qp->sq.prod != qp->sq.cons)) {
+				DP_NOTICE(dev,
+					  "Error->Reset with rq/sq not empty rq.prod=%x rq.cons=%x sq.prod=%x sq.cons=%x\n",
+					  qp->rq.prod, qp->rq.cons, qp->sq.prod,
+					  qp->sq.cons);
+				status = -EINVAL;
+			}
 			break;
 		default:
 			status = -EINVAL;
@@ -1870,18 +1888,23 @@ int qedr_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		SET_FIELD(qp_params.modify_flags,
 			  QED_ROCE_MODIFY_QP_VALID_ACK_TIMEOUT, 1);
 
-		qp_params.ack_timeout = attr->timeout;
-		if (attr->timeout) {
-			u32 temp;
-
-			temp = 4096 * (1UL << attr->timeout) / 1000 / 1000;
-			/* FW requires [msec] */
-			qp_params.ack_timeout = temp;
-		} else {
-			/* Infinite */
+		/* The received timeout value is an exponent used like this:
+		 *    "12.7.34 LOCAL ACK TIMEOUT
+		 *    Value representing the transport (ACK) timeout for use by
+		 *    the remote, expressed as: 4.096 * 2^timeout [usec]"
+		 * The FW expects timeout in msec so we need to divide the usec
+		 * result by 1000. We'll approximate 1000~2^10, and 4.096 ~ 2^2,
+		 * so we get: 2^2 * 2^timeout / 2^10 = 2^(timeout - 8).
+		 * The value of zero means infinite so we use a 'max_t' to make
+		 * sure that sub 1 msec values will be configured as 1 msec.
+		 */
+		if (attr->timeout)
+			qp_params.ack_timeout =
+					1 << max_t(int, attr->timeout - 8, 0);
+		else
 			qp_params.ack_timeout = 0;
-		}
 	}
+
 	if (attr_mask & IB_QP_RETRY_CNT) {
 		SET_FIELD(qp_params.modify_flags,
 			  QED_ROCE_MODIFY_QP_VALID_RETRY_CNT, 1);
@@ -2014,7 +2037,7 @@ int qedr_query_qp(struct ib_qp *ibqp,
 	qp_attr->cap.max_recv_wr = qp->rq.max_wr;
 	qp_attr->cap.max_send_sge = qp->sq.max_sges;
 	qp_attr->cap.max_recv_sge = qp->rq.max_sges;
-	qp_attr->cap.max_inline_data = qp->max_inline_data;
+	qp_attr->cap.max_inline_data = ROCE_REQ_MAX_INLINE_DATA_SIZE;
 	qp_init_attr->cap = qp_attr->cap;
 
 	memcpy(&qp_attr->ah_attr.grh.dgid.raw[0], &params.dgid.bytes[0],
@@ -2789,6 +2812,11 @@ int __qedr_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 
 	switch (wr->opcode) {
 	case IB_WR_SEND_WITH_IMM:
+		if (unlikely(rdma_protocol_iwarp(&dev->ibdev, 1))) {
+			rc = -EINVAL;
+			*bad_wr = wr;
+			break;
+		}
 		wqe->req_type = RDMA_SQ_REQ_TYPE_SEND_WITH_IMM;
 		swqe = (struct rdma_sq_send_wqe_1st *)wqe;
 		swqe->wqe_size = 2;
@@ -2830,6 +2858,11 @@ int __qedr_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 		break;
 
 	case IB_WR_RDMA_WRITE_WITH_IMM:
+		if (unlikely(rdma_protocol_iwarp(&dev->ibdev, 1))) {
+			rc = -EINVAL;
+			*bad_wr = wr;
+			break;
+		}
 		wqe->req_type = RDMA_SQ_REQ_TYPE_RDMA_WR_WITH_IMM;
 		rwqe = (struct rdma_sq_rdma_wqe_1st *)wqe;
 
@@ -3220,9 +3253,10 @@ static int qedr_poll_cq_req(struct qedr_dev *dev,
 				  IB_WC_SUCCESS, 0);
 		break;
 	case RDMA_CQE_REQ_STS_WORK_REQUEST_FLUSHED_ERR:
-		DP_ERR(dev,
-		       "Error: POLL CQ with RDMA_CQE_REQ_STS_WORK_REQUEST_FLUSHED_ERR. CQ icid=0x%x, QP icid=0x%x\n",
-		       cq->icid, qp->icid);
+		if (qp->state != QED_ROCE_QP_STATE_ERR)
+			DP_ERR(dev,
+			       "Error: POLL CQ with RDMA_CQE_REQ_STS_WORK_REQUEST_FLUSHED_ERR. CQ icid=0x%x, QP icid=0x%x\n",
+			       cq->icid, qp->icid);
 		cnt = process_req(dev, qp, cq, num_entries, wc, req->sq_cons,
 				  IB_WC_WR_FLUSH_ERR, 0);
 		break;
@@ -3448,7 +3482,7 @@ int qedr_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 {
 	struct qedr_dev *dev = get_qedr_dev(ibcq->device);
 	struct qedr_cq *cq = get_qedr_cq(ibcq);
-	union rdma_cqe *cqe = cq->latest_cqe;
+	union rdma_cqe *cqe;
 	u32 old_cons, new_cons;
 	unsigned long flags;
 	int update = 0;
@@ -3458,6 +3492,7 @@ int qedr_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 		return qedr_gsi_poll_cq(ibcq, num_entries, wc);
 
 	spin_lock_irqsave(&cq->cq_lock, flags);
+	cqe = cq->latest_cqe;
 	old_cons = qed_chain_get_cons_idx_u32(&cq->pbl);
 	while (num_entries && is_valid_cqe(cq, cqe)) {
 		struct qedr_qp *qp;

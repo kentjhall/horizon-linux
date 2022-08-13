@@ -8,6 +8,7 @@
  *
  * Copyright (C) 2003-2005,2008 David Brownell
  * Copyright (C) 2008 Nokia Corporation
+ * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -57,6 +58,7 @@ struct f_ncm {
 	struct usb_ep			*notify;
 	struct usb_request		*notify_req;
 	u8				notify_state;
+	atomic_t			notify_count;
 	bool				is_open;
 
 	const struct ndp_parser_opts	*parser_opts;
@@ -90,8 +92,10 @@ static inline struct f_ncm *func_to_ncm(struct usb_function *f)
 /* peak (theoretical) bulk transfer rate in bits-per-second */
 static inline unsigned ncm_bitrate(struct usb_gadget *g)
 {
-	if (gadget_is_superspeed(g) && g->speed == USB_SPEED_SUPER)
-		return 13 * 1024 * 8 * 1000 * 8;
+	if (gadget_is_superspeed(g) && g->speed >= USB_SPEED_SUPER_PLUS)
+		return 4250000000U;
+	else if (gadget_is_superspeed(g) && g->speed == USB_SPEED_SUPER)
+		return 3750000000U;
 	else if (gadget_is_dualspeed(g) && g->speed == USB_SPEED_HIGH)
 		return 13 * 512 * 8 * 1000 * 8;
 	else
@@ -552,7 +556,7 @@ static void ncm_do_notify(struct f_ncm *ncm)
 	int				status;
 
 	/* notification already in flight? */
-	if (!req)
+	if (atomic_read(&ncm->notify_count))
 		return;
 
 	event = req->buf;
@@ -592,7 +596,8 @@ static void ncm_do_notify(struct f_ncm *ncm)
 	event->bmRequestType = 0xA1;
 	event->wIndex = cpu_to_le16(ncm->ctrl_id);
 
-	ncm->notify_req = NULL;
+	atomic_inc(&ncm->notify_count);
+
 	/*
 	 * In double buffering if there is a space in FIFO,
 	 * completion callback can be called right after the call,
@@ -602,7 +607,7 @@ static void ncm_do_notify(struct f_ncm *ncm)
 	status = usb_ep_queue(ncm->notify, req, GFP_ATOMIC);
 	spin_lock(&ncm->lock);
 	if (status < 0) {
-		ncm->notify_req = req;
+		atomic_dec(&ncm->notify_count);
 		DBG(cdev, "notify --> %d\n", status);
 	}
 }
@@ -637,17 +642,19 @@ static void ncm_notify_complete(struct usb_ep *ep, struct usb_request *req)
 	case 0:
 		VDBG(cdev, "Notification %02x sent\n",
 		     event->bNotificationType);
+		atomic_dec(&ncm->notify_count);
 		break;
 	case -ECONNRESET:
 	case -ESHUTDOWN:
+		atomic_set(&ncm->notify_count, 0);
 		ncm->notify_state = NCM_NOTIFY_NONE;
 		break;
 	default:
 		DBG(cdev, "event %02x --> %d\n",
 			event->bNotificationType, req->status);
+		atomic_dec(&ncm->notify_count);
 		break;
 	}
-	ncm->notify_req = req;
 	ncm_do_notify(ncm);
 	spin_unlock(&ncm->lock);
 }
@@ -878,11 +885,10 @@ static int ncm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		DBG(cdev, "reset ncm control %d\n", intf);
 		usb_ep_disable(ncm->notify);
 
-		if (!(ncm->notify->desc)) {
-			DBG(cdev, "init ncm ctrl %d\n", intf);
-			if (config_ep_by_speed(cdev->gadget, f, ncm->notify))
-				goto fail;
-		}
+		DBG(cdev, "init ncm ctrl %d\n", intf);
+		if (config_ep_by_speed(cdev->gadget, f, ncm->notify))
+			goto fail;
+
 		usb_ep_enable(ncm->notify);
 
 	/* Data interface has two altsettings, 0 and 1 */
@@ -905,17 +911,14 @@ static int ncm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		if (alt == 1) {
 			struct net_device	*net;
 
-			if (!ncm->port.in_ep->desc ||
-			    !ncm->port.out_ep->desc) {
-				DBG(cdev, "init ncm\n");
-				if (config_ep_by_speed(cdev->gadget, f,
-						       ncm->port.in_ep) ||
-				    config_ep_by_speed(cdev->gadget, f,
-						       ncm->port.out_ep)) {
-					ncm->port.in_ep->desc = NULL;
-					ncm->port.out_ep->desc = NULL;
-					goto fail;
-				}
+			DBG(cdev, "init ncm\n");
+			if (config_ep_by_speed(cdev->gadget, f,
+					       ncm->port.in_ep) ||
+			    config_ep_by_speed(cdev->gadget, f,
+					       ncm->port.out_ep)) {
+				ncm->port.in_ep->desc = NULL;
+				ncm->port.out_ep->desc = NULL;
+				goto fail;
 			}
 
 			/* TODO */
@@ -1115,6 +1118,8 @@ static struct sk_buff *ncm_wrap_ntb(struct gether *port,
 			      HRTIMER_MODE_REL);
 
 		/* Add the datagram position entries */
+		if (!ncm->skb_tx_ndp)
+			goto err;
 		ntb_ndp = (void *) skb_put(ncm->skb_tx_ndp, dgram_idx_len);
 		memset(ntb_ndp, 0, dgram_idx_len);
 
@@ -1205,9 +1210,11 @@ static int ncm_unwrap_ntb(struct gether *port,
 	int		ndp_index;
 	unsigned	dg_len, dg_len2;
 	unsigned	ndp_len;
+	unsigned	block_len;
 	struct sk_buff	*skb2;
 	int		ret = -EINVAL;
-	unsigned	max_size = le32_to_cpu(ntb_parameters.dwNtbOutMaxSize);
+	unsigned	ntb_max = le32_to_cpu(ntb_parameters.dwNtbOutMaxSize);
+	unsigned	frame_max = le16_to_cpu(ecm_desc.wMaxSegmentSize);
 	const struct ndp_parser_opts *opts = ncm->parser_opts;
 	unsigned	crc_len = ncm->is_crc ? sizeof(uint32_t) : 0;
 	int		dgram_counter;
@@ -1229,8 +1236,9 @@ static int ncm_unwrap_ntb(struct gether *port,
 	}
 	tmp++; /* skip wSequence */
 
+	block_len = get_ncm(&tmp, opts->block_length);
 	/* (d)wBlockLength */
-	if (get_ncm(&tmp, opts->block_length) > max_size) {
+	if (block_len > ntb_max) {
 		INFO(port->func.config->cdev, "OUT size exceeded\n");
 		goto err;
 	}
@@ -1239,15 +1247,23 @@ static int ncm_unwrap_ntb(struct gether *port,
 
 	/* Run through all the NDP's in the NTB */
 	do {
-		/* NCM 3.2 */
-		if (((ndp_index % 4) != 0) &&
-				(ndp_index < opts->nth_size)) {
+		/*
+		 * NCM 3.2
+		 * dwNdpIndex
+		 */
+		if (((ndp_index % 4) != 0) ||
+				(ndp_index < opts->nth_size) ||
+				(ndp_index > (block_len -
+					      opts->ndp_size))) {
 			INFO(port->func.config->cdev, "Bad index: %#X\n",
 			     ndp_index);
 			goto err;
 		}
 
-		/* walk through NDP */
+		/*
+		 * walk through NDP
+		 * dwSignature
+		 */
 		tmp = (void *)(skb->data + ndp_index);
 		if (get_unaligned_le32(tmp) != ncm->ndp_sign) {
 			INFO(port->func.config->cdev, "Wrong NDP SIGN\n");
@@ -1258,14 +1274,15 @@ static int ncm_unwrap_ntb(struct gether *port,
 		ndp_len = get_unaligned_le16(tmp++);
 		/*
 		 * NCM 3.3.1
+		 * wLength
 		 * entry is 2 items
 		 * item size is 16/32 bits, opts->dgram_item_len * 2 bytes
 		 * minimal: struct usb_cdc_ncm_ndpX + normal entry + zero entry
 		 * Each entry is a dgram index and a dgram length.
 		 */
 		if ((ndp_len < opts->ndp_size
-				+ 2 * 2 * (opts->dgram_item_len * 2))
-				|| (ndp_len % opts->ndplen_align != 0)) {
+				+ 2 * 2 * (opts->dgram_item_len * 2)) ||
+				(ndp_len % opts->ndplen_align != 0)) {
 			INFO(port->func.config->cdev, "Bad NDP length: %#X\n",
 			     ndp_len);
 			goto err;
@@ -1282,8 +1299,21 @@ static int ncm_unwrap_ntb(struct gether *port,
 
 		do {
 			index = index2;
+			/* wDatagramIndex[0] */
+			if ((index < opts->nth_size) ||
+					(index > block_len - opts->dpe_size)) {
+				INFO(port->func.config->cdev,
+				     "Bad index: %#X\n", index);
+				goto err;
+			}
+
 			dg_len = dg_len2;
-			if (dg_len < 14 + crc_len) { /* ethernet hdr + crc */
+			/*
+			 * wDatagramLength[0]
+			 * ethernet hdr + crc or larger than max frame size
+			 */
+			if ((dg_len < 14 + crc_len) ||
+					(dg_len > frame_max)) {
 				INFO(port->func.config->cdev,
 				     "Bad dgram length: %#X\n", dg_len);
 				goto err;
@@ -1307,6 +1337,13 @@ static int ncm_unwrap_ntb(struct gether *port,
 			index2 = get_ncm(&tmp, opts->dgram_item_len);
 			dg_len2 = get_ncm(&tmp, opts->dgram_item_len);
 
+			/* wDatagramIndex[1] */
+			if (index2 > block_len - opts->dpe_size) {
+				INFO(port->func.config->cdev,
+				     "Bad index: %#X\n", index2);
+				goto err;
+			}
+
 			/*
 			 * Copy the data into a new skb.
 			 * This ensures the truesize is correct
@@ -1323,7 +1360,6 @@ static int ncm_unwrap_ntb(struct gether *port,
 			ndp_len -= 2 * (opts->dgram_item_len * 2);
 
 			dgram_counter++;
-
 			if (index2 == 0 || dg_len2 == 0)
 				break;
 		} while (ndp_len > 2 * (opts->dgram_item_len * 2));
@@ -1511,7 +1547,7 @@ static int ncm_bind(struct usb_configuration *c, struct usb_function *f)
 		fs_ncm_notify_desc.bEndpointAddress;
 
 	status = usb_assign_descriptors(f, ncm_fs_function, ncm_hs_function,
-			ncm_ss_function, NULL);
+			ncm_ss_function, ncm_ss_function);
 	if (status)
 		goto fail;
 
@@ -1638,6 +1674,11 @@ static void ncm_unbind(struct usb_configuration *c, struct usb_function *f)
 
 	ncm_string_defs[0].id = 0;
 	usb_free_all_descriptors(f);
+
+	if (atomic_read(&ncm->notify_count)) {
+		usb_ep_dequeue(ncm->notify, ncm->notify_req);
+		atomic_set(&ncm->notify_count, 0);
+	}
 
 	kfree(ncm->notify_req->buf);
 	usb_ep_free_request(ncm->notify, ncm->notify_req);

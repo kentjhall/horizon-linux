@@ -28,18 +28,32 @@ static inline __sum16 csum_fold(__wsum csum)
 
 static inline __sum16 ip_fast_csum(const void *iph, unsigned int ihl)
 {
-	__uint128_t tmp;
+	union {
+		struct {
+#ifdef CONFIG_CPU_BIG_ENDIAN
+			uint64_t hi;
+			uint64_t lo;
+#else
+			uint64_t lo;
+			uint64_t hi;
+#endif
+		};
+		__uint128_t val;
+	} tmp;
 	u64 sum;
+	int n = ihl; /* we want it signed */
 
-	tmp = *(const __uint128_t *)iph;
+	asm volatile ("ldp %0, %1, [%2]\n" : "=r" (tmp.lo)
+					, "=r" (tmp.hi)
+					: "r" (iph));
 	iph += 16;
-	ihl -= 4;
-	tmp += ((tmp >> 64) | (tmp << 64));
-	sum = tmp >> 64;
+	n -= 4;
+	tmp.val += ((tmp.val >> 64) | (tmp.val << 64));
+	sum = tmp.val >> 64;
 	do {
 		sum += *(const u32 *)iph;
 		iph += 4;
-	} while (--ihl);
+	} while (--n > 0);
 
 	sum += ((sum >> 32) | (sum << 32));
 	return csum_fold(sum >> 32);

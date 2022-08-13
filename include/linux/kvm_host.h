@@ -129,7 +129,7 @@ static inline bool is_error_page(struct page *page)
 
 extern struct kmem_cache *kvm_vcpu_cache;
 
-extern spinlock_t kvm_lock;
+extern struct mutex kvm_lock;
 extern struct list_head vm_list;
 
 struct kvm_io_range {
@@ -162,8 +162,8 @@ int kvm_io_bus_read(struct kvm_vcpu *vcpu, enum kvm_bus bus_idx, gpa_t addr,
 		    int len, void *val);
 int kvm_io_bus_register_dev(struct kvm *kvm, enum kvm_bus bus_idx, gpa_t addr,
 			    int len, struct kvm_io_device *dev);
-int kvm_io_bus_unregister_dev(struct kvm *kvm, enum kvm_bus bus_idx,
-			      struct kvm_io_device *dev);
+void kvm_io_bus_unregister_dev(struct kvm *kvm, enum kvm_bus bus_idx,
+			       struct kvm_io_device *dev);
 struct kvm_io_device *kvm_io_bus_get_dev(struct kvm *kvm, enum kvm_bus bus_idx,
 					 gpa_t addr);
 
@@ -843,6 +843,7 @@ int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu);
 void kvm_vcpu_kick(struct kvm_vcpu *vcpu);
 
 bool kvm_is_reserved_pfn(kvm_pfn_t pfn);
+bool kvm_is_zone_device_pfn(kvm_pfn_t pfn);
 
 struct kvm_irq_ack_notifier {
 	struct hlist_node link;
@@ -913,7 +914,7 @@ search_memslots(struct kvm_memslots *slots, gfn_t gfn)
 			start = slot + 1;
 	}
 
-	if (gfn >= memslots[start].base_gfn &&
+	if (start < slots->used_slots && gfn >= memslots[start].base_gfn &&
 	    gfn < memslots[start].base_gfn + memslots[start].npages) {
 		atomic_set(&slots->lru_slot, start);
 		return &memslots[start];
@@ -1070,7 +1071,6 @@ static inline void kvm_irq_routing_update(struct kvm *kvm)
 {
 }
 #endif
-void kvm_arch_irq_routing_update(struct kvm *kvm);
 
 static inline int kvm_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
 {
@@ -1078,6 +1078,8 @@ static inline int kvm_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
 }
 
 #endif /* CONFIG_HAVE_KVM_EVENTFD */
+
+void kvm_arch_irq_routing_update(struct kvm *kvm);
 
 static inline void kvm_make_request(int req, struct kvm_vcpu *vcpu)
 {
@@ -1206,5 +1208,11 @@ static inline bool vcpu_valid_wakeup(struct kvm_vcpu *vcpu)
 	return true;
 }
 #endif /* CONFIG_HAVE_KVM_INVALID_WAKEUPS */
+
+typedef int (*kvm_vm_thread_fn_t)(struct kvm *kvm, uintptr_t data);
+
+int kvm_vm_create_worker_thread(struct kvm *kvm, kvm_vm_thread_fn_t thread_fn,
+				uintptr_t data, const char *name,
+				struct task_struct **thread_ptr);
 
 #endif

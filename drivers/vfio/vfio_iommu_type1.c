@@ -53,10 +53,16 @@ module_param_named(disable_hugepages,
 MODULE_PARM_DESC(disable_hugepages,
 		 "Disable VFIO IOMMU support for IOMMU hugepages.");
 
+static unsigned int dma_entry_limit __read_mostly = U16_MAX;
+module_param_named(dma_entry_limit, dma_entry_limit, uint, 0644);
+MODULE_PARM_DESC(dma_entry_limit,
+		 "Maximum number of user DMA mappings per container (65535).");
+
 struct vfio_iommu {
 	struct list_head	domain_list;
 	struct mutex		lock;
 	struct rb_root		dma_list;
+	unsigned int		dma_avail;
 	bool			v2;
 	bool			nesting;
 };
@@ -130,57 +136,36 @@ static void vfio_unlink_dma(struct vfio_iommu *iommu, struct vfio_dma *old)
 	rb_erase(&old->node, &iommu->dma_list);
 }
 
-struct vwork {
-	struct mm_struct	*mm;
-	long			npage;
-	struct work_struct	work;
-};
-
-/* delayed decrement/increment for locked_vm */
-static void vfio_lock_acct_bg(struct work_struct *work)
+static int vfio_lock_acct(long npage, bool *lock_cap)
 {
-	struct vwork *vwork = container_of(work, struct vwork, work);
-	struct mm_struct *mm;
+	int ret;
 
-	mm = vwork->mm;
-	down_write(&mm->mmap_sem);
-	mm->locked_vm += vwork->npage;
-	up_write(&mm->mmap_sem);
-	mmput(mm);
-	kfree(vwork);
-}
+	if (!npage)
+		return 0;
 
-static void vfio_lock_acct(long npage)
-{
-	struct vwork *vwork;
-	struct mm_struct *mm;
+	if (!current->mm)
+		return -ESRCH; /* process exited */
 
-	if (!current->mm || !npage)
-		return; /* process exited or nothing to do */
+	ret = down_write_killable(&current->mm->mmap_sem);
+	if (!ret) {
+		if (npage > 0) {
+			if (lock_cap ? !*lock_cap : !capable(CAP_IPC_LOCK)) {
+				unsigned long limit;
 
-	if (down_write_trylock(&current->mm->mmap_sem)) {
-		current->mm->locked_vm += npage;
+				limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+
+				if (current->mm->locked_vm + npage > limit)
+					ret = -ENOMEM;
+			}
+		}
+
+		if (!ret)
+			current->mm->locked_vm += npage;
+
 		up_write(&current->mm->mmap_sem);
-		return;
 	}
 
-	/*
-	 * Couldn't get mmap_sem lock, so must setup to update
-	 * mm->locked_vm later. If locked_vm were atomic, we
-	 * wouldn't need this silliness
-	 */
-	vwork = kmalloc(sizeof(struct vwork), GFP_KERNEL);
-	if (!vwork)
-		return;
-	mm = get_task_mm(current);
-	if (!mm) {
-		kfree(vwork);
-		return;
-	}
-	INIT_WORK(&vwork->work, vfio_lock_acct_bg);
-	vwork->mm = mm;
-	vwork->npage = npage;
-	schedule_work(&vwork->work);
+	return ret;
 }
 
 /*
@@ -228,6 +213,32 @@ static int put_pfn(unsigned long pfn, int prot)
 	return 0;
 }
 
+static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
+			    unsigned long vaddr, unsigned long *pfn,
+			    bool write_fault)
+{
+	int ret;
+
+	ret = follow_pfn(vma, vaddr, pfn);
+	if (ret) {
+		bool unlocked = false;
+
+		ret = fixup_user_fault(NULL, mm, vaddr,
+				       FAULT_FLAG_REMOTE |
+				       (write_fault ?  FAULT_FLAG_WRITE : 0),
+				       &unlocked);
+		if (unlocked)
+			return -EAGAIN;
+
+		if (ret)
+			return ret;
+
+		ret = follow_pfn(vma, vaddr, pfn);
+	}
+
+	return ret;
+}
+
 static int vaddr_get_pfn(unsigned long vaddr, int prot, unsigned long *pfn)
 {
 	struct page *page[1];
@@ -241,12 +252,16 @@ static int vaddr_get_pfn(unsigned long vaddr, int prot, unsigned long *pfn)
 
 	down_read(&current->mm->mmap_sem);
 
+retry:
 	vma = find_vma_intersection(current->mm, vaddr, vaddr + 1);
 
 	if (vma && vma->vm_flags & VM_PFNMAP) {
-		*pfn = ((vaddr - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
-		if (is_invalid_reserved_pfn(*pfn))
-			ret = 0;
+		ret = follow_fault_pfn(vma, current->mm, vaddr, pfn, prot & IOMMU_WRITE);
+		if (ret == -EAGAIN)
+			goto retry;
+
+		if (!ret && !is_invalid_reserved_pfn(*pfn))
+			ret = -EFAULT;
 	}
 
 	up_read(&current->mm->mmap_sem);
@@ -262,9 +277,9 @@ static int vaddr_get_pfn(unsigned long vaddr, int prot, unsigned long *pfn)
 static long vfio_pin_pages(unsigned long vaddr, long npage,
 			   int prot, unsigned long *pfn_base)
 {
-	unsigned long limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+	unsigned long pfn = 0, limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
 	bool lock_cap = capable(CAP_IPC_LOCK);
-	long ret, i;
+	long ret, i = 1;
 	bool rsvd;
 
 	if (!current->mm)
@@ -283,16 +298,11 @@ static long vfio_pin_pages(unsigned long vaddr, long npage,
 		return -ENOMEM;
 	}
 
-	if (unlikely(disable_hugepages)) {
-		if (!rsvd)
-			vfio_lock_acct(1);
-		return 1;
-	}
+	if (unlikely(disable_hugepages))
+		goto out;
 
 	/* Lock all the consecutive pages from pfn_base */
-	for (i = 1, vaddr += PAGE_SIZE; i < npage; i++, vaddr += PAGE_SIZE) {
-		unsigned long pfn = 0;
-
+	for (vaddr += PAGE_SIZE; i < npage; i++, vaddr += PAGE_SIZE) {
 		ret = vaddr_get_pfn(vaddr, prot, &pfn);
 		if (ret)
 			break;
@@ -308,12 +318,24 @@ static long vfio_pin_pages(unsigned long vaddr, long npage,
 			put_pfn(pfn, prot);
 			pr_warn("%s: RLIMIT_MEMLOCK (%ld) exceeded\n",
 				__func__, limit << PAGE_SHIFT);
-			break;
+			ret = -ENOMEM;
+			goto unpin_out;
 		}
 	}
 
+out:
 	if (!rsvd)
-		vfio_lock_acct(i);
+		ret = vfio_lock_acct(i, &lock_cap);
+
+unpin_out:
+	if (ret) {
+		if (!rsvd) {
+			for (pfn = *pfn_base ; i ; pfn++, i--)
+				put_pfn(pfn, prot);
+		}
+
+		return ret;
+	}
 
 	return i;
 }
@@ -328,7 +350,7 @@ static long vfio_unpin_pages(unsigned long pfn, long npage,
 		unlocked += put_pfn(pfn++, prot);
 
 	if (do_accounting)
-		vfio_lock_acct(-unlocked);
+		vfio_lock_acct(-unlocked, NULL);
 
 	return unlocked;
 }
@@ -390,7 +412,7 @@ static void vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma)
 		cond_resched();
 	}
 
-	vfio_lock_acct(-unlocked);
+	vfio_lock_acct(-unlocked, NULL);
 }
 
 static void vfio_remove_dma(struct vfio_iommu *iommu, struct vfio_dma *dma)
@@ -398,6 +420,7 @@ static void vfio_remove_dma(struct vfio_iommu *iommu, struct vfio_dma *dma)
 	vfio_unmap_unpin(iommu, dma);
 	vfio_unlink_dma(iommu, dma);
 	kfree(dma);
+	iommu->dma_avail++;
 }
 
 static unsigned long vfio_pgsize_bitmap(struct vfio_iommu *iommu)
@@ -598,12 +621,18 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 		return -EEXIST;
 	}
 
+	if (!iommu->dma_avail) {
+		mutex_unlock(&iommu->lock);
+		return -ENOSPC;
+	}
+
 	dma = kzalloc(sizeof(*dma), GFP_KERNEL);
 	if (!dma) {
 		mutex_unlock(&iommu->lock);
 		return -ENOMEM;
 	}
 
+	iommu->dma_avail--;
 	dma->iova = iova;
 	dma->vaddr = vaddr;
 	dma->prot = prot;
@@ -919,6 +948,7 @@ static void *vfio_iommu_type1_open(unsigned long arg)
 
 	INIT_LIST_HEAD(&iommu->domain_list);
 	iommu->dma_list = RB_ROOT;
+	iommu->dma_avail = dma_entry_limit;
 	mutex_init(&iommu->lock);
 
 	return iommu;

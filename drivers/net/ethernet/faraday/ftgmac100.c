@@ -28,6 +28,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
+#include <linux/of.h>
 #include <linux/phy.h>
 #include <linux/platform_device.h>
 #include <net/ip.h>
@@ -1443,6 +1444,8 @@ static int ftgmac100_probe(struct platform_device *pdev)
 	return 0;
 
 err_ncsi_dev:
+	if (priv->ndev)
+		ncsi_unregister_dev(priv->ndev);
 err_register_netdev:
 	ftgmac100_destroy_mdio(netdev);
 err_setup_mdio:
@@ -1464,6 +1467,8 @@ static int __exit ftgmac100_remove(struct platform_device *pdev)
 	netdev = platform_get_drvdata(pdev);
 	priv = netdev_priv(netdev);
 
+	if (priv->ndev)
+		ncsi_unregister_dev(priv->ndev);
 	unregister_netdev(netdev);
 	ftgmac100_destroy_mdio(netdev);
 

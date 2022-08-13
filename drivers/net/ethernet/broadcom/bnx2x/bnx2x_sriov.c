@@ -434,7 +434,9 @@ static int bnx2x_vf_mac_vlan_config(struct bnx2x *bp,
 
 	/* Add/Remove the filter */
 	rc = bnx2x_config_vlan_mac(bp, &ramrod);
-	if (rc && rc != -EEXIST) {
+	if (rc == -EEXIST)
+		return 0;
+	if (rc) {
 		BNX2X_ERR("Failed to %s %s\n",
 			  filter->add ? "add" : "delete",
 			  (filter->type == BNX2X_VF_FILTER_VLAN_MAC) ?
@@ -443,6 +445,8 @@ static int bnx2x_vf_mac_vlan_config(struct bnx2x *bp,
 				"MAC" : "VLAN");
 		return rc;
 	}
+
+	filter->applied = true;
 
 	return 0;
 }
@@ -471,6 +475,8 @@ int bnx2x_vf_mac_vlan_config_list(struct bnx2x *bp, struct bnx2x_virtf *vf,
 		BNX2X_ERR("Managed only %d/%d filters - rolling back\n",
 			  i, filters->count + 1);
 		while (--i >= 0) {
+			if (!filters->filters[i].applied)
+				continue;
 			filters->filters[i].add = !filters->filters[i].add;
 			bnx2x_vf_mac_vlan_config(bp, vf, qid,
 						 &filters->filters[i],
@@ -2370,15 +2376,21 @@ static int bnx2x_set_pf_tx_switching(struct bnx2x *bp, bool enable)
 	/* send the ramrod on all the queues of the PF */
 	for_each_eth_queue(bp, i) {
 		struct bnx2x_fastpath *fp = &bp->fp[i];
+		int tx_idx;
 
 		/* Set the appropriate Queue object */
 		q_params.q_obj = &bnx2x_sp_obj(bp, fp).q_obj;
 
-		/* Update the Queue state */
-		rc = bnx2x_queue_state_change(bp, &q_params);
-		if (rc) {
-			BNX2X_ERR("Failed to configure Tx switching\n");
-			return rc;
+		for (tx_idx = FIRST_TX_COS_INDEX;
+		     tx_idx < fp->max_cos; tx_idx++) {
+			q_params.params.update.cid_index = tx_idx;
+
+			/* Update the Queue state */
+			rc = bnx2x_queue_state_change(bp, &q_params);
+			if (rc) {
+				BNX2X_ERR("Failed to configure Tx switching\n");
+				return rc;
+			}
 		}
 	}
 

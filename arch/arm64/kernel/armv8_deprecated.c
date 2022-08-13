@@ -14,7 +14,6 @@
 #include <linux/slab.h>
 #include <linux/sysctl.h>
 
-#include <asm/alternative.h>
 #include <asm/cpufeature.h>
 #include <asm/insn.h>
 #include <asm/opcodes.h>
@@ -285,10 +284,10 @@ static void __init register_insn_emulation_sysctl(struct ctl_table *table)
 #define __SWP_LL_SC_LOOPS	4
 
 #define __user_swpX_asm(data, addr, res, temp, temp2, B)	\
+do {								\
+	uaccess_enable();					\
 	__asm__ __volatile__(					\
 	"	mov		%w3, %w7\n"			\
-	ALTERNATIVE("nop", SET_PSTATE_PAN(0), ARM64_HAS_PAN,	\
-		    CONFIG_ARM64_PAN)				\
 	"0:	ldxr"B"		%w2, [%4]\n"			\
 	"1:	stxr"B"		%w0, %w1, [%4]\n"		\
 	"	cbz		%w0, 2f\n"			\
@@ -306,12 +305,13 @@ static void __init register_insn_emulation_sysctl(struct ctl_table *table)
 	"	.popsection"					\
 	_ASM_EXTABLE(0b, 4b)					\
 	_ASM_EXTABLE(1b, 4b)					\
-	ALTERNATIVE("nop", SET_PSTATE_PAN(1), ARM64_HAS_PAN,	\
-		CONFIG_ARM64_PAN)				\
 	: "=&r" (res), "+r" (data), "=&r" (temp), "=&r" (temp2)	\
-	: "r" (addr), "i" (-EAGAIN), "i" (-EFAULT),		\
+	: "r" ((unsigned long)addr), "i" (-EAGAIN),		\
+	  "i" (-EFAULT),					\
 	  "i" (__SWP_LL_SC_LOOPS)				\
-	: "memory")
+	: "memory");						\
+	uaccess_disable();					\
+} while (0)
 
 #define __user_swp_asm(data, addr, res, temp, temp2) \
 	__user_swpX_asm(data, addr, res, temp, temp2, "")
@@ -505,7 +505,12 @@ static int cp15barrier_handler(struct pt_regs *regs, u32 instr)
 	}
 
 ret:
-	pr_warn_ratelimited("\"%s\" (%ld) uses deprecated CP15 Barrier instruction at 0x%llx\n",
+	if (!test_thread_flag(TIF_DEPRECATED_WARN)) {
+		pr_warn("\"%s\" (%ld) uses deprecated CP15 Barrier instruction at 0x%llx\n",
+			current->comm, (unsigned long)current->pid, regs->pc);
+		set_thread_flag(TIF_DEPRECATED_WARN);
+	} else
+		pr_debug("\"%s\" (%ld) uses deprecated CP15 Barrier instruction at 0x%llx\n",
 			current->comm, (unsigned long)current->pid, regs->pc);
 
 	regs->pc += 4;
@@ -603,7 +608,7 @@ static struct undef_hook setend_hooks[] = {
 	},
 	{
 		/* Thumb mode */
-		.instr_mask	= 0x0000fff7,
+		.instr_mask	= 0xfffffff7,
 		.instr_val	= 0x0000b650,
 		.pstate_mask	= (COMPAT_PSR_T_BIT | COMPAT_PSR_MODE_MASK),
 		.pstate_val	= (COMPAT_PSR_T_BIT | COMPAT_PSR_MODE_USR),

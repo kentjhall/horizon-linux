@@ -144,7 +144,7 @@ static int page_cache_tree_insert(struct address_space *mapping,
 				workingset_node_pages_dec(node);
 			/* Wakeup waiters for exceptional entry lock */
 			dax_wake_mapping_entry_waiter(mapping, page->index,
-						      false);
+						      true);
 		}
 	}
 	radix_tree_replace_slot(slot, page);
@@ -343,6 +343,11 @@ void delete_from_page_cache(struct page *page)
 }
 EXPORT_SYMBOL(delete_from_page_cache);
 
+static int sleep_on_page_timeout(struct wait_bit_key *word, int unused)
+{
+	return io_schedule_timeout(2) ? 0 : -EAGAIN;
+}
+
 int filemap_check_errors(struct address_space *mapping)
 {
 	int ret = 0;
@@ -383,7 +388,8 @@ int __filemap_fdatawrite_range(struct address_space *mapping, loff_t start,
 		.range_end = end,
 	};
 
-	if (!mapping_cap_writeback_dirty(mapping))
+	if (!mapping_cap_writeback_dirty(mapping) ||
+	    !mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
 		return 0;
 
 	wbc_attach_fdatawrite_inode(&wbc, mapping->host);
@@ -616,7 +622,7 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 	VM_BUG_ON_PAGE(!PageLocked(new), new);
 	VM_BUG_ON_PAGE(new->mapping, new);
 
-	error = radix_tree_preload(gfp_mask & ~__GFP_HIGHMEM);
+	error = radix_tree_preload(gfp_mask & GFP_RECLAIM_MASK);
 	if (!error) {
 		struct address_space *mapping = old->mapping;
 		void (*freepage)(struct page *);
@@ -672,7 +678,7 @@ static int __add_to_page_cache_locked(struct page *page,
 			return error;
 	}
 
-	error = radix_tree_maybe_preload(gfp_mask & ~__GFP_HIGHMEM);
+	error = radix_tree_maybe_preload(gfp_mask & GFP_RECLAIM_MASK);
 	if (error) {
 		if (!huge)
 			mem_cgroup_cancel_charge(page, memcg, false);
@@ -804,6 +810,16 @@ void wait_on_page_bit(struct page *page, int bit_nr)
 }
 EXPORT_SYMBOL(wait_on_page_bit);
 
+void wait_on_page_bit_timeout(struct page *page, int bit_nr)
+{
+	DEFINE_WAIT_BIT(wait, &page->flags, bit_nr);
+
+	if (test_bit(bit_nr, &page->flags))
+		__wait_on_bit(page_waitqueue(page), &wait,
+				sleep_on_page_timeout, TASK_UNINTERRUPTIBLE);
+}
+EXPORT_SYMBOL(wait_on_page_bit_timeout);
+
 int wait_on_page_bit_killable(struct page *page, int bit_nr)
 {
 	DEFINE_WAIT_BIT(wait, &page->flags, bit_nr);
@@ -910,9 +926,12 @@ void page_endio(struct page *page, bool is_write, int err)
 		unlock_page(page);
 	} else {
 		if (err) {
+			struct address_space *mapping;
+
 			SetPageError(page);
-			if (page->mapping)
-				mapping_set_error(page->mapping, err);
+			mapping = page_mapping(page);
+			if (mapping)
+				mapping_set_error(mapping, err);
 		}
 		end_page_writeback(page);
 	}
@@ -1244,8 +1263,7 @@ no_page:
 		if (fgp_flags & FGP_ACCESSED)
 			__SetPageReferenced(page);
 
-		err = add_to_page_cache_lru(page, mapping, offset,
-				gfp_mask & GFP_RECLAIM_MASK);
+		err = add_to_page_cache_lru(page, mapping, offset, gfp_mask);
 		if (unlikely(err)) {
 			put_page(page);
 			page = NULL;
@@ -1686,7 +1704,7 @@ static ssize_t do_generic_file_read(struct file *filp, loff_t *ppos,
 	int error = 0;
 
 	if (unlikely(*ppos >= inode->i_sb->s_maxbytes))
-		return -EINVAL;
+		return 0;
 	iov_iter_truncate(iter, inode->i_sb->s_maxbytes);
 
 	index = *ppos >> PAGE_SHIFT;
@@ -1703,6 +1721,11 @@ static ssize_t do_generic_file_read(struct file *filp, loff_t *ppos,
 
 		cond_resched();
 find_page:
+		if (fatal_signal_pending(current)) {
+			error = -EINTR;
+			goto out;
+		}
+
 		page = find_get_page(mapping, index);
 		if (!page) {
 			page_cache_sync_readahead(mapping,
@@ -1988,7 +2011,7 @@ static int page_cache_read(struct file *file, pgoff_t offset, gfp_t gfp_mask)
 		if (!page)
 			return -ENOMEM;
 
-		ret = add_to_page_cache_lru(page, mapping, offset, gfp_mask & GFP_KERNEL);
+		ret = add_to_page_cache_lru(page, mapping, offset, gfp_mask);
 		if (ret == 0)
 			ret = mapping->a_ops->readpage(file, page);
 		else if (ret == -EEXIST)
@@ -2380,7 +2403,7 @@ static struct page *wait_on_page_read(struct page *page)
 
 static struct page *do_read_cache_page(struct address_space *mapping,
 				pgoff_t index,
-				int (*filler)(void *, struct page *),
+				int (*filler)(struct file *, struct page *),
 				void *data,
 				gfp_t gfp)
 {
@@ -2466,6 +2489,14 @@ filler:
 		unlock_page(page);
 		goto out;
 	}
+
+	/*
+	 * A previous I/O error may have been due to temporary
+	 * failures.
+	 * Clear page error before actual read, PG_error will be
+	 * set again if read page fails.
+	 */
+	ClearPageError(page);
 	goto filler;
 
 out:
@@ -2487,7 +2518,7 @@ out:
  */
 struct page *read_cache_page(struct address_space *mapping,
 				pgoff_t index,
-				int (*filler)(void *, struct page *),
+				int (*filler)(struct file *, struct page *),
 				void *data)
 {
 	return do_read_cache_page(mapping, index, filler, data, mapping_gfp_mask(mapping));
@@ -2509,7 +2540,7 @@ struct page *read_cache_page_gfp(struct address_space *mapping,
 				pgoff_t index,
 				gfp_t gfp)
 {
-	filler_t *filler = (filler_t *)mapping->a_ops->readpage;
+	filler_t *filler = mapping->a_ops->readpage;
 
 	return do_read_cache_page(mapping, index, filler, NULL, gfp);
 }

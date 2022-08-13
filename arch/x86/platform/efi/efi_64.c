@@ -45,6 +45,7 @@
 #include <asm/realmode.h>
 #include <asm/time.h>
 #include <asm/pgalloc.h>
+#include <asm/sections.h>
 
 /*
  * We allocate runtime services regions bottom-up, starting from -4G, i.e.
@@ -142,7 +143,7 @@ int __init efi_alloc_page_tables(void)
 		return 0;
 
 	gfp_mask = GFP_KERNEL | __GFP_NOTRACK | __GFP_ZERO;
-	efi_pgd = (pgd_t *)__get_free_page(gfp_mask);
+	efi_pgd = (pgd_t *)__get_free_pages(gfp_mask, PGD_ALLOCATION_ORDER);
 	if (!efi_pgd)
 		return -ENOMEM;
 
@@ -267,6 +268,22 @@ int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 	}
 
 	efi_scratch.use_pgd = true;
+
+	/*
+	 * Certain firmware versions are way too sentimential and still believe
+	 * they are exclusive and unquestionable owners of the first physical page,
+	 * even though they explicitly mark it as EFI_CONVENTIONAL_MEMORY
+	 * (but then write-access it later during SetVirtualAddressMap()).
+	 *
+	 * Create a 1:1 mapping for this page, to avoid triple faults during early
+	 * boot with such firmware. We are free to hand this page to the BIOS,
+	 * as trim_bios_range() will reserve the first page and isolate it away
+	 * from memory allocators anyway.
+	 */
+	if (kernel_map_pages_in_pgd(pgd, 0x0, 0x0, 1, _PAGE_RW)) {
+		pr_err("Failed to create 1:1 mapping for the first page!\n");
+		return 1;
+	}
 
 	/*
 	 * When making calls to the firmware everything needs to be 1:1

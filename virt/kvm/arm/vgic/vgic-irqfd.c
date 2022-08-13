@@ -99,6 +99,9 @@ int kvm_set_msi(struct kvm_kernel_irq_routing_entry *e,
 	if (!vgic_has_its(kvm))
 		return -ENODEV;
 
+	if (!level)
+		return -1;
+
 	return vgic_its_inject_msi(kvm, &msi);
 }
 
@@ -109,8 +112,7 @@ int kvm_vgic_setup_default_irq_routing(struct kvm *kvm)
 	u32 nr = dist->nr_spis;
 	int i, ret;
 
-	entries = kcalloc(nr, sizeof(struct kvm_kernel_irq_routing_entry),
-			  GFP_KERNEL);
+	entries = kcalloc(nr, sizeof(*entries), GFP_KERNEL);
 	if (!entries)
 		return -ENOMEM;
 

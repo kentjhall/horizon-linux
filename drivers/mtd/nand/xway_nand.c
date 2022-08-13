@@ -211,7 +211,7 @@ static int xway_nand_probe(struct platform_device *pdev)
 
 	err = mtd_device_register(mtd, NULL, 0);
 	if (err)
-		nand_release(mtd);
+		nand_cleanup(&data->chip);
 
 	return err;
 }
@@ -223,7 +223,7 @@ static int xway_nand_remove(struct platform_device *pdev)
 {
 	struct xway_nand_data *data = platform_get_drvdata(pdev);
 
-	nand_release(nand_to_mtd(&data->chip));
+	nand_release(&data->chip);
 
 	return 0;
 }
@@ -232,7 +232,6 @@ static const struct of_device_id xway_nand_match[] = {
 	{ .compatible = "lantiq,nand-xway" },
 	{},
 };
-MODULE_DEVICE_TABLE(of, xway_nand_match);
 
 static struct platform_driver xway_nand_driver = {
 	.probe	= xway_nand_probe,
@@ -243,6 +242,4 @@ static struct platform_driver xway_nand_driver = {
 	},
 };
 
-module_platform_driver(xway_nand_driver);
-
-MODULE_LICENSE("GPL");
+builtin_platform_driver(xway_nand_driver);

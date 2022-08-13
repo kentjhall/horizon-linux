@@ -146,6 +146,8 @@ static int brcm_tag_rcv(struct sk_buff *skb, struct net_device *dev,
 	skb->dev->stats.rx_packets++;
 	skb->dev->stats.rx_bytes += skb->len;
 
+	skb->offload_fwd_mark = 1;
+
 	netif_receive_skb(skb);
 
 	return 0;

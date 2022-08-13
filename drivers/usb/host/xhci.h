@@ -3,6 +3,7 @@
  * xHCI host controller driver
  *
  * Copyright (C) 2008 Intel Corp.
+ * Copyright (c) 2018 NVIDIA CORPORATION.  All rights reserved.
  *
  * Author: Sarah Sharp
  * Some code borrowed from the Linux EHCI driver.
@@ -311,10 +312,14 @@ struct xhci_op_regs {
  */
 #define PORT_PLS_MASK	(0xf << 5)
 #define XDEV_U0		(0x0 << 5)
+#define XDEV_U1		(0x1 << 5)
 #define XDEV_U2		(0x2 << 5)
 #define XDEV_U3		(0x3 << 5)
+#define XDEV_DISABLED	(0x4 << 5)
+#define XDEV_RXDETECT	(0x5 << 5)
 #define XDEV_INACTIVE	(0x6 << 5)
 #define XDEV_POLLING	(0x7 << 5)
+#define XDEV_RECOVERY	(0x8 << 5)
 #define XDEV_COMP_MODE  (0xa << 5)
 #define XDEV_RESUME	(0xf << 5)
 /* true: port has power (see HCC_PPC) */
@@ -385,6 +390,10 @@ struct xhci_op_regs {
 #define PORT_PLC	(1 << 22)
 /* port configure error change - port failed to configure its link partner */
 #define PORT_CEC	(1 << 23)
+#define PORT_CHANGE_MASK	(PORT_CSC | PORT_PEC | PORT_WRC | PORT_OCC | \
+				 PORT_RC | PORT_PLC | PORT_CEC)
+
+
 /* Cold Attach Status - xHC can set this bit to report device attached during
  * Sx state. Warm port reset should be perfomed to clear this bit and move port
  * to connected state.
@@ -703,7 +712,7 @@ struct xhci_ep_ctx {
  * 4 - TRB error
  * 5-7 - reserved
  */
-#define EP_STATE_MASK		(0xf)
+#define EP_STATE_MASK		(0x7)
 #define EP_STATE_DISABLED	0
 #define EP_STATE_RUNNING	1
 #define EP_STATE_HALTED		2
@@ -926,7 +935,6 @@ struct xhci_virt_ep {
 	unsigned int		stopped_stream;
 	/* Watchdog timer for stop endpoint command to cancel URBs */
 	struct timer_list	stop_cmd_timer;
-	int			stop_cmds_pending;
 	struct xhci_hcd		*xhci;
 	/* Dequeue pointer and dequeue segment for a submitted Set TR Dequeue
 	 * command.  We'll need to update the ring's dequeue segment and dequeue
@@ -1505,11 +1513,11 @@ struct xhci_bus_state {
  * It can take up to 20 ms to transition from RExit to U0 on the
  * Intel Lynx Point LP xHCI host.
  */
-#define	XHCI_MAX_REXIT_TIMEOUT	(20 * 1000)
+#define	XHCI_MAX_REXIT_TIMEOUT_MS	20
 
 static inline unsigned int hcd_index(struct usb_hcd *hcd)
 {
-	if (hcd->speed == HCD_USB3)
+	if (hcd->speed >= HCD_USB3)
 		return 0;
 	else
 		return 1;
@@ -1521,6 +1529,11 @@ struct xhci_hub {
 	u32	*psi;		/* array of protocol speed ID entries */
 	u8	psi_count;
 	u8	psi_uid_count;
+};
+
+struct xhci_err_cnt {
+	unsigned int version;
+	unsigned int comp_tx_err;
 };
 
 /* There is one xhci_hcd structure per controller */
@@ -1571,7 +1584,8 @@ struct xhci_hcd {
 #define CMD_RING_STATE_STOPPED         (1 << 2)
 	struct list_head        cmd_list;
 	unsigned int		cmd_ring_reserved_trbs;
-	struct timer_list	cmd_timer;
+	struct delayed_work	cmd_timer;
+	struct completion	cmd_ring_stop_completion;
 	struct xhci_command	*current_cmd;
 	struct xhci_ring	*event_ring;
 	struct xhci_erst	erst;
@@ -1656,6 +1670,12 @@ struct xhci_hcd {
 #define XHCI_SSIC_PORT_UNUSED	(1 << 22)
 #define XHCI_NO_64BIT_SUPPORT	(1 << 23)
 #define XHCI_MISSING_CAS	(1 << 24)
+/* For controller with a broken Port Disable implementation */
+#define XHCI_BROKEN_PORT_PED	(1 << 25)
+#define XHCI_LIMIT_ENDPOINT_INTERVAL_7	(1 << 26)
+/* Reserved. It was XHCI_U2_DISABLE_WAKE */
+#define XHCI_ASMEDIA_MODIFY_FLOWCONTROL	(1 << 28)
+
 	unsigned int		num_active_eps;
 	unsigned int		limit_active_eps;
 	/* There are two roothubs to keep track of bus suspend info for */
@@ -1683,8 +1703,13 @@ struct xhci_hcd {
 /* Compliance Mode Timer Triggered every 2 seconds */
 #define COMP_MODE_RCVRY_MSECS 2000
 
+	struct  work_struct	tegra_xhci_reinit_work;
+	bool	recovery_in_progress;
+	struct platform_device *pdev;
 	/* platform-specific data -- must come last */
 	unsigned long		priv[0] __aligned(sizeof(s64));
+	/* Error collecting struct for sysfs */
+	struct xhci_err_cnt xhci_ereport;
 };
 
 /* Platform specific overrides to generic XHCI hc_driver ops */
@@ -1718,6 +1743,8 @@ static inline struct usb_hcd *xhci_to_hcd(struct xhci_hcd *xhci)
 	dev_dbg(xhci_to_hcd(xhci)->self.controller , fmt , ## args)
 #define xhci_err(xhci, fmt, args...) \
 	dev_err(xhci_to_hcd(xhci)->self.controller , fmt , ## args)
+#define xhci_err_ratelimited(xhci, fmt, args...) \
+	dev_err_ratelimited(xhci_to_hcd(xhci)->self.controller, fmt, ## args)
 #define xhci_warn(xhci, fmt, args...) \
 	dev_warn(xhci_to_hcd(xhci)->self.controller , fmt , ## args)
 #define xhci_warn_ratelimited(xhci, fmt, args...) \
@@ -1853,6 +1880,7 @@ int xhci_run(struct usb_hcd *hcd);
 void xhci_stop(struct usb_hcd *hcd);
 void xhci_shutdown(struct usb_hcd *hcd);
 int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks);
+void xhci_shutdown(struct usb_hcd *hcd);
 void xhci_init_driver(struct hc_driver *drv,
 		      const struct xhci_driver_overrides *over);
 
@@ -1941,7 +1969,7 @@ void xhci_queue_config_ep_quirk(struct xhci_hcd *xhci,
 		unsigned int slot_id, unsigned int ep_index,
 		struct xhci_dequeue_state *deq_state);
 void xhci_stop_endpoint_command_watchdog(unsigned long arg);
-void xhci_handle_command_timeout(unsigned long data);
+void xhci_handle_command_timeout(struct work_struct *work);
 
 void xhci_ring_ep_doorbell(struct xhci_hcd *xhci, unsigned int slot_id,
 		unsigned int ep_index, unsigned int stream_id);
@@ -1989,5 +2017,9 @@ static inline struct xhci_ring *xhci_urb_to_transfer_ring(struct xhci_hcd *xhci,
 					xhci_get_endpoint_index(&urb->ep->desc),
 					urb->stream_id);
 }
+
+#ifdef CONFIG_USB_OTG_WAKELOCK
+extern void otgwl_acquire_temp_lock(void);
+#endif
 
 #endif /* __LINUX_XHCI_HCD_H */

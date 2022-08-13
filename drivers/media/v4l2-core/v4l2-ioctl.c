@@ -30,12 +30,19 @@
 #include <media/v4l2-mc.h>
 
 #include <trace/events/v4l2.h>
+#include <asm/barrier.h>
 
 /* Zero out the end of the struct pointed to by p.  Everything after, but
  * not including, the specified field is cleared. */
 #define CLEAR_AFTER_FIELD(p, field) \
 	memset((u8 *)(p) + offsetof(typeof(*(p)), field) + sizeof((p)->field), \
 	0, sizeof(*(p)) - offsetof(typeof(*(p)), field) - sizeof((p)->field))
+
+/* Zero out the end of the struct pointed to by p.  Everything from
+ * the specified field is cleared. */
+#define CLEAR_FROM_FIELD(p, field) \
+	memset((u8 *)(p) + offsetof(typeof(*(p)), field), \
+	0, sizeof(*(p)) - offsetof(typeof(*(p)), field))
 
 #define is_valid_ioctl(vfd, cmd) test_bit(_IOC_NR(cmd), (vfd)->valid_ioctls)
 
@@ -1167,6 +1174,9 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
 	case V4L2_PIX_FMT_Y16:		descr = "16-bit Greyscale"; break;
 	case V4L2_PIX_FMT_Y16_BE:	descr = "16-bit Greyscale BE"; break;
 	case V4L2_PIX_FMT_Y10BPACK:	descr = "10-bit Greyscale (Packed)"; break;
+	case V4L2_PIX_FMT_Y8I:		descr = "Interleaved 8-bit Greyscale"; break;
+	case V4L2_PIX_FMT_Y12I:		descr = "Interleaved 12-bit Greyscale"; break;
+	case V4L2_PIX_FMT_Z16:		descr = "16-bit Depth"; break;
 	case V4L2_PIX_FMT_PAL8:		descr = "8-bit Palette"; break;
 	case V4L2_PIX_FMT_UV8:		descr = "8-bit Chrominance UV 4-4"; break;
 	case V4L2_PIX_FMT_YVU410:	descr = "Planar YVU 4:1:0"; break;
@@ -1222,6 +1232,10 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
 	case V4L2_PIX_FMT_SGBRG10P:	descr = "10-bit Bayer GBGB/RGRG Packed"; break;
 	case V4L2_PIX_FMT_SGRBG10P:	descr = "10-bit Bayer GRGR/BGBG Packed"; break;
 	case V4L2_PIX_FMT_SRGGB10P:	descr = "10-bit Bayer RGRG/GBGB Packed"; break;
+	case V4L2_PIX_FMT_XBGGR10P:	descr = "10-bit Bayer BGGR(10-10-10-2)"; break;
+	case V4L2_PIX_FMT_XGBRG10P:	descr = "10-bit Bayer GBRG(10-10-10-2)"; break;
+	case V4L2_PIX_FMT_XGRBG10P:	descr = "10-bit Bayer GRBG(10-10-10-2)"; break;
+	case V4L2_PIX_FMT_XRGGB10P:	descr = "10-bit Bayer RGGB(10-10-10-2)"; break;
 	case V4L2_PIX_FMT_SBGGR10ALAW8:	descr = "8-bit Bayer BGBG/GRGR (A-law)"; break;
 	case V4L2_PIX_FMT_SGBRG10ALAW8:	descr = "8-bit Bayer GBGB/RGRG (A-law)"; break;
 	case V4L2_PIX_FMT_SGRBG10ALAW8:	descr = "8-bit Bayer GRGR/BGBG (A-law)"; break;
@@ -1231,6 +1245,9 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
 	case V4L2_PIX_FMT_SGRBG10DPCM8:	descr = "8-bit Bayer GRGR/BGBG (DPCM)"; break;
 	case V4L2_PIX_FMT_SRGGB10DPCM8:	descr = "8-bit Bayer RGRG/GBGB (DPCM)"; break;
 	case V4L2_PIX_FMT_SBGGR16:	descr = "16-bit Bayer BGBG/GRGR (Exp.)"; break;
+	case V4L2_PIX_FMT_SGBRG16:	descr = "16-bit Bayer GBGB/RGRG (Exp.)"; break;
+	case V4L2_PIX_FMT_SGRBG16:	descr = "16-bit Bayer GRGR/BGBG (Exp.)"; break;
+	case V4L2_PIX_FMT_SRGGB16:	descr = "16-bit Bayer RGRG/GBGB (Exp.)"; break;
 	case V4L2_PIX_FMT_SN9C20X_I420:	descr = "GSPCA SN9C20X I420"; break;
 	case V4L2_PIX_FMT_SPCA501:	descr = "GSPCA SPCA501"; break;
 	case V4L2_PIX_FMT_SPCA505:	descr = "GSPCA SPCA505"; break;
@@ -1248,6 +1265,20 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
 	case V4L2_TCH_FMT_DELTA_TD08:	descr = "8-bit signed deltas"; break;
 	case V4L2_TCH_FMT_TU16:		descr = "16-bit unsigned touch data"; break;
 	case V4L2_TCH_FMT_TU08:		descr = "8-bit unsigned touch data"; break;
+	case V4L2_PIX_FMT_RW16:
+		descr = "16-bit Raw data"; break;
+	case V4L2_PIX_FMT_INZI:
+		descr = "32-bit IR:Depth 10:16"; break;
+	case V4L2_PIX_FMT_W10:
+		descr = "10-bit packed 8888[2222]"; break;
+	case V4L2_PIX_FMT_CONFIDENCE_MAP:
+		descr = "4-bit per pixel packed"; break;
+	case V4L2_PIX_FMT_FG:
+		descr = "Frame Grabber (FG  )"; break;
+	case V4L2_PIX_FMT_INZC:
+		descr = "Planar Depth/Confidence (INZC)"; break;
+	case V4L2_PIX_FMT_PAIR:
+		descr = "Relative IR (PAIR)"; break;
 
 	default:
 		/* Compressed formats */
@@ -1504,7 +1535,7 @@ static int v4l_s_fmt(const struct v4l2_ioctl_ops *ops,
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		if (unlikely(!is_rx || !is_vid || !ops->vidioc_s_fmt_vid_cap_mplane))
 			break;
-		CLEAR_AFTER_FIELD(p, fmt.pix_mp.xfer_func);
+		CLEAR_FROM_FIELD(p, fmt.pix_mp.reserved[0]);
 		return ops->vidioc_s_fmt_vid_cap_mplane(file, fh, arg);
 	case V4L2_BUF_TYPE_VIDEO_OVERLAY:
 		if (unlikely(!is_rx || !is_vid || !ops->vidioc_s_fmt_vid_overlay))
@@ -1532,7 +1563,7 @@ static int v4l_s_fmt(const struct v4l2_ioctl_ops *ops,
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
 		if (unlikely(!is_tx || !is_vid || !ops->vidioc_s_fmt_vid_out_mplane))
 			break;
-		CLEAR_AFTER_FIELD(p, fmt.pix_mp.xfer_func);
+		CLEAR_FROM_FIELD(p, fmt.pix_mp.reserved[0]);
 		return ops->vidioc_s_fmt_vid_out_mplane(file, fh, arg);
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_OVERLAY:
 		if (unlikely(!is_tx || !is_vid || !ops->vidioc_s_fmt_vid_out_overlay))
@@ -1589,7 +1620,7 @@ static int v4l_try_fmt(const struct v4l2_ioctl_ops *ops,
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		if (unlikely(!is_rx || !is_vid || !ops->vidioc_try_fmt_vid_cap_mplane))
 			break;
-		CLEAR_AFTER_FIELD(p, fmt.pix_mp.xfer_func);
+		CLEAR_FROM_FIELD(p, fmt.pix_mp.reserved[0]);
 		return ops->vidioc_try_fmt_vid_cap_mplane(file, fh, arg);
 	case V4L2_BUF_TYPE_VIDEO_OVERLAY:
 		if (unlikely(!is_rx || !is_vid || !ops->vidioc_try_fmt_vid_overlay))
@@ -1617,7 +1648,7 @@ static int v4l_try_fmt(const struct v4l2_ioctl_ops *ops,
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
 		if (unlikely(!is_tx || !is_vid || !ops->vidioc_try_fmt_vid_out_mplane))
 			break;
-		CLEAR_AFTER_FIELD(p, fmt.pix_mp.xfer_func);
+		CLEAR_FROM_FIELD(p, fmt.pix_mp.reserved[0]);
 		return ops->vidioc_try_fmt_vid_out_mplane(file, fh, arg);
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_OVERLAY:
 		if (unlikely(!is_tx || !is_vid || !ops->vidioc_try_fmt_vid_out_overlay))
@@ -1959,7 +1990,22 @@ static int v4l_s_parm(const struct v4l2_ioctl_ops *ops,
 	struct v4l2_streamparm *p = arg;
 	int ret = check_fmt(file, p->type);
 
-	return ret ? ret : ops->vidioc_s_parm(file, fh, p);
+	if (ret)
+		return ret;
+
+	/* Note: extendedmode is never used in drivers */
+	if (V4L2_TYPE_IS_OUTPUT(p->type)) {
+		memset(p->parm.output.reserved, 0,
+		       sizeof(p->parm.output.reserved));
+		p->parm.output.extendedmode = 0;
+		p->parm.output.outputmode &= V4L2_MODE_HIGHQUALITY;
+	} else {
+		memset(p->parm.capture.reserved, 0,
+		       sizeof(p->parm.capture.reserved));
+		p->parm.capture.extendedmode = 0;
+		p->parm.capture.capturemode &= V4L2_MODE_HIGHQUALITY;
+	}
+	return ops->vidioc_s_parm(file, fh, p);
 }
 
 static int v4l_queryctrl(const struct v4l2_ioctl_ops *ops,
@@ -2444,8 +2490,7 @@ static int v4l_enum_freq_bands(const struct v4l2_ioctl_ops *ops,
 		p->capability = m.capability | V4L2_TUNER_CAP_FREQ_BANDS;
 		p->rangelow = m.rangelow;
 		p->rangehigh = m.rangehigh;
-		p->modulation = (type == V4L2_TUNER_RADIO) ?
-			V4L2_BAND_MODULATION_FM : V4L2_BAND_MODULATION_VSB;
+		p->modulation = V4L2_BAND_MODULATION_FM;
 		return 0;
 	}
 	return -ENOTTY;
@@ -2455,11 +2500,8 @@ struct v4l2_ioctl_info {
 	unsigned int ioctl;
 	u32 flags;
 	const char * const name;
-	union {
-		u32 offset;
-		int (*func)(const struct v4l2_ioctl_ops *ops,
-				struct file *file, void *fh, void *p);
-	} u;
+	int (*func)(const struct v4l2_ioctl_ops *ops, struct file *file,
+		    void *fh, void *p);
 	void (*debug)(const void *arg, bool write_only);
 };
 
@@ -2467,25 +2509,21 @@ struct v4l2_ioctl_info {
 #define INFO_FL_PRIO	(1 << 0)
 /* This control can be valid if the filehandle passes a control handler. */
 #define INFO_FL_CTRL	(1 << 1)
-/* This is a standard ioctl, no need for special code */
-#define INFO_FL_STD	(1 << 2)
 /* This is ioctl has its own function */
-#define INFO_FL_FUNC	(1 << 3)
+#define INFO_FL_FUNC	(1 << 2)
 /* Queuing ioctl */
-#define INFO_FL_QUEUE	(1 << 4)
+#define INFO_FL_QUEUE	(1 << 3)
 /* Zero struct from after the field to the end */
 #define INFO_FL_CLEAR(v4l2_struct, field)			\
 	((offsetof(struct v4l2_struct, field) +			\
 	  sizeof(((struct v4l2_struct *)0)->field)) << 16)
 #define INFO_FL_CLEAR_MASK (_IOC_SIZEMASK << 16)
 
-#define IOCTL_INFO_STD(_ioctl, _vidioc, _debug, _flags)			\
-	[_IOC_NR(_ioctl)] = {						\
-		.ioctl = _ioctl,					\
-		.flags = _flags | INFO_FL_STD,				\
-		.name = #_ioctl,					\
-		.u.offset = offsetof(struct v4l2_ioctl_ops, _vidioc),	\
-		.debug = _debug,					\
+#define DEFINE_IOCTL_STD_FNC(_vidioc) \
+	static int __v4l_ ## _vidioc ## _fnc(				\
+			const struct v4l2_ioctl_ops *ops, 		\
+			struct file *file, void *fh, void *p) {		\
+		return ops->_vidioc(file, fh, p); 			\
 	}
 
 #define IOCTL_INFO_FNC(_ioctl, _func, _debug, _flags)			\
@@ -2493,9 +2531,43 @@ struct v4l2_ioctl_info {
 		.ioctl = _ioctl,					\
 		.flags = _flags | INFO_FL_FUNC,				\
 		.name = #_ioctl,					\
-		.u.func = _func,					\
+		.func = _func,						\
 		.debug = _debug,					\
 	}
+
+#define IOCTL_INFO_STD(_ioctl, _vidioc, _debug, _flags)	\
+	IOCTL_INFO_FNC(_ioctl, __v4l_ ## _vidioc ## _fnc, _debug, _flags)
+
+DEFINE_IOCTL_STD_FNC(vidioc_g_fbuf)
+DEFINE_IOCTL_STD_FNC(vidioc_s_fbuf)
+DEFINE_IOCTL_STD_FNC(vidioc_expbuf)
+DEFINE_IOCTL_STD_FNC(vidioc_g_std)
+DEFINE_IOCTL_STD_FNC(vidioc_g_audio)
+DEFINE_IOCTL_STD_FNC(vidioc_s_audio)
+DEFINE_IOCTL_STD_FNC(vidioc_g_input)
+DEFINE_IOCTL_STD_FNC(vidioc_g_edid)
+DEFINE_IOCTL_STD_FNC(vidioc_s_edid)
+DEFINE_IOCTL_STD_FNC(vidioc_g_output)
+DEFINE_IOCTL_STD_FNC(vidioc_g_audout)
+DEFINE_IOCTL_STD_FNC(vidioc_s_audout)
+DEFINE_IOCTL_STD_FNC(vidioc_g_selection)
+DEFINE_IOCTL_STD_FNC(vidioc_s_selection)
+DEFINE_IOCTL_STD_FNC(vidioc_g_jpegcomp)
+DEFINE_IOCTL_STD_FNC(vidioc_s_jpegcomp)
+DEFINE_IOCTL_STD_FNC(vidioc_enumaudio)
+DEFINE_IOCTL_STD_FNC(vidioc_enumaudout)
+DEFINE_IOCTL_STD_FNC(vidioc_enum_framesizes)
+DEFINE_IOCTL_STD_FNC(vidioc_enum_frameintervals)
+DEFINE_IOCTL_STD_FNC(vidioc_g_enc_index)
+DEFINE_IOCTL_STD_FNC(vidioc_encoder_cmd)
+DEFINE_IOCTL_STD_FNC(vidioc_try_encoder_cmd)
+DEFINE_IOCTL_STD_FNC(vidioc_decoder_cmd)
+DEFINE_IOCTL_STD_FNC(vidioc_try_decoder_cmd)
+DEFINE_IOCTL_STD_FNC(vidioc_s_dv_timings)
+DEFINE_IOCTL_STD_FNC(vidioc_g_dv_timings)
+DEFINE_IOCTL_STD_FNC(vidioc_enum_dv_timings)
+DEFINE_IOCTL_STD_FNC(vidioc_query_dv_timings)
+DEFINE_IOCTL_STD_FNC(vidioc_dv_timings_cap)
 
 static struct v4l2_ioctl_info v4l2_ioctls[] = {
 	IOCTL_INFO_FNC(VIDIOC_QUERYCAP, v4l_querycap, v4l_print_querycap, 0),
@@ -2587,6 +2659,9 @@ bool v4l2_is_known_ioctl(unsigned int cmd)
 {
 	if (_IOC_NR(cmd) >= V4L2_IOCTLS)
 		return false;
+
+	speculation_barrier();
+
 	return v4l2_ioctls[_IOC_NR(cmd)].ioctl == cmd;
 }
 
@@ -2628,11 +2703,10 @@ void v4l_printk_ioctl(const char *prefix, unsigned int cmd)
 	}
 
 	switch (_IOC_DIR(cmd)) {
-	case _IOC_NONE:              dir = "--"; break;
 	case _IOC_READ:              dir = "r-"; break;
 	case _IOC_WRITE:             dir = "-w"; break;
 	case _IOC_READ | _IOC_WRITE: dir = "rw"; break;
-	default:                     dir = "*ERR*"; break;
+	default:                     dir = "--"; break;
 	}
 	pr_cont("%s ioctl '%c', dir=%s, #%d (0x%08x)",
 		type, _IOC_TYPE(cmd), dir, _IOC_NR(cmd), cmd);
@@ -2646,7 +2720,7 @@ static long __video_do_ioctl(struct file *file,
 	const struct v4l2_ioctl_ops *ops = vfd->ioctl_ops;
 	bool write_only = false;
 	struct v4l2_ioctl_info default_info;
-	const struct v4l2_ioctl_info *info;
+	struct v4l2_ioctl_info *info;
 	void *fh = file->private_data;
 	struct v4l2_fh *vfh = NULL;
 	int dev_debug = vfd->dev_debug;
@@ -2681,14 +2755,8 @@ static long __video_do_ioctl(struct file *file,
 	}
 
 	write_only = _IOC_DIR(cmd) == _IOC_WRITE;
-	if (info->flags & INFO_FL_STD) {
-		typedef int (*vidioc_op)(struct file *file, void *fh, void *p);
-		const void *p = vfd->ioctl_ops;
-		const vidioc_op *vidioc = p + info->u.offset;
-
-		ret = (*vidioc)(file, fh, arg);
-	} else if (info->flags & INFO_FL_FUNC) {
-		ret = info->u.func(ops, file, fh, arg);
+	if (info->flags & INFO_FL_FUNC) {
+		ret = info->func(ops, file, fh, arg);
 	} else if (!ops->vidioc_default) {
 		ret = -ENOTTY;
 	} else {
@@ -2796,6 +2864,7 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 	size_t  array_size = 0;
 	void __user *user_ptr = NULL;
 	void	**kernel_ptr = NULL;
+	mm_segment_t old_fs = get_fs();
 
 	/*  Copy arguments into temp kernel buffer  */
 	if (_IOC_DIR(cmd) != _IOC_NONE) {
@@ -2855,15 +2924,28 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 		if (NULL == mbuf)
 			goto out_array_args;
 		err = -EFAULT;
-		if (copy_from_user(mbuf, user_ptr, array_size))
+		/* during 32-bit userspace app to 64-bit kernel conversion,
+		 * v4l2 core driver prepare kernel space memory for pass-in
+		 * arg and user space memory for array inside, set fs to
+		 * KERNEL_DS and call native_ioctl here. So set it back to
+		 * USER_DS for user space copy to avoid break access policy.
+		 */
+		set_fs(USER_DS);
+		if (copy_from_user(mbuf, user_ptr, array_size)) {
+			set_fs(old_fs);
 			goto out_array_args;
+		}
+		set_fs(old_fs);
 		*kernel_ptr = mbuf;
 	}
 
 	/* Handles IOCTL */
 	err = func(file, cmd, parg);
-	if (err == -ENOIOCTLCMD)
+	if (err == -ENOTTY || err == -ENOIOCTLCMD) {
 		err = -ENOTTY;
+		goto out;
+	}
+
 	if (err == 0) {
 		if (cmd == VIDIOC_DQBUF)
 			trace_v4l2_dqbuf(video_devdata(file)->minor, parg);
@@ -2873,8 +2955,10 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 
 	if (has_array_args) {
 		*kernel_ptr = (void __force *)user_ptr;
+		set_fs(USER_DS);
 		if (copy_to_user(user_ptr, mbuf, array_size))
 			err = -EFAULT;
+		set_fs(old_fs);
 		goto out_array_args;
 	}
 	/* VIDIOC_QUERY_DV_TIMINGS can return an error, but still have valid

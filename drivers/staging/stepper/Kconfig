@@ -1,0 +1,16 @@
+config STEPPER
+	tristate "Stepper Class Support"
+	help
+	  This option enables the stepper motor control sysfs class in /sys/class/stepper.
+	  The sysfs class provides useful interfaces to control stepper motor.
+	  If stepper motor is not used in the platform, select N.
+
+config STEPPER_PCA
+	tristate "NXP PCA Support"
+	depends on STEPPER
+	help
+	  This option enables the NXP PCA control sysfs class in /sys/class/stepper.
+	  It implements stepper class functions and communicates over I2C bus.
+	  It should be enabled in the device tree under the right I2C bus.
+
+comment "STEPPER drivers"

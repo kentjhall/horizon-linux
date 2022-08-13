@@ -1058,8 +1058,11 @@ static int wl12xx_chip_wakeup(struct wl1271 *wl, bool plt)
 		goto out;
 
 	ret = wl12xx_fetch_firmware(wl, plt);
-	if (ret < 0)
-		goto out;
+	if (ret < 0) {
+		kfree(wl->fw_status);
+		kfree(wl->raw_fw_status);
+		kfree(wl->tx_res_if);
+	}
 
 out:
 	return ret;
@@ -5285,7 +5288,9 @@ static int wl1271_op_ampdu_action(struct ieee80211_hw *hw,
 		}
 
 		ret = wl12xx_acx_set_ba_receiver_session(wl, tid, *ssn, true,
-							 hlid);
+				hlid,
+				params->buf_size);
+
 		if (!ret) {
 			*ba_bitmap |= BIT(tid);
 			wl->ba_rx_session_count++;
@@ -5306,7 +5311,7 @@ static int wl1271_op_ampdu_action(struct ieee80211_hw *hw,
 		}
 
 		ret = wl12xx_acx_set_ba_receiver_session(wl, tid, 0, false,
-							 hlid);
+							 hlid, 0);
 		if (!ret) {
 			*ba_bitmap &= ~BIT(tid);
 			wl->ba_rx_session_count--;

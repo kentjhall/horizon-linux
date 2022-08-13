@@ -1,0 +1,25 @@
+SN65DSI86 MIPI DSI to eDP bridge driver
+
+Required properties:
+- compatible : should be "ti,sn65dsi86".
+- reg : i2c regmap address
+- ti,enable-gpio : GPIO for enabling DS90UH949 chip
+- ti,pll-refclk-cfg : Register value to control DP PLL clock source and frequency
+
+Optional properties:
+- ti,disable-assr : Disable ASSR (Alternate Scrambler Seed Reset)
+- ti,dp-ssc-cfg : Register value to configure SSC (Spread Spectrum Clock)
+
+Examples:
+        i2c@3160000 {
+                sn65dsi86@2d {
+                        compatible = "ti,sn65dsi86";
+                        reg = <0x2d>;
+                        status = "okay";
+                        ti,enable-gpio = <&tegra_main_gpio TEGRA_MAIN_GPIO(O, 1) 0>;
+                        ti,pll-refclk-cfg = <0x4>;
+                        ti,disable-assr = <1>;
+                        ti,dp-ssc-cfg = <0x30>;
+                };
+
+}

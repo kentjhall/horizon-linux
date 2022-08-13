@@ -109,7 +109,11 @@
 #define	READ_ADDR			0
 
 /* NAND_DEV_CMD_VLD bits */
-#define	READ_START_VLD			0
+#define	READ_START_VLD			BIT(0)
+#define	READ_STOP_VLD			BIT(1)
+#define	WRITE_START_VLD			BIT(2)
+#define	ERASE_START_VLD			BIT(3)
+#define	SEQ_READ_START_VLD		BIT(4)
 
 /* NAND_EBI2_ECC_BUF_CFG bits */
 #define	NUM_STEPS			0
@@ -138,15 +142,19 @@
 #define	NAND_VERSION_MINOR_SHIFT	16
 
 /* NAND OP_CMDs */
-#define	PAGE_READ			0x2
-#define	PAGE_READ_WITH_ECC		0x3
-#define	PAGE_READ_WITH_ECC_SPARE	0x4
-#define	PROGRAM_PAGE			0x6
-#define	PAGE_PROGRAM_WITH_ECC		0x7
-#define	PROGRAM_PAGE_SPARE		0x9
-#define	BLOCK_ERASE			0xa
-#define	FETCH_ID			0xb
-#define	RESET_DEVICE			0xd
+#define	OP_PAGE_READ			0x2
+#define	OP_PAGE_READ_WITH_ECC		0x3
+#define	OP_PAGE_READ_WITH_ECC_SPARE	0x4
+#define	OP_PROGRAM_PAGE			0x6
+#define	OP_PAGE_PROGRAM_WITH_ECC	0x7
+#define	OP_PROGRAM_PAGE_SPARE		0x9
+#define	OP_BLOCK_ERASE			0xa
+#define	OP_FETCH_ID			0xb
+#define	OP_RESET_DEVICE			0xd
+
+/* Default Value for NAND_DEV_CMD_VLD */
+#define NAND_DEV_CMD_VLD_VAL		(READ_START_VLD | WRITE_START_VLD | \
+					 ERASE_START_VLD | SEQ_READ_START_VLD)
 
 /*
  * the NAND controller performs reads/writes with ECC in 516 byte chunks.
@@ -417,11 +425,11 @@ static void update_rw_regs(struct qcom_nand_host *host, int num_cw, bool read)
 
 	if (read) {
 		if (host->use_ecc)
-			cmd = PAGE_READ_WITH_ECC | PAGE_ACC | LAST_PAGE;
+			cmd = OP_PAGE_READ_WITH_ECC | PAGE_ACC | LAST_PAGE;
 		else
-			cmd = PAGE_READ | PAGE_ACC | LAST_PAGE;
+			cmd = OP_PAGE_READ | PAGE_ACC | LAST_PAGE;
 	} else {
-			cmd = PROGRAM_PAGE | PAGE_ACC | LAST_PAGE;
+		cmd = OP_PROGRAM_PAGE | PAGE_ACC | LAST_PAGE;
 	}
 
 	if (host->use_ecc) {
@@ -654,7 +662,7 @@ static int nandc_param(struct qcom_nand_host *host)
 	 * in use. we configure the controller to perform a raw read of 512
 	 * bytes to read onfi params
 	 */
-	nandc_set_reg(nandc, NAND_FLASH_CMD, PAGE_READ | PAGE_ACC | LAST_PAGE);
+	nandc_set_reg(nandc, NAND_FLASH_CMD, OP_PAGE_READ | PAGE_ACC | LAST_PAGE);
 	nandc_set_reg(nandc, NAND_ADDR0, 0);
 	nandc_set_reg(nandc, NAND_ADDR1, 0);
 	nandc_set_reg(nandc, NAND_DEV0_CFG0, 0 << CW_PER_PAGE
@@ -672,8 +680,7 @@ static int nandc_param(struct qcom_nand_host *host)
 
 	/* configure CMD1 and VLD for ONFI param probing */
 	nandc_set_reg(nandc, NAND_DEV_CMD_VLD,
-		      (nandc->vld & ~(1 << READ_START_VLD))
-		      | 0 << READ_START_VLD);
+		      (nandc->vld & ~READ_START_VLD));
 	nandc_set_reg(nandc, NAND_DEV_CMD1,
 		      (nandc->cmd1 & ~(0xFF << READ_ADDR))
 		      | NAND_CMD_PARAM << READ_ADDR);
@@ -708,7 +715,7 @@ static int erase_block(struct qcom_nand_host *host, int page_addr)
 	struct qcom_nand_controller *nandc = get_qcom_nand_controller(chip);
 
 	nandc_set_reg(nandc, NAND_FLASH_CMD,
-		      BLOCK_ERASE | PAGE_ACC | LAST_PAGE);
+		      OP_BLOCK_ERASE | PAGE_ACC | LAST_PAGE);
 	nandc_set_reg(nandc, NAND_ADDR0, page_addr);
 	nandc_set_reg(nandc, NAND_ADDR1, 0);
 	nandc_set_reg(nandc, NAND_DEV0_CFG0,
@@ -739,7 +746,7 @@ static int read_id(struct qcom_nand_host *host, int column)
 	if (column == -1)
 		return 0;
 
-	nandc_set_reg(nandc, NAND_FLASH_CMD, FETCH_ID);
+	nandc_set_reg(nandc, NAND_FLASH_CMD, OP_FETCH_ID);
 	nandc_set_reg(nandc, NAND_ADDR0, column);
 	nandc_set_reg(nandc, NAND_ADDR1, 0);
 	nandc_set_reg(nandc, NAND_FLASH_CHIP_SELECT, DM_EN);
@@ -759,7 +766,7 @@ static int reset(struct qcom_nand_host *host)
 	struct nand_chip *chip = &host->chip;
 	struct qcom_nand_controller *nandc = get_qcom_nand_controller(chip);
 
-	nandc_set_reg(nandc, NAND_FLASH_CMD, RESET_DEVICE);
+	nandc_set_reg(nandc, NAND_FLASH_CMD, OP_RESET_DEVICE);
 	nandc_set_reg(nandc, NAND_EXEC_CMD, 1);
 
 	write_reg_dma(nandc, NAND_FLASH_CMD, 1);
@@ -1893,7 +1900,7 @@ static int qcom_nand_host_setup(struct qcom_nand_host *host)
 				| wide_bus << WIDE_FLASH
 				| 1 << DEV0_CFG1_ECC_DISABLE;
 
-	host->ecc_bch_cfg = host->bch_enabled << ECC_CFG_ECC_DISABLE
+	host->ecc_bch_cfg = !host->bch_enabled << ECC_CFG_ECC_DISABLE
 				| 0 << ECC_SW_RESET
 				| host->cw_data << ECC_NUM_DATA_BYTES
 				| 1 << ECC_FORCE_CLK_OPEN
@@ -1972,13 +1979,14 @@ static int qcom_nandc_setup(struct qcom_nand_controller *nandc)
 {
 	/* kill onenand */
 	nandc_write(nandc, SFLASHC_BURST_CFG, 0);
+	nandc_write(nandc, NAND_DEV_CMD_VLD, NAND_DEV_CMD_VLD_VAL);
 
 	/* enable ADM DMA */
 	nandc_write(nandc, NAND_FLASH_CHIP_SELECT, DM_EN);
 
 	/* save the original values of these registers */
 	nandc->cmd1 = nandc_read(nandc, NAND_DEV_CMD1);
-	nandc->vld = nandc_read(nandc, NAND_DEV_CMD_VLD);
+	nandc->vld = NAND_DEV_CMD_VLD_VAL;
 
 	return 0;
 }
@@ -2000,6 +2008,9 @@ static int qcom_nand_host_init(struct qcom_nand_controller *nandc,
 
 	nand_set_flash_node(chip, dn);
 	mtd->name = devm_kasprintf(dev, GFP_KERNEL, "qcom_nand.%d", host->cs);
+	if (!mtd->name)
+		return -ENOMEM;
+
 	mtd->owner = THIS_MODULE;
 	mtd->dev.parent = dev;
 
@@ -2152,7 +2163,7 @@ static int qcom_nandc_probe(struct platform_device *pdev)
 
 err_cs_init:
 	list_for_each_entry(host, &nandc->host_list, node)
-		nand_release(nand_to_mtd(&host->chip));
+		nand_release(&host->chip);
 err_setup:
 	clk_disable_unprepare(nandc->aon_clk);
 err_aon_clk:
@@ -2169,7 +2180,7 @@ static int qcom_nandc_remove(struct platform_device *pdev)
 	struct qcom_nand_host *host;
 
 	list_for_each_entry(host, &nandc->host_list, node)
-		nand_release(nand_to_mtd(&host->chip));
+		nand_release(&host->chip);
 
 	qcom_nandc_unalloc(nandc);
 

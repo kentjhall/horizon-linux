@@ -46,6 +46,7 @@
 #define REPEAT_BYTE(x)	((~0ul / 0xff) * (x))
 
 #define ALIGN(x, a)		__ALIGN_KERNEL((x), (a))
+#define ALIGN_DOWN(x, a)	__ALIGN_KERNEL((x) - ((a) - 1), (a))
 #define __ALIGN_MASK(x, mask)	__ALIGN_KERNEL_MASK((x), (mask))
 #define PTR_ALIGN(p, a)		((typeof(p))ALIGN((unsigned long)(p), (a)))
 #define IS_ALIGNED(x, a)		(((x) & ((typeof(x))(a) - 1)) == 0)
@@ -54,8 +55,8 @@
 
 #define u64_to_user_ptr(x) (		\
 {					\
-	typecheck(u64, x);		\
-	(void __user *)(uintptr_t)x;	\
+	typecheck(u64, (x));		\
+	(void __user *)(uintptr_t)(x);	\
 }					\
 )
 
@@ -483,6 +484,7 @@ extern bool early_boot_irqs_disabled;
 
 /* Values used for system_state */
 extern enum system_states {
+	SYSTEM_BOOTING_SINGLECORE,
 	SYSTEM_BOOTING,
 	SYSTEM_RUNNING,
 	SYSTEM_HALT,

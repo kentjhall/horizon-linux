@@ -148,14 +148,14 @@ smb2_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
 
 			scredits = server->credits;
 			/* can deadlock with reopen */
-			if (scredits == 1) {
+			if (scredits <= 8) {
 				*num = SMB2_MAX_BUFFER_SIZE;
 				*credits = 0;
 				break;
 			}
 
-			/* leave one credit for a possible reopen */
-			scredits--;
+			/* leave some credits for reopen and other ops */
+			scredits -= 8;
 			*num = min_t(unsigned int, size,
 				     scredits * SMB2_MAX_BUFFER_SIZE);
 
@@ -894,6 +894,13 @@ smb3_set_integrity(const unsigned int xid, struct cifs_tcon *tcon,
 
 }
 
+/* GMT Token is @GMT-YYYY.MM.DD-HH.MM.SS Unicode which is 48 bytes + null */
+#define GMT_TOKEN_SIZE 50
+
+/*
+ * Input buffer contains (empty) struct smb_snapshot array with size filled in
+ * For output see struct SRV_SNAPSHOT_ARRAY in MS-SMB2 section 2.2.32.2
+ */
 static int
 smb3_enum_snapshots(const unsigned int xid, struct cifs_tcon *tcon,
 		   struct cifsFileInfo *cfile, void __user *ioc_buf)
@@ -922,13 +929,27 @@ smb3_enum_snapshots(const unsigned int xid, struct cifs_tcon *tcon,
 			kfree(retbuf);
 			return rc;
 		}
-		if (snapshot_in.snapshot_array_size < sizeof(struct smb_snapshot_array)) {
-			rc = -ERANGE;
-			return rc;
-		}
 
-		if (ret_data_len > snapshot_in.snapshot_array_size)
-			ret_data_len = snapshot_in.snapshot_array_size;
+		/*
+		 * Check for min size, ie not large enough to fit even one GMT
+		 * token (snapshot).  On the first ioctl some users may pass in
+		 * smaller size (or zero) to simply get the size of the array
+		 * so the user space caller can allocate sufficient memory
+		 * and retry the ioctl again with larger array size sufficient
+		 * to hold all of the snapshot GMT tokens on the second try.
+		 */
+		if (snapshot_in.snapshot_array_size < GMT_TOKEN_SIZE)
+			ret_data_len = sizeof(struct smb_snapshot_array);
+
+		/*
+		 * We return struct SRV_SNAPSHOT_ARRAY, followed by
+		 * the snapshot array (of 50 byte GMT tokens) each
+		 * representing an available previous version of the data
+		 */
+		if (ret_data_len > (snapshot_in.snapshot_array_size +
+					sizeof(struct smb_snapshot_array)))
+			ret_data_len = snapshot_in.snapshot_array_size +
+					sizeof(struct smb_snapshot_array);
 
 		if (copy_to_user(ioc_buf, retbuf, ret_data_len))
 			rc = -EFAULT;
@@ -963,17 +984,17 @@ smb2_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
 	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL);
 	kfree(utf16_path);
 	if (rc) {
-		cifs_dbg(VFS, "open dir failed\n");
+		cifs_dbg(FYI, "open dir failed rc=%d\n", rc);
 		return rc;
 	}
 
 	srch_inf->entries_in_buffer = 0;
-	srch_inf->index_of_last_entry = 0;
+	srch_inf->index_of_last_entry = 2;
 
 	rc = SMB2_query_directory(xid, tcon, fid->persistent_fid,
 				  fid->volatile_fid, 0, srch_inf);
 	if (rc) {
-		cifs_dbg(VFS, "query directory failed\n");
+		cifs_dbg(FYI, "query directory failed rc=%d\n", rc);
 		SMB2_close(xid, tcon, fid->persistent_fid, fid->volatile_fid);
 	}
 	return rc;
@@ -1014,6 +1035,18 @@ smb2_is_status_pending(char *buf, struct TCP_Server_Info *server, int length)
 		wake_up(&server->request_q);
 	}
 
+	return true;
+}
+
+static bool
+smb2_is_session_expired(char *buf)
+{
+	struct smb2_hdr *hdr = (struct smb2_hdr *)buf;
+
+	if (hdr->Status != STATUS_NETWORK_SESSION_EXPIRED)
+		return false;
+
+	cifs_dbg(FYI, "Session expired\n");
 	return true;
 }
 
@@ -1187,6 +1220,12 @@ static long smb3_zero_range(struct file *file, struct cifs_tcon *tcon,
 	inode = d_inode(cfile->dentry);
 	cifsi = CIFS_I(inode);
 
+	/*
+	 * We zero the range through ioctl, so we need remove the page caches
+	 * first, otherwise the data may be inconsistent with the server.
+	 */
+	truncate_pagecache_range(inode, offset, offset + len - 1);
+
 	/* if file not oplocked can't be sure whether asking to extend size */
 	if (!CIFS_CACHE_READ(cifsi))
 		if (keep_size == false)
@@ -1242,6 +1281,12 @@ static long smb3_punch_hole(struct file *file, struct cifs_tcon *tcon,
 	/* Consider adding equivalent for compressed since it could also work */
 	if (!smb2_set_sparse(xid, tcon, cfile, inode, set_sparse))
 		return -EOPNOTSUPP;
+
+	/*
+	 * We implement the punch hole through ioctl, so we need remove the page
+	 * caches first, otherwise the data may be inconsistent with the server.
+	 */
+	truncate_pagecache_range(inode, offset, offset + len - 1);
 
 	cifs_dbg(FYI, "offset %lld len %lld", offset, len);
 
@@ -1334,13 +1379,47 @@ static long smb3_fallocate(struct file *file, struct cifs_tcon *tcon, int mode,
 
 static void
 smb2_downgrade_oplock(struct TCP_Server_Info *server,
-			struct cifsInodeInfo *cinode, bool set_level2)
+		      struct cifsInodeInfo *cinode, __u32 oplock,
+		      unsigned int epoch, bool *purge_cache)
 {
-	if (set_level2)
-		server->ops->set_oplock_level(cinode, SMB2_OPLOCK_LEVEL_II,
-						0, NULL);
-	else
-		server->ops->set_oplock_level(cinode, 0, 0, NULL);
+	server->ops->set_oplock_level(cinode, oplock, 0, NULL);
+}
+
+static void
+smb21_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
+		       unsigned int epoch, bool *purge_cache);
+
+static void
+smb3_downgrade_oplock(struct TCP_Server_Info *server,
+		       struct cifsInodeInfo *cinode, __u32 oplock,
+		       unsigned int epoch, bool *purge_cache)
+{
+	unsigned int old_state = cinode->oplock;
+	unsigned int old_epoch = cinode->epoch;
+	unsigned int new_state;
+
+	if (epoch > old_epoch) {
+		smb21_set_oplock_level(cinode, oplock, 0, NULL);
+		cinode->epoch = epoch;
+	}
+
+	new_state = cinode->oplock;
+	*purge_cache = false;
+
+	if ((old_state & CIFS_CACHE_READ_FLG) != 0 &&
+	    (new_state & CIFS_CACHE_READ_FLG) == 0)
+		*purge_cache = true;
+	else if (old_state == new_state && (epoch - old_epoch > 1))
+		*purge_cache = true;
+}
+
+static void
+smb21_downgrade_oplock(struct TCP_Server_Info *server,
+		       struct cifsInodeInfo *cinode, bool set_level2)
+{
+	server->ops->set_oplock_level(cinode,
+				      set_level2 ? SMB2_LEASE_READ_CACHING_HE :
+				      0, 0, NULL);
 }
 
 static void
@@ -1371,26 +1450,33 @@ smb21_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 		       unsigned int epoch, bool *purge_cache)
 {
 	char message[5] = {0};
+	unsigned int new_oplock = 0;
 
 	oplock &= 0xFF;
 	if (oplock == SMB2_OPLOCK_LEVEL_NOCHANGE)
 		return;
 
-	cinode->oplock = 0;
+	/* Check if the server granted an oplock rather than a lease */
+	if (oplock & SMB2_OPLOCK_LEVEL_EXCLUSIVE)
+		return smb2_set_oplock_level(cinode, oplock, epoch,
+					     purge_cache);
+
 	if (oplock & SMB2_LEASE_READ_CACHING_HE) {
-		cinode->oplock |= CIFS_CACHE_READ_FLG;
+		new_oplock |= CIFS_CACHE_READ_FLG;
 		strcat(message, "R");
 	}
 	if (oplock & SMB2_LEASE_HANDLE_CACHING_HE) {
-		cinode->oplock |= CIFS_CACHE_HANDLE_FLG;
+		new_oplock |= CIFS_CACHE_HANDLE_FLG;
 		strcat(message, "H");
 	}
 	if (oplock & SMB2_LEASE_WRITE_CACHING_HE) {
-		cinode->oplock |= CIFS_CACHE_WRITE_FLG;
+		new_oplock |= CIFS_CACHE_WRITE_FLG;
 		strcat(message, "W");
 	}
-	if (!cinode->oplock)
-		strcat(message, "None");
+	if (!new_oplock)
+		strncpy(message, "None", sizeof(message));
+
+	cinode->oplock = new_oplock;
 	cifs_dbg(FYI, "%s Lease granted on inode %p\n", message,
 		 &cinode->vfs_inode);
 }
@@ -1565,6 +1651,7 @@ struct smb_version_operations smb20_operations = {
 	.clear_stats = smb2_clear_stats,
 	.print_stats = smb2_print_stats,
 	.is_oplock_break = smb2_is_valid_oplock_break,
+	.handle_cancelled_mid = smb2_handle_cancelled_mid,
 	.downgrade_oplock = smb2_downgrade_oplock,
 	.need_neg = smb2_need_neg,
 	.negotiate = smb2_negotiate,
@@ -1607,6 +1694,7 @@ struct smb_version_operations smb20_operations = {
 	.close_dir = smb2_close_dir,
 	.calc_smb_size = smb2_calc_size,
 	.is_status_pending = smb2_is_status_pending,
+	.is_session_expired = smb2_is_session_expired,
 	.oplock_response = smb2_oplock_response,
 	.queryfs = smb2_queryfs,
 	.mand_lock = smb2_mand_lock,
@@ -1645,6 +1733,7 @@ struct smb_version_operations smb21_operations = {
 	.clear_stats = smb2_clear_stats,
 	.print_stats = smb2_print_stats,
 	.is_oplock_break = smb2_is_valid_oplock_break,
+	.handle_cancelled_mid = smb2_handle_cancelled_mid,
 	.downgrade_oplock = smb2_downgrade_oplock,
 	.need_neg = smb2_need_neg,
 	.negotiate = smb2_negotiate,
@@ -1687,6 +1776,7 @@ struct smb_version_operations smb21_operations = {
 	.close_dir = smb2_close_dir,
 	.calc_smb_size = smb2_calc_size,
 	.is_status_pending = smb2_is_status_pending,
+	.is_session_expired = smb2_is_session_expired,
 	.oplock_response = smb2_oplock_response,
 	.queryfs = smb2_queryfs,
 	.mand_lock = smb2_mand_lock,
@@ -1727,7 +1817,8 @@ struct smb_version_operations smb30_operations = {
 	.print_stats = smb2_print_stats,
 	.dump_share_caps = smb2_dump_share_caps,
 	.is_oplock_break = smb2_is_valid_oplock_break,
-	.downgrade_oplock = smb2_downgrade_oplock,
+	.handle_cancelled_mid = smb2_handle_cancelled_mid,
+	.downgrade_oplock = smb3_downgrade_oplock,
 	.need_neg = smb2_need_neg,
 	.negotiate = smb2_negotiate,
 	.negotiate_wsize = smb2_negotiate_wsize,
@@ -1769,6 +1860,7 @@ struct smb_version_operations smb30_operations = {
 	.close_dir = smb2_close_dir,
 	.calc_smb_size = smb2_calc_size,
 	.is_status_pending = smb2_is_status_pending,
+	.is_session_expired = smb2_is_session_expired,
 	.oplock_response = smb2_oplock_response,
 	.queryfs = smb2_queryfs,
 	.mand_lock = smb2_mand_lock,
@@ -1815,7 +1907,8 @@ struct smb_version_operations smb311_operations = {
 	.print_stats = smb2_print_stats,
 	.dump_share_caps = smb2_dump_share_caps,
 	.is_oplock_break = smb2_is_valid_oplock_break,
-	.downgrade_oplock = smb2_downgrade_oplock,
+	.handle_cancelled_mid = smb2_handle_cancelled_mid,
+	.downgrade_oplock = smb3_downgrade_oplock,
 	.need_neg = smb2_need_neg,
 	.negotiate = smb2_negotiate,
 	.negotiate_wsize = smb2_negotiate_wsize,
@@ -1857,6 +1950,7 @@ struct smb_version_operations smb311_operations = {
 	.close_dir = smb2_close_dir,
 	.calc_smb_size = smb2_calc_size,
 	.is_status_pending = smb2_is_status_pending,
+	.is_session_expired = smb2_is_session_expired,
 	.oplock_response = smb2_oplock_response,
 	.queryfs = smb2_queryfs,
 	.mand_lock = smb2_mand_lock,

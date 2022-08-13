@@ -929,23 +929,25 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 			goto out_error;
 	}
 
-	/* New message, alloc head skb */
-	head = alloc_skb(0, sk->sk_allocation);
-	while (!head) {
-		kcm_push(kcm);
-		err = sk_stream_wait_memory(sk, &timeo);
-		if (err)
-			goto out_error;
-
+	if (msg_data_left(msg)) {
+		/* New message, alloc head skb */
 		head = alloc_skb(0, sk->sk_allocation);
+		while (!head) {
+			kcm_push(kcm);
+			err = sk_stream_wait_memory(sk, &timeo);
+			if (err)
+				goto out_error;
+
+			head = alloc_skb(0, sk->sk_allocation);
+		}
+
+		skb = head;
+
+		/* Set ip_summed to CHECKSUM_UNNECESSARY to avoid calling
+		 * csum_and_copy_from_iter from skb_do_copy_data_nocache.
+		 */
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
 	}
-
-	skb = head;
-
-	/* Set ip_summed to CHECKSUM_UNNECESSARY to avoid calling
-	 * csum_and_copy_from_iter from skb_do_copy_data_nocache.
-	 */
-	skb->ip_summed = CHECKSUM_UNNECESSARY;
 
 start:
 	while (msg_data_left(msg)) {
@@ -1018,10 +1020,12 @@ wait_for_memory:
 	if (eor) {
 		bool not_busy = skb_queue_empty(&sk->sk_write_queue);
 
-		/* Message complete, queue it on send buffer */
-		__skb_queue_tail(&sk->sk_write_queue, head);
-		kcm->seq_skb = NULL;
-		KCM_STATS_INCR(kcm->stats.tx_msgs);
+		if (head) {
+			/* Message complete, queue it on send buffer */
+			__skb_queue_tail(&sk->sk_write_queue, head);
+			kcm->seq_skb = NULL;
+			KCM_STATS_INCR(kcm->stats.tx_msgs);
+		}
 
 		if (msg->msg_flags & MSG_BATCH) {
 			kcm->tx_wait_more = true;
@@ -1040,8 +1044,10 @@ wait_for_memory:
 	} else {
 		/* Message not complete, save state */
 partial_message:
-		kcm->seq_skb = head;
-		kcm_tx_msg(head)->last_skb = skb;
+		if (head) {
+			kcm->seq_skb = head;
+			kcm_tx_msg(head)->last_skb = skb;
+		}
 	}
 
 	KCM_STATS_ADD(kcm->stats.tx_bytes, copied);
@@ -1369,15 +1375,32 @@ static int kcm_attach(struct socket *sock, struct socket *csock,
 	struct list_head *head;
 	int index = 0;
 	struct strp_callbacks cb;
-	int err;
+	int err = 0;
 
 	csk = csock->sk;
 	if (!csk)
 		return -EINVAL;
 
+	lock_sock(csk);
+
+	/* Only allow TCP sockets to be attached for now */
+	if ((csk->sk_family != AF_INET && csk->sk_family != AF_INET6) ||
+	    csk->sk_protocol != IPPROTO_TCP) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
+	/* Don't allow listeners or closed sockets */
+	if (csk->sk_state == TCP_LISTEN || csk->sk_state == TCP_CLOSE) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
 	psock = kmem_cache_zalloc(kcm_psockp, GFP_KERNEL);
-	if (!psock)
-		return -ENOMEM;
+	if (!psock) {
+		err = -ENOMEM;
+		goto out;
+	}
 
 	psock->mux = mux;
 	psock->sk = csk;
@@ -1391,12 +1414,23 @@ static int kcm_attach(struct socket *sock, struct socket *csock,
 	err = strp_init(&psock->strp, csk, &cb);
 	if (err) {
 		kmem_cache_free(kcm_psockp, psock);
-		return err;
+		goto out;
 	}
 
-	sock_hold(csk);
-
 	write_lock_bh(&csk->sk_callback_lock);
+
+	/* Check if sk_user_data is aready by KCM or someone else.
+	 * Must be done under lock to prevent race conditions.
+	 */
+	if (csk->sk_user_data) {
+		write_unlock_bh(&csk->sk_callback_lock);
+		strp_stop(&psock->strp);
+		strp_done(&psock->strp);
+		kmem_cache_free(kcm_psockp, psock);
+		err = -EALREADY;
+		goto out;
+	}
+
 	psock->save_data_ready = csk->sk_data_ready;
 	psock->save_write_space = csk->sk_write_space;
 	psock->save_state_change = csk->sk_state_change;
@@ -1404,7 +1438,10 @@ static int kcm_attach(struct socket *sock, struct socket *csock,
 	csk->sk_data_ready = psock_data_ready;
 	csk->sk_write_space = psock_write_space;
 	csk->sk_state_change = psock_state_change;
+
 	write_unlock_bh(&csk->sk_callback_lock);
+
+	sock_hold(csk);
 
 	/* Finished initialization, now add the psock to the MUX. */
 	spin_lock_bh(&mux->lock);
@@ -1427,7 +1464,10 @@ static int kcm_attach(struct socket *sock, struct socket *csock,
 	/* Schedule RX work in case there are already bytes queued */
 	strp_check_rcv(&psock->strp);
 
-	return 0;
+out:
+	release_sock(csk);
+
+	return err;
 }
 
 static int kcm_attach_ioctl(struct socket *sock, struct kcm_attach *info)
@@ -1479,6 +1519,7 @@ static void kcm_unattach(struct kcm_psock *psock)
 
 	if (WARN_ON(psock->rx_kcm)) {
 		write_unlock_bh(&csk->sk_callback_lock);
+		release_sock(csk);
 		return;
 	}
 
@@ -1614,60 +1655,35 @@ static struct proto kcm_proto = {
 };
 
 /* Clone a kcm socket. */
-static int kcm_clone(struct socket *osock, struct kcm_clone *info,
-		     struct socket **newsockp)
+static struct file *kcm_clone(struct socket *osock)
 {
 	struct socket *newsock;
 	struct sock *newsk;
-	struct file *newfile;
-	int err, newfd;
+	struct file *file;
 
-	err = -ENFILE;
 	newsock = sock_alloc();
 	if (!newsock)
-		goto out;
+		return ERR_PTR(-ENFILE);
 
 	newsock->type = osock->type;
 	newsock->ops = osock->ops;
 
 	__module_get(newsock->ops->owner);
 
-	newfd = get_unused_fd_flags(0);
-	if (unlikely(newfd < 0)) {
-		err = newfd;
-		goto out_fd_fail;
-	}
-
-	newfile = sock_alloc_file(newsock, 0, osock->sk->sk_prot_creator->name);
-	if (unlikely(IS_ERR(newfile))) {
-		err = PTR_ERR(newfile);
-		goto out_sock_alloc_fail;
-	}
-
 	newsk = sk_alloc(sock_net(osock->sk), PF_KCM, GFP_KERNEL,
-			 &kcm_proto, true);
+			 &kcm_proto, false);
 	if (!newsk) {
-		err = -ENOMEM;
-		goto out_sk_alloc_fail;
+		sock_release(newsock);
+		return ERR_PTR(-ENOMEM);
 	}
-
 	sock_init_data(newsock, newsk);
 	init_kcm_sock(kcm_sk(newsk), kcm_sk(osock->sk)->mux);
 
-	fd_install(newfd, newfile);
-	*newsockp = newsock;
-	info->fd = newfd;
+	file = sock_alloc_file(newsock, 0, osock->sk->sk_prot_creator->name);
+	if (IS_ERR(file))
+		sock_release(newsock);
 
-	return 0;
-
-out_sk_alloc_fail:
-	fput(newfile);
-out_sock_alloc_fail:
-	put_unused_fd(newfd);
-out_fd_fail:
-	sock_release(newsock);
-out:
-	return err;
+	return file;
 }
 
 static int kcm_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
@@ -1679,7 +1695,7 @@ static int kcm_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 		struct kcm_attach info;
 
 		if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
-			err = -EFAULT;
+			return -EFAULT;
 
 		err = kcm_attach_ioctl(sock, &info);
 
@@ -1689,7 +1705,7 @@ static int kcm_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 		struct kcm_unattach info;
 
 		if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
-			err = -EFAULT;
+			return -EFAULT;
 
 		err = kcm_unattach_ioctl(sock, &info);
 
@@ -1697,21 +1713,25 @@ static int kcm_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	}
 	case SIOCKCMCLONE: {
 		struct kcm_clone info;
-		struct socket *newsock = NULL;
+		struct file *file;
 
-		if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
-			err = -EFAULT;
+		info.fd = get_unused_fd_flags(0);
+		if (unlikely(info.fd < 0))
+			return info.fd;
 
-		err = kcm_clone(sock, &info, &newsock);
-
-		if (!err) {
-			if (copy_to_user((void __user *)arg, &info,
-					 sizeof(info))) {
-				err = -EFAULT;
-				sys_close(info.fd);
-			}
+		file = kcm_clone(sock);
+		if (IS_ERR(file)) {
+			put_unused_fd(info.fd);
+			return PTR_ERR(file);
 		}
-
+		if (copy_to_user((void __user *)arg, &info,
+				 sizeof(info))) {
+			put_unused_fd(info.fd);
+			fput(file);
+			return -EFAULT;
+		}
+		fd_install(info.fd, file);
+		err = 0;
 		break;
 	}
 	default:
@@ -2038,13 +2058,13 @@ static int __init kcm_init(void)
 	if (err)
 		goto fail;
 
-	err = sock_register(&kcm_family_ops);
-	if (err)
-		goto sock_register_fail;
-
 	err = register_pernet_device(&kcm_net_ops);
 	if (err)
 		goto net_ops_fail;
+
+	err = sock_register(&kcm_family_ops);
+	if (err)
+		goto sock_register_fail;
 
 	err = kcm_proc_init();
 	if (err)
@@ -2053,12 +2073,12 @@ static int __init kcm_init(void)
 	return 0;
 
 proc_init_fail:
-	unregister_pernet_device(&kcm_net_ops);
-
-net_ops_fail:
 	sock_unregister(PF_KCM);
 
 sock_register_fail:
+	unregister_pernet_device(&kcm_net_ops);
+
+net_ops_fail:
 	proto_unregister(&kcm_proto);
 
 fail:
@@ -2074,8 +2094,8 @@ fail:
 static void __exit kcm_exit(void)
 {
 	kcm_proc_exit();
-	unregister_pernet_device(&kcm_net_ops);
 	sock_unregister(PF_KCM);
+	unregister_pernet_device(&kcm_net_ops);
 	proto_unregister(&kcm_proto);
 	destroy_workqueue(kcm_wq);
 

@@ -44,7 +44,7 @@ TRACE_EVENT(sock_exceed_buf_limit,
 	),
 
 	TP_fast_assign(
-		strncpy(__entry->name, prot->name, 32);
+		strlcpy(__entry->name, prot->name, 32);
 		__entry->sysctl_mem = prot->sysctl_mem;
 		__entry->allocated = allocated;
 		__entry->sysctl_rmem = prot->sysctl_rmem[0];

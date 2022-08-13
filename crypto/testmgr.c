@@ -5,6 +5,7 @@
  * Copyright (c) 2002 Jean-Francois Dive <jef@linuxbe.org>
  * Copyright (c) 2007 Nokia Siemens Networks
  * Copyright (c) 2008 Herbert Xu <herbert@gondor.apana.org.au>
+ * Copyright (c) 2017-2018, NVIDIA Corporation. All Rights Reserved.
  *
  * Updated RFC4106 AES-GCM testing.
  *    Authors: Aidan O'Mahony (aidan.o.mahony@intel.com)
@@ -39,16 +40,6 @@
 static bool notests;
 module_param(notests, bool, 0644);
 MODULE_PARM_DESC(notests, "disable crypto self-tests");
-
-#ifdef CONFIG_CRYPTO_MANAGER_DISABLE_TESTS
-
-/* a perfect nop */
-int alg_test(const char *driver, const char *alg, u32 type, u32 mask)
-{
-	return 0;
-}
-
-#else
 
 #include "testmgr.h"
 
@@ -130,6 +121,8 @@ struct alg_test_desc {
 	const char *alg;
 	int (*test)(const struct alg_test_desc *desc, const char *driver,
 		    u32 type, u32 mask);
+	int (*hash_test)(const struct alg_test_desc *desc, const char *driver,
+		    u32 type, u32 mask, bool skip_partial);
 	int fips_allowed;	/* set if alg is allowed in fips mode */
 
 	union {
@@ -261,7 +254,7 @@ out_nostate:
 
 static int __test_hash(struct crypto_ahash *tfm, struct hash_testvec *template,
 		       unsigned int tcount, bool use_digest,
-		       const int align_offset)
+		       const int align_offset, bool skip_partial)
 {
 	const char *algo = crypto_tfm_alg_driver_name(crypto_ahash_tfm(tfm));
 	unsigned int i, j, k, temp;
@@ -366,6 +359,10 @@ static int __test_hash(struct crypto_ahash *tfm, struct hash_testvec *template,
 			hexdump(result, crypto_ahash_digestsize(tfm));
 			ret = -EINVAL;
 			goto out;
+		} else {
+			pr_info("alg: hash: Test %d passed for %s\n",
+				j, algo);
+			hexdump(result, crypto_ahash_digestsize(tfm));
 		}
 	}
 
@@ -444,6 +441,12 @@ static int __test_hash(struct crypto_ahash *tfm, struct hash_testvec *template,
 			ret = -EINVAL;
 			goto out;
 		}
+	}
+
+	if (skip_partial) {
+		ret = 0;
+		printk("\n SKIP Testing partial update for %s \n", algo);
+		goto out;
 	}
 
 	/* partial update exercise */
@@ -537,17 +540,17 @@ out_nobuf:
 }
 
 static int test_hash(struct crypto_ahash *tfm, struct hash_testvec *template,
-		     unsigned int tcount, bool use_digest)
+		     unsigned int tcount, bool use_digest, bool skip_partial)
 {
 	unsigned int alignmask;
 	int ret;
 
-	ret = __test_hash(tfm, template, tcount, use_digest, 0);
+	ret = __test_hash(tfm, template, tcount, use_digest, 0, skip_partial);
 	if (ret)
 		return ret;
 
 	/* test unaligned buffers, check with one byte offset */
-	ret = __test_hash(tfm, template, tcount, use_digest, 1);
+	ret = __test_hash(tfm, template, tcount, use_digest, 1, skip_partial);
 	if (ret)
 		return ret;
 
@@ -555,7 +558,7 @@ static int test_hash(struct crypto_ahash *tfm, struct hash_testvec *template,
 	if (alignmask) {
 		/* Check if alignment mask for tfm is correctly set. */
 		ret = __test_hash(tfm, template, tcount, use_digest,
-				  alignmask + 1);
+				  alignmask + 1, skip_partial);
 		if (ret)
 			return ret;
 	}
@@ -1185,6 +1188,10 @@ static int __test_skcipher(struct crypto_skcipher *tfm, int enc,
 			hexdump(q, template[i].rlen);
 			ret = -EINVAL;
 			goto out;
+		} else {
+			pr_info("alg: skcipher%s: Test %d passed on %s for %s\n",
+				d, j, e, algo);
+			hexdump(q, template[i].rlen);
 		}
 
 		if (template[i].iv_out &&
@@ -1626,10 +1633,33 @@ static int alg_test_hash(const struct alg_test_desc *desc, const char *driver,
 	}
 
 	err = test_hash(tfm, desc->suite.hash.vecs,
-			desc->suite.hash.count, true);
+			desc->suite.hash.count, true, 0);
 	if (!err)
 		err = test_hash(tfm, desc->suite.hash.vecs,
-				desc->suite.hash.count, false);
+				desc->suite.hash.count, false, 0);
+
+	crypto_free_ahash(tfm);
+	return err;
+}
+
+static int alg_test_hash_sha(const struct alg_test_desc *desc, const char *driver,
+			 u32 type, u32 mask, bool skip_partial)
+{
+	struct crypto_ahash *tfm;
+	int err;
+
+	tfm = crypto_alloc_ahash(driver, type | CRYPTO_ALG_INTERNAL, mask);
+	if (IS_ERR(tfm)) {
+		printk(KERN_ERR "alg: hash: Failed to load transform for %s: "
+		       "%ld\n", driver, PTR_ERR(tfm));
+		return PTR_ERR(tfm);
+	}
+
+	err = test_hash(tfm, desc->suite.hash.vecs,
+			desc->suite.hash.count, true, skip_partial);
+	if (!err)
+		err = test_hash(tfm, desc->suite.hash.vecs,
+				desc->suite.hash.count, false, skip_partial);
 
 	crypto_free_ahash(tfm);
 	return err;
@@ -1877,7 +1907,6 @@ static int do_test_kpp(struct crypto_kpp *tfm, struct kpp_testvec *vec,
 		       alg);
 		err = -EINVAL;
 	}
-
 free_all:
 	kfree(input_buf);
 free_output:
@@ -1898,6 +1927,9 @@ static int test_kpp(struct crypto_kpp *tfm, const char *alg,
 			pr_err("alg: %s: test failed on vector %d, err=%d\n",
 			       alg, i + 1, ret);
 			return ret;
+		} else {
+			pr_err("alg: %s: test passed on vector %d\n",
+				alg, i + 1);
 		}
 	}
 	return 0;
@@ -1921,6 +1953,326 @@ static int alg_test_kpp(const struct alg_test_desc *desc, const char *driver,
 
 	crypto_free_kpp(tfm);
 	return err;
+}
+
+#define ECDSA_TEST_VALID_VERIFY		0
+#define ECDSA_TEST_INVALID_VERIFY	1
+#define ECDSA_TEST_SIGN_VERIFY		2
+#define ECDSA_TEST_SIGN			3
+
+static int __do_test_ecdsa_verify(struct crypto_akcipher *tfm,
+				  struct akcipher_testvec *vec, int test)
+{
+	struct akcipher_request *req = NULL;
+	u8 *r_str = NULL, *s_str = NULL;
+	u8 *m_str = NULL;
+	struct scatterlist src_tab[3], dst;
+	struct tcrypt_result result;
+	int outbuf_maxlen;
+	u8 *outbuf = NULL;
+	unsigned int nbytes;
+	int err, m_size;
+
+	/* Alloc akcipher request */
+	req = akcipher_request_alloc(tfm, GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	/* Set private key */
+	err = crypto_akcipher_set_pub_key(tfm, vec->key, vec->key_len);
+	if (err)
+		goto error;
+
+	/*
+	 * vec->c always contains k, R and S in that order. All are
+	 * of same size and are equal to n i.e. the order of
+	 * an elliptic curve.
+	 */
+	nbytes = vec->c_size / 3;
+
+	r_str = kzalloc(nbytes, GFP_KERNEL);
+	s_str = kzalloc(nbytes, GFP_KERNEL);
+	m_str = kzalloc(vec->m_size, GFP_KERNEL);
+	if (!r_str || !s_str || !m_str) {
+		err = -ENOMEM;
+		goto error;
+	}
+	memcpy(r_str, (u8 *)vec->c + 1 * nbytes, nbytes);
+	memcpy(s_str, (u8 *)vec->c + 2 * nbytes, nbytes);
+	memcpy(m_str, vec->m, vec->m_size);
+
+	outbuf_maxlen = crypto_akcipher_maxsize(tfm);
+	if (outbuf_maxlen < 0) {
+		err = outbuf_maxlen;
+		goto error;
+	}
+	outbuf = kzalloc(outbuf_maxlen, GFP_KERNEL);
+	if (!outbuf) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	/* Intentionally set m_size to 8 to test invalid hash */
+	m_size = test == ECDSA_TEST_VALID_VERIFY ? vec->m_size : 8;
+
+	/* Set src and dst buffers */
+	sg_init_table(src_tab, 3);
+	sg_set_buf(&src_tab[0], m_str, m_size);
+	sg_set_buf(&src_tab[1], r_str, nbytes);
+	sg_set_buf(&src_tab[2], s_str, nbytes);
+	sg_init_one(&dst, outbuf, outbuf_maxlen);
+
+	akcipher_request_set_crypt(req, src_tab, &dst,
+				   vec->m_size + 2 * nbytes, outbuf_maxlen);
+
+	/* Set up result callback */
+	init_completion(&result.completion);
+	akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				      tcrypt_complete, &result);
+
+	/* Run ecdsa verify operation on sig (r,s) */
+	err = wait_async_op(&result, crypto_akcipher_verify(req));
+error:
+	akcipher_request_free(req);
+	kfree(r_str);
+	kfree(s_str);
+	kfree(m_str);
+	kfree(outbuf);
+	return err;
+}
+
+static int do_test_ecdsa_verify(struct crypto_akcipher *tfm,
+				struct akcipher_testvec *vec)
+{
+	int err;
+
+	err = __do_test_ecdsa_verify(tfm, vec, ECDSA_TEST_VALID_VERIFY);
+	if (err)
+		pr_err("alg: ecdsa: verify(rs) test failed. err %d\n", err);
+
+	return err;
+}
+
+static int do_test_ecdsa_invalid_verify(struct crypto_akcipher *tfm,
+					struct akcipher_testvec *vec)
+{
+	int err;
+
+	err = __do_test_ecdsa_verify(tfm, vec, ECDSA_TEST_INVALID_VERIFY);
+	if (err != -EBADMSG) {
+		pr_err("alg: ecdsa: invalid verify test failed. err %d\n", err);
+		return err;
+	}
+
+	return 0;
+}
+
+static int __do_test_ecdsa_sign_verify(struct crypto_akcipher *tfm,
+				       struct akcipher_testvec *vec,
+				       int test)
+{
+	struct akcipher_request *req = NULL;
+	u8 *r_str = NULL, *s_str = NULL;
+	u8 *sig_r = NULL, *sig_s = NULL;
+	u8 *m_str = NULL, *k_str = NULL;
+	struct scatterlist src_tab[3];
+	struct scatterlist src, dst;
+	struct tcrypt_result result;
+	int outbuf_maxlen;
+	void *outbuf = NULL;
+	unsigned int nbytes;
+	int err;
+
+	/* Alloc akcipher request */
+	req = akcipher_request_alloc(tfm, GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	/* Set private key */
+	err = crypto_akcipher_set_priv_key(tfm, vec->key, vec->key_len);
+	if (err)
+		goto error;
+
+	/* Set pub key */
+	err = crypto_akcipher_set_pub_key(tfm, vec->key, vec->key_len);
+	if (err)
+		goto error;
+
+	/*
+	 * vec->c always contains k, R and S in that order. All are
+	 * of same size and are equal to n i.e. the order of
+	 * an elliptic curve.
+	 */
+	nbytes = vec->c_size / 3;
+
+	k_str = kzalloc(nbytes, GFP_KERNEL);
+	r_str = kzalloc(nbytes, GFP_KERNEL);
+	s_str = kzalloc(nbytes, GFP_KERNEL);
+	m_str = kzalloc(vec->m_size, GFP_KERNEL);
+	if (!k_str || !r_str || !s_str || !m_str) {
+		err = -ENOMEM;
+		goto error;
+	}
+	memcpy(k_str, (u8 *)vec->c + 0 * nbytes, nbytes);
+	memcpy(r_str, (u8 *)vec->c + 1 * nbytes, nbytes);
+	memcpy(s_str, (u8 *)vec->c + 2 * nbytes, nbytes);
+	memcpy(m_str, vec->m, vec->m_size);
+
+	outbuf_maxlen = crypto_akcipher_maxsize(tfm);
+	if (outbuf_maxlen < 0) {
+		err = outbuf_maxlen;
+		goto error;
+	}
+	outbuf = kzalloc(outbuf_maxlen, GFP_KERNEL);
+	if (!outbuf) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	sg_init_one(&src, m_str, vec->m_size);
+	sg_init_one(&dst, outbuf, outbuf_maxlen);
+
+	akcipher_request_set_crypt(req, &src, &dst,
+				   vec->m_size, outbuf_maxlen);
+
+	/* Set up result callback */
+	init_completion(&result.completion);
+	akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				      tcrypt_complete, &result);
+
+	/* Set K in request for signing */
+	if (test == ECDSA_TEST_SIGN)
+		req->info = k_str;
+
+	/* Run ecdsa sign operation on message digest */
+	err = wait_async_op(&result, crypto_akcipher_sign(req));
+	if (err)
+		goto error;
+
+	/* verify that signature (r,s) is valid */
+	if (req->dst_len != 2 * nbytes) {
+		err = -EINVAL;
+		goto error;
+	}
+
+	/* outbuf contains r and s */
+	sig_r = outbuf;
+	sig_s = (u8 *)outbuf + nbytes;
+
+	if (test == ECDSA_TEST_SIGN) {
+		/* compare r & s */
+		if (memcmp(r_str, sig_r, nbytes) ||
+		    memcmp(s_str, sig_s, nbytes)) {
+			err = -EINVAL;
+			goto error;
+		}
+	} else {
+		/* Set src and dst buffers */
+		sg_init_table(src_tab, 3);
+		sg_set_buf(&src_tab[0], m_str, vec->m_size);
+		sg_set_buf(&src_tab[1], sig_r, nbytes);
+		sg_set_buf(&src_tab[2], sig_s, nbytes);
+		sg_init_one(&dst, outbuf, outbuf_maxlen);
+
+		akcipher_request_set_crypt(req, src_tab, &dst,
+					   vec->m_size + 2 * nbytes,
+					   outbuf_maxlen);
+
+		/* Set up result callback */
+		init_completion(&result.completion);
+		akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+					      tcrypt_complete, &result);
+
+		/* Run ecdsa verify operation on sig (r,s) */
+		err = wait_async_op(&result, crypto_akcipher_verify(req));
+		if (err)
+			goto error;
+	}
+
+error:
+	akcipher_request_free(req);
+	kfree(k_str);
+	kfree(r_str);
+	kfree(s_str);
+	kfree(m_str);
+	kfree(outbuf);
+	return err;
+}
+
+static int do_test_ecdsa_sign_verify(struct crypto_akcipher *tfm,
+				     struct akcipher_testvec *vec)
+{
+	int err;
+
+	err = __do_test_ecdsa_sign_verify(tfm, vec, ECDSA_TEST_SIGN_VERIFY);
+	if (err)
+		pr_err("alg: ecdsa: sign/verify test failed. err %d\n", err);
+
+	return err;
+}
+
+static int do_test_ecdsa_sign(struct crypto_akcipher *tfm,
+			      struct akcipher_testvec *vec)
+{
+	int err;
+
+	err = __do_test_ecdsa_sign_verify(tfm, vec, ECDSA_TEST_SIGN);
+	if (err)
+		pr_err("alg: ecdsa: sign test failed. err %d\n", err);
+
+	return err;
+}
+
+static int test_ecdsa_akcipher(struct crypto_akcipher *tfm, const char *alg,
+		       struct akcipher_testvec *vecs, unsigned int tcount)
+{
+	int i, err = 0;
+
+	for (i = 0; i < tcount; i++) {
+		err = do_test_ecdsa_verify(tfm, &vecs[i]);
+		if (!err) {
+			pr_err("alg: %s: verify passed on vector %d\n",
+				alg, i + 1);
+			continue;
+		}
+
+		return err;
+	}
+
+	for (i = 0; i < tcount; i++) {
+		err = do_test_ecdsa_invalid_verify(tfm, &vecs[i]);
+		if (!err) {
+			pr_err("alg: %s: invalid verify passed on vector %d\n",
+			       alg, i + 1);
+			continue;
+		}
+
+		return err;
+	}
+
+	for (i = 0; i < tcount; i++) {
+		err = do_test_ecdsa_sign_verify(tfm, &vecs[i]);
+		if (!err) {
+			pr_err("alg: %s: sign verify passed on vector %d\n",
+			       alg, i + 1);
+			continue;
+		}
+
+		return err;
+	}
+
+	for (i = 0; i < tcount; i++) {
+		err = do_test_ecdsa_sign(tfm, &vecs[i]);
+		if (!err) {
+			pr_err("alg: %s: sign passed on vector %d\n",
+				alg, i + 1);
+			continue;
+		}
+
+		return err;
+	}
+
+	return 0;
 }
 
 static int test_akcipher_one(struct crypto_akcipher *tfm,
@@ -2062,6 +2414,273 @@ static int test_akcipher(struct crypto_akcipher *tfm, const char *alg,
 	return 0;
 }
 
+#define EDDSA_TEST_SIGN		0
+#define EDDSA_TEST_VERIFY	1
+
+static int __do_test_eddsa_sign(struct crypto_akcipher *tfm,
+			      struct akcipher_testvec *vec)
+{
+	struct akcipher_request *req = NULL;
+	u8 *sig_r = NULL, *sig_s = NULL;
+	u8 *m_str = NULL;
+	struct scatterlist src, dst;
+	struct tcrypt_result result;
+	unsigned int outbuf_maxlen;
+	void *outbuf = NULL;
+	void *key = NULL;
+	unsigned int nbytes;
+	int err;
+
+	/* Alloc akcipher request */
+	req = akcipher_request_alloc(tfm, GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	/* Set private key */
+	err = crypto_akcipher_set_priv_key(tfm, vec->key, vec->key_len);
+	if (err)
+		goto error;
+
+	nbytes = vec->c_size / 3;
+
+	key = kzalloc(nbytes, GFP_KERNEL);
+	if (!key) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	/* Set up result callback */
+	init_completion(&result.completion);
+	akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				      tcrypt_complete, &result);
+
+	/* Generate pub key */
+	err = wait_async_op(&result,
+			    crypto_akcipher_set_pub_key(tfm, key, nbytes));
+	if (err) {
+		pr_err("alg:eddsa set_pub_key test failed\n");
+		goto error;
+	}
+
+	if (memcmp(key, vec->c, nbytes)) {
+		err = -EINVAL;
+		pr_err("alg:eddsa set_pub_key test failed. Invalid Output\n");
+		goto error;
+	}
+
+	m_str = kzalloc(nbytes, GFP_KERNEL);
+	if (!m_str) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	memcpy(m_str, vec->m, vec->m_size);
+
+	outbuf_maxlen = crypto_akcipher_maxsize(tfm);
+	outbuf = kzalloc(outbuf_maxlen, GFP_KERNEL);
+	if (!outbuf) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	sg_init_one(&src, m_str, vec->m_size);
+	sg_init_one(&dst, outbuf, outbuf_maxlen);
+
+	akcipher_request_set_crypt(req, &src, &dst,
+				   vec->m_size, outbuf_maxlen);
+
+	/* Set up result callback */
+	init_completion(&result.completion);
+	akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				      tcrypt_complete, &result);
+
+	/* Run eddsa sign operation on message digest */
+	err = wait_async_op(&result, crypto_akcipher_sign(req));
+	if (err) {
+		pr_err("alg:eddsa sign test failed\n");
+		goto error;
+	}
+
+	/* verify that signature (r,s) is valid */
+	if (req->dst_len != 2 * nbytes) {
+		err = -EINVAL;
+		goto error;
+	}
+
+	/* outbuf contains r and s */
+	sig_r = outbuf;
+	sig_s = (u8 *)outbuf + nbytes;
+
+	/* compare r & s */
+	if (memcmp((u8 *)vec->c + 1 * nbytes, sig_r, nbytes) ||
+	    memcmp((u8 *)vec->c + 2 * nbytes, sig_s, nbytes)) {
+		pr_err("alg:eddsa sign test failed. Invalid Output\n");
+		err = -EINVAL;
+		goto error;
+	}
+error:
+	kfree(outbuf);
+	kfree(m_str);
+	kfree(key);
+
+	akcipher_request_free(req);
+
+	return err;
+}
+
+
+static int __do_test_eddsa_verify(struct crypto_akcipher *tfm,
+				  struct akcipher_testvec *vec)
+{
+	struct akcipher_request *req = NULL;
+	u8 *r_str = NULL, *s_str = NULL;
+	u8 *m_str = NULL;
+	struct scatterlist src_tab[3], dst;
+	struct tcrypt_result result;
+	unsigned int outbuf_maxlen;
+	u8 *outbuf = NULL, *key = NULL;
+	unsigned int nbytes;
+	int err;
+
+	/* Alloc akcipher request */
+	req = akcipher_request_alloc(tfm, GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	/* Set private key */
+	err = crypto_akcipher_set_priv_key(tfm, vec->key, vec->key_len);
+	if (err)
+		goto error;
+
+	nbytes = vec->c_size / 3;
+
+	key = kzalloc(nbytes, GFP_KERNEL);
+	if (!key) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	/* Set up result callback */
+	init_completion(&result.completion);
+	akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				      tcrypt_complete, &result);
+
+	/* Generate pub key */
+	err = wait_async_op(&result,
+			    crypto_akcipher_set_pub_key(tfm, key, nbytes));
+	if (err) {
+		pr_err("alg:eddsa set_pub_key test failed\n");
+		goto error;
+	}
+
+	if (memcmp(key, vec->c, nbytes)) {
+		err = -EINVAL;
+		pr_err("alg:eddsa set_pub_key test failed. Invalid Output\n");
+		goto error;
+	}
+
+	/* vec->c contains public key, R and S in that order */
+
+	r_str = kzalloc(nbytes, GFP_KERNEL);
+	s_str = kzalloc(nbytes, GFP_KERNEL);
+	m_str = kzalloc(vec->m_size, GFP_KERNEL);
+	if (!r_str || !s_str || !m_str) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	memcpy(r_str, (u8 *)vec->c + 1 * nbytes, nbytes);
+	memcpy(s_str, (u8 *)vec->c + 2 * nbytes, nbytes);
+	memcpy(m_str, vec->m, vec->m_size);
+
+	outbuf_maxlen = crypto_akcipher_maxsize(tfm);
+	outbuf = kzalloc(outbuf_maxlen, GFP_KERNEL);
+	if (!outbuf) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	/* Set src and dst buffers */
+	sg_init_table(src_tab, 3);
+	sg_set_buf(&src_tab[0], m_str, vec->m_size);
+	sg_set_buf(&src_tab[1], r_str, nbytes);
+	sg_set_buf(&src_tab[2], s_str, nbytes);
+	sg_init_one(&dst, outbuf, outbuf_maxlen);
+
+	akcipher_request_set_crypt(req, src_tab, &dst,
+				   vec->m_size + 2 * nbytes, outbuf_maxlen);
+
+	/* Set up result callback */
+	init_completion(&result.completion);
+	akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				      tcrypt_complete, &result);
+
+	/* Run eddsa verify operation on sig (r,s) */
+	err = wait_async_op(&result, crypto_akcipher_verify(req));
+	if (err)
+		pr_err("alg:eddsa verify test failed\n");
+error:
+	kfree(outbuf);
+	kfree(m_str);
+	kfree(s_str);
+	kfree(r_str);
+	kfree(key);
+
+	akcipher_request_free(req);
+
+	return err;
+}
+
+static int do_test_eddsa(struct crypto_akcipher *tfm,
+			 struct akcipher_testvec *vec, int type)
+{
+	int err = 0;
+
+	if (type == EDDSA_TEST_SIGN) {
+		err = __do_test_eddsa_sign(tfm, vec);
+		if (err)
+			pr_err("alg: eddsa: sign test failed. err %d\n", err);
+	}
+
+	if (type == EDDSA_TEST_VERIFY) {
+		err = __do_test_eddsa_verify(tfm, vec);
+		if (err)
+			pr_err("alg: eddsa: verify test failed. err %d\n", err);
+	}
+
+	return err;
+}
+
+static int test_eddsa_akcipher(struct crypto_akcipher *tfm, const char *alg,
+		       struct akcipher_testvec *vecs, unsigned int tcount)
+{
+	int i, err = 0;
+
+	for (i = 0; i < tcount; i++) {
+		err = do_test_eddsa(tfm, &vecs[i], EDDSA_TEST_SIGN);
+		if (!err) {
+			pr_err("alg: %s: sign test passed on vectotr %d\n",
+				alg, i + 1);
+			continue;
+		}
+
+		return err;
+	}
+
+	for (i = 0; i < tcount; i++) {
+		err = do_test_eddsa(tfm, &vecs[i], EDDSA_TEST_VERIFY);
+		if (!err) {
+			pr_err("alg: %s: verify test passed on vectotr %d\n",
+				alg, i + 1);
+			continue;
+		}
+
+		return err;
+	}
+
+	return 0;
+}
+
 static int alg_test_akcipher(const struct alg_test_desc *desc,
 			     const char *driver, u32 type, u32 mask)
 {
@@ -2074,9 +2693,21 @@ static int alg_test_akcipher(const struct alg_test_desc *desc,
 		       driver, PTR_ERR(tfm));
 		return PTR_ERR(tfm);
 	}
-	if (desc->suite.akcipher.vecs)
-		err = test_akcipher(tfm, desc->alg, desc->suite.akcipher.vecs,
-				    desc->suite.akcipher.count);
+
+	if (desc->suite.akcipher.vecs) {
+		if (strncmp(desc->alg, "ecdsa", 5) == 0)
+			err = test_ecdsa_akcipher(tfm, desc->alg,
+						  desc->suite.akcipher.vecs,
+						  desc->suite.akcipher.count);
+		else if (strncmp(desc->alg, "eddsa", 5) == 0)
+			err = test_eddsa_akcipher(tfm, desc->alg,
+						  desc->suite.akcipher.vecs,
+						  desc->suite.akcipher.count);
+		else
+			err = test_akcipher(tfm, desc->alg,
+					    desc->suite.akcipher.vecs,
+					    desc->suite.akcipher.count);
+	}
 
 	crypto_free_akcipher(tfm);
 	return err;
@@ -3238,6 +3869,36 @@ static const struct alg_test_desc alg_test_descs[] = {
 			}
 		}
 	}, {
+		.alg = "ecb(speck128)",
+		.test = alg_test_skcipher,
+		.suite = {
+			.cipher = {
+				.enc = {
+					.vecs = speck128_enc_tv_template,
+					.count = ARRAY_SIZE(speck128_enc_tv_template)
+				},
+				.dec = {
+					.vecs = speck128_dec_tv_template,
+					.count = ARRAY_SIZE(speck128_dec_tv_template)
+				}
+			}
+		}
+	}, {
+		.alg = "ecb(speck64)",
+		.test = alg_test_skcipher,
+		.suite = {
+			.cipher = {
+				.enc = {
+					.vecs = speck64_enc_tv_template,
+					.count = ARRAY_SIZE(speck64_enc_tv_template)
+				},
+				.dec = {
+					.vecs = speck64_dec_tv_template,
+					.count = ARRAY_SIZE(speck64_dec_tv_template)
+				}
+			}
+		}
+	}, {
 		.alg = "ecb(tea)",
 		.test = alg_test_skcipher,
 		.suite = {
@@ -3320,6 +3981,26 @@ static const struct alg_test_desc alg_test_descs[] = {
 			.kpp = {
 				.vecs = ecdh_tv_template,
 				.count = ECDH_TEST_VECTORS
+			}
+		}
+	}, {
+		.alg = "ecdsa",
+		.test = alg_test_akcipher,
+		.fips_allowed = 1,
+		.suite = {
+			.akcipher = {
+				.vecs = ecdsa_tv_template,
+				.count = ECDSA_TEST_VECTORS
+			}
+		}
+	}, {
+		.alg = "eddsa",
+		.test = alg_test_akcipher,
+		.fips_allowed = 1,
+		.suite = {
+			.akcipher = {
+				.vecs = eddsa_tv_template,
+				.count = EDDSA_TEST_VECTORS
 			}
 		}
 	}, {
@@ -3836,7 +4517,7 @@ static const struct alg_test_desc alg_test_descs[] = {
 		}
 	}, {
 		.alg = "sha1",
-		.test = alg_test_hash,
+		.hash_test = alg_test_hash_sha,
 		.fips_allowed = 1,
 		.suite = {
 			.hash = {
@@ -3846,7 +4527,7 @@ static const struct alg_test_desc alg_test_descs[] = {
 		}
 	}, {
 		.alg = "sha224",
-		.test = alg_test_hash,
+		.hash_test = alg_test_hash_sha,
 		.fips_allowed = 1,
 		.suite = {
 			.hash = {
@@ -3856,7 +4537,7 @@ static const struct alg_test_desc alg_test_descs[] = {
 		}
 	}, {
 		.alg = "sha256",
-		.test = alg_test_hash,
+		.hash_test = alg_test_hash_sha,
 		.fips_allowed = 1,
 		.suite = {
 			.hash = {
@@ -3906,7 +4587,7 @@ static const struct alg_test_desc alg_test_descs[] = {
 		}
 	}, {
 		.alg = "sha384",
-		.test = alg_test_hash,
+		.hash_test = alg_test_hash_sha,
 		.fips_allowed = 1,
 		.suite = {
 			.hash = {
@@ -3916,7 +4597,7 @@ static const struct alg_test_desc alg_test_descs[] = {
 		}
 	}, {
 		.alg = "sha512",
-		.test = alg_test_hash,
+		.hash_test = alg_test_hash_sha,
 		.fips_allowed = 1,
 		.suite = {
 			.hash = {
@@ -4058,6 +4739,36 @@ static const struct alg_test_desc alg_test_descs[] = {
 			}
 		}
 	}, {
+		.alg = "xts(speck128)",
+		.test = alg_test_skcipher,
+		.suite = {
+			.cipher = {
+				.enc = {
+					.vecs = speck128_xts_enc_tv_template,
+					.count = ARRAY_SIZE(speck128_xts_enc_tv_template)
+				},
+				.dec = {
+					.vecs = speck128_xts_dec_tv_template,
+					.count = ARRAY_SIZE(speck128_xts_dec_tv_template)
+				}
+			}
+		}
+	}, {
+		.alg = "xts(speck64)",
+		.test = alg_test_skcipher,
+		.suite = {
+			.cipher = {
+				.enc = {
+					.vecs = speck64_xts_enc_tv_template,
+					.count = ARRAY_SIZE(speck64_xts_enc_tv_template)
+				},
+				.dec = {
+					.vecs = speck64_xts_dec_tv_template,
+					.count = ARRAY_SIZE(speck64_xts_dec_tv_template)
+				}
+			}
+		}
+	}, {
 		.alg = "xts(twofish)",
 		.test = alg_test_skcipher,
 		.suite = {
@@ -4168,14 +4879,19 @@ int alg_test(const char *driver, const char *alg, u32 type, u32 mask)
 	if (fips_enabled && ((i >= 0 && !alg_test_descs[i].fips_allowed) ||
 			     (j >= 0 && !alg_test_descs[j].fips_allowed)))
 		goto non_fips_alg;
-
 	rc = 0;
-	if (i >= 0)
+	if (i >= 0) {
+		if (!alg_test_descs[i].test)
+			goto non_fips_alg;
 		rc |= alg_test_descs[i].test(alg_test_descs + i, driver,
 					     type, mask);
-	if (j >= 0 && j != i)
+	}
+	if (j >= 0 && j != i) {
+		if (!alg_test_descs[j].test)
+			goto non_fips_alg;
 		rc |= alg_test_descs[j].test(alg_test_descs + j, driver,
 					     type, mask);
+	}
 
 test_done:
 	if (fips_enabled && rc)
@@ -4192,7 +4908,60 @@ notest:
 non_fips_alg:
 	return -EINVAL;
 }
-
-#endif /* CONFIG_CRYPTO_MANAGER_DISABLE_TESTS */
-
 EXPORT_SYMBOL_GPL(alg_test);
+
+int alg_hash_test(const char *driver, const char *alg, u32 type, u32 mask,
+	bool skip_partial_test)
+{
+	int i;
+	int j;
+	int rc;
+
+	if (!fips_enabled && notests) {
+		printk_once(KERN_INFO "alg: self-tests disabled\n");
+		return 0;
+	}
+
+	alg_test_descs_check_order();
+
+	i = alg_find_test(alg);
+	j = alg_find_test(driver);
+	if (i < 0 && j < 0)
+		goto notest;
+
+	if (fips_enabled && ((i >= 0 && !alg_test_descs[i].fips_allowed) ||
+			     (j >= 0 && !alg_test_descs[j].fips_allowed)))
+		goto non_fips_alg;
+
+	rc = 0;
+	if (i >= 0) {
+		if (!alg_test_descs[i].hash_test)
+			goto non_fips_alg;
+
+		rc |= alg_test_descs[i].hash_test(alg_test_descs + i, driver,
+					     type, mask, skip_partial_test);
+	}
+
+	if (j >= 0 && j != i) {
+		if (!alg_test_descs[j].hash_test)
+			goto non_fips_alg;
+
+		rc |= alg_test_descs[j].hash_test(alg_test_descs + j, driver,
+					     type, mask, skip_partial_test);
+	}
+
+	if (fips_enabled && rc)
+		panic("%s: %s alg self test failed in fips mode!\n", driver, alg);
+
+	if (fips_enabled && !rc)
+		pr_info("alg: self-tests for %s (%s) passed\n", driver, alg);
+
+	return rc;
+
+notest:
+	printk(KERN_INFO "alg: No test for %s (%s)\n", alg, driver);
+	return 0;
+non_fips_alg:
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(alg_hash_test);

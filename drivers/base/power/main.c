@@ -33,6 +33,7 @@
 #include <linux/cpufreq.h>
 #include <linux/cpuidle.h>
 #include <linux/timer.h>
+#include <linux/wakeup_reason.h>
 
 #include "../base.h"
 #include "power.h"
@@ -158,6 +159,9 @@ void device_pm_remove(struct device *dev)
  */
 void device_pm_move_before(struct device *deva, struct device *devb)
 {
+	if (!deva || !devb)
+		return;
+
 	pr_debug("PM: Moving %s:%s before %s:%s\n",
 		 deva->bus ? deva->bus->name : "No Bus", dev_name(deva),
 		 devb->bus ? devb->bus->name : "No Bus", dev_name(devb));
@@ -172,6 +176,9 @@ void device_pm_move_before(struct device *deva, struct device *devb)
  */
 void device_pm_move_after(struct device *deva, struct device *devb)
 {
+	if (!deva || !devb)
+		return;
+
 	pr_debug("PM: Moving %s:%s after %s:%s\n",
 		 deva->bus ? deva->bus->name : "No Bus", dev_name(deva),
 		 devb->bus ? devb->bus->name : "No Bus", dev_name(devb));
@@ -1353,6 +1360,7 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 	pm_callback_t callback = NULL;
 	char *info = NULL;
 	int error = 0;
+	char suspend_abort[MAX_SUSPEND_ABORT_LEN];
 	DECLARE_DPM_WATCHDOG_ON_STACK(wd);
 
 	TRACE_DEVICE(dev);
@@ -1360,25 +1368,39 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 
 	dpm_wait_for_children(dev, async);
 
-	if (async_error)
+	if (async_error) {
+		dev->power.direct_complete = false;
 		goto Complete;
+	}
 
 	/*
-	 * If a device configured to wake up the system from sleep states
-	 * has been suspended at run time and there's a resume request pending
-	 * for it, this is equivalent to the device signaling wakeup, so the
-	 * system suspend operation should be aborted.
+	 * Wait for possible runtime PM transitions of the device in progress
+	 * to complete and if there's a runtime resume request pending for it,
+	 * resume it before proceeding with invoking the system-wide suspend
+	 * callbacks for it.
+	 *
+	 * If the system-wide suspend callbacks below change the configuration
+	 * of the device, they must disable runtime PM for it or otherwise
+	 * ensure that its runtime-resume callbacks will not be confused by that
+	 * change in case they are invoked going forward.
 	 */
-	if (pm_runtime_barrier(dev) && device_may_wakeup(dev))
-		pm_wakeup_event(dev, 0);
+	pm_runtime_barrier(dev);
 
 	if (pm_wakeup_pending()) {
+		pm_get_active_wakeup_sources(suspend_abort,
+			MAX_SUSPEND_ABORT_LEN);
+		log_suspend_abort_reason(suspend_abort);
+		dev->power.direct_complete = false;
 		async_error = -EBUSY;
 		goto Complete;
 	}
 
 	if (dev->power.syscore)
 		goto Complete;
+
+	/* Avoid direct_complete to let wakeup_path propagate. */
+	if (device_may_wakeup(dev) || dev->power.wakeup_path)
+		dev->power.direct_complete = false;
 
 	if (dev->power.direct_complete) {
 		if (pm_runtime_status_suspended(dev)) {
@@ -1757,10 +1779,13 @@ void device_pm_check_callbacks(struct device *dev)
 {
 	spin_lock_irq(&dev->power.lock);
 	dev->power.no_pm_callbacks =
-		(!dev->bus || pm_ops_is_empty(dev->bus->pm)) &&
-		(!dev->class || pm_ops_is_empty(dev->class->pm)) &&
+		(!dev->bus || (pm_ops_is_empty(dev->bus->pm) &&
+		 !dev->bus->suspend && !dev->bus->resume)) &&
+		(!dev->class || (pm_ops_is_empty(dev->class->pm) &&
+		 !dev->class->suspend && !dev->class->resume)) &&
 		(!dev->type || pm_ops_is_empty(dev->type->pm)) &&
 		(!dev->pm_domain || pm_ops_is_empty(&dev->pm_domain->ops)) &&
-		(!dev->driver || pm_ops_is_empty(dev->driver->pm));
+		(!dev->driver || (pm_ops_is_empty(dev->driver->pm) &&
+		 !dev->driver->suspend && !dev->driver->resume));
 	spin_unlock_irq(&dev->power.lock);
 }

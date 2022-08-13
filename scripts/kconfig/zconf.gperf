@@ -14,9 +14,11 @@ static const struct kconf_id *kconf_id_lookup(register const char *str, register
 %%
 mainmenu,	T_MAINMENU,	TF_COMMAND
 menu,		T_MENU,		TF_COMMAND
+append_menu,	T_APPEND_MENU,	TF_COMMAND
 endmenu,	T_ENDMENU,	TF_COMMAND
 source,		T_SOURCE,	TF_COMMAND
 choice,		T_CHOICE,	TF_COMMAND
+append_choice,	T_APPEND_CHOICE,	TF_COMMAND
 endchoice,	T_ENDCHOICE,	TF_COMMAND
 comment,	T_COMMENT,	TF_COMMAND
 config,		T_CONFIG,	TF_COMMAND

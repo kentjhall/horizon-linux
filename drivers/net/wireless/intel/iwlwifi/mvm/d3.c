@@ -935,8 +935,10 @@ int iwl_mvm_wowlan_config_key_params(struct iwl_mvm *mvm,
 {
 	struct iwl_wowlan_kek_kck_material_cmd kek_kck_cmd = {};
 	struct iwl_wowlan_tkip_params_cmd tkip_cmd = {};
+	bool unified = fw_has_capa(&mvm->fw->ucode_capa,
+				   IWL_UCODE_TLV_CAPA_CNSLDTD_D3_D0_IMG);
 	struct wowlan_key_data key_data = {
-		.configure_keys = !d0i3,
+		.configure_keys = !d0i3 && !unified,
 		.use_rsc_tsc = false,
 		.tkip = &tkip_cmd,
 		.use_tkip = false,
@@ -1262,12 +1264,15 @@ static int __iwl_mvm_suspend(struct ieee80211_hw *hw,
 	iwl_trans_d3_suspend(mvm->trans, test, !unified_image);
  out:
 	if (ret < 0) {
-		iwl_mvm_ref(mvm, IWL_MVM_REF_UCODE_DOWN);
-		if (mvm->restart_fw > 0) {
-			mvm->restart_fw--;
-			ieee80211_restart_hw(mvm->hw);
-		}
 		iwl_mvm_free_nd(mvm);
+
+		if (!unified_image) {
+			iwl_mvm_ref(mvm, IWL_MVM_REF_UCODE_DOWN);
+			if (mvm->restart_fw > 0) {
+				mvm->restart_fw--;
+				ieee80211_restart_hw(mvm->hw);
+			}
+		}
 	}
  out_noreset:
 	mutex_unlock(&mvm->mutex);

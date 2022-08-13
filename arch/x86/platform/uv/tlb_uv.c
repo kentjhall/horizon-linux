@@ -1283,6 +1283,7 @@ void uv_bau_message_interrupt(struct pt_regs *regs)
 	struct msg_desc msgdesc;
 
 	ack_APIC_irq();
+	kvm_set_cpu_l1tf_flush_l1d();
 	time_start = get_cycles();
 
 	bcp = &per_cpu(bau_control, smp_processor_id());
@@ -1848,7 +1849,6 @@ static void pq_init(int node, int pnode)
 
 	ops.write_payload_first(pnode, first);
 	ops.write_payload_last(pnode, last);
-	ops.write_g_sw_ack(pnode, 0xffffUL);
 
 	/* in effect, all msg_type's are set to MSG_NOOP */
 	memset(pqp, 0, sizeof(struct bau_pq_entry) * DEST_Q_SIZE);

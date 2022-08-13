@@ -1,7 +1,7 @@
 /*
  * Maxim MAX77620 MFD Driver
  *
- * Copyright (C) 2016 NVIDIA CORPORATION. All rights reserved.
+ * Copyright (C) 2016-2019 NVIDIA CORPORATION. All rights reserved.
  *
  * Author:
  *	Laxman Dewangan <ldewangan@nvidia.com>
@@ -32,6 +32,7 @@
 #include <linux/mfd/core.h>
 #include <linux/mfd/max77620.h>
 #include <linux/init.h>
+#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/regmap.h>
@@ -108,6 +109,10 @@ static const struct mfd_cell max20024_children[] = {
 		.name = "max20024-power",
 		.resources = power_resources,
 		.num_resources = ARRAY_SIZE(power_resources),
+	}, {
+		.name = "max77620-thermal",
+		.resources = thermal_resources,
+		.num_resources = ARRAY_SIZE(thermal_resources),
 	},
 };
 
@@ -291,6 +296,10 @@ static int max77620_config_fps(struct max77620_chip *chip,
 
 	ret = of_property_read_u32(fps_np, "maxim,shutdown-fps-time-period-us",
 				   &param_val);
+	if (ret < 0)
+		ret = of_property_read_u32(fps_np,
+					   "shutdown-fps-time-period-us",
+					   &param_val);
 	if (!ret) {
 		mask |= MAX77620_FPS_TIME_PERIOD_MASK;
 		chip->shutdown_fps_period[fps_id] = min(param_val,
@@ -302,12 +311,18 @@ static int max77620_config_fps(struct max77620_chip *chip,
 
 	ret = of_property_read_u32(fps_np, "maxim,suspend-fps-time-period-us",
 				   &param_val);
+	if (ret < 0)
+		ret = of_property_read_u32(fps_np, "suspend-fps-time-period-us",
+					   &param_val);
 	if (!ret)
 		chip->suspend_fps_period[fps_id] = min(param_val,
 						       fps_max_period);
 
 	ret = of_property_read_u32(fps_np, "maxim,fps-event-source",
 				   &param_val);
+	if (ret < 0)
+		ret = of_property_read_u32(fps_np, "fps-event-source",
+					   &param_val);
 	if (!ret) {
 		if (param_val > 2) {
 			dev_err(dev, "FPS%d event-source invalid\n", fps_id);
@@ -325,6 +340,10 @@ static int max77620_config_fps(struct max77620_chip *chip,
 		ret = of_property_read_u32(fps_np,
 				"maxim,device-state-on-disabled-event",
 				&param_val);
+		if (ret < 0)
+			ret = of_property_read_u32(fps_np,
+					"device-state-on-disabled-event",
+					&param_val);
 		if (!ret) {
 			if (param_val == 0)
 				chip->sleep_enable = true;
@@ -393,6 +412,162 @@ skip_fps:
 			dev_err(dev, "Failed to update SLPEN: %d\n", ret);
 			return ret;
 		}
+	}
+
+	return 0;
+}
+
+static int max77620_init_backup_battery_charging(struct max77620_chip *chip)
+{
+	struct device *dev = chip->dev;
+	struct device_node *np;
+	u32 pval;
+	u8 config;
+	int charging_current;
+	int charging_voltage;
+	int resistor;
+	int ret;
+
+	np = of_get_child_by_name(dev->of_node, "backup-battery");
+	if (!np) {
+		dev_info(dev, "Backup battery charging support disabled\n");
+		ret = regmap_update_bits(chip->rmap, MAX77620_REG_CNFGBBC,
+					 MAX77620_CNFGBBC_ENABLE, 0);
+		if (ret < 0)
+			dev_err(dev, "Failed to update CNFGBBC: %d\n", ret);
+		return ret;
+	}
+
+	ret = of_property_read_u32(np,
+			"backup-battery-charging-current", &pval);
+	if (ret < 0)
+		ret = of_property_read_u32(np,
+			"maxim,backup-battery-charging-current", &pval);
+	charging_current = (!ret) ? pval : 50;
+
+	ret = of_property_read_u32(np,
+			"backup-battery-charging-voltage", &pval);
+	if (ret < 0)
+		ret = of_property_read_u32(np,
+			"maxim,backup-battery-charging-voltage", &pval);
+	charging_voltage = (!ret) ? pval : 2500000;
+	charging_voltage /= 1000;
+
+	ret = of_property_read_u32(np, "backup-battery-output-resister", &pval);
+	if (ret < 0)
+		ret = of_property_read_u32(np,
+			"maxim,backup-battery-output-resister", &pval);
+	resistor = (!ret) ? pval : 1000;
+
+	config = MAX77620_CNFGBBC_ENABLE;
+	if (charging_current <= 50)
+		config |= 0 << MAX77620_CNFGBBC_CURRENT_SHIFT;
+	else if (charging_current <= 100)
+		config |= 3 << MAX77620_CNFGBBC_CURRENT_SHIFT;
+	else if (charging_current <= 200)
+		config |= 0 << MAX77620_CNFGBBC_CURRENT_SHIFT;
+	else if (charging_current <= 400)
+		config |= 3 << MAX77620_CNFGBBC_CURRENT_SHIFT;
+	else if (charging_current <= 600)
+		config |= 1 << MAX77620_CNFGBBC_CURRENT_SHIFT;
+	else
+		config |= 2 << MAX77620_CNFGBBC_CURRENT_SHIFT;
+
+	if (charging_current > 100)
+		config |= MAX77620_CNFGBBC_LOW_CURRENT_DISABLE;
+
+	if (charging_voltage <= 2500)
+		config |= 0 << MAX77620_CNFGBBC_VOLTAGE_SHIFT;
+	else if (charging_voltage <= 3000)
+		config |= 1 << MAX77620_CNFGBBC_VOLTAGE_SHIFT;
+	else if (charging_voltage <= 3300)
+		config |= 2 << MAX77620_CNFGBBC_VOLTAGE_SHIFT;
+	else
+		config |= 3 << MAX77620_CNFGBBC_VOLTAGE_SHIFT;
+
+	if (resistor <= 100)
+		config |= 0 << MAX77620_CNFGBBC_RESISTOR_SHIFT;
+	else if (resistor <= 1000)
+		config |= 1 << MAX77620_CNFGBBC_RESISTOR_SHIFT;
+	else if (resistor <= 3000)
+		config |= 2 << MAX77620_CNFGBBC_RESISTOR_SHIFT;
+	else if (resistor <= 6000)
+		config |= 3 << MAX77620_CNFGBBC_RESISTOR_SHIFT;
+
+	ret = regmap_write(chip->rmap, MAX77620_REG_CNFGBBC, config);
+	if (ret < 0) {
+		dev_err(dev, "Reg 0x%02x write failed, %d\n",
+			MAX77620_REG_CNFGBBC, ret);
+		return ret;
+	}
+	return 0;
+}
+
+static int max77620_init_low_battery_monitor(struct max77620_chip *chip)
+{
+	struct device *dev = chip->dev;
+	struct device_node *np;
+	bool pval;
+	u8 mask = 0;
+	u8 val = 0;
+	int ret;
+
+	np = of_get_child_by_name(dev->of_node, "low-battery-monitor");
+	if (!np)
+		return 0;
+
+	pval = of_property_read_bool(np, "low-battery-dac-enable");
+	if (!pval)
+		pval = of_property_read_bool(np,
+				"maxim,low-battery-dac-enable");
+	if (pval) {
+		mask |= MAX77620_CNFGGLBL1_LBDAC_EN;
+		val |= MAX77620_CNFGGLBL1_LBDAC_EN;
+	}
+
+	pval = of_property_read_bool(np, "low-battery-dac-disable");
+	if (!pval)
+		pval = of_property_read_bool(np,
+				"maxim,low-battery-dac-disable");
+	if (pval)
+		mask |= MAX77620_CNFGGLBL1_LBDAC_EN;
+
+	pval = of_property_read_bool(np, "low-battery-shutdown-enable");
+	if (!pval)
+		pval = of_property_read_bool(np,
+				"maxim,low-battery-shutdown-enable");
+	if (pval) {
+		mask |= MAX77620_CNFGGLBL1_MPPLD;
+		val |= MAX77620_CNFGGLBL1_MPPLD;
+	}
+
+	pval = of_property_read_bool(np, "low-battery-shutdown-disable");
+	if (!pval)
+		pval = of_property_read_bool(np,
+				"maxim,low-battery-shutdown-disable");
+	if (pval)
+		mask |= MAX77620_CNFGGLBL1_MPPLD;
+
+	pval = of_property_read_bool(np, "low-battery-reset-enable");
+	if (!pval)
+		pval = of_property_read_bool(np,
+				"maxim,low-battery-reset-enable");
+	if (pval) {
+		mask |= MAX77620_CNFGGLBL1_LBRSTEN;
+		val |= MAX77620_CNFGGLBL1_LBRSTEN;
+	}
+
+	pval = of_property_read_bool(np, "low-battery-reset-disable");
+	if (!pval)
+		pval = of_property_read_bool(np,
+				"maxim,low-battery-reset-disable");
+	if (pval)
+		mask |= MAX77620_CNFGGLBL1_LBRSTEN;
+
+	ret = regmap_update_bits(chip->rmap, MAX77620_REG_CNFGGLBL1, mask, val);
+	if (ret < 0) {
+		dev_err(dev, "Reg CNFGGLBL1 update failed, %d\n", ret);
+		return ret;
 	}
 
 	return 0;
@@ -483,6 +658,14 @@ static int max77620_probe(struct i2c_client *client,
 	if (ret < 0)
 		return ret;
 
+	ret = max77620_init_backup_battery_charging(chip);
+	if (ret < 0)
+		return ret;
+
+	ret = max77620_init_low_battery_monitor(chip);
+	if (ret < 0)
+		return ret;
+
 	ret =  devm_mfd_add_devices(chip->dev, PLATFORM_DEVID_NONE,
 				    mfd_cells, n_mfd_cells, NULL, 0,
 				    regmap_irq_get_domain(chip->top_irq_data));
@@ -491,6 +674,7 @@ static int max77620_probe(struct i2c_client *client,
 		return ret;
 	}
 
+	dev_info(chip->dev, "max77620 probe successful");
 	return 0;
 }
 
@@ -548,9 +732,9 @@ static int max77620_i2c_suspend(struct device *dev)
 
 	/* Disable WK_EN0 */
 	ret = regmap_update_bits(chip->rmap, MAX77620_REG_ONOFFCNFG2,
-				 MAX77620_ONOFFCNFG2_WK_EN0, 0);
+				 MAX77620_ONOFFCNFG2_WK_EN0 | MAX77620_ONOFFCNFG2_WK_ALARM2, 0);
 	if (ret < 0) {
-		dev_err(dev, "Failed to configure WK_EN in suspend: %d\n", ret);
+		dev_err(dev, "Failed to configure WK_EN/WK_ALARM2 in suspend: %d\n", ret);
 		return ret;
 	}
 
@@ -586,10 +770,10 @@ static int max77620_i2c_resume(struct device *dev)
 
 	/* Enable WK_EN0 */
 	ret = regmap_update_bits(chip->rmap, MAX77620_REG_ONOFFCNFG2,
-				 MAX77620_ONOFFCNFG2_WK_EN0,
-				 MAX77620_ONOFFCNFG2_WK_EN0);
+				 MAX77620_ONOFFCNFG2_WK_EN0 | MAX77620_ONOFFCNFG2_WK_ALARM2,
+				 MAX77620_ONOFFCNFG2_WK_EN0 | MAX77620_ONOFFCNFG2_WK_ALARM2);
 	if (ret < 0) {
-		dev_err(dev, "Failed to configure WK_EN0 n resume: %d\n", ret);
+		dev_err(dev, "Failed to configure WK_EN0/WK_ALARM2 in resume: %d\n", ret);
 		return ret;
 	}
 
@@ -618,4 +802,22 @@ static struct i2c_driver max77620_driver = {
 	.probe = max77620_probe,
 	.id_table = max77620_id,
 };
-builtin_i2c_driver(max77620_driver);
+
+static int __init max77620_init(void)
+{
+	return i2c_add_driver(&max77620_driver);
+}
+subsys_initcall(max77620_init);
+
+static void __exit max77620_exit(void)
+{
+	i2c_del_driver(&max77620_driver);
+}
+module_exit(max77620_exit);
+
+MODULE_DESCRIPTION("MAX77620/MAX20024 Multi Function Device Core Driver");
+MODULE_AUTHOR("Laxman Dewangan <ldewangan@nvidia.com>");
+MODULE_AUTHOR("Chaitanya Bandi <bandik@nvidia.com>");
+MODULE_AUTHOR("Mallikarjun Kasoju <mkasoju@nvidia.com>");
+MODULE_ALIAS("i2c:max77620");
+MODULE_LICENSE("GPL v2");

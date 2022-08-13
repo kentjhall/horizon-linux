@@ -96,8 +96,10 @@
 #define DP0_STARTVAL		0x064c
 #define DP0_ACTIVEVAL		0x0650
 #define DP0_SYNCVAL		0x0654
+#define SYNCVAL_HS_POL_ACTIVE_LOW	(1 << 15)
+#define SYNCVAL_VS_POL_ACTIVE_LOW	(1 << 31)
 #define DP0_MISC		0x0658
-#define TU_SIZE_RECOMMENDED		(0x3f << 16) /* LSCLK cycles per TU */
+#define TU_SIZE_RECOMMENDED		(63) /* LSCLK cycles per TU */
 #define BPC_6				(0 << 5)
 #define BPC_8				(1 << 5)
 
@@ -140,6 +142,8 @@
 #define DP0_LTLOOPCTRL		0x06d8
 #define DP0_SNKLTCTRL		0x06e4
 
+#define DP1_SRCCTRL		0x07a0
+
 /* PHY */
 #define DP_PHY_CTRL		0x0800
 #define DP_PHY_RST			BIT(28)  /* DP PHY Global Soft Reset */
@@ -148,6 +152,7 @@
 #define PHY_M1_RST			BIT(12)  /* Reset PHY1 Main Channel */
 #define PHY_RDY				BIT(16)  /* PHY Main Channels Ready */
 #define PHY_M0_RST			BIT(8)   /* Reset PHY0 Main Channel */
+#define PHY_2LANE			BIT(2)   /* PHY Enable 2 lanes */
 #define PHY_A0_EN			BIT(1)   /* PHY Aux Channel0 Enable */
 #define PHY_M0_EN			BIT(0)   /* PHY Main Channel0 Enable */
 
@@ -295,7 +300,7 @@ static ssize_t tc_aux_transfer(struct drm_dp_aux *aux,
 			       struct drm_dp_aux_msg *msg)
 {
 	struct tc_data *tc = aux_to_tc(aux);
-	size_t size = min_t(size_t, 8, msg->size);
+	size_t size = min_t(size_t, DP_AUX_MAX_PAYLOAD_BYTES - 1, msg->size);
 	u8 request = msg->request & ~DP_AUX_I2C_MOT;
 	u8 *buf = msg->buffer;
 	u32 tmp = 0;
@@ -318,7 +323,7 @@ static ssize_t tc_aux_transfer(struct drm_dp_aux *aux,
 				tmp = (tmp << 8) | buf[i];
 			i++;
 			if (((i % 4) == 0) || (i == size)) {
-				tc_write(DP0_AUXWDATA(i >> 2), tmp);
+				tc_write(DP0_AUXWDATA((i - 1) >> 2), tmp);
 				tmp = 0;
 			}
 		}
@@ -538,6 +543,7 @@ static int tc_aux_link_setup(struct tc_data *tc)
 	unsigned long rate;
 	u32 value;
 	int ret;
+	u32 dp_phy_ctrl;
 
 	rate = clk_get_rate(tc->refclk);
 	switch (rate) {
@@ -562,7 +568,10 @@ static int tc_aux_link_setup(struct tc_data *tc)
 	value |= SYSCLK_SEL_LSCLK | LSCLK_DIV_2;
 	tc_write(SYS_PLLPARAM, value);
 
-	tc_write(DP_PHY_CTRL, BGREN | PWR_SW_EN | BIT(2) | PHY_A0_EN);
+	dp_phy_ctrl = BGREN | PWR_SW_EN | PHY_A0_EN;
+	if (tc->link.base.num_lanes == 2)
+		dp_phy_ctrl |= PHY_2LANE;
+	tc_write(DP_PHY_CTRL, dp_phy_ctrl);
 
 	/*
 	 * Initially PLLs are in bypass. Force PLL parameter update,
@@ -603,8 +612,15 @@ static int tc_get_display_props(struct tc_data *tc)
 	ret = drm_dp_link_probe(&tc->aux, &tc->link.base);
 	if (ret < 0)
 		goto err_dpcd_read;
-	if ((tc->link.base.rate != 162000) && (tc->link.base.rate != 270000))
-		goto err_dpcd_inval;
+	if (tc->link.base.rate != 162000 && tc->link.base.rate != 270000) {
+		dev_dbg(tc->dev, "Falling to 2.7 Gbps rate\n");
+		tc->link.base.rate = 270000;
+	}
+
+	if (tc->link.base.num_lanes > 2) {
+		dev_dbg(tc->dev, "Falling to 2 lanes\n");
+		tc->link.base.num_lanes = 2;
+	}
 
 	ret = drm_dp_dpcd_readb(&tc->aux, DP_MAX_DOWNSPREAD, tmp);
 	if (ret < 0)
@@ -637,9 +653,6 @@ static int tc_get_display_props(struct tc_data *tc)
 err_dpcd_read:
 	dev_err(tc->dev, "failed to read DPCD: %d\n", ret);
 	return ret;
-err_dpcd_inval:
-	dev_err(tc->dev, "invalid DPCD\n");
-	return -EINVAL;
 }
 
 static int tc_set_video_mode(struct tc_data *tc, struct drm_display_mode *mode)
@@ -655,6 +668,14 @@ static int tc_set_video_mode(struct tc_data *tc, struct drm_display_mode *mode)
 	int lower_margin = mode->vsync_start - mode->vdisplay;
 	int vsync_len = mode->vsync_end - mode->vsync_start;
 
+	/*
+	 * Recommended maximum number of symbols transferred in a transfer unit:
+	 * DIV_ROUND_UP((input active video bandwidth in bytes) * tu_size,
+	 *              (output active video bandwidth in bytes))
+	 * Must be less than tu_size.
+	 */
+	max_tu_symbol = TU_SIZE_RECOMMENDED - 1;
+
 	dev_dbg(tc->dev, "set mode %dx%d\n",
 		mode->hdisplay, mode->vdisplay);
 	dev_dbg(tc->dev, "H margin %d,%d sync %d\n",
@@ -664,13 +685,18 @@ static int tc_set_video_mode(struct tc_data *tc, struct drm_display_mode *mode)
 	dev_dbg(tc->dev, "total: %dx%d\n", mode->htotal, mode->vtotal);
 
 
-	/* LCD Ctl Frame Size */
-	tc_write(VPCTRL0, (0x40 << 20) /* VSDELAY */ |
+	/*
+	 * LCD Ctl Frame Size
+	 * datasheet is not clear of vsdelay in case of DPI
+	 * assume we do not need any delay when DPI is a source of
+	 * sync signals
+	 */
+	tc_write(VPCTRL0, (0 << 20) /* VSDELAY */ |
 		 OPXLFMT_RGB888 | FRMSYNC_DISABLED | MSF_DISABLED);
-	tc_write(HTIM01, (left_margin << 16) |		/* H back porch */
-			 (hsync_len << 0));		/* Hsync */
-	tc_write(HTIM02, (right_margin << 16) |		/* H front porch */
-			 (mode->hdisplay << 0));	/* width */
+	tc_write(HTIM01, (ALIGN(left_margin, 2) << 16) | /* H back porch */
+			 (ALIGN(hsync_len, 2) << 0));	 /* Hsync */
+	tc_write(HTIM02, (ALIGN(right_margin, 2) << 16) |  /* H front porch */
+			 (ALIGN(mode->hdisplay, 2) << 0)); /* width */
 	tc_write(VTIM01, (upper_margin << 16) |		/* V back porch */
 			 (vsync_len << 0));		/* Vsync */
 	tc_write(VTIM02, (lower_margin << 16) |		/* V front porch */
@@ -689,7 +715,7 @@ static int tc_set_video_mode(struct tc_data *tc, struct drm_display_mode *mode)
 	/* DP Main Stream Attributes */
 	vid_sync_dly = hsync_len + left_margin + mode->hdisplay;
 	tc_write(DP0_VIDSYNCDELAY,
-		 (0x003e << 16) |	/* thresh_dly */
+		 (max_tu_symbol << 16) |	/* thresh_dly */
 		 (vid_sync_dly << 0));
 
 	tc_write(DP0_TOTALVAL, (mode->vtotal << 16) | (mode->htotal));
@@ -700,19 +726,15 @@ static int tc_set_video_mode(struct tc_data *tc, struct drm_display_mode *mode)
 
 	tc_write(DP0_ACTIVEVAL, (mode->vdisplay << 16) | (mode->hdisplay));
 
-	tc_write(DP0_SYNCVAL, (vsync_len << 16) | (hsync_len << 0));
+	tc_write(DP0_SYNCVAL, (vsync_len << 16) | (hsync_len << 0) |
+		 ((mode->flags & DRM_MODE_FLAG_NHSYNC) ? SYNCVAL_HS_POL_ACTIVE_LOW : 0) |
+		 ((mode->flags & DRM_MODE_FLAG_NVSYNC) ? SYNCVAL_VS_POL_ACTIVE_LOW : 0));
 
 	tc_write(DPIPXLFMT, VS_POL_ACTIVE_LOW | HS_POL_ACTIVE_LOW |
 		 DE_POL_ACTIVE_HIGH | SUB_CFG_TYPE_CONFIG1 | DPI_BPP_RGB888);
 
-	/*
-	 * Recommended maximum number of symbols transferred in a transfer unit:
-	 * DIV_ROUND_UP((input active video bandwidth in bytes) * tu_size,
-	 *              (output active video bandwidth in bytes))
-	 * Must be less than tu_size.
-	 */
-	max_tu_symbol = TU_SIZE_RECOMMENDED - 1;
-	tc_write(DP0_MISC, (max_tu_symbol << 23) | TU_SIZE_RECOMMENDED | BPC_8);
+	tc_write(DP0_MISC, (max_tu_symbol << 23) | (TU_SIZE_RECOMMENDED << 16) |
+			   BPC_8);
 
 	return 0;
 err:
@@ -808,8 +830,6 @@ static int tc_main_link_setup(struct tc_data *tc)
 	unsigned int rate;
 	u32 dp_phy_ctrl;
 	int timeout;
-	bool aligned;
-	bool ready;
 	u32 value;
 	int ret;
 	u8 tmp[8];
@@ -818,12 +838,11 @@ static int tc_main_link_setup(struct tc_data *tc)
 	if (!tc->mode)
 		return -EINVAL;
 
-	/* from excel file - DP0_SrcCtrl */
-	tc_write(DP0_SRCCTRL, DP0_SRCCTRL_SCRMBLDIS | DP0_SRCCTRL_EN810B |
-		 DP0_SRCCTRL_LANESKEW | DP0_SRCCTRL_LANES_2 |
-		 DP0_SRCCTRL_BW27 | DP0_SRCCTRL_AUTOCORRECT);
-	/* from excel file - DP1_SrcCtrl */
-	tc_write(0x07a0, 0x00003083);
+	tc_write(DP0_SRCCTRL, tc_srcctrl(tc));
+	/* SSCG and BW27 on DP1 must be set to the same as on DP0 */
+	tc_write(DP1_SRCCTRL,
+		 (tc->link.spread ? DP0_SRCCTRL_SSCG : 0) |
+		 ((tc->link.base.rate != 162000) ? DP0_SRCCTRL_BW27 : 0));
 
 	rate = clk_get_rate(tc->refclk);
 	switch (rate) {
@@ -844,8 +863,11 @@ static int tc_main_link_setup(struct tc_data *tc)
 	}
 	value |= SYSCLK_SEL_LSCLK | LSCLK_DIV_2;
 	tc_write(SYS_PLLPARAM, value);
+
 	/* Setup Main Link */
-	dp_phy_ctrl = BGREN | PWR_SW_EN | BIT(2) | PHY_A0_EN |  PHY_M0_EN;
+	dp_phy_ctrl = BGREN | PWR_SW_EN | PHY_A0_EN | PHY_M0_EN;
+	if (tc->link.base.num_lanes == 2)
+		dp_phy_ctrl |= PHY_2LANE;
 	tc_write(DP_PHY_CTRL, dp_phy_ctrl);
 	msleep(100);
 
@@ -954,16 +976,15 @@ static int tc_main_link_setup(struct tc_data *tc)
 		ret = drm_dp_dpcd_read_link_status(aux, tmp + 2);
 		if (ret < 0)
 			goto err_dpcd_read;
-		ready = (tmp[2] == ((DP_CHANNEL_EQ_BITS << 4) | /* Lane1 */
-				     DP_CHANNEL_EQ_BITS));      /* Lane0 */
-		aligned = tmp[4] & DP_INTERLANE_ALIGN_DONE;
-	} while ((--timeout) && !(ready && aligned));
+	} while ((--timeout) &&
+		 !(drm_dp_channel_eq_ok(tmp + 2,  tc->link.base.num_lanes)));
 
 	if (timeout == 0) {
 		/* Read DPCD 0x200-0x201 */
 		ret = drm_dp_dpcd_read(aux, DP_SINK_COUNT, tmp, 2);
 		if (ret < 0)
 			goto err_dpcd_read;
+		dev_err(dev, "channel(s) EQ not ok\n");
 		dev_info(dev, "0x0200 SINK_COUNT: 0x%02x\n", tmp[0]);
 		dev_info(dev, "0x0201 DEVICE_SERVICE_IRQ_VECTOR: 0x%02x\n",
 			 tmp[1]);
@@ -974,10 +995,6 @@ static int tc_main_link_setup(struct tc_data *tc)
 		dev_info(dev, "0x0206 ADJUST_REQUEST_LANE0_1: 0x%02x\n",
 			 tmp[6]);
 
-		if (!ready)
-			dev_err(dev, "Lane0/1 not ready\n");
-		if (!aligned)
-			dev_err(dev, "Lane0/1 not aligned\n");
 		return -EAGAIN;
 	}
 
@@ -1105,7 +1122,20 @@ static bool tc_bridge_mode_fixup(struct drm_bridge *bridge,
 static int tc_connector_mode_valid(struct drm_connector *connector,
 				   struct drm_display_mode *mode)
 {
-	/* Accept any mode */
+	struct tc_data *tc = connector_to_tc(connector);
+	u32 req, avail;
+	u32 bits_per_pixel = 24;
+
+	/* DPI interface clock limitation: upto 154 MHz */
+	if (mode->clock > 154000)
+		return MODE_CLOCK_HIGH;
+
+	req = mode->clock * bits_per_pixel / 8;
+	avail = tc->link.base.num_lanes * tc->link.base.rate;
+
+	if (req > avail)
+		return MODE_BAD;
+
 	return MODE_OK;
 }
 
@@ -1123,6 +1153,13 @@ static int tc_connector_get_modes(struct drm_connector *connector)
 	struct tc_data *tc = connector_to_tc(connector);
 	struct edid *edid;
 	unsigned int count;
+	int ret;
+
+	ret = tc_get_display_props(tc);
+	if (ret < 0) {
+		dev_err(tc->dev, "failed to read display props: %d\n", ret);
+		return 0;
+	}
 
 	if (tc->panel && tc->panel->funcs && tc->panel->funcs->get_modes) {
 		count = tc->panel->funcs->get_modes(tc->panel);

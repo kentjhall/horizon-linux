@@ -31,9 +31,26 @@ Required properties :
 - #thermal-sensor-cells : Should be 1. See ./thermal.txt for a description
     of this property. See <dt-bindings/thermal/tegra124-soctherm.h> for a
     list of valid values when referring to thermal sensors.
+- hw-pllx-offsets : All the tsensors can be invalidated under certain conditions
+  and be configured to report temperature as an offset from the PLLX tsensor.
+  When present this property enables this offsetting. It is an array of triplets
+  where each triplet represents a tsensor id followed by a min and a max offset.
+  - All tsensors except the PLLX sensor may have an offset defined and offsets
+    for PLLX tsensor are ignored. The list of valid tsensor ids are present in
+    <dt-bindings/thermal/tegra124-soctherm.h>.
+  - The min and max offsets are used to bound the temperature reported by the
+    soctherm hardware after offsetting has been applied.
+  Offsets are disabled if one or more elements of a triplet are missing or
+  incorrect.
+- nvidia, thermtrips : When present, this property specifies the temperature at
+  which the soctherm hardware will assert the thermal trigger signal to the
+  Power Management IC, which can be configured to reset or shutdown the device.
+  It is an array of pairs where each pair represents a tsensor id followed by a
+  temperature in milli Celcius. In the absence of this property the critical
+  trip point will be used for thermtrip temperature.
 - throttle-cfgs: A sub-node which is a container of configuration for each
     hardware throttle events. These events can be set as cooling devices.
-  * throttle events: Sub-nodes must be named as "light" or "heavy".
+  * throttle events: Sub-nodes must be named as "light", "heavy", "oc1" - "oc5".
       Properties:
       - nvidia,priority: Each throttles has its own throttle settings, so the
         SW need to set priorities for various throttle, the HW arbiter can select
@@ -52,13 +69,37 @@ Required properties :
         Must set as following values:
         TEGRA_SOCTHERM_THROT_LEVEL_LOW, TEGRA_SOCTHERM_THROT_LEVEL_MED
         TEGRA_SOCTHERM_THROT_LEVEL_HIGH, TEGRA_SOCTHERM_THROT_LEVEL_NONE
+      - nvidia,gpu-throt-level:This property is for Tegra124 and Tegra210.
+        It is the level of pulse skippers, which used to throttle clock
+        frequencies. It indicates gpu clock throttling depth and can be
+        programmed to any of the following values which represent a throttling
+        percentage:
+        TEGRA_SOCTHERM_THROT_LEVEL_LOW (50%),
+        TEGRA_SOCTHERM_THROT_LEVEL_MED (75%),
+        TEGRA_SOCTHERM_THROT_LEVEL_HIGH (85%),
+        TEGRA_SOCTHERM_THROT_LEVEL_NONE (0%)
       - #cooling-cells: Should be 1. This cooling device only support on/off state.
         See ./thermal.txt for a description of this property.
+      Optional properties: The following properties are T210 specific and
+      valid only for OCx throttle events.
+      - nvidia,count-threshold: Specifies the number of OC events that are
+        required for triggering an interrupt. Interrupts are not triggered if
+        the property is missing. A value of 0 will interrupt on every OC alarm.
+      - nvidia,polarity-active-low: Configures the polarity of the OC alaram
+        signal. Accepted values are 1 for assert low and 0 for assert high.
+        Default value is 0.
+      - nvidia,alarm-filter: Number of clocks to filter event. When the filter
+        expires (which means the OC event has not occurred for a long time),
+        the counter is cleared and filter is rearmed. Default value is 0.
+      - nvidia,throttle-period: Specifies the number of uSec for which
+        throttling is engaged after the OC event is deasserted. Default value
+        is 0.
 
 Note:
-- the "critical" type trip points will be set to SOC_THERM hardware as the
-shut down temperature. Once the temperature of this thermal zone is higher
-than it, the system will be shutdown or reset by hardware.
+- the "critical" type trip points will be used to set the temperature at which
+the SOC_THERM hardware will assert a thermal trigger if the thermtrips property
+is missing. When the thermtrips property is present the breach of a critical
+trip point is reported back to the thermal framework.
 - the "hot" type trip points will be set to SOC_THERM hardware as the throttle
 temperature. Once the the temperature of this thermal zone is higher
 than it, it will trigger the HW throttle event.

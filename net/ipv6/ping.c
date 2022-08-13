@@ -113,6 +113,7 @@ static int ping_v6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	fl6.daddr = *daddr;
 	fl6.flowi6_oif = oif;
 	fl6.flowi6_mark = sk->sk_mark;
+	fl6.flowi6_uid = sk->sk_uid;
 	fl6.fl6_icmp_type = user_icmph.icmp6_type;
 	fl6.fl6_icmp_code = user_icmph.icmp6_code;
 	security_sk_classify_flow(sk, flowi6_to_flowi(&fl6));
@@ -198,7 +199,7 @@ static struct inet_protosw pingv6_protosw = {
 	.type =      SOCK_DGRAM,
 	.protocol =  IPPROTO_ICMPV6,
 	.prot =      &pingv6_prot,
-	.ops =       &inet6_dgram_ops,
+	.ops =       &inet6_sockraw_ops,
 	.flags =     INET_PROTOSW_REUSE,
 };
 
@@ -239,7 +240,7 @@ static int __net_init ping_v6_proc_init_net(struct net *net)
 	return ping_proc_register(net, &ping_v6_seq_afinfo);
 }
 
-static void __net_init ping_v6_proc_exit_net(struct net *net)
+static void __net_exit ping_v6_proc_exit_net(struct net *net)
 {
 	return ping_proc_unregister(net, &ping_v6_seq_afinfo);
 }

@@ -69,7 +69,7 @@ static struct sk_buff *named_prepare_buf(struct net *net, u32 type, u32 size,
 					 u32 dest)
 {
 	struct tipc_net *tn = net_generic(net, tipc_net_id);
-	struct sk_buff *buf = tipc_buf_acquire(INT_H_SIZE + size);
+	struct sk_buff *buf = tipc_buf_acquire(INT_H_SIZE + size, GFP_ATOMIC);
 	struct tipc_msg *msg;
 
 	if (buf != NULL) {
@@ -224,7 +224,8 @@ static void tipc_publ_purge(struct net *net, struct publication *publ, u32 addr)
 		       publ->key);
 	}
 
-	kfree_rcu(p, rcu);
+	if (p)
+		kfree_rcu(p, rcu);
 }
 
 /**

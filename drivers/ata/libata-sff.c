@@ -703,6 +703,10 @@ static void ata_pio_sector(struct ata_queued_cmd *qc)
 	unsigned int offset;
 	unsigned char *buf;
 
+	if (!qc->cursg) {
+		qc->curbytes = qc->nbytes;
+		return;
+	}
 	if (qc->curbytes == qc->nbytes - qc->sect_size)
 		ap->hsm_task_state = HSM_ST_LAST;
 
@@ -742,6 +746,8 @@ static void ata_pio_sector(struct ata_queued_cmd *qc)
 
 	if (qc->cursg_ofs == qc->cursg->length) {
 		qc->cursg = sg_next(qc->cursg);
+		if (!qc->cursg)
+			ap->hsm_task_state = HSM_ST_LAST;
 		qc->cursg_ofs = 0;
 	}
 }
@@ -853,7 +859,7 @@ next_sg:
 	offset %= PAGE_SIZE;
 
 	/* don't overrun current sg */
-	count = min(sg->length - qc->cursg_ofs, bytes);
+	count = min(sg->length - qc->cursg_ofs, (size_t)bytes);
 
 	/* don't cross page boundaries */
 	count = min(count, (unsigned int)PAGE_SIZE - offset);
@@ -1481,7 +1487,6 @@ unsigned int ata_sff_qc_issue(struct ata_queued_cmd *qc)
 		break;
 
 	default:
-		WARN_ON_ONCE(1);
 		return AC_ERR_SYSTEM;
 	}
 
@@ -2737,12 +2742,14 @@ static void ata_bmdma_fill_sg_dumb(struct ata_queued_cmd *qc)
  *	LOCKING:
  *	spin_lock_irqsave(host lock)
  */
-void ata_bmdma_qc_prep(struct ata_queued_cmd *qc)
+enum ata_completion_errors ata_bmdma_qc_prep(struct ata_queued_cmd *qc)
 {
 	if (!(qc->flags & ATA_QCFLAG_DMAMAP))
-		return;
+		return AC_ERR_OK;
 
 	ata_bmdma_fill_sg(qc);
+
+	return AC_ERR_OK;
 }
 EXPORT_SYMBOL_GPL(ata_bmdma_qc_prep);
 
@@ -2755,12 +2762,14 @@ EXPORT_SYMBOL_GPL(ata_bmdma_qc_prep);
  *	LOCKING:
  *	spin_lock_irqsave(host lock)
  */
-void ata_bmdma_dumb_qc_prep(struct ata_queued_cmd *qc)
+enum ata_completion_errors ata_bmdma_dumb_qc_prep(struct ata_queued_cmd *qc)
 {
 	if (!(qc->flags & ATA_QCFLAG_DMAMAP))
-		return;
+		return AC_ERR_OK;
 
 	ata_bmdma_fill_sg_dumb(qc);
+
+	return AC_ERR_OK;
 }
 EXPORT_SYMBOL_GPL(ata_bmdma_dumb_qc_prep);
 

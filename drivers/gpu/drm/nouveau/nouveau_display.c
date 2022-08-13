@@ -24,6 +24,7 @@
  *
  */
 
+#include <acpi/video.h>
 #include <drm/drmP.h>
 #include <drm/drm_crtc_helper.h>
 
@@ -105,7 +106,7 @@ nouveau_display_scanoutpos_head(struct drm_crtc *crtc, int *vpos, int *hpos,
 	};
 	struct nouveau_display *disp = nouveau_display(crtc->dev);
 	struct drm_vblank_crtc *vblank = &crtc->dev->vblank[drm_crtc_index(crtc)];
-	int ret, retry = 1;
+	int ret, retry = 20;
 
 	do {
 		ret = nvif_mthd(&disp->disp, 0, &args, sizeof(args));
@@ -358,6 +359,69 @@ static struct nouveau_drm_prop_enum_list dither_depth[] = {
 	}                                                                      \
 } while(0)
 
+static void
+nouveau_display_hpd_work(struct work_struct *work)
+{
+	struct nouveau_drm *drm = container_of(work, typeof(*drm), hpd_work);
+
+	pm_runtime_get_sync(drm->dev->dev);
+
+	drm_helper_hpd_irq_event(drm->dev);
+
+	pm_runtime_mark_last_busy(drm->dev->dev);
+	pm_runtime_put_sync(drm->dev->dev);
+}
+
+#ifdef CONFIG_ACPI
+
+/*
+ * Hans de Goede: This define belongs in acpi/video.h, I've submitted a patch
+ * to the acpi subsys to move it there from drivers/acpi/acpi_video.c .
+ * This should be dropped once that is merged.
+ */
+#ifndef ACPI_VIDEO_NOTIFY_PROBE
+#define ACPI_VIDEO_NOTIFY_PROBE			0x81
+#endif
+
+static int
+nouveau_display_acpi_ntfy(struct notifier_block *nb, unsigned long val,
+			  void *data)
+{
+	struct nouveau_drm *drm = container_of(nb, typeof(*drm), acpi_nb);
+	struct acpi_bus_event *info = data;
+	int ret;
+
+	if (!strcmp(info->device_class, ACPI_VIDEO_CLASS)) {
+		if (info->type == ACPI_VIDEO_NOTIFY_PROBE) {
+			ret = pm_runtime_get(drm->dev->dev);
+			if (ret == 1 || ret == -EACCES) {
+				/* If the GPU is already awake, or in a state
+				 * where we can't wake it up, it can handle
+				 * it's own hotplug events.
+				 */
+				pm_runtime_put_autosuspend(drm->dev->dev);
+			} else if (ret == 0) {
+				/* This may be the only indication we receive
+				 * of a connector hotplug on a runtime
+				 * suspended GPU, schedule hpd_work to check.
+				 */
+				NV_DEBUG(drm, "ACPI requested connector reprobe\n");
+				schedule_work(&drm->hpd_work);
+				pm_runtime_put_noidle(drm->dev->dev);
+			} else {
+				NV_WARN(drm, "Dropped ACPI reprobe event due to RPM error: %d\n",
+					ret);
+			}
+
+			/* acpi-video should not generate keypresses for this */
+			return NOTIFY_BAD;
+		}
+	}
+
+	return NOTIFY_DONE;
+}
+#endif
+
 int
 nouveau_display_init(struct drm_device *dev)
 {
@@ -370,7 +434,9 @@ nouveau_display_init(struct drm_device *dev)
 	if (ret)
 		return ret;
 
-	/* enable polling for external displays */
+	/* enable connector detection and polling for connectors without HPD
+	 * support
+	 */
 	drm_kms_helper_poll_enable(dev);
 
 	/* enable hotplug interrupts */
@@ -537,6 +603,12 @@ nouveau_display_create(struct drm_device *dev)
 	}
 
 	nouveau_backlight_init(dev);
+	INIT_WORK(&drm->hpd_work, nouveau_display_hpd_work);
+#ifdef CONFIG_ACPI
+	drm->acpi_nb.notifier_call = nouveau_display_acpi_ntfy;
+	register_acpi_notifier(&drm->acpi_nb);
+#endif
+
 	return 0;
 
 vblank_err:
@@ -552,6 +624,9 @@ nouveau_display_destroy(struct drm_device *dev)
 {
 	struct nouveau_display *disp = nouveau_display(dev);
 
+#ifdef CONFIG_ACPI
+	unregister_acpi_notifier(&nouveau_drm(dev)->acpi_nb);
+#endif
 	nouveau_backlight_exit(dev);
 	nouveau_display_vblank_fini(dev);
 

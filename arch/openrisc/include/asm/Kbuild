@@ -1,6 +1,3 @@
-
-header-y += ucontext.h
-
 generic-y += atomic.h
 generic-y += auxvec.h
 generic-y += barrier.h

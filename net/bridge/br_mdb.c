@@ -30,8 +30,6 @@ static int br_rports_fill_info(struct sk_buff *skb, struct netlink_callback *cb,
 		return -EMSGSIZE;
 
 	hlist_for_each_entry_rcu(p, &br->router_list, rlist) {
-		if (!p)
-			continue;
 		port_nest = nla_nest_start(skb, MDBA_ROUTER_PORT);
 		if (!port_nest)
 			goto fail;
@@ -323,7 +321,8 @@ static void __br_mdb_notify(struct net_device *dev, struct net_bridge_port *p,
 			__mdb_entry_to_br_ip(entry, &complete_info->ip);
 			mdb.obj.complete_priv = complete_info;
 			mdb.obj.complete = br_mdb_complete;
-			switchdev_port_obj_add(port_dev, &mdb.obj);
+			if (switchdev_port_obj_add(port_dev, &mdb.obj))
+				kfree(complete_info);
 		}
 	} else if (port_dev && type == RTM_DELMDB) {
 		switchdev_port_obj_del(port_dev, &mdb.obj);
@@ -371,7 +370,7 @@ static int nlmsg_populate_rtr_fill(struct sk_buff *skb,
 	struct nlmsghdr *nlh;
 	struct nlattr *nest;
 
-	nlh = nlmsg_put(skb, pid, seq, type, sizeof(*bpm), NLM_F_MULTI);
+	nlh = nlmsg_put(skb, pid, seq, type, sizeof(*bpm), 0);
 	if (!nlh)
 		return -EMSGSIZE;
 

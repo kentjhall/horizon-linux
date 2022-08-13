@@ -1,0 +1,9 @@
+config TEGRA_DC
+	tristate "Tegra Display Contoller"
+	depends on (TEGRA_GRHOST || TEGRA_HOST1X) && I2C
+	select BACKLIGHT_CLASS_DEVICE
+	select FB_MODE_HELPERS
+	help
+	 Tegra display controller support.
+	 Enable this to access the Tegra display controller using either framebuffer
+	 console interface and a proprietary dc-ext interface or with ADF.

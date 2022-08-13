@@ -51,6 +51,7 @@
 #include <asm/idle.h>
 #include <asm/mips-cm.h>
 #include <asm/mips-r2-to-r6-emul.h>
+#include <asm/mips-cm.h>
 #include <asm/mipsregs.h>
 #include <asm/mipsmtregs.h>
 #include <asm/module.h>
@@ -81,7 +82,7 @@ extern asmlinkage void handle_dbe(void);
 extern asmlinkage void handle_sys(void);
 extern asmlinkage void handle_bp(void);
 extern asmlinkage void handle_ri(void);
-extern asmlinkage void handle_ri_rdhwr_vivt(void);
+extern asmlinkage void handle_ri_rdhwr_tlbp(void);
 extern asmlinkage void handle_ri_rdhwr(void);
 extern asmlinkage void handle_cpu(void);
 extern asmlinkage void handle_ov(void);
@@ -199,6 +200,8 @@ void show_stack(struct task_struct *task, unsigned long *sp)
 {
 	struct pt_regs regs;
 	mm_segment_t old_fs = get_fs();
+
+	regs.cp0_status = KSU_KERNEL;
 	if (sp) {
 		regs.regs[29] = (unsigned long)sp;
 		regs.regs[31] = 0;
@@ -348,6 +351,7 @@ static void __show_regs(const struct pt_regs *regs)
 void show_regs(struct pt_regs *regs)
 {
 	__show_regs((struct pt_regs *)regs);
+	dump_stack();
 }
 
 void show_registers(struct pt_regs *regs)
@@ -1644,6 +1648,65 @@ __setup("nol2par", nol2parity);
  */
 static inline void parity_protection_init(void)
 {
+#define ERRCTL_PE	0x80000000
+#define ERRCTL_L2P	0x00800000
+
+	if (mips_cm_revision() >= CM_REV_CM3) {
+		ulong gcr_ectl, cp0_ectl;
+
+		/*
+		 * With CM3 systems we need to ensure that the L1 & L2
+		 * parity enables are set to the same value, since this
+		 * is presumed by the hardware engineers.
+		 *
+		 * If the user disabled either of L1 or L2 ECC checking,
+		 * disable both.
+		 */
+		l1parity &= l2parity;
+		l2parity &= l1parity;
+
+		/* Probe L1 ECC support */
+		cp0_ectl = read_c0_ecc();
+		write_c0_ecc(cp0_ectl | ERRCTL_PE);
+		back_to_back_c0_hazard();
+		cp0_ectl = read_c0_ecc();
+
+		/* Probe L2 ECC support */
+		gcr_ectl = read_gcr_err_control();
+
+		if (!(gcr_ectl & CM_GCR_ERR_CONTROL_L2_ECC_SUPPORT_MSK) ||
+		    !(cp0_ectl & ERRCTL_PE)) {
+			/*
+			 * One of L1 or L2 ECC checking isn't supported,
+			 * so we cannot enable either.
+			 */
+			l1parity = l2parity = 0;
+		}
+
+		/* Configure L1 ECC checking */
+		if (l1parity)
+			cp0_ectl |= ERRCTL_PE;
+		else
+			cp0_ectl &= ~ERRCTL_PE;
+		write_c0_ecc(cp0_ectl);
+		back_to_back_c0_hazard();
+		WARN_ON(!!(read_c0_ecc() & ERRCTL_PE) != l1parity);
+
+		/* Configure L2 ECC checking */
+		if (l2parity)
+			gcr_ectl |= CM_GCR_ERR_CONTROL_L2_ECC_EN_MSK;
+		else
+			gcr_ectl &= ~CM_GCR_ERR_CONTROL_L2_ECC_EN_MSK;
+		write_gcr_err_control(gcr_ectl);
+		gcr_ectl = read_gcr_err_control();
+		gcr_ectl &= CM_GCR_ERR_CONTROL_L2_ECC_EN_MSK;
+		WARN_ON(!!gcr_ectl != l2parity);
+
+		pr_info("Cache parity protection %sabled\n",
+			l1parity ? "en" : "dis");
+		return;
+	}
+
 	switch (current_cpu_type()) {
 	case CPU_24K:
 	case CPU_34K:
@@ -1654,11 +1717,8 @@ static inline void parity_protection_init(void)
 	case CPU_PROAPTIV:
 	case CPU_P5600:
 	case CPU_QEMU_GENERIC:
-	case CPU_I6400:
 	case CPU_P6600:
 		{
-#define ERRCTL_PE	0x80000000
-#define ERRCTL_L2P	0x00800000
 			unsigned long errctl;
 			unsigned int l1parity_present, l2parity_present;
 
@@ -2077,6 +2137,7 @@ static void configure_status(void)
 
 	change_c0_status(ST0_CU|ST0_MX|ST0_RE|ST0_FR|ST0_BEV|ST0_TS|ST0_KX|ST0_SX|ST0_UX,
 			 status_set);
+	back_to_back_c0_hazard();
 }
 
 unsigned int hwrena;
@@ -2352,9 +2413,18 @@ void __init trap_init(void)
 
 	set_except_vector(EXCCODE_SYS, handle_sys);
 	set_except_vector(EXCCODE_BP, handle_bp);
-	set_except_vector(EXCCODE_RI, rdhwr_noopt ? handle_ri :
-			  (cpu_has_vtag_icache ?
-			   handle_ri_rdhwr_vivt : handle_ri_rdhwr));
+
+	if (rdhwr_noopt)
+		set_except_vector(EXCCODE_RI, handle_ri);
+	else {
+		if (cpu_has_vtag_icache)
+			set_except_vector(EXCCODE_RI, handle_ri_rdhwr_tlbp);
+		else if (current_cpu_type() == CPU_LOONGSON3)
+			set_except_vector(EXCCODE_RI, handle_ri_rdhwr_tlbp);
+		else
+			set_except_vector(EXCCODE_RI, handle_ri_rdhwr);
+	}
+
 	set_except_vector(EXCCODE_CPU, handle_cpu);
 	set_except_vector(EXCCODE_OV, handle_ov);
 	set_except_vector(EXCCODE_TR, handle_tr);

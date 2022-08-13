@@ -473,6 +473,7 @@ struct bmic_host_wellness_driver_version {
 	u8	driver_version_tag[2];
 	__le16	driver_version_length;
 	char	driver_version[32];
+	u8	dont_write_tag[2];
 	u8	end_tag[2];
 };
 
@@ -502,6 +503,8 @@ static int pqi_write_driver_version_to_host_wellness(
 	strncpy(buffer->driver_version, DRIVER_VERSION,
 		sizeof(buffer->driver_version) - 1);
 	buffer->driver_version[sizeof(buffer->driver_version) - 1] = '\0';
+	buffer->dont_write_tag[0] = 'D';
+	buffer->dont_write_tag[1] = 'W';
 	buffer->end_tag[0] = 'Z';
 	buffer->end_tag[1] = 'Z';
 
@@ -533,8 +536,7 @@ static int pqi_write_current_time_to_host_wellness(
 	size_t buffer_length;
 	time64_t local_time;
 	unsigned int year;
-	struct timeval time;
-	struct rtc_time tm;
+	struct tm tm;
 
 	buffer_length = sizeof(*buffer);
 
@@ -551,9 +553,8 @@ static int pqi_write_current_time_to_host_wellness(
 	put_unaligned_le16(sizeof(buffer->time),
 		&buffer->time_length);
 
-	do_gettimeofday(&time);
-	local_time = time.tv_sec - (sys_tz.tz_minuteswest * 60);
-	rtc_time64_to_tm(local_time, &tm);
+	local_time = ktime_get_real_seconds();
+	time64_to_tm(local_time, -sys_tz.tz_minuteswest * 60, &tm);
 	year = tm.tm_year + 1900;
 
 	buffer->time[0] = bin2bcd(tm.tm_hour);
@@ -980,6 +981,9 @@ static void pqi_get_volume_status(struct pqi_ctrl_info *ctrl_info,
 	rc = pqi_scsi_inquiry(ctrl_info, device->scsi3addr,
 		VPD_PAGE | CISS_VPD_LV_STATUS, vpd, sizeof(*vpd));
 	if (rc)
+		goto out;
+
+	if (vpd->page_code != CISS_VPD_LV_STATUS)
 		goto out;
 
 	page_length = offsetof(struct ciss_vpd_logical_volume_status,
@@ -2525,6 +2529,9 @@ static unsigned int pqi_process_io_intr(struct pqi_ctrl_info *ctrl_info,
 		switch (response->header.iu_type) {
 		case PQI_RESPONSE_IU_RAID_PATH_IO_SUCCESS:
 		case PQI_RESPONSE_IU_AIO_PATH_IO_SUCCESS:
+			if (io_request->scmd)
+				io_request->scmd->result = 0;
+			/* fall through */
 		case PQI_RESPONSE_IU_GENERAL_MANAGEMENT:
 			break;
 		case PQI_RESPONSE_IU_TASK_MANAGEMENT:
@@ -5471,7 +5478,7 @@ static int pqi_pci_init(struct pqi_ctrl_info *ctrl_info)
 	else
 		mask = DMA_BIT_MASK(32);
 
-	rc = dma_set_mask(&ctrl_info->pci_dev->dev, mask);
+	rc = dma_set_mask_and_coherent(&ctrl_info->pci_dev->dev, mask);
 	if (rc) {
 		dev_err(&ctrl_info->pci_dev->dev, "failed to set DMA mask\n");
 		goto disable_device;

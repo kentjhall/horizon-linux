@@ -1085,7 +1085,7 @@ static void mxs_auart_settermios(struct uart_port *u,
 					AUART_LINECTRL_BAUD_DIV_MAX);
 		baud_max = u->uartclk * 32 / AUART_LINECTRL_BAUD_DIV_MIN;
 		baud = uart_get_baud_rate(u, termios, old, baud_min, baud_max);
-		div = u->uartclk * 32 / baud;
+		div = DIV_ROUND_CLOSEST(u->uartclk * 32, baud);
 	}
 
 	ctrl |= AUART_LINECTRL_BAUD_DIVFRAC(div & 0x3F);
@@ -1635,8 +1635,9 @@ static int mxs_auart_request_gpio_irq(struct mxs_auart_port *s)
 
 	/*
 	 * If something went wrong, rollback.
+	 * Be careful: i may be unsigned.
 	 */
-	while (err && (--i >= 0))
+	while (err && (i-- > 0))
 		if (irq[i] >= 0)
 			free_irq(irq[i], s);
 
@@ -1664,6 +1665,10 @@ static int mxs_auart_probe(struct platform_device *pdev)
 		s->port.line = pdev->id < 0 ? 0 : pdev->id;
 	else if (ret < 0)
 		return ret;
+	if (s->port.line >= ARRAY_SIZE(auart_port)) {
+		dev_err(&pdev->dev, "serial%d out of range\n", s->port.line);
+		return -EINVAL;
+	}
 
 	if (of_id) {
 		pdev->id_entry = of_id->data;

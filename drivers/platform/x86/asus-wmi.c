@@ -156,6 +156,21 @@ MODULE_LICENSE("GPL");
 #define ASUS_FAN_CTRL_MANUAL		1
 #define ASUS_FAN_CTRL_AUTO		2
 
+#define USB_INTEL_XUSB2PR		0xD0
+#define PCI_DEVICE_ID_INTEL_LYNXPOINT_LP_XHCI	0x9c31
+
+static const char * const ashs_ids[] = { "ATK4001", "ATK4002", NULL };
+
+static bool ashs_present(void)
+{
+	int i = 0;
+	while (ashs_ids[i]) {
+		if (acpi_dev_found(ashs_ids[i++]))
+			return true;
+	}
+	return false;
+}
+
 struct bios_args {
 	u32 arg0;
 	u32 arg1;
@@ -446,13 +461,7 @@ static void kbd_led_update(struct work_struct *work)
 
 	asus = container_of(work, struct asus_wmi, kbd_led_work);
 
-	/*
-	 * bits 0-2: level
-	 * bit 7: light on/off
-	 */
-	if (asus->kbd_led_wk > 0)
-		ctrl_param = 0x80 | (asus->kbd_led_wk & 0x7F);
-
+	ctrl_param = 0x80 | (asus->kbd_led_wk & 0x7F);
 	asus_wmi_set_devstate(ASUS_WMI_DEVID_KBD_BACKLIGHT, ctrl_param, NULL);
 }
 
@@ -961,6 +970,9 @@ static int asus_new_rfkill(struct asus_wmi *asus,
 
 static void asus_wmi_rfkill_exit(struct asus_wmi *asus)
 {
+	if (asus->driver->wlan_ctrl_by_user && ashs_present())
+		return;
+
 	asus_unregister_rfkill_notifier(asus, "\\_SB.PCI0.P0P5");
 	asus_unregister_rfkill_notifier(asus, "\\_SB.PCI0.P0P6");
 	asus_unregister_rfkill_notifier(asus, "\\_SB.PCI0.P0P7");
@@ -1078,6 +1090,38 @@ exit:
 		result = 0;
 
 	return result;
+}
+
+static void asus_wmi_set_xusb2pr(struct asus_wmi *asus)
+{
+	struct pci_dev *xhci_pdev;
+	u32 orig_ports_available;
+	u32 ports_available = asus->driver->quirks->xusb2pr;
+
+	xhci_pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+			PCI_DEVICE_ID_INTEL_LYNXPOINT_LP_XHCI,
+			NULL);
+
+	if (!xhci_pdev)
+		return;
+
+	pci_read_config_dword(xhci_pdev, USB_INTEL_XUSB2PR,
+				&orig_ports_available);
+
+	pci_write_config_dword(xhci_pdev, USB_INTEL_XUSB2PR,
+				cpu_to_le32(ports_available));
+
+	pr_info("set USB_INTEL_XUSB2PR old: 0x%04x, new: 0x%04x\n",
+			orig_ports_available, ports_available);
+}
+
+/*
+ * Some devices dont support or have borcken get_als method
+ * but still support set method.
+ */
+static void asus_wmi_set_als(void)
+{
+	asus_wmi_set_devstate(ASUS_WMI_DEVID_ALS_ENABLE, 1, NULL);
 }
 
 /*
@@ -2069,11 +2113,21 @@ static int asus_wmi_add(struct platform_device *pdev)
 	if (err)
 		goto fail_leds;
 
+	asus_wmi_get_devstate(asus, ASUS_WMI_DEVID_WLAN, &result);
+	if (result & (ASUS_WMI_DSTS_PRESENCE_BIT | ASUS_WMI_DSTS_USER_BIT))
+		asus->driver->wlan_ctrl_by_user = 1;
+
+	if (asus->driver->wlan_ctrl_by_user && ashs_present())
+		asus->driver->quirks->no_rfkill = 1;
+
 	if (!asus->driver->quirks->no_rfkill) {
 		err = asus_wmi_rfkill_init(asus);
 		if (err)
 			goto fail_rfkill;
 	}
+
+	if (asus->driver->quirks->wmi_force_als_set)
+		asus_wmi_set_als();
 
 	/* Some Asus desktop boards export an acpi-video backlight interface,
 	   stop this from showing up */
@@ -2087,11 +2141,15 @@ static int asus_wmi_add(struct platform_device *pdev)
 	if (asus->driver->quirks->wmi_backlight_native)
 		acpi_video_set_dmi_backlight_type(acpi_backlight_native);
 
+	if (asus->driver->quirks->xusb2pr)
+		asus_wmi_set_xusb2pr(asus);
+
 	if (acpi_video_get_backlight_type() == acpi_backlight_vendor) {
 		err = asus_wmi_backlight_init(asus);
 		if (err && err != -ENODEV)
 			goto fail_backlight;
-	}
+	} else if (asus->driver->quirks->wmi_backlight_set_devstate)
+		err = asus_wmi_set_devstate(ASUS_WMI_DEVID_BACKLIGHT, 2, NULL);
 
 	status = wmi_install_notify_handler(asus->driver->event_guid,
 					    asus_wmi_notify, asus);
@@ -2104,10 +2162,6 @@ static int asus_wmi_add(struct platform_device *pdev)
 	err = asus_wmi_debugfs_init(asus);
 	if (err)
 		goto fail_debugfs;
-
-	asus_wmi_get_devstate(asus, ASUS_WMI_DEVID_WLAN, &result);
-	if (result & (ASUS_WMI_DSTS_PRESENCE_BIT | ASUS_WMI_DSTS_USER_BIT))
-		asus->driver->wlan_ctrl_by_user = 1;
 
 	return 0;
 

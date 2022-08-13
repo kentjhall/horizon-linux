@@ -52,64 +52,87 @@ static int target_xcopy_gen_naa_ieee(struct se_device *dev, unsigned char *buf)
 	return 0;
 }
 
-static int target_xcopy_locate_se_dev_e4(struct se_cmd *se_cmd, struct xcopy_op *xop,
-					bool src)
+/**
+ * target_xcopy_locate_se_dev_e4_iter - compare XCOPY NAA device identifiers
+ *
+ * @se_dev: device being considered for match
+ * @dev_wwn: XCOPY requested NAA dev_wwn
+ * @return: 1 on match, 0 on no-match
+ */
+static int target_xcopy_locate_se_dev_e4_iter(struct se_device *se_dev,
+					      const unsigned char *dev_wwn)
 {
-	struct se_device *se_dev;
-	unsigned char tmp_dev_wwn[XCOPY_NAA_IEEE_REGEX_LEN], *dev_wwn;
+	unsigned char tmp_dev_wwn[XCOPY_NAA_IEEE_REGEX_LEN];
 	int rc;
 
-	if (src)
-		dev_wwn = &xop->dst_tid_wwn[0];
-	else
-		dev_wwn = &xop->src_tid_wwn[0];
-
-	mutex_lock(&g_device_mutex);
-	list_for_each_entry(se_dev, &g_device_list, g_dev_node) {
-
-		if (!se_dev->dev_attrib.emulate_3pc)
-			continue;
-
-		memset(&tmp_dev_wwn[0], 0, XCOPY_NAA_IEEE_REGEX_LEN);
-		target_xcopy_gen_naa_ieee(se_dev, &tmp_dev_wwn[0]);
-
-		rc = memcmp(&tmp_dev_wwn[0], dev_wwn, XCOPY_NAA_IEEE_REGEX_LEN);
-		if (rc != 0)
-			continue;
-
-		if (src) {
-			xop->dst_dev = se_dev;
-			pr_debug("XCOPY 0xe4: Setting xop->dst_dev: %p from located"
-				" se_dev\n", xop->dst_dev);
-		} else {
-			xop->src_dev = se_dev;
-			pr_debug("XCOPY 0xe4: Setting xop->src_dev: %p from located"
-				" se_dev\n", xop->src_dev);
-		}
-
-		rc = target_depend_item(&se_dev->dev_group.cg_item);
-		if (rc != 0) {
-			pr_err("configfs_depend_item attempt failed:"
-				" %d for se_dev: %p\n", rc, se_dev);
-			mutex_unlock(&g_device_mutex);
-			return rc;
-		}
-
-		pr_debug("Called configfs_depend_item for se_dev: %p"
-			" se_dev->se_dev_group: %p\n", se_dev,
-			&se_dev->dev_group);
-
-		mutex_unlock(&g_device_mutex);
+	if (!se_dev->dev_attrib.emulate_3pc) {
+		pr_debug("XCOPY: emulate_3pc disabled on se_dev %p\n", se_dev);
 		return 0;
 	}
-	mutex_unlock(&g_device_mutex);
 
+	memset(&tmp_dev_wwn[0], 0, XCOPY_NAA_IEEE_REGEX_LEN);
+	target_xcopy_gen_naa_ieee(se_dev, &tmp_dev_wwn[0]);
+
+	rc = memcmp(&tmp_dev_wwn[0], dev_wwn, XCOPY_NAA_IEEE_REGEX_LEN);
+	if (rc != 0) {
+		pr_debug("XCOPY: skip non-matching: %*ph\n",
+			 XCOPY_NAA_IEEE_REGEX_LEN, tmp_dev_wwn);
+		return 0;
+	}
+	pr_debug("XCOPY 0xe4: located se_dev: %p\n", se_dev);
+
+	return 1;
+}
+
+static int target_xcopy_locate_se_dev_e4(struct se_session *sess,
+					const unsigned char *dev_wwn,
+					struct se_device **_found_dev,
+					struct percpu_ref **_found_lun_ref)
+{
+	struct se_dev_entry *deve;
+	struct se_node_acl *nacl;
+	struct se_lun *this_lun = NULL;
+	struct se_device *found_dev = NULL;
+
+	/* cmd with NULL sess indicates no associated $FABRIC_MOD */
+	if (!sess)
+		goto err_out;
+
+	pr_debug("XCOPY 0xe4: searching for: %*ph\n",
+		 XCOPY_NAA_IEEE_REGEX_LEN, dev_wwn);
+
+	nacl = sess->se_node_acl;
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
+		struct se_device *this_dev;
+		int rc;
+
+		this_lun = rcu_dereference(deve->se_lun);
+		this_dev = rcu_dereference_raw(this_lun->lun_se_dev);
+
+		rc = target_xcopy_locate_se_dev_e4_iter(this_dev, dev_wwn);
+		if (rc) {
+			if (percpu_ref_tryget_live(&this_lun->lun_ref))
+				found_dev = this_dev;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	if (found_dev == NULL)
+		goto err_out;
+
+	pr_debug("lun_ref held for se_dev: %p se_dev->se_dev_group: %p\n",
+		 found_dev, &found_dev->dev_group);
+	*_found_dev = found_dev;
+	*_found_lun_ref = &this_lun->lun_ref;
+	return 0;
+err_out:
 	pr_debug_ratelimited("Unable to locate 0xe4 descriptor for EXTENDED_COPY\n");
 	return -EINVAL;
 }
 
 static int target_xcopy_parse_tiddesc_e4(struct se_cmd *se_cmd, struct xcopy_op *xop,
-				unsigned char *p, bool src)
+				unsigned char *p, unsigned short cscd_index)
 {
 	unsigned char *desc = p;
 	unsigned short ript;
@@ -154,7 +177,13 @@ static int target_xcopy_parse_tiddesc_e4(struct se_cmd *se_cmd, struct xcopy_op 
 		return -EINVAL;
 	}
 
-	if (src) {
+	if (cscd_index != xop->stdi && cscd_index != xop->dtdi) {
+		pr_debug("XCOPY 0xe4: ignoring CSCD entry %d - neither src nor "
+			 "dest\n", cscd_index);
+		return 0;
+	}
+
+	if (cscd_index == xop->stdi) {
 		memcpy(&xop->src_tid_wwn[0], &desc[8], XCOPY_NAA_IEEE_REGEX_LEN);
 		/*
 		 * Determine if the source designator matches the local device
@@ -166,10 +195,15 @@ static int target_xcopy_parse_tiddesc_e4(struct se_cmd *se_cmd, struct xcopy_op 
 			pr_debug("XCOPY 0xe4: Set xop->src_dev %p from source"
 					" received xop\n", xop->src_dev);
 		}
-	} else {
+	}
+
+	if (cscd_index == xop->dtdi) {
 		memcpy(&xop->dst_tid_wwn[0], &desc[8], XCOPY_NAA_IEEE_REGEX_LEN);
 		/*
-		 * Determine if the destination designator matches the local device
+		 * Determine if the destination designator matches the local
+		 * device. If @cscd_index corresponds to both source (stdi) and
+		 * destination (dtdi), or dtdi comes after stdi, then
+		 * XCOL_DEST_RECV_OP wins.
 		 */
 		if (!memcmp(&xop->local_dev_wwn[0], &xop->dst_tid_wwn[0],
 				XCOPY_NAA_IEEE_REGEX_LEN)) {
@@ -189,9 +223,9 @@ static int target_xcopy_parse_target_descriptors(struct se_cmd *se_cmd,
 {
 	struct se_device *local_dev = se_cmd->se_dev;
 	unsigned char *desc = p;
-	int offset = tdll % XCOPY_TARGET_DESC_LEN, rc, ret = 0;
+	int offset = tdll % XCOPY_TARGET_DESC_LEN, rc;
+	unsigned short cscd_index = 0;
 	unsigned short start = 0;
-	bool src = true;
 
 	*sense_ret = TCM_INVALID_PARAMETER_LIST;
 
@@ -214,25 +248,19 @@ static int target_xcopy_parse_target_descriptors(struct se_cmd *se_cmd,
 
 	while (start < tdll) {
 		/*
-		 * Check target descriptor identification with 0xE4 type with
-		 * use VPD 0x83 WWPN matching ..
+		 * Check target descriptor identification with 0xE4 type, and
+		 * compare the current index with the CSCD descriptor IDs in
+		 * the segment descriptor. Use VPD 0x83 WWPN matching ..
 		 */
 		switch (desc[0]) {
 		case 0xe4:
 			rc = target_xcopy_parse_tiddesc_e4(se_cmd, xop,
-							&desc[0], src);
+							&desc[0], cscd_index);
 			if (rc != 0)
 				goto out;
-			/*
-			 * Assume target descriptors are in source -> destination order..
-			 */
-			if (src)
-				src = false;
-			else
-				src = true;
 			start += XCOPY_TARGET_DESC_LEN;
 			desc += XCOPY_TARGET_DESC_LEN;
-			ret++;
+			cscd_index++;
 			break;
 		default:
 			pr_err("XCOPY unsupported descriptor type code:"
@@ -241,10 +269,25 @@ static int target_xcopy_parse_target_descriptors(struct se_cmd *se_cmd,
 		}
 	}
 
-	if (xop->op_origin == XCOL_SOURCE_RECV_OP)
-		rc = target_xcopy_locate_se_dev_e4(se_cmd, xop, true);
-	else
-		rc = target_xcopy_locate_se_dev_e4(se_cmd, xop, false);
+	switch (xop->op_origin) {
+	case XCOL_SOURCE_RECV_OP:
+		rc = target_xcopy_locate_se_dev_e4(se_cmd->se_sess,
+						xop->dst_tid_wwn,
+						&xop->dst_dev,
+						&xop->remote_lun_ref);
+		break;
+	case XCOL_DEST_RECV_OP:
+		rc = target_xcopy_locate_se_dev_e4(se_cmd->se_sess,
+						xop->src_tid_wwn,
+						&xop->src_dev,
+						&xop->remote_lun_ref);
+		break;
+	default:
+		pr_err("XCOPY CSCD descriptor IDs not found in CSCD list - "
+			"stdi: %hu dtdi: %hu\n", xop->stdi, xop->dtdi);
+		rc = -EINVAL;
+		break;
+	}
 	/*
 	 * If a matching IEEE NAA 0x83 descriptor for the requested device
 	 * is not located on this node, return COPY_ABORTED with ASQ/ASQC
@@ -261,7 +304,7 @@ static int target_xcopy_parse_target_descriptors(struct se_cmd *se_cmd,
 	pr_debug("XCOPY TGT desc: Dest dev: %p NAA IEEE WWN: 0x%16phN\n",
 		 xop->dst_dev, &xop->dst_tid_wwn[0]);
 
-	return ret;
+	return cscd_index;
 
 out:
 	return -EINVAL;
@@ -305,15 +348,24 @@ static int target_xcopy_parse_segdesc_02(struct se_cmd *se_cmd, struct xcopy_op 
 
 static int target_xcopy_parse_segment_descriptors(struct se_cmd *se_cmd,
 				struct xcopy_op *xop, unsigned char *p,
-				unsigned int sdll)
+				unsigned int sdll, sense_reason_t *sense_ret)
 {
 	unsigned char *desc = p;
 	unsigned int start = 0;
 	int offset = sdll % XCOPY_SEGMENT_DESC_LEN, rc, ret = 0;
 
+	*sense_ret = TCM_INVALID_PARAMETER_LIST;
+
 	if (offset != 0) {
 		pr_err("XCOPY segment descriptor list length is not"
 			" multiple of %d\n", XCOPY_SEGMENT_DESC_LEN);
+		return -EINVAL;
+	}
+	if (sdll > RCR_OP_MAX_SG_DESC_COUNT * XCOPY_SEGMENT_DESC_LEN) {
+		pr_err("XCOPY supports %u segment descriptor(s), sdll: %u too"
+			" large..\n", RCR_OP_MAX_SG_DESC_COUNT, sdll);
+		/* spc4r37 6.4.3.5 SEGMENT DESCRIPTOR LIST LENGTH field */
+		*sense_ret = TCM_TOO_MANY_SEGMENT_DESCS;
 		return -EINVAL;
 	}
 
@@ -372,18 +424,12 @@ static int xcopy_pt_get_cmd_state(struct se_cmd *se_cmd)
 
 static void xcopy_pt_undepend_remotedev(struct xcopy_op *xop)
 {
-	struct se_device *remote_dev;
-
 	if (xop->op_origin == XCOL_SOURCE_RECV_OP)
-		remote_dev = xop->dst_dev;
+		pr_debug("putting dst lun_ref for %p\n", xop->dst_dev);
 	else
-		remote_dev = xop->src_dev;
+		pr_debug("putting src lun_ref for %p\n", xop->src_dev);
 
-	pr_debug("Calling configfs_undepend_item for"
-		  " remote_dev: %p remote_dev->dev_group: %p\n",
-		  remote_dev, &remote_dev->dev_group.cg_item);
-
-	target_undepend_item(&remote_dev->dev_group.cg_item);
+	percpu_ref_put(xop->remote_lun_ref);
 }
 
 static void xcopy_pt_release_cmd(struct se_cmd *se_cmd)
@@ -836,7 +882,7 @@ out:
 			" CHECK_CONDITION -> sending response\n", rc);
 		ec_cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
 	}
-	target_complete_cmd(ec_cmd, SAM_STAT_CHECK_CONDITION);
+	target_complete_cmd(ec_cmd, ec_cmd->scsi_status);
 }
 
 sense_reason_t target_do_xcopy(struct se_cmd *se_cmd)
@@ -893,6 +939,20 @@ sense_reason_t target_do_xcopy(struct se_cmd *se_cmd)
 		" tdll: %hu sdll: %u inline_dl: %u\n", list_id, list_id_usage,
 		tdll, sdll, inline_dl);
 
+	/*
+	 * skip over the target descriptors until segment descriptors
+	 * have been passed - CSCD ids are needed to determine src and dest.
+	 */
+	seg_desc = &p[16] + tdll;
+
+	rc = target_xcopy_parse_segment_descriptors(se_cmd, xop, seg_desc,
+						    sdll, &ret);
+	if (rc <= 0)
+		goto out;
+
+	pr_debug("XCOPY: Processed %d segment descriptors, length: %u\n", rc,
+				rc * XCOPY_SEGMENT_DESC_LEN);
+
 	rc = target_xcopy_parse_target_descriptors(se_cmd, xop, &p[16], tdll, &ret);
 	if (rc <= 0)
 		goto out;
@@ -910,18 +970,8 @@ sense_reason_t target_do_xcopy(struct se_cmd *se_cmd)
 
 	pr_debug("XCOPY: Processed %d target descriptors, length: %u\n", rc,
 				rc * XCOPY_TARGET_DESC_LEN);
-	seg_desc = &p[16];
-	seg_desc += (rc * XCOPY_TARGET_DESC_LEN);
-
-	rc = target_xcopy_parse_segment_descriptors(se_cmd, xop, seg_desc, sdll);
-	if (rc <= 0) {
-		xcopy_pt_undepend_remotedev(xop);
-		goto out;
-	}
 	transport_kunmap_data_sg(se_cmd);
 
-	pr_debug("XCOPY: Processed %d segment descriptors, length: %u\n", rc,
-				rc * XCOPY_SEGMENT_DESC_LEN);
 	INIT_WORK(&xop->xop_work, target_xcopy_do_work);
 	queue_work(xcopy_wq, &xop->xop_work);
 	return TCM_NO_SENSE;

@@ -1951,7 +1951,7 @@ static int mb86a20s_read_status_and_stats(struct dvb_frontend *fe,
 					  enum fe_status *status)
 {
 	struct mb86a20s_state *state = fe->demodulator_priv;
-	int rc, status_nr;
+	int rc = 0, status_nr;
 
 	dev_dbg(&state->i2c->dev, "%s called.\n", __func__);
 

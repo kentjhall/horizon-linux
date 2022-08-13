@@ -110,7 +110,7 @@ static int ion_handle_test_kernel(struct dma_buf *dma_buf, void __user *ptr,
 	if (offset > dma_buf->size || size > dma_buf->size - offset)
 		return -EINVAL;
 
-	ret = dma_buf_begin_cpu_access(dma_buf, dir);
+	ret = dma_buf_begin_cpu_access(dma_buf, offset, size, dir);
 	if (ret)
 		return ret;
 
@@ -140,7 +140,7 @@ static int ion_handle_test_kernel(struct dma_buf *dma_buf, void __user *ptr,
 		copy_offset = 0;
 	}
 err:
-	dma_buf_end_cpu_access(dma_buf, dir);
+	dma_buf_end_cpu_access(dma_buf, offset, size, dir);
 	return ret;
 }
 

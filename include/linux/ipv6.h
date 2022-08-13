@@ -37,9 +37,11 @@ struct ipv6_devconf {
 	__s32		accept_ra_rtr_pref;
 	__s32		rtr_probe_interval;
 #ifdef CONFIG_IPV6_ROUTE_INFO
+	__s32		accept_ra_rt_info_min_plen;
 	__s32		accept_ra_rt_info_max_plen;
 #endif
 #endif
+	__s32		accept_ra_rt_table;
 	__s32		proxy_ndp;
 	__s32		accept_source_route;
 	__s32		accept_ra_from_local;
@@ -64,6 +66,7 @@ struct ipv6_devconf {
 	} stable_secret;
 	__s32		use_oif_addrs_only;
 	__s32		keep_addr_on_down;
+	__u32		addr_gen_mode;
 
 	struct ctl_table_header *sysctl_header;
 };
@@ -246,7 +249,8 @@ struct ipv6_pinfo {
 						 * 100: prefer care-of address
 						 */
 				dontfrag:1,
-				autoflowlabel:1;
+				autoflowlabel:1,
+				autoflowlabel_set:1;
 	__u8			min_hopcount;
 	__u8			tclass;
 	__be32			rcv_flowinfo;

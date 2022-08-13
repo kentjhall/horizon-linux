@@ -5,6 +5,12 @@
 # Rewritten to use lists instead of if-statements.
 #
 
+subdir-ccflags-y += -Werror
+
+ifeq ($(CONFIG_ARCH_TEGRA_19x_SOC),y)
+KBUILD_CFLAGS += -I$(tegra-dtstree)/soc/t19x/kernel-include
+endif
+
 obj-y				+= irqchip/
 obj-y				+= bus/
 
@@ -15,10 +21,15 @@ obj-$(CONFIG_PINCTRL)		+= pinctrl/
 obj-$(CONFIG_GPIOLIB)		+= gpio/
 obj-y				+= pwm/
 obj-$(CONFIG_PCI)		+= pci/
+obj-$(CONFIG_PCI_ENDPOINT)	+= pci/endpoint/
+# PCI dwc controller drivers
+obj-y				+= pci/dwc/
 obj-$(CONFIG_PARISC)		+= parisc/
 obj-$(CONFIG_RAPIDIO)		+= rapidio/
 obj-y				+= video/
 obj-y				+= idle/
+
+obj-$(CONFIG_PADCTRL)		+= padctrl/
 
 # IPMI must come before ACPI in order to provide IPMI opregion support
 obj-y				+= char/ipmi/
@@ -99,8 +110,10 @@ obj-$(CONFIG_TC)		+= tc/
 obj-$(CONFIG_UWB)		+= uwb/
 obj-$(CONFIG_USB_PHY)		+= usb/
 obj-$(CONFIG_USB)		+= usb/
+obj-$(CONFIG_USB_SUPPORT)	+= usb/
 obj-$(CONFIG_PCI)		+= usb/
 obj-$(CONFIG_USB_GADGET)	+= usb/
+obj-$(CONFIG_OF)		+= usb/
 obj-$(CONFIG_SERIO)		+= input/serio/
 obj-$(CONFIG_GAMEPORT)		+= input/gameport/
 obj-$(CONFIG_INPUT)		+= input/
@@ -125,6 +138,7 @@ obj-$(CONFIG_CPU_IDLE)		+= cpuidle/
 obj-y				+= mmc/
 obj-$(CONFIG_MEMSTICK)		+= memstick/
 obj-$(CONFIG_NEW_LEDS)		+= leds/
+obj-$(CONFIG_SWITCH)		+= switch/
 obj-$(CONFIG_INFINIBAND)	+= infiniband/
 obj-$(CONFIG_SGI_SN)		+= sn/
 obj-y				+= firmware/
@@ -173,3 +187,4 @@ obj-$(CONFIG_STM)		+= hwtracing/stm/
 obj-$(CONFIG_ANDROID)		+= android/
 obj-$(CONFIG_NVMEM)		+= nvmem/
 obj-$(CONFIG_FPGA)		+= fpga/
+obj-$(CONFIG_TEE)		+= tee/

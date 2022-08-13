@@ -45,6 +45,7 @@
 #include <soc/fsl/qe/ucc.h>
 #include <soc/fsl/qe/ucc_fast.h>
 #include <asm/machdep.h>
+#include <net/sch_generic.h>
 
 #include "ucc_geth.h"
 
@@ -1551,11 +1552,8 @@ static int ugeth_disable(struct ucc_geth_private *ugeth, enum comm_dir mode)
 
 static void ugeth_quiesce(struct ucc_geth_private *ugeth)
 {
-	/* Prevent any further xmits, plus detach the device. */
-	netif_device_detach(ugeth->ndev);
-
-	/* Wait for any current xmits to finish. */
-	netif_tx_disable(ugeth->ndev);
+	/* Prevent any further xmits */
+	netif_tx_stop_all_queues(ugeth->ndev);
 
 	/* Disable the interrupt to avoid NAPI rescheduling. */
 	disable_irq(ugeth->ug_info->uf_info.irq);
@@ -1568,7 +1566,10 @@ static void ugeth_activate(struct ucc_geth_private *ugeth)
 {
 	napi_enable(&ugeth->napi);
 	enable_irq(ugeth->ug_info->uf_info.irq);
-	netif_device_attach(ugeth->ndev);
+
+	/* allow to xmit again  */
+	netif_tx_wake_all_queues(ugeth->ndev);
+	__netdev_watchdog_up(ugeth->ndev);
 }
 
 /* Called every time the controller might need to be made
@@ -1887,6 +1888,8 @@ static void ucc_geth_free_tx(struct ucc_geth_private *ugeth)
 	struct ucc_fast_info *uf_info;
 	u16 i, j;
 	u8 __iomem *bd;
+
+	netdev_reset_queue(ugeth->ndev);
 
 	ug_info = ugeth->ug_info;
 	uf_info = &ug_info->uf_info;
@@ -2594,11 +2597,10 @@ static int ucc_geth_startup(struct ucc_geth_private *ugeth)
 		} else if (ugeth->ug_info->uf_info.bd_mem_part ==
 			   MEM_PART_MURAM) {
 			out_be32(&ugeth->p_send_q_mem_reg->sqqd[i].bd_ring_base,
-				 (u32) immrbar_virt_to_phys(ugeth->
-							    p_tx_bd_ring[i]));
+				 (u32)qe_muram_dma(ugeth->p_tx_bd_ring[i]));
 			out_be32(&ugeth->p_send_q_mem_reg->sqqd[i].
 				 last_bd_completed_address,
-				 (u32) immrbar_virt_to_phys(endOfRing));
+				 (u32)qe_muram_dma(endOfRing));
 		}
 	}
 
@@ -2844,8 +2846,7 @@ static int ucc_geth_startup(struct ucc_geth_private *ugeth)
 		} else if (ugeth->ug_info->uf_info.bd_mem_part ==
 			   MEM_PART_MURAM) {
 			out_be32(&ugeth->p_rx_bd_qs_tbl[i].externalbdbaseptr,
-				 (u32) immrbar_virt_to_phys(ugeth->
-							    p_rx_bd_ring[i]));
+				 (u32)qe_muram_dma(ugeth->p_rx_bd_ring[i]));
 		}
 		/* rest of fields handled by QE */
 	}
@@ -3938,12 +3939,12 @@ static int ucc_geth_remove(struct platform_device* ofdev)
 	struct device_node *np = ofdev->dev.of_node;
 
 	unregister_netdev(dev);
-	free_netdev(dev);
 	ucc_geth_memclean(ugeth);
 	if (of_phy_is_fixed_link(np))
 		of_phy_deregister_fixed_link(np);
 	of_node_put(ugeth->ug_info->tbi_node);
 	of_node_put(ugeth->ug_info->phy_node);
+	free_netdev(dev);
 
 	return 0;
 }

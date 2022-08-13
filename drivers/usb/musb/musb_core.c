@@ -578,11 +578,11 @@ static irqreturn_t musb_stage0_irq(struct musb *musb, u8 int_usb,
 						| MUSB_PORT_STAT_RESUME;
 				musb->rh_timer = jiffies
 					+ msecs_to_jiffies(USB_RESUME_TIMEOUT);
-				musb->need_finish_resume = 1;
-
 				musb->xceiv->otg->state = OTG_STATE_A_HOST;
 				musb->is_active = 1;
 				musb_host_resume_root_hub(musb);
+				schedule_delayed_work(&musb->finish_resume_work,
+					msecs_to_jiffies(USB_RESUME_TIMEOUT));
 				break;
 			case OTG_STATE_B_WAIT_ACON:
 				musb->xceiv->otg->state = OTG_STATE_B_PERIPHERAL;
@@ -890,7 +890,7 @@ b_host:
 	 */
 	if (int_usb & MUSB_INTR_RESET) {
 		handled = IRQ_HANDLED;
-		if (devctl & MUSB_DEVCTL_HM) {
+		if (is_host_active(musb)) {
 			/*
 			 * When BABBLE happens what we can depends on which
 			 * platform MUSB is running, because some platforms
@@ -900,9 +900,7 @@ b_host:
 			 * drop the session.
 			 */
 			dev_err(musb->controller, "Babble\n");
-
-			if (is_host_active(musb))
-				musb_recover_from_babble(musb);
+			musb_recover_from_babble(musb);
 		} else {
 			musb_dbg(musb, "BUS RESET as %s",
 				usb_otg_state_string(musb->xceiv->otg->state));
@@ -1776,6 +1774,7 @@ musb_vbus_show(struct device *dev, struct device_attribute *attr, char *buf)
 	int		vbus;
 	u8		devctl;
 
+	pm_runtime_get_sync(dev);
 	spin_lock_irqsave(&musb->lock, flags);
 	val = musb->a_wait_bcon;
 	vbus = musb_platform_get_vbus_status(musb);
@@ -1789,6 +1788,7 @@ musb_vbus_show(struct device *dev, struct device_attribute *attr, char *buf)
 			vbus = 0;
 	}
 	spin_unlock_irqrestore(&musb->lock, flags);
+	pm_runtime_put_sync(dev);
 
 	return sprintf(buf, "Vbus %s, timeout %lu msec\n",
 			vbus ? "on" : "off", val);
@@ -1832,6 +1832,9 @@ static const struct attribute_group musb_attr_group = {
 #define MUSB_QUIRK_B_INVALID_VBUS_91	(MUSB_DEVCTL_BDEVICE | \
 					 (2 << MUSB_DEVCTL_VBUS_SHIFT) | \
 					 MUSB_DEVCTL_SESSION)
+#define MUSB_QUIRK_B_DISCONNECT_99	(MUSB_DEVCTL_BDEVICE | \
+					 (3 << MUSB_DEVCTL_VBUS_SHIFT) | \
+					 MUSB_DEVCTL_SESSION)
 #define MUSB_QUIRK_A_DISCONNECT_19	((3 << MUSB_DEVCTL_VBUS_SHIFT) | \
 					 MUSB_DEVCTL_SESSION)
 
@@ -1854,6 +1857,11 @@ static void musb_pm_runtime_check_session(struct musb *musb)
 	s = MUSB_DEVCTL_FSDEV | MUSB_DEVCTL_LSDEV |
 		MUSB_DEVCTL_HR;
 	switch (devctl & ~s) {
+	case MUSB_QUIRK_B_DISCONNECT_99:
+		musb_dbg(musb, "Poll devctl in case of suspend after disconnect\n");
+		schedule_delayed_work(&musb->irq_work,
+				      msecs_to_jiffies(1000));
+		break;
 	case MUSB_QUIRK_B_INVALID_VBUS_91:
 		if (musb->quirk_retries--) {
 			musb_dbg(musb,
@@ -1909,6 +1917,14 @@ static void musb_pm_runtime_check_session(struct musb *musb)
 static void musb_irq_work(struct work_struct *data)
 {
 	struct musb *musb = container_of(data, struct musb, irq_work.work);
+	int error;
+
+	error = pm_runtime_get_sync(musb->controller);
+	if (error < 0) {
+		dev_err(musb->controller, "Could not enable: %i\n", error);
+
+		return;
+	}
 
 	musb_pm_runtime_check_session(musb);
 
@@ -1916,6 +1932,9 @@ static void musb_irq_work(struct work_struct *data)
 		musb->xceiv_old_state = musb->xceiv->otg->state;
 		sysfs_notify(&musb->controller->kobj, NULL, "mode");
 	}
+
+	pm_runtime_mark_last_busy(musb->controller);
+	pm_runtime_put_autosuspend(musb->controller);
 }
 
 static void musb_recover_from_babble(struct musb *musb)
@@ -2034,6 +2053,7 @@ struct musb_pending_work {
 	struct list_head node;
 };
 
+#ifdef CONFIG_PM
 /*
  * Called from musb_runtime_resume(), musb_resume(), and
  * musb_queue_resume_work(). Callers must take musb->lock.
@@ -2061,6 +2081,7 @@ static int musb_run_resume_work(struct musb *musb)
 
 	return error;
 }
+#endif
 
 /*
  * Called to run work if device is active or else queue the work to happen
@@ -2296,6 +2317,9 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
 	musb_platform_disable(musb);
 	musb_generic_disable(musb);
 
+	/* MUSB_POWER_SOFTCONN might be already set, JZ4740 does this. */
+	musb_writeb(musb->mregs, MUSB_POWER, 0);
+
 	/* Init IRQ workqueue before request_irq */
 	INIT_DELAYED_WORK(&musb->irq_work, musb_irq_work);
 	INIT_DELAYED_WORK(&musb->deassert_reset_work, musb_deassert_reset);
@@ -2467,15 +2491,16 @@ static int musb_remove(struct platform_device *pdev)
 	pm_runtime_get_sync(musb->controller);
 	musb_host_cleanup(musb);
 	musb_gadget_cleanup(musb);
-	spin_lock_irqsave(&musb->lock, flags);
 	musb_platform_disable(musb);
+	spin_lock_irqsave(&musb->lock, flags);
 	musb_generic_disable(musb);
 	spin_unlock_irqrestore(&musb->lock, flags);
 	musb_writeb(musb->mregs, MUSB_DEVCTL, 0);
+	musb_platform_exit(musb);
+
 	pm_runtime_dont_use_autosuspend(musb->controller);
 	pm_runtime_put_sync(musb->controller);
 	pm_runtime_disable(musb->controller);
-	musb_platform_exit(musb);
 	musb_phy_callback = NULL;
 	if (musb->dma_controller)
 		musb_dma_controller_destroy(musb->dma_controller);
@@ -2644,6 +2669,13 @@ static int musb_suspend(struct device *dev)
 {
 	struct musb	*musb = dev_to_musb(dev);
 	unsigned long	flags;
+	int ret;
+
+	ret = pm_runtime_get_sync(dev);
+	if (ret < 0) {
+		pm_runtime_put_noidle(dev);
+		return ret;
+	}
 
 	musb_platform_disable(musb);
 	musb_generic_disable(musb);
@@ -2691,21 +2723,9 @@ static int musb_resume(struct device *dev)
 	mask = MUSB_DEVCTL_BDEVICE | MUSB_DEVCTL_FSDEV | MUSB_DEVCTL_LSDEV;
 	if ((devctl & mask) != (musb->context.devctl & mask))
 		musb->port1_status = 0;
-	if (musb->need_finish_resume) {
-		musb->need_finish_resume = 0;
-		schedule_delayed_work(&musb->finish_resume_work,
-				      msecs_to_jiffies(USB_RESUME_TIMEOUT));
-	}
 
-	/*
-	 * The USB HUB code expects the device to be in RPM_ACTIVE once it came
-	 * out of suspend
-	 */
-	pm_runtime_disable(dev);
-	pm_runtime_set_active(dev);
-	pm_runtime_enable(dev);
-
-	musb_start(musb);
+	musb_enable_interrupts(musb);
+	musb_platform_enable(musb);
 
 	spin_lock_irqsave(&musb->lock, flags);
 	error = musb_run_resume_work(musb);
@@ -2713,6 +2733,9 @@ static int musb_resume(struct device *dev)
 		dev_err(musb->controller, "resume work failed with %i\n",
 			error);
 	spin_unlock_irqrestore(&musb->lock, flags);
+
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
 
 	return 0;
 }
@@ -2746,12 +2769,6 @@ static int musb_runtime_resume(struct device *dev)
 		return 0;
 
 	musb_restore_context(musb);
-
-	if (musb->need_finish_resume) {
-		musb->need_finish_resume = 0;
-		schedule_delayed_work(&musb->finish_resume_work,
-				msecs_to_jiffies(USB_RESUME_TIMEOUT));
-	}
 
 	spin_lock_irqsave(&musb->lock, flags);
 	error = musb_run_resume_work(musb);

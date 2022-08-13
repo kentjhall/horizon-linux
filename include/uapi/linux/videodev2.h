@@ -349,8 +349,8 @@ enum v4l2_quantization {
 	/*
 	 * The default for R'G'B' quantization is always full range, except
 	 * for the BT2020 colorspace. For Y'CbCr the quantization is always
-	 * limited range, except for COLORSPACE_JPEG, SRGB, ADOBERGB,
-	 * XV601 or XV709: those are full range.
+	 * limited range, except for COLORSPACE_JPEG, XV601 or XV709: those
+	 * are full range.
 	 */
 	V4L2_QUANTIZATION_DEFAULT     = 0,
 	V4L2_QUANTIZATION_FULL_RANGE  = 1,
@@ -365,8 +365,7 @@ enum v4l2_quantization {
 #define V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb, colsp, ycbcr_enc) \
 	(((is_rgb) && (colsp) == V4L2_COLORSPACE_BT2020) ? V4L2_QUANTIZATION_LIM_RANGE : \
 	 (((is_rgb) || (ycbcr_enc) == V4L2_YCBCR_ENC_XV601 || \
-	  (ycbcr_enc) == V4L2_YCBCR_ENC_XV709 || (colsp) == V4L2_COLORSPACE_JPEG) || \
-	  (colsp) == V4L2_COLORSPACE_ADOBERGB || (colsp) == V4L2_COLORSPACE_SRGB ? \
+	  (ycbcr_enc) == V4L2_YCBCR_ENC_XV709 || (colsp) == V4L2_COLORSPACE_JPEG) ? \
 	 V4L2_QUANTIZATION_FULL_RANGE : V4L2_QUANTIZATION_LIM_RANGE))
 
 enum v4l2_priority {
@@ -566,6 +565,11 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_SGBRG10 v4l2_fourcc('G', 'B', '1', '0') /* 10  GBGB.. RGRG.. */
 #define V4L2_PIX_FMT_SGRBG10 v4l2_fourcc('B', 'A', '1', '0') /* 10  GRGR.. BGBG.. */
 #define V4L2_PIX_FMT_SRGGB10 v4l2_fourcc('R', 'G', '1', '0') /* 10  RGRG.. GBGB.. */
+	/*10bit raw bayer packed, 4 bytes for every 3 pixels */
+#define V4L2_PIX_FMT_XBGGR10P   v4l2_fourcc('X', 'B', 'G', 'P') /* 32  BGGR Packed 10-10-10-2 */
+#define V4L2_PIX_FMT_XGBRG10P   v4l2_fourcc('X', 'G', 'B', 'P') /* 32  GBRG Packed 10-10-10-2 */
+#define V4L2_PIX_FMT_XGRBG10P   v4l2_fourcc('X', 'G', 'R', 'P') /* 32  GRBG Packed 10-10-10-2 */
+#define V4L2_PIX_FMT_XRGGB10P   v4l2_fourcc('X', 'R', 'G', 'P') /* 32  RGGB Packed 10-10-10-2 */
 	/* 10bit raw bayer packed, 5 bytes for every 4 pixels */
 #define V4L2_PIX_FMT_SBGGR10P v4l2_fourcc('p', 'B', 'A', 'A')
 #define V4L2_PIX_FMT_SGBRG10P v4l2_fourcc('p', 'G', 'A', 'A')
@@ -586,6 +590,9 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_SGRBG12 v4l2_fourcc('B', 'A', '1', '2') /* 12  GRGR.. BGBG.. */
 #define V4L2_PIX_FMT_SRGGB12 v4l2_fourcc('R', 'G', '1', '2') /* 12  RGRG.. GBGB.. */
 #define V4L2_PIX_FMT_SBGGR16 v4l2_fourcc('B', 'Y', 'R', '2') /* 16  BGBG.. GRGR.. */
+#define V4L2_PIX_FMT_SGBRG16 v4l2_fourcc('G', 'B', '1', '6') /* 16  GBGB.. RGRG.. */
+#define V4L2_PIX_FMT_SGRBG16 v4l2_fourcc('G', 'R', '1', '6') /* 16  GRGR.. BGBG.. */
+#define V4L2_PIX_FMT_SRGGB16 v4l2_fourcc('R', 'G', '1', '6') /* 16  RGRG.. GBGB.. */
 
 /* compressed formats */
 #define V4L2_PIX_FMT_MJPEG    v4l2_fourcc('M', 'J', 'P', 'G') /* Motion-JPEG   */
@@ -634,6 +641,28 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_Y8I      v4l2_fourcc('Y', '8', 'I', ' ') /* Greyscale 8-bit L/R interleaved */
 #define V4L2_PIX_FMT_Y12I     v4l2_fourcc('Y', '1', '2', 'I') /* Greyscale 12-bit L/R interleaved */
 #define V4L2_PIX_FMT_Z16      v4l2_fourcc('Z', '1', '6', ' ') /* Depth data 16-bit */
+/* Greyscale 16-bit */
+#define V4L2_PIX_FMT_Y16      v4l2_fourcc('Y', '1', '6', ' ')
+/* Raw data 16-bit */
+#define V4L2_PIX_FMT_RW16     v4l2_fourcc('R', 'W', '1', '6')
+/* 24 Depth/IR 16:8 */
+#define V4L2_PIX_FMT_INZI     v4l2_fourcc('I', 'N', 'Z', 'I')
+/* 16 Depth */
+#define V4L2_PIX_FMT_INVR     v4l2_fourcc('I', 'N', 'V', 'R')
+/* 24 Depth/IR 16:8 */
+#define V4L2_PIX_FMT_INRI     v4l2_fourcc('I', 'N', 'R', 'I')
+/* 8 IR alternating on off illumination */
+#define V4L2_PIX_FMT_RELI     v4l2_fourcc('R', 'E', 'L', 'I')
+/* Packed raw data 10-bit */
+#define V4L2_PIX_FMT_W10      v4l2_fourcc('W', '1', '0', ' ')
+/* Two pixels in one byte */
+#define V4L2_PIX_FMT_CONFIDENCE_MAP  v4l2_fourcc('C', ' ', ' ', ' ')
+/* Frame Grabber */
+#define V4L2_PIX_FMT_FG	v4l2_fourcc('F', 'G', ' ', ' ')
+/* Planar Depth/Confidence */
+#define V4L2_PIX_FMT_INZC	v4l2_fourcc('I', 'N', 'Z', 'C')
+/* Relative IR */
+#define V4L2_PIX_FMT_PAIR	v4l2_fourcc('P', 'A', 'I', 'R')
 
 /* SDR formats - used only for Software Defined Radio devices */
 #define V4L2_SDR_FMT_CU8          v4l2_fourcc('C', 'U', '0', '8') /* IQ u8 */
@@ -2009,7 +2038,8 @@ struct v4l2_pix_format_mplane {
 	__u8				ycbcr_enc;
 	__u8				quantization;
 	__u8				xfer_func;
-	__u8				reserved[7];
+	__u8				metadata_height;
+	__u8				reserved[6];
 } __attribute__ ((packed));
 
 /**
@@ -2100,6 +2130,7 @@ struct v4l2_event_frame_sync {
 };
 
 #define V4L2_EVENT_SRC_CH_RESOLUTION		(1 << 0)
+#define V4L2_EVENT_SRC_ERROR		(1 << 1)
 
 struct v4l2_event_src_change {
 	__u32 changes;

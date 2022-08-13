@@ -53,6 +53,9 @@
 #ifdef CONFIG_CIFS_SMB2
 #include "smb2pdu.h"
 #endif
+#ifdef CONFIG_CIFS_SYSFS
+#include "sysfs.h"
+#endif
 
 int cifsFYI = 0;
 bool traceSMB;
@@ -87,6 +90,7 @@ extern mempool_t *cifs_req_poolp;
 extern mempool_t *cifs_mid_poolp;
 
 struct workqueue_struct	*cifsiod_wq;
+struct workqueue_struct	*cifsoplockd_wq;
 __u32 cifs_lock_secret;
 
 /*
@@ -926,8 +930,8 @@ static int cifs_clone_file_range(struct file *src_file, loff_t off,
 	struct inode *src_inode = file_inode(src_file);
 	struct inode *target_inode = file_inode(dst_file);
 	struct cifsFileInfo *smb_file_src = src_file->private_data;
-	struct cifsFileInfo *smb_file_target = dst_file->private_data;
-	struct cifs_tcon *target_tcon = tlink_tcon(smb_file_target->tlink);
+	struct cifsFileInfo *smb_file_target;
+	struct cifs_tcon *target_tcon;
 	unsigned int xid;
 	int rc;
 
@@ -940,6 +944,9 @@ static int cifs_clone_file_range(struct file *src_file, loff_t off,
 		cifs_dbg(VFS, "missing cifsFileInfo on copy range src file\n");
 		goto out;
 	}
+
+	smb_file_target = dst_file->private_data;
+	target_tcon = tlink_tcon(smb_file_target->tlink);
 
 	/*
 	 * Note: cifs case is easier than btrfs since server responsible for
@@ -1283,9 +1290,16 @@ init_cifs(void)
 		goto out_clean_proc;
 	}
 
+	cifsoplockd_wq = alloc_workqueue("cifsoplockd",
+					 WQ_FREEZABLE|WQ_MEM_RECLAIM, 0);
+	if (!cifsoplockd_wq) {
+		rc = -ENOMEM;
+		goto out_destroy_cifsiod_wq;
+	}
+
 	rc = cifs_fscache_register();
 	if (rc)
-		goto out_destroy_wq;
+		goto out_destroy_cifsoplockd_wq;
 
 	rc = cifs_init_inodecache();
 	if (rc)
@@ -1314,8 +1328,13 @@ init_cifs(void)
 	rc = register_filesystem(&cifs_fs_type);
 	if (rc)
 		goto out_init_cifs_idmap;
-
+#ifdef CONFIG_CIFS_SYSFS
+        rc = cifs_sysfs_init();
+        if (rc)
+		printk(KERN_WARNING "CIFS: Failed to init sysfs: %d\n", rc);
+#endif
 	return 0;
+
 
 out_init_cifs_idmap:
 #ifdef CONFIG_CIFS_ACL
@@ -1333,7 +1352,9 @@ out_destroy_inodecache:
 	cifs_destroy_inodecache();
 out_unreg_fscache:
 	cifs_fscache_unregister();
-out_destroy_wq:
+out_destroy_cifsoplockd_wq:
+	destroy_workqueue(cifsoplockd_wq);
+out_destroy_cifsiod_wq:
 	destroy_workqueue(cifsiod_wq);
 out_clean_proc:
 	cifs_proc_clean();
@@ -1344,18 +1365,22 @@ static void __exit
 exit_cifs(void)
 {
 	cifs_dbg(NOISY, "exit_cifs\n");
+#ifdef CONFIG_CIFS_SYSFS
+	cifs_sysfs_exit();
+#endif
 	unregister_filesystem(&cifs_fs_type);
 	cifs_dfs_release_automount_timer();
 #ifdef CONFIG_CIFS_ACL
 	exit_cifs_idmap();
 #endif
 #ifdef CONFIG_CIFS_UPCALL
-	unregister_key_type(&cifs_spnego_key_type);
+	exit_cifs_spnego();
 #endif
 	cifs_destroy_request_bufs();
 	cifs_destroy_mids();
 	cifs_destroy_inodecache();
 	cifs_fscache_unregister();
+	destroy_workqueue(cifsoplockd_wq);
 	destroy_workqueue(cifsiod_wq);
 	cifs_proc_clean();
 }

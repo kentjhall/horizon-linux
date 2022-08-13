@@ -20,6 +20,7 @@
 #define PHY_ID_BCM5461			0x002060c0
 #define PHY_ID_BCM54616S		0x03625d10
 #define PHY_ID_BCM57780			0x03625d90
+#define PHY_ID_BCM89610			0x03625cd0
 
 #define PHY_ID_BCM7250			0xae025280
 #define PHY_ID_BCM7364			0xae025260
@@ -91,11 +92,19 @@
 #define MII_BCM54XX_INT_HC	0x1000	/* Counter above 32768 */
 #define MII_BCM54XX_INT_MDIX	0x2000	/* MDIX status change */
 #define MII_BCM54XX_INT_PSERR	0x4000	/* Pair swap error */
+#define MII_BCM54XX_INT_EDETECT 0x8000  /* Energy change detected */
 
 #define MII_BCM54XX_SHD		0x1c	/* 0x1c shadow registers */
 #define MII_BCM54XX_SHD_WRITE	0x8000
 #define MII_BCM54XX_SHD_VAL(x)	((x & 0x1f) << 10)
 #define MII_BCM54XX_SHD_DATA(x)	((x & 0x3ff) << 0)
+
+/* Broadcom IDDQ-LP regs */
+#define MII_BCM54XX_SHD_IDDQ           0x3000
+#define MII_BCM54XX_IDDQ_LP            0x0001
+#define MII_BCM54XX_EXT_CTL_WR_ENABLE  0X8000
+
+#define BCM_IDDQ_EN                    1
 
 /*
  * AUXILIARY CONTROL SHADOW ACCESS REGISTERS.  (PHY REG 0x18)
@@ -140,6 +149,7 @@
 #define  BCM54XX_SHD_SCR3_DEF_CLK125	0x0001
 #define  BCM54XX_SHD_SCR3_DLLAPD_DIS	0x0002
 #define  BCM54XX_SHD_SCR3_TRDDAPD	0x0004
+#define BCM54XX_SHD_SCR3_EDETECT_EN	0x0020
 
 /* 01010: Auto Power-Down */
 #define BCM54XX_SHD_APD			0x0a

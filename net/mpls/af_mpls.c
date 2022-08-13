@@ -7,6 +7,7 @@
 #include <linux/if_arp.h>
 #include <linux/ipv6.h>
 #include <linux/mpls.h>
+#include <linux/nospec.h>
 #include <linux/vmalloc.h>
 #include <net/ip.h>
 #include <net/dst.h>
@@ -98,18 +99,19 @@ bool mpls_pkt_too_big(const struct sk_buff *skb, unsigned int mtu)
 }
 EXPORT_SYMBOL_GPL(mpls_pkt_too_big);
 
-static u32 mpls_multipath_hash(struct mpls_route *rt,
-			       struct sk_buff *skb, bool bos)
+static u32 mpls_multipath_hash(struct mpls_route *rt, struct sk_buff *skb)
 {
 	struct mpls_entry_decoded dec;
+	unsigned int mpls_hdr_len = 0;
 	struct mpls_shim_hdr *hdr;
 	bool eli_seen = false;
 	int label_index;
 	u32 hash = 0;
 
-	for (label_index = 0; label_index < MAX_MP_SELECT_LABELS && !bos;
+	for (label_index = 0; label_index < MAX_MP_SELECT_LABELS;
 	     label_index++) {
-		if (!pskb_may_pull(skb, sizeof(*hdr) * label_index))
+		mpls_hdr_len += sizeof(*hdr);
+		if (!pskb_may_pull(skb, mpls_hdr_len))
 			break;
 
 		/* Read and decode the current label */
@@ -134,37 +136,38 @@ static u32 mpls_multipath_hash(struct mpls_route *rt,
 			eli_seen = true;
 		}
 
-		bos = dec.bos;
-		if (bos && pskb_may_pull(skb, sizeof(*hdr) * label_index +
-					 sizeof(struct iphdr))) {
+		if (!dec.bos)
+			continue;
+
+		/* found bottom label; does skb have room for a header? */
+		if (pskb_may_pull(skb, mpls_hdr_len + sizeof(struct iphdr))) {
 			const struct iphdr *v4hdr;
 
-			v4hdr = (const struct iphdr *)(mpls_hdr(skb) +
-						       label_index);
+			v4hdr = (const struct iphdr *)(hdr + 1);
 			if (v4hdr->version == 4) {
 				hash = jhash_3words(ntohl(v4hdr->saddr),
 						    ntohl(v4hdr->daddr),
 						    v4hdr->protocol, hash);
 			} else if (v4hdr->version == 6 &&
-				pskb_may_pull(skb, sizeof(*hdr) * label_index +
-					      sizeof(struct ipv6hdr))) {
+				   pskb_may_pull(skb, mpls_hdr_len +
+						 sizeof(struct ipv6hdr))) {
 				const struct ipv6hdr *v6hdr;
 
-				v6hdr = (const struct ipv6hdr *)(mpls_hdr(skb) +
-								label_index);
-
+				v6hdr = (const struct ipv6hdr *)(hdr + 1);
 				hash = __ipv6_addr_jhash(&v6hdr->saddr, hash);
 				hash = __ipv6_addr_jhash(&v6hdr->daddr, hash);
 				hash = jhash_1word(v6hdr->nexthdr, hash);
 			}
 		}
+
+		break;
 	}
 
 	return hash;
 }
 
 static struct mpls_nh *mpls_select_multipath(struct mpls_route *rt,
-					     struct sk_buff *skb, bool bos)
+					     struct sk_buff *skb)
 {
 	int alive = ACCESS_ONCE(rt->rt_nhn_alive);
 	u32 hash = 0;
@@ -180,7 +183,7 @@ static struct mpls_nh *mpls_select_multipath(struct mpls_route *rt,
 	if (alive <= 0)
 		return NULL;
 
-	hash = mpls_multipath_hash(rt, skb, bos);
+	hash = mpls_multipath_hash(rt, skb);
 	nh_index = hash % alive;
 	if (alive == rt->rt_nhn)
 		goto out;
@@ -278,17 +281,11 @@ static int mpls_forward(struct sk_buff *skb, struct net_device *dev,
 	hdr = mpls_hdr(skb);
 	dec = mpls_entry_decode(hdr);
 
-	/* Pop the label */
-	skb_pull(skb, sizeof(*hdr));
-	skb_reset_network_header(skb);
-
-	skb_orphan(skb);
-
 	rt = mpls_route_input_rcu(net, dec.label);
 	if (!rt)
 		goto drop;
 
-	nh = mpls_select_multipath(rt, skb, dec.bos);
+	nh = mpls_select_multipath(rt, skb);
 	if (!nh)
 		goto drop;
 
@@ -296,6 +293,12 @@ static int mpls_forward(struct sk_buff *skb, struct net_device *dev,
 	out_dev = rcu_dereference(nh->nh_dev);
 	if (!mpls_output_possible(out_dev))
 		goto drop;
+
+	/* Pop the label */
+	skb_pull(skb, sizeof(*hdr));
+	skb_reset_network_header(skb);
+
+	skb_orphan(skb);
 
 	if (skb_warn_if_lro(skb))
 		goto drop;
@@ -494,16 +497,15 @@ static struct net_device *inet6_fib_lookup_dev(struct net *net,
 	struct net_device *dev;
 	struct dst_entry *dst;
 	struct flowi6 fl6;
-	int err;
 
 	if (!ipv6_stub)
 		return ERR_PTR(-EAFNOSUPPORT);
 
 	memset(&fl6, 0, sizeof(fl6));
 	memcpy(&fl6.daddr, addr, sizeof(struct in6_addr));
-	err = ipv6_stub->ipv6_dst_lookup(net, NULL, &dst, &fl6);
-	if (err)
-		return ERR_PTR(err);
+	dst = ipv6_stub->ipv6_dst_lookup_flow(net, NULL, &fl6, NULL);
+	if (IS_ERR(dst))
+		return ERR_CAST(dst);
 
 	dev = dst->dev;
 	dev_hold(dev);
@@ -754,6 +756,22 @@ errout:
 	return err;
 }
 
+static bool mpls_label_ok(struct net *net, unsigned int *index)
+{
+	bool is_ok = true;
+
+	/* Reserved labels may not be set */
+	if (*index < MPLS_LABEL_FIRST_UNRESERVED)
+		is_ok = false;
+
+	/* The full 20 bit range may not be supported. */
+	if (is_ok && *index >= net->mpls.platform_labels)
+		is_ok = false;
+
+	*index = array_index_nospec(*index, net->mpls.platform_labels);
+	return is_ok;
+}
+
 static int mpls_route_add(struct mpls_route_config *cfg)
 {
 	struct mpls_route __rcu **platform_label;
@@ -772,12 +790,7 @@ static int mpls_route_add(struct mpls_route_config *cfg)
 		index = find_free_label(net);
 	}
 
-	/* Reserved labels may not be set */
-	if (index < MPLS_LABEL_FIRST_UNRESERVED)
-		goto errout;
-
-	/* The full 20 bit range may not be supported. */
-	if (index >= net->mpls.platform_labels)
+	if (!mpls_label_ok(net, &index))
 		goto errout;
 
 	/* Append makes no sense with mpls */
@@ -838,12 +851,7 @@ static int mpls_route_del(struct mpls_route_config *cfg)
 
 	index = cfg->rc_label;
 
-	/* Reserved labels may not be removed */
-	if (index < MPLS_LABEL_FIRST_UNRESERVED)
-		goto errout;
-
-	/* The full 20 bit range may not be supported */
-	if (index >= net->mpls.platform_labels)
+	if (!mpls_label_ok(net, &index))
 		goto errout;
 
 	mpls_route_update(net, index, NULL, &cfg->rc_nlinfo);
@@ -935,6 +943,8 @@ static void mpls_ifdown(struct net_device *dev, int event)
 {
 	struct mpls_route __rcu **platform_label;
 	struct net *net = dev_net(dev);
+	unsigned int nh_flags = RTNH_F_DEAD | RTNH_F_LINKDOWN;
+	unsigned int alive;
 	unsigned index;
 
 	platform_label = rtnl_dereference(net->mpls.platform_label);
@@ -944,9 +954,11 @@ static void mpls_ifdown(struct net_device *dev, int event)
 		if (!rt)
 			continue;
 
+		alive = 0;
 		change_nexthops(rt) {
 			if (rtnl_dereference(nh->nh_dev) != dev)
-				continue;
+				goto next;
+
 			switch (event) {
 			case NETDEV_DOWN:
 			case NETDEV_UNREGISTER:
@@ -954,12 +966,16 @@ static void mpls_ifdown(struct net_device *dev, int event)
 				/* fall through */
 			case NETDEV_CHANGE:
 				nh->nh_flags |= RTNH_F_LINKDOWN;
-				ACCESS_ONCE(rt->rt_nhn_alive) = rt->rt_nhn_alive - 1;
 				break;
 			}
 			if (event == NETDEV_UNREGISTER)
 				RCU_INIT_POINTER(nh->nh_dev, NULL);
+next:
+			if (!(nh->nh_flags & nh_flags))
+				alive++;
 		} endfor_nexthops(rt);
+
+		WRITE_ONCE(rt->rt_nhn_alive, alive);
 	}
 }
 
@@ -1269,10 +1285,9 @@ static int rtm_to_route_config(struct sk_buff *skb,  struct nlmsghdr *nlh,
 					   &cfg->rc_label))
 				goto errout;
 
-			/* Reserved labels may not be set */
-			if (cfg->rc_label < MPLS_LABEL_FIRST_UNRESERVED)
+			if (!mpls_label_ok(cfg->rc_nlinfo.nl_net,
+					   &cfg->rc_label))
 				goto errout;
-
 			break;
 		}
 		case RTA_VIA:
@@ -1694,6 +1709,7 @@ static void mpls_net_exit(struct net *net)
 	for (index = 0; index < platform_labels; index++) {
 		struct mpls_route *rt = rtnl_dereference(platform_label[index]);
 		RCU_INIT_POINTER(platform_label[index], NULL);
+		mpls_notify_route(net, index, rt, NULL, NULL);
 		mpls_rt_free(rt);
 	}
 	rtnl_unlock();

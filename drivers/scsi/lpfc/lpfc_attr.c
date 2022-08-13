@@ -635,7 +635,12 @@ lpfc_issue_lip(struct Scsi_Host *shost)
 	LPFC_MBOXQ_t *pmboxq;
 	int mbxstatus = MBXERR_ERROR;
 
+	/*
+	 * If the link is offline, disabled or BLOCK_MGMT_IO
+	 * it doesn't make any sense to allow issue_lip
+	 */
 	if ((vport->fc_flag & FC_OFFLINE_MODE) ||
+	    (phba->hba_flag & LINK_DISABLED) ||
 	    (phba->sli.sli_flag & LPFC_BLOCK_MGMT_IO))
 		return -EPERM;
 
@@ -1209,6 +1214,9 @@ lpfc_get_hba_info(struct lpfc_hba *phba,
 		max_vpi = (bf_get(lpfc_mbx_rd_conf_vpi_count, rd_config) > 0) ?
 			(bf_get(lpfc_mbx_rd_conf_vpi_count, rd_config) - 1) : 0;
 
+		/* Limit the max we support */
+		if (max_vpi > LPFC_MAX_VPI)
+			max_vpi = LPFC_MAX_VPI;
 		if (mvpi)
 			*mvpi = max_vpi;
 		if (avpi)
@@ -1224,8 +1232,13 @@ lpfc_get_hba_info(struct lpfc_hba *phba,
 			*axri = pmb->un.varRdConfig.avail_xri;
 		if (mvpi)
 			*mvpi = pmb->un.varRdConfig.max_vpi;
-		if (avpi)
-			*avpi = pmb->un.varRdConfig.avail_vpi;
+		if (avpi) {
+			/* avail_vpi is only valid if link is up and ready */
+			if (phba->link_state == LPFC_HBA_READY)
+				*avpi = pmb->un.varRdConfig.avail_vpi;
+			else
+				*avpi = pmb->un.varRdConfig.max_vpi;
+		}
 	}
 
 	mempool_free(pmboxq, phba->mbox_mem_pool);
@@ -5131,6 +5144,19 @@ lpfc_free_sysfs_attr(struct lpfc_vport *vport)
  */
 
 /**
+ * lpfc_get_host_symbolic_name - Copy symbolic name into the scsi host
+ * @shost: kernel scsi host pointer.
+ **/
+static void
+lpfc_get_host_symbolic_name(struct Scsi_Host *shost)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)shost->hostdata;
+
+	lpfc_vport_symbolic_node_name(vport, fc_host_symbolic_name(shost),
+				      sizeof fc_host_symbolic_name(shost));
+}
+
+/**
  * lpfc_get_host_port_id - Copy the vport DID into the scsi host port id
  * @shost: kernel scsi host pointer.
  **/
@@ -5667,6 +5693,8 @@ struct fc_function_template lpfc_transport_functions = {
 	.show_host_supported_fc4s = 1,
 	.show_host_supported_speeds = 1,
 	.show_host_maxframe_size = 1,
+
+	.get_host_symbolic_name = lpfc_get_host_symbolic_name,
 	.show_host_symbolic_name = 1,
 
 	/* dynamic attributes the driver supports */
@@ -5734,6 +5762,8 @@ struct fc_function_template lpfc_vport_transport_functions = {
 	.show_host_supported_fc4s = 1,
 	.show_host_supported_speeds = 1,
 	.show_host_maxframe_size = 1,
+
+	.get_host_symbolic_name = lpfc_get_host_symbolic_name,
 	.show_host_symbolic_name = 1,
 
 	/* dynamic attributes the driver supports */

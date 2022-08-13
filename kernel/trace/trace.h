@@ -491,6 +491,12 @@ enum {
  * can only be modified by current, we can reuse trace_recursion.
  */
 	TRACE_IRQ_BIT,
+
+	/*
+	 * When transitioning between context, the preempt_count() may
+	 * not be correct. Allow for a single recursion to cover this case.
+	 */
+	TRACE_TRANSITION_BIT,
 };
 
 #define trace_recursion_set(bit)	do { (current)->trace_recursion |= (1<<(bit)); } while (0)
@@ -535,14 +541,27 @@ static __always_inline int trace_test_and_set_recursion(int start, int max)
 		return 0;
 
 	bit = trace_get_context_bit() + start;
-	if (unlikely(val & (1 << bit)))
-		return -1;
+	if (unlikely(val & (1 << bit))) {
+		/*
+		 * It could be that preempt_count has not been updated during
+		 * a switch between contexts. Allow for a single recursion.
+		 */
+		bit = TRACE_TRANSITION_BIT;
+		if (trace_recursion_test(bit))
+			return -1;
+		trace_recursion_set(bit);
+		barrier();
+		return bit + 1;
+	}
+
+	/* Normal check passed, clear the transition to allow it again */
+	trace_recursion_clear(TRACE_TRANSITION_BIT);
 
 	val |= 1 << bit;
 	current->trace_recursion = val;
 	barrier();
 
-	return bit;
+	return bit + 1;
 }
 
 static __always_inline void trace_clear_recursion(int bit)
@@ -552,6 +571,7 @@ static __always_inline void trace_clear_recursion(int bit)
 	if (!bit)
 		return;
 
+	bit--;
 	bit = 1 << bit;
 	val &= ~bit;
 
@@ -669,13 +689,15 @@ void update_max_tr_single(struct trace_array *tr,
 #endif /* CONFIG_TRACER_MAX_TRACE */
 
 #ifdef CONFIG_STACKTRACE
-void ftrace_trace_userstack(struct ring_buffer *buffer, unsigned long flags,
+void ftrace_trace_userstack(struct trace_array *tr,
+			    struct ring_buffer *buffer, unsigned long flags,
 			    int pc);
 
 void __trace_stack(struct trace_array *tr, unsigned long flags, int skip,
 		   int pc);
 #else
-static inline void ftrace_trace_userstack(struct ring_buffer *buffer,
+static inline void ftrace_trace_userstack(struct trace_array *tr,
+					  struct ring_buffer *buffer,
 					  unsigned long flags, int pc)
 {
 }
@@ -690,6 +712,7 @@ extern cycle_t ftrace_now(int cpu);
 
 extern void trace_find_cmdline(int pid, char comm[]);
 extern void trace_event_follow_fork(struct trace_array *tr, bool enable);
+extern int trace_find_tgid(int pid);
 
 #ifdef CONFIG_DYNAMIC_FTRACE
 extern unsigned long ftrace_update_tot_cnt;
@@ -870,6 +893,7 @@ int using_ftrace_ops_list_func(void);
 void ftrace_init_tracefs(struct trace_array *tr, struct dentry *d_tracer);
 void ftrace_init_tracefs_toplevel(struct trace_array *tr,
 				  struct dentry *d_tracer);
+void ftrace_clear_pids(struct trace_array *tr);
 #else
 static inline int ftrace_trace_task(struct trace_array *tr)
 {
@@ -888,6 +912,7 @@ ftrace_init_global_array_ops(struct trace_array *tr) { }
 static inline void ftrace_reset_array_ops(struct trace_array *tr) { }
 static inline void ftrace_init_tracefs(struct trace_array *tr, struct dentry *d) { }
 static inline void ftrace_init_tracefs_toplevel(struct trace_array *tr, struct dentry *d) { }
+static inline void ftrace_clear_pids(struct trace_array *tr) { }
 /* ftace_func_t type is not defined, use macro instead of static inline */
 #define ftrace_init_array_ops(tr, func) do { } while (0)
 #endif /* CONFIG_FUNCTION_TRACER */
@@ -1007,7 +1032,8 @@ extern int trace_get_user(struct trace_parser *parser, const char __user *ubuf,
 		FUNCTION_FLAGS					\
 		FGRAPH_FLAGS					\
 		STACK_FLAGS					\
-		BRANCH_FLAGS
+		BRANCH_FLAGS					\
+		C(TGID,			"print-tgid"),
 
 /*
  * By defining C, we can make TRACE_FLAGS a list of bit names
@@ -1670,5 +1696,23 @@ static inline void trace_event_enum_update(struct trace_enum_map **map, int len)
 #endif
 
 extern struct trace_iterator *tracepoint_print_iter;
+
+/*
+ * Reset the state of the trace_iterator so that it can read consumed data.
+ * Normally, the trace_iterator is used for reading the data when it is not
+ * consumed, and must retain state.
+ */
+static __always_inline void trace_iterator_reset(struct trace_iterator *iter)
+{
+	const size_t offset = offsetof(struct trace_iterator, seq);
+
+	/*
+	 * Keep gcc from complaining about overwriting more than just one
+	 * member in the structure.
+	 */
+	memset((char *)iter + offset, 0, sizeof(struct trace_iterator) - offset);
+
+	iter->pos = -1;
+}
 
 #endif /* _LINUX_KERNEL_TRACE_H */

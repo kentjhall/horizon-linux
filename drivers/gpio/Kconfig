@@ -670,6 +670,7 @@ config GPIO_ADP5588
 config GPIO_ADP5588_IRQ
 	bool "Interrupt controller support for ADP5588"
 	depends on GPIO_ADP5588=y
+	select GPIOLIB_IRQCHIP
 	help
 	  Say yes here to enable the adp5588 to be used as an interrupt
 	  controller. It requires the driver to be built in the kernel.
@@ -750,6 +751,13 @@ config GPIO_PCA953X_IRQ
 	help
 	  Say yes here to enable the pca953x to be used as an interrupt
 	  controller. It requires the driver to be built in the kernel.
+
+config GPIO_PCA9570
+	tristate "PCA9570 IO ports"
+	depends on I2C
+	help
+	  Say yes here to provide access to several register-oriented
+	  SMBus I/O expanders, made mostly by NXP or TI.
 
 config GPIO_PCF857X
 	tristate "PCF857x, PCA{85,96}7x, and MAX732[89] I2C GPIO expanders"
@@ -919,6 +927,7 @@ config GPIO_LP873X
 config GPIO_MAX77620
 	tristate "GPIO support for PMIC MAX77620 and MAX20024"
 	depends on MFD_MAX77620
+	select GPIOLIB_IRQCHIP
 	help
 	  GPIO driver for MAX77620 and MAX20024 PMIC from Maxim Semiconductor.
 	  MAX77620 PMIC has 8 pins that can be configured as GPIOs. The
@@ -1187,6 +1196,8 @@ config GPIO_MCP23S08
 	tristate "Microchip MCP23xxx I/O expander"
 	depends on OF_GPIO
 	select GPIOLIB_IRQCHIP
+	select REGMAP_I2C if I2C
+	select REGMAP if SPI_MASTER
 	help
 	  SPI/I2C driver for Microchip MCP23S08/MCP23S17/MCP23008/MCP23017
 	  I/O expanders.

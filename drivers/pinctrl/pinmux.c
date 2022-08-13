@@ -304,6 +304,30 @@ int pinmux_gpio_direction(struct pinctrl_dev *pctldev,
 	return ret;
 }
 
+int pinmux_gpio_save_config(struct pinctrl_dev *pctldev,
+			    struct pinctrl_gpio_range *range,
+			    unsigned pin)
+{
+	const struct pinmux_ops *ops = pctldev->desc->pmxops;
+
+	if (ops->gpio_save_config)
+		return ops->gpio_save_config(pctldev, range, pin);
+
+	return 0;
+}
+
+int pinmux_gpio_restore_config(struct pinctrl_dev *pctldev,
+			       struct pinctrl_gpio_range *range,
+			       unsigned pin)
+{
+	const struct pinmux_ops *ops = pctldev->desc->pmxops;
+
+	if (ops->gpio_restore_config)
+		return ops->gpio_restore_config(pctldev, range, pin);
+
+	return 0;
+}
+
 static int pinmux_func_name_to_selector(struct pinctrl_dev *pctldev,
 					const char *function)
 {

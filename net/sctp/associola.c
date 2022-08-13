@@ -81,6 +81,7 @@ static struct sctp_association *sctp_association_init(struct sctp_association *a
 	/* Discarding const is appropriate here.  */
 	asoc->ep = (struct sctp_endpoint *)ep;
 	asoc->base.sk = (struct sock *)sk;
+	asoc->base.net = sock_net(sk);
 
 	sctp_endpoint_hold(asoc->ep);
 	sock_hold(asoc->base.sk);
@@ -488,8 +489,9 @@ void sctp_assoc_set_primary(struct sctp_association *asoc,
 void sctp_assoc_rm_peer(struct sctp_association *asoc,
 			struct sctp_transport *peer)
 {
-	struct list_head	*pos;
-	struct sctp_transport	*transport;
+	struct sctp_transport *transport;
+	struct list_head *pos;
+	struct sctp_chunk *ch;
 
 	pr_debug("%s: association:%p addr:%pISpc\n",
 		 __func__, asoc, &peer->ipaddr.sa);
@@ -547,7 +549,6 @@ void sctp_assoc_rm_peer(struct sctp_association *asoc,
 	 */
 	if (!list_empty(&peer->transmitted)) {
 		struct sctp_transport *active = asoc->peer.active_path;
-		struct sctp_chunk *ch;
 
 		/* Reset the transport of each chunk on this list */
 		list_for_each_entry(ch, &peer->transmitted,
@@ -568,6 +569,10 @@ void sctp_assoc_rm_peer(struct sctp_association *asoc,
 					jiffies + active->rto))
 				sctp_transport_hold(active);
 	}
+
+	list_for_each_entry(ch, &asoc->outqueue.out_chunk_list, list)
+		if (ch->transport == peer)
+			ch->transport = NULL;
 
 	asoc->peer.transport_count--;
 
@@ -1006,9 +1011,10 @@ static void sctp_assoc_bh_rcv(struct work_struct *work)
 	struct sctp_endpoint *ep;
 	struct sctp_chunk *chunk;
 	struct sctp_inq *inqueue;
-	int state;
 	sctp_subtype_t subtype;
+	int first_time = 1;	/* is this the first time through the loop */
 	int error = 0;
+	int state;
 
 	/* The association should be held so we should be safe. */
 	ep = asoc->ep;
@@ -1019,6 +1025,30 @@ static void sctp_assoc_bh_rcv(struct work_struct *work)
 		state = asoc->state;
 		subtype = SCTP_ST_CHUNK(chunk->chunk_hdr->type);
 
+		/* If the first chunk in the packet is AUTH, do special
+		 * processing specified in Section 6.3 of SCTP-AUTH spec
+		 */
+		if (first_time && subtype.chunk == SCTP_CID_AUTH) {
+			struct sctp_chunkhdr *next_hdr;
+
+			next_hdr = sctp_inq_peek(inqueue);
+			if (!next_hdr)
+				goto normal;
+
+			/* If the next chunk is COOKIE-ECHO, skip the AUTH
+			 * chunk while saving a pointer to it so we can do
+			 * Authentication later (during cookie-echo
+			 * processing).
+			 */
+			if (next_hdr->type == SCTP_CID_COOKIE_ECHO) {
+				chunk->auth_chunk = skb_clone(chunk->skb,
+							      GFP_ATOMIC);
+				chunk->auth = 1;
+				continue;
+			}
+		}
+
+normal:
 		/* SCTP-AUTH, Section 6.3:
 		 *    The receiver has a list of chunk types which it expects
 		 *    to be received only after an AUTH-chunk.  This list has
@@ -1057,6 +1087,9 @@ static void sctp_assoc_bh_rcv(struct work_struct *work)
 		/* If there is an error on chunk, discard this packet. */
 		if (error && chunk)
 			chunk->pdiscard = 1;
+
+		if (first_time)
+			first_time = 0;
 	}
 	sctp_association_put(asoc);
 }
@@ -1550,12 +1583,15 @@ void sctp_assoc_rwnd_decrease(struct sctp_association *asoc, unsigned int len)
 int sctp_assoc_set_bind_addr_from_ep(struct sctp_association *asoc,
 				     sctp_scope_t scope, gfp_t gfp)
 {
+	struct sock *sk = asoc->base.sk;
 	int flags;
 
 	/* Use scoping rules to determine the subset of addresses from
 	 * the endpoint.
 	 */
-	flags = (PF_INET6 == asoc->base.sk->sk_family) ? SCTP_ADDR6_ALLOWED : 0;
+	flags = (PF_INET6 == sk->sk_family) ? SCTP_ADDR6_ALLOWED : 0;
+	if (!inet_v6_ipv6only(sk))
+		flags |= SCTP_ADDR4_ALLOWED;
 	if (asoc->peer.ipv4_address)
 		flags |= SCTP_ADDR4_PEERSUPP;
 	if (asoc->peer.ipv6_address)

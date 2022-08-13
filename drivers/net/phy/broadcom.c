@@ -13,6 +13,18 @@
  *	as published by the Free Software Foundation; either version
  *	2 of the License, or (at your option) any later version.
  */
+/*
+ * Copyright (c) 2020-2021, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ */
 
 #include "bcm-phy-lib.h"
 #include <linux/module.h>
@@ -26,9 +38,46 @@
 #define BRCM_PHY_REV(phydev) \
 	((phydev)->drv->phy_id & ~((phydev)->drv->phy_id_mask))
 
+#ifdef CONFIG_EQOS_DISABLE_EEE
+#define MII_BCM89610_CLAUSE22_DEVAD_FIELD	0x1F
+#define MII_BCM89610_CLAUSE22_FUNCTION_FIELD	0xC000
+#define MII_BCM89610_CLAUSE22_DEVAD_7		0x7
+#define MII_BCM89610_CLAUSE22_FUNCTION_ADDR	(0UL << 14)
+#define MII_BCM89610_CLAUSE22_FUNCTION_DATA	BIT(14)
+#define MII_BCM89610_CLAUSE22_REG_ADDR		0xd
+#define MII_BCM89610_CLAUSE22_REG_DATA		0xe
+#define BCM89610_EEE_ADVERTISEMENT_REG		0x3c
+#define BCM89610_EEE_ADVERTISEMENT_DISABLE	0x0
+#endif /* CONFIG_EQOS_DISABLE_EEE */
+
 MODULE_DESCRIPTION("Broadcom PHY driver");
 MODULE_AUTHOR("Maciej W. Rozycki");
 MODULE_LICENSE("GPL");
+
+/* Tx FIFO latency. Set to one to allow jumbo frames to be sent */
+#define MII_BCM89XX_ECR_TXFIFOLAT	0x0001
+#define MII_BCM89XX_SHD_AUX_CONTROL	0x0
+#define MII_BCM89XX_SHD_MISC_CONTROL	0x7
+#define MII_BCM89XX_SHD_SELECT(shadow)	(((shadow)) << 0xC)
+
+/* Indirect register access functions for 89xx */
+static int bcm89xx_shadow_read(struct phy_device *phydev, u16 shadow)
+{
+	phy_write(phydev, MII_BCM54XX_AUX_CTL,
+		((MII_BCM89XX_SHD_SELECT(shadow) | 0x7) & ~BIT(15)));
+	return phy_read(phydev, MII_BCM54XX_AUX_CTL);
+}
+
+static void bcm89xx_shadow_write(struct phy_device *phydev, u8 shadow,
+					u16 val)
+{
+	/* Bits 2:0 should contain shadow. */
+	val = (val & 0xFFF8) | (shadow & 0x7);
+	/* Bit 15 should be 1 for MII_BCM89XX_SHD_MISC_CONTROL */
+	if (MII_BCM89XX_SHD_MISC_CONTROL == shadow)
+		val |= BIT(15);
+	phy_write(phydev, MII_BCM54XX_AUX_CTL, val);
+}
 
 static int bcm54xx_auxctl_write(struct phy_device *phydev, u16 regnum, u16 val)
 {
@@ -124,7 +173,8 @@ static void bcm54xx_adjust_rxrefclk(struct phy_device *phydev)
 	/* Abort if we are using an untested phy. */
 	if (BRCM_PHY_MODEL(phydev) != PHY_ID_BCM57780 &&
 	    BRCM_PHY_MODEL(phydev) != PHY_ID_BCM50610 &&
-	    BRCM_PHY_MODEL(phydev) != PHY_ID_BCM50610M)
+	    BRCM_PHY_MODEL(phydev) != PHY_ID_BCM50610M &&
+	    BRCM_PHY_MODEL(phydev) != PHY_ID_BCM89610)
 		return;
 
 	val = bcm_phy_read_shadow(phydev, BCM54XX_SHD_SCR3);
@@ -175,6 +225,103 @@ static void bcm54xx_adjust_rxrefclk(struct phy_device *phydev)
 		bcm_phy_write_shadow(phydev, BCM54XX_SHD_APD, val);
 }
 
+void bcm_phy_ultra_low_power(struct phy_device *phydev)
+{
+	unsigned int reg = 0;
+
+	reg |= MII_BCM54XX_SHD_IDDQ | MII_BCM54XX_IDDQ_LP |
+		MII_BCM54XX_EXT_CTL_WR_ENABLE;
+
+	phy_write(phydev, MII_BCM54XX_SHD, reg);
+
+	phydev->dev_flags |= BCM_IDDQ_EN;
+}
+
+void bcm54xx_low_power_mode(struct phy_device *phydev,
+			    bool lp_mode_en)
+{
+	if (lp_mode_en) {
+		if (phydev->dev_flags & BCM_IDDQ_EN) {
+			pr_debug("%s(): bcm-phy already in iddq-lp mode\n",
+				 __func__);
+			return;
+		}
+		pr_info("%s(): put phy in iddq-lp mode\n", __func__);
+		bcm_phy_ultra_low_power(phydev);
+	} else {
+		pr_debug("%s(): re-initialze phy after exiting "
+			 "from iddq-lp mode\n", __func__);
+		phydev->dev_flags &= ~BCM_IDDQ_EN;
+	}
+}
+
+/* enable RGMII Out-of-Band Status */
+static void bcm89xx_enable_oob(struct phy_device *phydev)
+{
+	int reg_val = 0;
+
+	/* Read the value at MISC_CONTROL shadow register, set bit 5 to zero, */
+	/* set bit 15 to 1 and write the value to MISC_CONTROL register */
+	reg_val = bcm89xx_shadow_read(phydev, MII_BCM89XX_SHD_MISC_CONTROL);
+	reg_val &= ~BIT(5); /* Bit 5 set to zero */
+	bcm89xx_shadow_write(phydev, MII_BCM89XX_SHD_MISC_CONTROL, reg_val);
+
+	/* Following register writes need to happen once.  They are needed
+	 * to get 10mb working.
+	 */
+	phy_write(phydev, 0x18, 0x0c00);
+	phy_write(phydev, 0x17, 0x0ff0);
+	phy_write(phydev, 0x15, 0x2000);
+	phy_write(phydev, 0x18, 0x0400);
+}
+
+#ifdef CONFIG_EQOS_DISABLE_EEE
+static int bcm89610_disable_eee_adv(struct phy_device *phydev)
+{
+	int ret;
+	u32 val;
+
+	val = phy_read(phydev, MII_BCM89610_CLAUSE22_REG_ADDR);
+
+	/* Clear function field and device address fields */
+	val &= ~(MII_BCM89610_CLAUSE22_DEVAD_FIELD |
+		 MII_BCM89610_CLAUSE22_FUNCTION_FIELD);
+	/* Set function field to addr and device addr 7 */
+	val |= (MII_BCM89610_CLAUSE22_DEVAD_7 |
+		MII_BCM89610_CLAUSE22_FUNCTION_ADDR);
+
+	ret = phy_write(phydev, MII_BCM89610_CLAUSE22_REG_ADDR, val);
+	if (ret < 0)
+		goto exit;
+
+	ret = phy_write(phydev, MII_BCM89610_CLAUSE22_REG_DATA,
+			BCM89610_EEE_ADVERTISEMENT_REG);
+	if (ret < 0)
+		goto exit;
+
+	val = phy_read(phydev, MII_BCM89610_CLAUSE22_REG_ADDR);
+
+	/* Clear function field and device address fields */
+	val &= ~(MII_BCM89610_CLAUSE22_DEVAD_FIELD |
+		 MII_BCM89610_CLAUSE22_FUNCTION_FIELD);
+	/* Set function field to data and device addr 7 */
+	val |= (MII_BCM89610_CLAUSE22_DEVAD_7 |
+		MII_BCM89610_CLAUSE22_FUNCTION_DATA);
+
+	ret = phy_write(phydev, MII_BCM89610_CLAUSE22_REG_ADDR, val);
+	if (ret < 0)
+		goto exit;
+
+	val = phy_write(phydev, MII_BCM89610_CLAUSE22_REG_DATA,
+			BCM89610_EEE_ADVERTISEMENT_DISABLE);
+	if (ret < 0)
+		goto exit;
+
+exit:
+	return ret;
+}
+#endif /* CONFIG_EQOS_DISABLE_EEE */
+
 static int bcm54xx_config_init(struct phy_device *phydev)
 {
 	int reg, err;
@@ -192,7 +339,14 @@ static int bcm54xx_config_init(struct phy_device *phydev)
 	/* Unmask events we are interested in.  */
 	reg = ~(MII_BCM54XX_INT_DUPLEX |
 		MII_BCM54XX_INT_SPEED |
-		MII_BCM54XX_INT_LINK);
+		MII_BCM54XX_INT_LINK |
+		MII_BCM54XX_INT_ANPR);
+
+	/* unmask energy detect interrupt */
+	if (BRCM_PHY_MODEL(phydev) == PHY_ID_BCM89610 ||
+	    BRCM_PHY_MODEL(phydev) == PHY_ID_BCM50610)
+		reg &= ~MII_BCM54XX_INT_EDETECT;
+
 	err = phy_write(phydev, MII_BCM54XX_IMR, reg);
 	if (err < 0)
 		return err;
@@ -206,6 +360,35 @@ static int bcm54xx_config_init(struct phy_device *phydev)
 	    (phydev->dev_flags & PHY_BRCM_DIS_TXCRXC_NOENRGY) ||
 	    (phydev->dev_flags & PHY_BRCM_AUTO_PWRDWN_ENABLE))
 		bcm54xx_adjust_rxrefclk(phydev);
+
+	/* enable energy detect interrupt status update */
+	if (BRCM_PHY_MODEL(phydev) == PHY_ID_BCM89610 ||
+	    BRCM_PHY_MODEL(phydev) == PHY_ID_BCM50610) {
+		reg = bcm_phy_read_shadow(phydev, BCM54XX_SHD_SCR3);
+		reg |= BCM54XX_SHD_SCR3_EDETECT_EN;
+		bcm_phy_write_shadow(phydev, BCM54XX_SHD_SCR3, reg);
+		bcm89xx_enable_oob(phydev);
+
+		/* Enable phy to tx/rx jumbo frames. Driver
+		 * will drop jumbo frames if it is not enabled.
+		 */
+		reg = phy_read(phydev, MII_BCM54XX_ECR);
+		reg |= MII_BCM89XX_ECR_TXFIFOLAT;
+		err = phy_write(phydev, MII_BCM54XX_ECR, reg);
+		if (err < 0)
+			return err;
+
+		reg = bcm89xx_shadow_read(phydev, MII_BCM89XX_SHD_AUX_CONTROL);
+		reg |= BIT(14); /* Enable rx of extended pkts */
+		bcm89xx_shadow_write(phydev, MII_BCM89XX_SHD_AUX_CONTROL, reg);
+
+#ifdef CONFIG_EQOS_DISABLE_EEE
+		/* Disable EEE advertisement. Nvbugs 2678273 */
+		err = bcm89610_disable_eee_adv(phydev);
+		if (err < 0)
+			return err;
+#endif /* CONFIG_EQOS_DISABLE_EEE */
+	}
 
 	bcm54xx_phydsp_config(phydev);
 
@@ -447,6 +630,25 @@ static int brcm_fet_config_intr(struct phy_device *phydev)
 	return err;
 }
 
+static int bcm89610_probe(struct phy_device *phydev)
+{
+	bcm54xx_low_power_mode(phydev, true);
+
+	return 0;
+}
+
+int bcm89610_suspend(struct phy_device *phydev)
+{
+	bcm54xx_low_power_mode(phydev, true);
+	return 0;
+}
+
+int bcm89610_resume(struct phy_device *phydev)
+{
+	bcm54xx_low_power_mode(phydev, false);
+	return 0;
+}
+
 static struct phy_driver broadcom_drivers[] = {
 {
 	.phy_id		= PHY_ID_BCM5411,
@@ -592,6 +794,22 @@ static struct phy_driver broadcom_drivers[] = {
 	.read_status	= genphy_read_status,
 	.ack_interrupt	= brcm_fet_ack_interrupt,
 	.config_intr	= brcm_fet_config_intr,
+}, {
+	.phy_id         = PHY_ID_BCM89610,
+	.phy_id_mask    = 0xfffffff0,
+	.name           = "Broadcom BCM89610",
+	.features       = PHY_GBIT_FEATURES |
+			  SUPPORTED_Pause | SUPPORTED_Asym_Pause,
+	.flags          = PHY_HAS_MAGICANEG | PHY_HAS_INTERRUPT,
+	.probe		= bcm89610_probe,
+	.config_init    = bcm54xx_config_init,
+	.config_aneg    = genphy_config_aneg,
+	.read_status    = genphy_read_status,
+	.low_power_mode = bcm54xx_low_power_mode,
+	.ack_interrupt  = bcm_phy_ack_intr,
+	.config_intr    = bcm_phy_config_intr,
+	.resume		= bcm89610_resume,
+	.suspend	= bcm89610_suspend,
 } };
 
 module_phy_driver(broadcom_drivers);
@@ -609,6 +827,7 @@ static struct mdio_device_id __maybe_unused broadcom_tbl[] = {
 	{ PHY_ID_BCM57780, 0xfffffff0 },
 	{ PHY_ID_BCMAC131, 0xfffffff0 },
 	{ PHY_ID_BCM5241, 0xfffffff0 },
+	{ PHY_ID_BCM89610, 0xfffffff0 },
 	{ }
 };
 

@@ -122,7 +122,9 @@ static void port_subs_info_init(struct snd_seq_port_subs_info *grp)
 }
 
 
-/* create a port, port number is returned (-1 on failure) */
+/* create a port, port number is returned (-1 on failure);
+ * the caller needs to unref the port via snd_seq_port_unlock() appropriately
+ */
 struct snd_seq_client_port *snd_seq_create_port(struct snd_seq_client *client,
 						int port)
 {
@@ -151,6 +153,7 @@ struct snd_seq_client_port *snd_seq_create_port(struct snd_seq_client *client,
 	snd_use_lock_init(&new_port->use_lock);
 	port_subs_info_init(&new_port->c_src);
 	port_subs_info_init(&new_port->c_dest);
+	snd_use_lock_use(&new_port->use_lock);
 
 	num = port >= 0 ? port : 0;
 	mutex_lock(&client->ports_mutex);
@@ -165,9 +168,9 @@ struct snd_seq_client_port *snd_seq_create_port(struct snd_seq_client *client,
 	list_add_tail(&new_port->list, &p->list);
 	client->num_ports++;
 	new_port->addr.port = num;	/* store the port number in the port */
+	sprintf(new_port->name, "port-%d", num);
 	write_unlock_irqrestore(&client->ports_lock, flags);
 	mutex_unlock(&client->ports_mutex);
-	sprintf(new_port->name, "port-%d", num);
 
 	return new_port;
 }
@@ -547,10 +550,10 @@ static void delete_and_unsubscribe_port(struct snd_seq_client *client,
 		list_del_init(list);
 	grp->exclusive = 0;
 	write_unlock_irq(&grp->list_lock);
-	up_write(&grp->list_mutex);
 
 	if (!empty)
 		unsubscribe_port(client, port, grp, &subs->info, ack);
+	up_write(&grp->list_mutex);
 }
 
 /* connect two ports */
@@ -632,20 +635,23 @@ int snd_seq_port_disconnect(struct snd_seq_client *connector,
 
 
 /* get matched subscriber */
-struct snd_seq_subscribers *snd_seq_port_get_subscription(struct snd_seq_port_subs_info *src_grp,
-							  struct snd_seq_addr *dest_addr)
+int snd_seq_port_get_subscription(struct snd_seq_port_subs_info *src_grp,
+				  struct snd_seq_addr *dest_addr,
+				  struct snd_seq_port_subscribe *subs)
 {
-	struct snd_seq_subscribers *s, *found = NULL;
+	struct snd_seq_subscribers *s;
+	int err = -ENOENT;
 
 	down_read(&src_grp->list_mutex);
 	list_for_each_entry(s, &src_grp->list_head, src_list) {
 		if (addr_match(dest_addr, &s->info.dest)) {
-			found = s;
+			*subs = s->info;
+			err = 0;
 			break;
 		}
 	}
 	up_read(&src_grp->list_mutex);
-	return found;
+	return err;
 }
 
 /*

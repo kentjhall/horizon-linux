@@ -1901,9 +1901,12 @@ static void megasas_complete_outstanding_ioctls(struct megasas_instance *instanc
 			if (cmd_fusion->sync_cmd_idx != (u32)ULONG_MAX) {
 				cmd_mfi = instance->cmd_list[cmd_fusion->sync_cmd_idx];
 				if (cmd_mfi->sync_cmd &&
-					cmd_mfi->frame->hdr.cmd != MFI_CMD_ABORT)
+				    (cmd_mfi->frame->hdr.cmd != MFI_CMD_ABORT)) {
+					cmd_mfi->frame->hdr.cmd_status =
+							MFI_STAT_WRONG_STATE;
 					megasas_complete_cmd(instance,
 							     cmd_mfi, DID_OK);
+				}
 			}
 		}
 	} else {
@@ -2844,6 +2847,7 @@ megasas_fw_crash_buffer_show(struct device *cdev,
 	u32 size;
 	unsigned long buff_addr;
 	unsigned long dmachunk = CRASH_DMA_BUF_SIZE;
+	unsigned long chunk_left_bytes;
 	unsigned long src_addr;
 	unsigned long flags;
 	u32 buff_offset;
@@ -2869,6 +2873,8 @@ megasas_fw_crash_buffer_show(struct device *cdev,
 	}
 
 	size = (instance->fw_crash_buffer_size * dmachunk) - buff_offset;
+	chunk_left_bytes = dmachunk - (buff_offset % dmachunk);
+	size = (size > chunk_left_bytes) ? chunk_left_bytes : size;
 	size = (size >= PAGE_SIZE) ? (PAGE_SIZE - 1) : size;
 
 	src_addr = (unsigned long)instance->crash_buf[buff_offset / dmachunk] +
@@ -3688,12 +3694,12 @@ megasas_transition_to_ready(struct megasas_instance *instance, int ocr)
 		/*
 		 * The cur_state should not last for more than max_wait secs
 		 */
-		for (i = 0; i < (max_wait * 1000); i++) {
+		for (i = 0; i < max_wait * 50; i++) {
 			curr_abs_state = instance->instancet->
 				read_fw_status_reg(instance->reg_set);
 
 			if (abs_state == curr_abs_state) {
-				msleep(1);
+				msleep(20);
 			} else
 				break;
 		}
@@ -3953,6 +3959,7 @@ int megasas_alloc_cmds(struct megasas_instance *instance)
 	if (megasas_create_frame_pool(instance)) {
 		dev_printk(KERN_DEBUG, &instance->pdev->dev, "Error creating frame DMA pool\n");
 		megasas_free_cmds(instance);
+		return -ENOMEM;
 	}
 
 	return 0;
@@ -3971,7 +3978,8 @@ dcmd_timeout_ocr_possible(struct megasas_instance *instance) {
 	if (!instance->ctrl_context)
 		return KILL_ADAPTER;
 	else if (instance->unload ||
-			test_bit(MEGASAS_FUSION_IN_RESET, &instance->reset_flags))
+			test_bit(MEGASAS_FUSION_OCR_NOT_POSSIBLE,
+				 &instance->reset_flags))
 		return IGNORE_TIMEOUT;
 	else
 		return INITIATE_OCR;
@@ -5290,7 +5298,8 @@ static int megasas_init_fw(struct megasas_instance *instance)
 		instance->throttlequeuedepth =
 				MEGASAS_THROTTLE_QUEUE_DEPTH;
 
-	if (resetwaittime > MEGASAS_RESET_WAIT_TIME)
+	if ((resetwaittime < 1) ||
+	    (resetwaittime > MEGASAS_RESET_WAIT_TIME))
 		resetwaittime = MEGASAS_RESET_WAIT_TIME;
 
 	if ((scmd_timeout < 10) || (scmd_timeout > MEGASAS_DEFAULT_CMD_TIMEOUT))
@@ -5458,6 +5467,14 @@ megasas_register_aen(struct megasas_instance *instance, u32 seq_num,
 
 		prev_aen.word =
 			le32_to_cpu(instance->aen_cmd->frame->dcmd.mbox.w[1]);
+
+		if ((curr_aen.members.class < MFI_EVT_CLASS_DEBUG) ||
+		    (curr_aen.members.class > MFI_EVT_CLASS_DEAD)) {
+			dev_info(&instance->pdev->dev,
+				 "%s %d out of range class %d send by application\n",
+				 __func__, __LINE__, curr_aen.members.class);
+			return 0;
+		}
 
 		/*
 		 * A class whose enum value is smaller is inclusive of all
@@ -6181,6 +6198,9 @@ megasas_resume(struct pci_dev *pdev)
 			goto fail_init_mfi;
 	}
 
+	if (megasas_get_ctrl_info(instance) != DCMD_SUCCESS)
+		goto fail_init_mfi;
+
 	tasklet_init(&instance->isr_tasklet, instance->instancet->tasklet,
 		     (unsigned long)instance);
 
@@ -6885,6 +6905,9 @@ static int megasas_mgmt_compat_ioctl_fw(struct file *file, unsigned long arg)
 		get_user(local_sense_len, &ioc->sense_len) ||
 		get_user(user_sense_off, &cioc->sense_off))
 		return -EFAULT;
+
+	if (local_sense_off != user_sense_off)
+		return -EINVAL;
 
 	if (local_sense_len) {
 		void __user **sense_ioc_ptr =

@@ -16,6 +16,7 @@
 #include "ieee80211_i.h"
 #include "driver-ops.h"
 #include "rate.h"
+#include "wme.h"
 
 /* give usermode some time for retries in setting up the TDLS session */
 #define TDLS_PEER_SETUP_TIMEOUT	(15 * HZ)
@@ -47,8 +48,7 @@ static void ieee80211_tdls_add_ext_capab(struct ieee80211_sub_if_data *sdata,
 			   NL80211_FEATURE_TDLS_CHANNEL_SWITCH;
 	bool wider_band = ieee80211_hw_check(&local->hw, TDLS_WIDER_BW) &&
 			  !ifmgd->tdls_wider_bw_prohibited;
-	enum nl80211_band band = ieee80211_get_sdata_band(sdata);
-	struct ieee80211_supported_band *sband = local->hw.wiphy->bands[band];
+	struct ieee80211_supported_band *sband = ieee80211_get_sband(sdata);
 	bool vht = sband && sband->vht_cap.vht_supported;
 	u8 *pos = (void *)skb_put(skb, 10);
 
@@ -180,11 +180,14 @@ static void ieee80211_tdls_add_bss_coex_ie(struct sk_buff *skb)
 static u16 ieee80211_get_tdls_sta_capab(struct ieee80211_sub_if_data *sdata,
 					u16 status_code)
 {
+	struct ieee80211_supported_band *sband;
+
 	/* The capability will be 0 when sending a failure code */
 	if (status_code != 0)
 		return 0;
 
-	if (ieee80211_get_sdata_band(sdata) == NL80211_BAND_2GHZ) {
+	sband = ieee80211_get_sband(sdata);
+	if (sband && sband->band == NL80211_BAND_2GHZ) {
 		return WLAN_CAPABILITY_SHORT_SLOT_TIME |
 		       WLAN_CAPABILITY_SHORT_PREAMBLE;
 	}
@@ -358,17 +361,20 @@ ieee80211_tdls_add_setup_start_ies(struct ieee80211_sub_if_data *sdata,
 				   u8 action_code, bool initiator,
 				   const u8 *extra_ies, size_t extra_ies_len)
 {
-	enum nl80211_band band = ieee80211_get_sdata_band(sdata);
-	struct ieee80211_local *local = sdata->local;
 	struct ieee80211_supported_band *sband;
+	struct ieee80211_local *local = sdata->local;
 	struct ieee80211_sta_ht_cap ht_cap;
 	struct ieee80211_sta_vht_cap vht_cap;
 	struct sta_info *sta = NULL;
 	size_t offset = 0, noffset;
 	u8 *pos;
 
-	ieee80211_add_srates_ie(sdata, skb, false, band);
-	ieee80211_add_ext_srates_ie(sdata, skb, false, band);
+	sband = ieee80211_get_sband(sdata);
+	if (!sband)
+		return;
+
+	ieee80211_add_srates_ie(sdata, skb, false, sband->band);
+	ieee80211_add_ext_srates_ie(sdata, skb, false, sband->band);
 	ieee80211_tdls_add_supp_channels(sdata, skb);
 
 	/* add any custom IEs that go before Extended Capabilities */
@@ -439,7 +445,6 @@ ieee80211_tdls_add_setup_start_ies(struct ieee80211_sub_if_data *sdata,
 	 * the same on all bands. The specification limits the setup to a
 	 * single HT-cap, so use the current band for now.
 	 */
-	sband = local->hw.wiphy->bands[band];
 	memcpy(&ht_cap, &sband->ht_cap, sizeof(ht_cap));
 
 	if ((action_code == WLAN_TDLS_SETUP_REQUEST ||
@@ -545,8 +550,12 @@ ieee80211_tdls_add_setup_cfm_ies(struct ieee80211_sub_if_data *sdata,
 	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
 	size_t offset = 0, noffset;
 	struct sta_info *sta, *ap_sta;
-	enum nl80211_band band = ieee80211_get_sdata_band(sdata);
+	struct ieee80211_supported_band *sband;
 	u8 *pos;
+
+	sband = ieee80211_get_sband(sdata);
+	if (!sband)
+		return;
 
 	mutex_lock(&local->sta_mtx);
 
@@ -612,7 +621,8 @@ ieee80211_tdls_add_setup_cfm_ies(struct ieee80211_sub_if_data *sdata,
 	ieee80211_tdls_add_link_ie(sdata, skb, peer, initiator);
 
 	/* only include VHT-operation if not on the 2.4GHz band */
-	if (band != NL80211_BAND_2GHZ && sta->sta.vht_cap.vht_supported) {
+	if (sband->band != NL80211_BAND_2GHZ &&
+	    sta->sta.vht_cap.vht_supported) {
 		/*
 		 * if both peers support WIDER_BW, we can expand the chandef to
 		 * a wider compatible one, up to 80MHz
@@ -1010,14 +1020,13 @@ ieee80211_tdls_prep_mgmt_packet(struct wiphy *wiphy, struct net_device *dev,
 	switch (action_code) {
 	case WLAN_TDLS_SETUP_REQUEST:
 	case WLAN_TDLS_SETUP_RESPONSE:
-		skb_set_queue_mapping(skb, IEEE80211_AC_BK);
-		skb->priority = 2;
+		skb->priority = 256 + 2;
 		break;
 	default:
-		skb_set_queue_mapping(skb, IEEE80211_AC_VI);
-		skb->priority = 5;
+		skb->priority = 256 + 5;
 		break;
 	}
+	skb_set_queue_mapping(skb, ieee80211_select_queue(sdata, skb));
 
 	/*
 	 * Set the WLAN_TDLS_TEARDOWN flag to indicate a teardown in progress.
@@ -1991,4 +2000,27 @@ void ieee80211_tdls_chsw_work(struct work_struct *wk)
 		kfree_skb(skb);
 	}
 	rtnl_unlock();
+}
+
+void ieee80211_tdls_handle_disconnect(struct ieee80211_sub_if_data *sdata,
+				      const u8 *peer, u16 reason)
+{
+	struct ieee80211_sta *sta;
+
+	rcu_read_lock();
+	sta = ieee80211_find_sta(&sdata->vif, peer);
+	if (!sta || !sta->tdls) {
+		rcu_read_unlock();
+		return;
+	}
+	rcu_read_unlock();
+
+	tdls_dbg(sdata, "disconnected from TDLS peer %pM (Reason: %u=%s)\n",
+		 peer, reason,
+		 ieee80211_get_reason_code_string(reason));
+
+	ieee80211_tdls_oper_request(&sdata->vif, peer,
+				    NL80211_TDLS_TEARDOWN,
+				    WLAN_REASON_TDLS_TEARDOWN_UNREACHABLE,
+				    GFP_ATOMIC);
 }

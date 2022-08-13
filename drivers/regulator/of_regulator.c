@@ -42,6 +42,9 @@ static void of_get_regulation_constraints(struct device_node *np,
 	if (!of_property_read_u32(np, "regulator-max-microvolt", &pval))
 		constraints->max_uV = pval;
 
+	if (!of_property_read_u32(np, "regulator-init-microvolt", &pval))
+		constraints->init_uV = pval;
+
 	/* Voltage change possible? */
 	if (constraints->min_uV != constraints->max_uV)
 		constraints->valid_ops_mask |= REGULATOR_CHANGE_VOLTAGE;
@@ -72,6 +75,9 @@ static void of_get_regulation_constraints(struct device_node *np,
 
 	constraints->pull_down = of_property_read_bool(np, "regulator-pull-down");
 
+	if (of_find_property(np, "regulator-bypass-on", NULL))
+		constraints->bypass_on = true;
+
 	if (of_property_read_bool(np, "regulator-allow-bypass"))
 		constraints->valid_ops_mask |= REGULATOR_CHANGE_BYPASS;
 
@@ -85,6 +91,10 @@ static void of_get_regulation_constraints(struct device_node *np,
 		else
 			constraints->ramp_disable = true;
 	}
+
+	ret = of_property_read_u32(np, "regulator-settling-time-us", &pval);
+	if (!ret)
+		constraints->settling_time = pval;
 
 	ret = of_property_read_u32(np, "regulator-enable-ramp-delay", &pval);
 	if (!ret)
@@ -282,6 +292,7 @@ int of_regulator_match(struct device *dev, struct device_node *node,
 				dev_err(dev,
 					"failed to parse DT for regulator %s\n",
 					child->name);
+				of_node_put(child);
 				return -EINVAL;
 			}
 			match->of_node = of_node_get(child);

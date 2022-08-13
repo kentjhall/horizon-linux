@@ -23,6 +23,62 @@ Required properties:
 Recommended properties:
 - spi-max-frequency: Definition as per
                      Documentation/devicetree/bindings/spi/spi-bus.txt
+- cs-gpios: Definition as per
+            Documentation/devicetree/bindings/spi/spi-bus.txt
+
+Optional properties:
+- nvidia,clock-always-on : Enable clock of spi always.
+- nvidia,polling-mode : Use polling method instead of interrupts
+- nvidia,boost-reg-access : In T210 and earlier chips SPI register access
+  is dependent on SPI clock frequency. Setting this option would
+  allow SPI clock frequency to be boosted. Benefitial when running
+  SPI at low frequencies with cpu based transfers. Default false.
+- nvidia,maximum-dma-buffer-size : Maximum dma buffer size per transfer.
+  If this is not available then 16K will be default. The value should
+  be unit of byte.
+
+spi-client device controller properties:
+  Below properties should be defined under 'controller-data' child node
+- nvidia,enable-hw-based-cs : (Boolean) Use the HW based CS if enabled.
+- nvidia,tx-clk-tap-delay: Delays the clock going out to the external device
+  with this tap value.
+- nvidia,rx-clk-tap-delay : Delays the clock coming in from the external
+  device with this tap value.
+- nvidia,cs-setup-clk-count : CS setup timing parameter.
+- nvidia,cs-hold-clk-count : CS hold timing parameter.
+- nvidia,cs-inactive-cycles : Cycles to be inactive between two packets.
+  CS Inactive between packets is disabled if value of this is zero.
+- nvidia,clk-delay-between-packets : Clock delay  between packets by keeping
+  CS active. For this, it is required to pass the Chip select
+  as GPIO.
+
+Production settings:
+  Default settings that would apply during initialization. They can be
+  chip specific or platform specific. These settings override trimmer and
+  timing settings that would be provided with above properties. SPI prod
+  settings are provided in below format.
+	spi1@3210000 {
+		prod-settings {
+			prod {
+				prod = <
+					0x0 0x73fff83f 0x43c01807
+					0xc 0x0000003f 0x00000020>;
+			};
+			prod_c_cs1 {
+				prod = <
+					0x4 0x00000fff 0x00000008
+					0x8 0x0000ff00 0x00000000>;
+			};
+		};
+	};
+- prod : settings that would apply to all client devices for specified
+  controller.
+- prod_c_csX : settings applied on client csX when it is active.
+  Refer to prod settings documentation on how reg/mask/value are provided.
+  Care taken prod-settings which is a child of SPI controller is not
+  treated as a SPI client.
+
+
 Example:
 
 spi@7000d600 {
@@ -30,6 +86,7 @@ spi@7000d600 {
 	reg = <0x7000d600 0x200>;
 	interrupts = <0 82 0x04>;
 	spi-max-frequency = <25000000>;
+	nvidia,clock-always-on;
 	#address-cells = <1>;
 	#size-cells = <0>;
 	clocks = <&tegra_car 44>;

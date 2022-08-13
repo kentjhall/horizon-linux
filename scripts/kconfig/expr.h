@@ -21,6 +21,8 @@ struct file {
 	struct file *next;
 	struct file *parent;
 	const char *name;
+	int overlay_id;
+	const char *logical_name;
 	int lineno;
 };
 

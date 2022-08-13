@@ -27,6 +27,7 @@
 #include <linux/compiler.h>
 #include <linux/if_ether.h>
 #include <linux/kref.h>
+#include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/netlink.h>
 #include <linux/sched.h> /* for linux/wait.h */
@@ -81,11 +82,13 @@ enum batadv_dhcp_recipient {
  * @ogm_buff: buffer holding the OGM packet
  * @ogm_buff_len: length of the OGM packet buffer
  * @ogm_seqno: OGM sequence number - used to identify each OGM
+ * @ogm_buff_mutex: lock protecting ogm_buff and ogm_buff_len
  */
 struct batadv_hard_iface_bat_iv {
 	unsigned char *ogm_buff;
 	int ogm_buff_len;
 	atomic_t ogm_seqno;
+	struct mutex ogm_buff_mutex;
 };
 
 /**
@@ -139,7 +142,7 @@ struct batadv_hard_iface_bat_v {
  */
 struct batadv_hard_iface {
 	struct list_head list;
-	s16 if_num;
+	unsigned int if_num;
 	char if_status;
 	struct net_device *net_dev;
 	u8 num_bcasts;
@@ -966,12 +969,14 @@ struct batadv_softif_vlan {
  * @ogm_buff: buffer holding the OGM packet
  * @ogm_buff_len: length of the OGM packet buffer
  * @ogm_seqno: OGM sequence number - used to identify each OGM
+ * @ogm_buff_mutex: lock protecting ogm_buff and ogm_buff_len
  * @ogm_wq: workqueue used to schedule OGM transmissions
  */
 struct batadv_priv_bat_v {
 	unsigned char *ogm_buff;
 	int ogm_buff_len;
 	atomic_t ogm_seqno;
+	struct mutex ogm_buff_mutex;
 	struct delayed_work ogm_wq;
 };
 
@@ -1060,7 +1065,7 @@ struct batadv_priv {
 	atomic_t bcast_seqno;
 	atomic_t bcast_queue_left;
 	atomic_t batman_queue_left;
-	char num_ifaces;
+	unsigned int num_ifaces;
 	struct kobject *mesh_obj;
 	struct dentry *debug_dir;
 	struct hlist_head forw_bat_list;
@@ -1241,6 +1246,7 @@ struct batadv_tt_global_entry {
  * struct batadv_tt_orig_list_entry - orig node announcing a non-mesh client
  * @orig_node: pointer to orig node announcing this non-mesh client
  * @ttvn: translation table version number which added the non-mesh client
+ * @flags: per orig entry TT sync flags
  * @list: list node for batadv_tt_global_entry::orig_list
  * @refcount: number of contexts the object is used
  * @rcu: struct used for freeing in an RCU-safe manner
@@ -1248,6 +1254,7 @@ struct batadv_tt_global_entry {
 struct batadv_tt_orig_list_entry {
 	struct batadv_orig_node *orig_node;
 	u8 ttvn;
+	u8 flags;
 	struct hlist_node list;
 	struct kref refcount;
 	struct rcu_head rcu;
@@ -1397,6 +1404,7 @@ struct batadv_forw_packet {
  * @activate: start routing mechanisms when hard-interface is brought up
  *  (optional)
  * @enable: init routing info when hard-interface is enabled
+ * @enabled: notification when hard-interface was enabled (optional)
  * @disable: de-init routing info when hard-interface is disabled
  * @update_mac: (re-)init mac addresses of the protocol information
  *  belonging to this hard-interface
@@ -1405,6 +1413,7 @@ struct batadv_forw_packet {
 struct batadv_algo_iface_ops {
 	void (*activate)(struct batadv_hard_iface *hard_iface);
 	int (*enable)(struct batadv_hard_iface *hard_iface);
+	void (*enabled)(struct batadv_hard_iface *hard_iface);
 	void (*disable)(struct batadv_hard_iface *hard_iface);
 	void (*update_mac)(struct batadv_hard_iface *hard_iface);
 	void (*primary_set)(struct batadv_hard_iface *hard_iface);
@@ -1452,9 +1461,10 @@ struct batadv_algo_neigh_ops {
  */
 struct batadv_algo_orig_ops {
 	void (*free)(struct batadv_orig_node *orig_node);
-	int (*add_if)(struct batadv_orig_node *orig_node, int max_if_num);
-	int (*del_if)(struct batadv_orig_node *orig_node, int max_if_num,
-		      int del_if_num);
+	int (*add_if)(struct batadv_orig_node *orig_node,
+		      unsigned int max_if_num);
+	int (*del_if)(struct batadv_orig_node *orig_node,
+		      unsigned int max_if_num, unsigned int del_if_num);
 #ifdef CONFIG_BATMAN_ADV_DEBUGFS
 	void (*print)(struct batadv_priv *priv, struct seq_file *seq,
 		      struct batadv_hard_iface *hard_iface);
@@ -1466,6 +1476,7 @@ struct batadv_algo_orig_ops {
 
 /**
  * struct batadv_algo_gw_ops - mesh algorithm callbacks (GW specific)
+ * @init_sel_class: initialize GW selection class (optional)
  * @store_sel_class: parse and stores a new GW selection class (optional)
  * @show_sel_class: prints the current GW selection class (optional)
  * @get_best_gw_node: select the best GW from the list of available nodes
@@ -1476,6 +1487,7 @@ struct batadv_algo_orig_ops {
  * @dump: dump gateways to a netlink socket (optional)
  */
 struct batadv_algo_gw_ops {
+	void (*init_sel_class)(struct batadv_priv *bat_priv);
 	ssize_t (*store_sel_class)(struct batadv_priv *bat_priv, char *buff,
 				   size_t count);
 	ssize_t (*show_sel_class)(struct batadv_priv *bat_priv, char *buff);

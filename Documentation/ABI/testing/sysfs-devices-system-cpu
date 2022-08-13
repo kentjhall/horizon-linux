@@ -350,3 +350,47 @@ Contact:	Linux ARM Kernel Mailing list <linux-arm-kernel@lists.infradead.org>
 Description:	AArch64 CPU registers
 		'identification' directory exposes the CPU ID registers for
 		 identifying model and revision of the CPU.
+
+What:		/sys/devices/system/cpu/vulnerabilities
+		/sys/devices/system/cpu/vulnerabilities/meltdown
+		/sys/devices/system/cpu/vulnerabilities/spectre_v1
+		/sys/devices/system/cpu/vulnerabilities/spectre_v2
+		/sys/devices/system/cpu/vulnerabilities/spec_store_bypass
+		/sys/devices/system/cpu/vulnerabilities/l1tf
+		/sys/devices/system/cpu/vulnerabilities/mds
+		/sys/devices/system/cpu/vulnerabilities/srbds
+		/sys/devices/system/cpu/vulnerabilities/tsx_async_abort
+		/sys/devices/system/cpu/vulnerabilities/itlb_multihit
+Date:		January 2018
+Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+Description:	Information about CPU vulnerabilities
+
+		The files are named after the code names of CPU
+		vulnerabilities. The output of those files reflects the
+		state of the CPUs in the system. Possible output values:
+
+		"Not affected"	  CPU is not affected by the vulnerability
+		"Vulnerable"	  CPU is affected and no mitigation in effect
+		"Mitigation: $M"  CPU is affected and mitigation $M is in effect
+
+		See also: Documentation/hw-vuln/index.rst
+
+What:		/sys/devices/system/cpu/smt
+		/sys/devices/system/cpu/smt/active
+		/sys/devices/system/cpu/smt/control
+Date:		June 2018
+Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+Description:	Control Symetric Multi Threading (SMT)
+
+		active:  Tells whether SMT is active (enabled and siblings online)
+
+		control: Read/write interface to control SMT. Possible
+			 values:
+
+			 "on"		SMT is enabled
+			 "off"		SMT is disabled
+			 "forceoff"	SMT is force disabled. Cannot be changed.
+			 "notsupported" SMT is not supported by the CPU
+
+			 If control status is "forceoff" or "notsupported" writes
+			 are rejected.

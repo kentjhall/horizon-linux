@@ -1,0 +1,21 @@
+Binding for GPIO Gas Gauge
+
+Required properties:
+ - compatible: "gpio-gas-gauge"
+ - gpios: GPIO which will change value to signal when the power is low and
+          the system should shutdown. This GPIO should include flags to
+          specify if the GPIO is active low or not. In this case, active low
+          would mean that the GPIO would go 0->1 when the power is low.
+
+Optional properties:
+ - supply-name: This is a string which can be passed through to use as the
+                name of the power supply. It defaults to gpio-gas-gauge.
+
+Example:
+
+gpio-gas-gauge {
+	compatible = "gpio-gas-gauge";
+	gpios = <TEGRA_GPIO(D, 3) 0>;
+	supply-name = "GPIO_gas_gage";
+	status = "okay";
+};

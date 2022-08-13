@@ -1284,6 +1284,8 @@ static void ack_a_interrupt(struct comedi_device *dev, unsigned short a_status)
 		ack |= NISTC_INTA_ACK_AI_START;
 	if (a_status & NISTC_AI_STATUS1_STOP)
 		ack |= NISTC_INTA_ACK_AI_STOP;
+	if (a_status & NISTC_AI_STATUS1_OVER)
+		ack |= NISTC_INTA_ACK_AI_ERR;
 	if (ack)
 		ni_stc_writew(dev, ack, NISTC_INTA_ACK_REG);
 }
@@ -1832,7 +1834,7 @@ static int ni_ai_insn_read(struct comedi_device *dev,
 			   unsigned int *data)
 {
 	struct ni_private *devpriv = dev->private;
-	unsigned int mask = (s->maxdata + 1) >> 1;
+	unsigned int mask = s->maxdata;
 	int i, n;
 	unsigned int signbits;
 	unsigned int d;
@@ -1875,7 +1877,7 @@ static int ni_ai_insn_read(struct comedi_device *dev,
 				return -ETIME;
 			}
 			d += signbits;
-			data[n] = d;
+			data[n] = d & 0xffff;
 		}
 	} else if (devpriv->is_6143) {
 		for (n = 0; n < insn->n; n++) {
@@ -1924,9 +1926,8 @@ static int ni_ai_insn_read(struct comedi_device *dev,
 				data[n] = dl;
 			} else {
 				d = ni_readw(dev, NI_E_AI_FIFO_DATA_REG);
-				/* subtle: needs to be short addition */
 				d += signbits;
-				data[n] = d;
+				data[n] = d & 0xffff;
 			}
 		}
 	}
@@ -3079,8 +3080,7 @@ static void ni_ao_cmd_set_update(struct comedi_device *dev,
 		/* following line: 2-1 per STC */
 		ni_stc_writel(dev, 1, NISTC_AO_UI_LOADA_REG);
 		ni_stc_writew(dev, NISTC_AO_CMD1_UI_LOAD, NISTC_AO_CMD1_REG);
-		/* following line: N-1 per STC */
-		ni_stc_writel(dev, trigvar - 1, NISTC_AO_UI_LOADA_REG);
+		ni_stc_writel(dev, trigvar, NISTC_AO_UI_LOADA_REG);
 	} else { /* TRIG_EXT */
 		/* FIXME:  assert scan_begin_arg != 0, ret failure otherwise */
 		devpriv->ao_cmd2  |= NISTC_AO_CMD2_BC_GATE_ENA;
@@ -3477,6 +3477,7 @@ static int ni_cdio_check_chanlist(struct comedi_device *dev,
 static int ni_cdio_cmdtest(struct comedi_device *dev,
 			   struct comedi_subdevice *s, struct comedi_cmd *cmd)
 {
+	unsigned int bytes_per_scan;
 	int err = 0;
 	int tmp;
 
@@ -3506,9 +3507,12 @@ static int ni_cdio_cmdtest(struct comedi_device *dev,
 	err |= comedi_check_trigger_arg_is(&cmd->convert_arg, 0);
 	err |= comedi_check_trigger_arg_is(&cmd->scan_end_arg,
 					   cmd->chanlist_len);
-	err |= comedi_check_trigger_arg_max(&cmd->stop_arg,
-					    s->async->prealloc_bufsz /
-					    comedi_bytes_per_scan(s));
+	bytes_per_scan = comedi_bytes_per_scan_cmd(s, cmd);
+	if (bytes_per_scan) {
+		err |= comedi_check_trigger_arg_max(&cmd->stop_arg,
+						    s->async->prealloc_bufsz /
+						    bytes_per_scan);
+	}
 
 	if (err)
 		return 3;
@@ -4941,7 +4945,10 @@ static int ni_valid_rtsi_output_source(struct comedi_device *dev,
 	case NI_RTSI_OUTPUT_G_SRC0:
 	case NI_RTSI_OUTPUT_G_GATE0:
 	case NI_RTSI_OUTPUT_RGOUT0:
-	case NI_RTSI_OUTPUT_RTSI_BRD_0:
+	case NI_RTSI_OUTPUT_RTSI_BRD(0):
+	case NI_RTSI_OUTPUT_RTSI_BRD(1):
+	case NI_RTSI_OUTPUT_RTSI_BRD(2):
+	case NI_RTSI_OUTPUT_RTSI_BRD(3):
 		return 1;
 	case NI_RTSI_OUTPUT_RTSI_OSC:
 		return (devpriv->is_m_series) ? 1 : 0;
@@ -4962,11 +4969,18 @@ static int ni_set_rtsi_routing(struct comedi_device *dev,
 		devpriv->rtsi_trig_a_output_reg |= NISTC_RTSI_TRIG(chan, src);
 		ni_stc_writew(dev, devpriv->rtsi_trig_a_output_reg,
 			      NISTC_RTSI_TRIGA_OUT_REG);
-	} else if (chan < 8) {
+	} else if (chan < NISTC_RTSI_TRIG_NUM_CHAN(devpriv->is_m_series)) {
 		devpriv->rtsi_trig_b_output_reg &= ~NISTC_RTSI_TRIG_MASK(chan);
 		devpriv->rtsi_trig_b_output_reg |= NISTC_RTSI_TRIG(chan, src);
 		ni_stc_writew(dev, devpriv->rtsi_trig_b_output_reg,
 			      NISTC_RTSI_TRIGB_OUT_REG);
+	} else if (chan != NISTC_RTSI_TRIG_OLD_CLK_CHAN) {
+		/* probably should never reach this, since the
+		 * ni_valid_rtsi_output_source above errors out if chan is too
+		 * high
+		 */
+		dev_err(dev->class_dev, "%s: unknown rtsi channel\n", __func__);
+		return -EINVAL;
 	}
 	return 2;
 }
@@ -4982,12 +4996,12 @@ static unsigned int ni_get_rtsi_routing(struct comedi_device *dev,
 	} else if (chan < NISTC_RTSI_TRIG_NUM_CHAN(devpriv->is_m_series)) {
 		return NISTC_RTSI_TRIG_TO_SRC(chan,
 					      devpriv->rtsi_trig_b_output_reg);
-	} else {
-		if (chan == NISTC_RTSI_TRIG_OLD_CLK_CHAN)
-			return NI_RTSI_OUTPUT_RTSI_OSC;
-		dev_err(dev->class_dev, "bug! should never get here?\n");
-		return 0;
+	} else if (chan == NISTC_RTSI_TRIG_OLD_CLK_CHAN) {
+		return NI_RTSI_OUTPUT_RTSI_OSC;
 	}
+
+	dev_err(dev->class_dev, "%s: unknown rtsi channel\n", __func__);
+	return -EINVAL;
 }
 
 static int ni_rtsi_insn_config(struct comedi_device *dev,
@@ -5407,11 +5421,11 @@ static int ni_E_init(struct comedi_device *dev,
 	/* Digital I/O (PFI) subdevice */
 	s = &dev->subdevices[NI_PFI_DIO_SUBDEV];
 	s->type		= COMEDI_SUBD_DIO;
-	s->subdev_flags	= SDF_READABLE | SDF_WRITABLE | SDF_INTERNAL;
 	s->maxdata	= 1;
 	if (devpriv->is_m_series) {
 		s->n_chan	= 16;
 		s->insn_bits	= ni_pfi_insn_bits;
+		s->subdev_flags	= SDF_READABLE | SDF_WRITABLE | SDF_INTERNAL;
 
 		ni_writew(dev, s->state, NI_M_PFI_DO_REG);
 		for (i = 0; i < NUM_PFI_OUTPUT_SELECT_REGS; ++i) {
@@ -5420,6 +5434,7 @@ static int ni_E_init(struct comedi_device *dev,
 		}
 	} else {
 		s->n_chan	= 10;
+		s->subdev_flags	= SDF_INTERNAL;
 	}
 	s->insn_config	= ni_pfi_insn_config;
 

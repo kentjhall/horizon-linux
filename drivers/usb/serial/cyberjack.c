@@ -50,6 +50,7 @@
 #define CYBERJACK_PRODUCT_ID	0x0100
 
 /* Function prototypes */
+static int cyberjack_attach(struct usb_serial *serial);
 static int cyberjack_port_probe(struct usb_serial_port *port);
 static int cyberjack_port_remove(struct usb_serial_port *port);
 static int  cyberjack_open(struct tty_struct *tty,
@@ -77,6 +78,7 @@ static struct usb_serial_driver cyberjack_device = {
 	.description =		"Reiner SCT Cyberjack USB card reader",
 	.id_table =		id_table,
 	.num_ports =		1,
+	.attach =		cyberjack_attach,
 	.port_probe =		cyberjack_port_probe,
 	.port_remove =		cyberjack_port_remove,
 	.open =			cyberjack_open,
@@ -99,6 +101,14 @@ struct cyberjack_private {
 	short		wrfilled;	/* Overall data size we already got */
 	short		wrsent;		/* Data already sent */
 };
+
+static int cyberjack_attach(struct usb_serial *serial)
+{
+	if (serial->num_bulk_out < serial->num_ports)
+		return -ENODEV;
+
+	return 0;
+}
 
 static int cyberjack_port_probe(struct usb_serial_port *port)
 {
@@ -357,11 +367,12 @@ static void cyberjack_write_bulk_callback(struct urb *urb)
 	struct cyberjack_private *priv = usb_get_serial_port_data(port);
 	struct device *dev = &port->dev;
 	int status = urb->status;
+	bool resubmitted = false;
 
-	set_bit(0, &port->write_urbs_free);
 	if (status) {
 		dev_dbg(dev, "%s - nonzero write bulk status received: %d\n",
 			__func__, status);
+		set_bit(0, &port->write_urbs_free);
 		return;
 	}
 
@@ -394,6 +405,8 @@ static void cyberjack_write_bulk_callback(struct urb *urb)
 			goto exit;
 		}
 
+		resubmitted = true;
+
 		dev_dbg(dev, "%s - priv->wrsent=%d\n", __func__, priv->wrsent);
 		dev_dbg(dev, "%s - priv->wrfilled=%d\n", __func__, priv->wrfilled);
 
@@ -410,6 +423,8 @@ static void cyberjack_write_bulk_callback(struct urb *urb)
 
 exit:
 	spin_unlock(&priv->lock);
+	if (!resubmitted)
+		set_bit(0, &port->write_urbs_free);
 	usb_serial_port_softint(port);
 }
 

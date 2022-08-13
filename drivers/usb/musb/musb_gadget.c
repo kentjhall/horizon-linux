@@ -442,7 +442,6 @@ void musb_g_tx(struct musb *musb, u8 epnum)
 	req = next_request(musb_ep);
 	request = &req->request;
 
-	trace_musb_req_tx(req);
 	csr = musb_readw(epio, MUSB_TXCSR);
 	musb_dbg(musb, "<== %s, txcsr %04x", musb_ep->end_point.name, csr);
 
@@ -478,11 +477,10 @@ void musb_g_tx(struct musb *musb, u8 epnum)
 	}
 
 	if (request) {
-		u8	is_dma = 0;
-		bool	short_packet = false;
+
+		trace_musb_req_tx(req);
 
 		if (dma && (csr & MUSB_TXCSR_DMAENAB)) {
-			is_dma = 1;
 			csr |= MUSB_TXCSR_P_WZC_BITS;
 			csr &= ~(MUSB_TXCSR_DMAENAB | MUSB_TXCSR_P_UNDERRUN |
 				 MUSB_TXCSR_TXPKTRDY | MUSB_TXCSR_AUTOSET);
@@ -500,16 +498,8 @@ void musb_g_tx(struct musb *musb, u8 epnum)
 		 */
 		if ((request->zero && request->length)
 			&& (request->length % musb_ep->packet_sz == 0)
-			&& (request->actual == request->length))
-				short_packet = true;
+			&& (request->actual == request->length)) {
 
-		if ((musb_dma_inventra(musb) || musb_dma_ux500(musb)) &&
-			(is_dma && (!dma->desired_mode ||
-				(request->actual &
-					(musb_ep->packet_sz - 1)))))
-				short_packet = true;
-
-		if (short_packet) {
 			/*
 			 * On DMA completion, FIFO may not be
 			 * available yet...

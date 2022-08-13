@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2007 Patrick McHardy <kaber@trash.net>
+ * Copyright (c) 2008-2017, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -309,6 +310,8 @@ static void macvlan_process_broadcast(struct work_struct *w)
 		if (src)
 			dev_put(src->dev);
 		kfree_skb(skb);
+
+		cond_resched();
 	}
 }
 
@@ -334,10 +337,11 @@ static void macvlan_broadcast_enqueue(struct macvlan_port *port,
 	}
 	spin_unlock(&port->bc_queue.lock);
 
+	schedule_work(&port->bc_work);
+
 	if (err)
 		goto free_nskb;
 
-	schedule_work(&port->bc_work);
 	return;
 
 free_nskb:
@@ -418,6 +422,10 @@ static rx_handler_result_t macvlan_handle_frame(struct sk_buff **pskb)
 	int ret;
 	rx_handler_result_t handle_res;
 
+	/* Packets from dev_loopback_xmit() do not have L2 header, bail out */
+	if (unlikely(skb->pkt_type == PACKET_LOOPBACK))
+		return RX_HANDLER_PASS;
+
 	port = macvlan_port_get_rcu(skb->dev);
 	if (is_multicast_ether_addr(eth->h_dest)) {
 		unsigned int hash;
@@ -452,7 +460,7 @@ static rx_handler_result_t macvlan_handle_frame(struct sk_buff **pskb)
 					      struct macvlan_dev, list);
 	else
 		vlan = macvlan_hash_lookup(port, eth->h_dest);
-	if (vlan == NULL)
+	if (!vlan || vlan->mode == MACVLAN_MODE_SOURCE)
 		return RX_HANDLER_PASS;
 
 	dev = vlan->dev;
@@ -486,10 +494,11 @@ static int macvlan_queue_xmit(struct sk_buff *skb, struct net_device *dev)
 	const struct macvlan_dev *dest;
 
 	if (vlan->mode == MACVLAN_MODE_BRIDGE) {
-		const struct ethhdr *eth = (void *)skb->data;
+		const struct ethhdr *eth = skb_eth_hdr(skb);
 
 		/* send to other bridge ports directly */
 		if (is_multicast_ether_addr(eth->h_dest)) {
+			skb_reset_mac_header(skb);
 			macvlan_broadcast(skb, port, dev, MACVLAN_MODE_BRIDGE);
 			goto xmit_world;
 		}
@@ -1140,6 +1149,7 @@ static int macvlan_port_create(struct net_device *dev)
 static void macvlan_port_destroy(struct net_device *dev)
 {
 	struct macvlan_port *port = macvlan_port_get_rtnl(dev);
+	struct sk_buff *skb;
 
 	dev->priv_flags &= ~IFF_MACVLAN_PORT;
 	netdev_rx_handler_unregister(dev);
@@ -1148,7 +1158,15 @@ static void macvlan_port_destroy(struct net_device *dev)
 	 * but we need to cancel it and purge left skbs if any.
 	 */
 	cancel_work_sync(&port->bc_work);
-	__skb_queue_purge(&port->bc_queue);
+
+	while ((skb = __skb_dequeue(&port->bc_queue))) {
+		const struct macvlan_dev *src = MACVLAN_SKB_CB(skb)->src;
+
+		if (src)
+			dev_put(src->dev);
+
+		kfree_skb(skb);
+	}
 
 	kfree_rcu(port, rcu);
 }
@@ -1219,6 +1237,9 @@ static int macvlan_changelink_sources(struct macvlan_dev *vlan, u32 mode,
 	struct nlattr *nla, *head;
 	struct macvlan_source_entry *entry;
 
+	if (!data)
+		return -EINVAL;
+
 	if (data[IFLA_MACVLAN_MACADDR])
 		addr = nla_data(data[IFLA_MACVLAN_MACADDR]);
 
@@ -1248,7 +1269,7 @@ static int macvlan_changelink_sources(struct macvlan_dev *vlan, u32 mode,
 				return ret;
 		}
 
-		if (!data || !data[IFLA_MACVLAN_MACADDR_DATA])
+		if (!data[IFLA_MACVLAN_MACADDR_DATA])
 			return 0;
 
 		head = nla_data(data[IFLA_MACVLAN_MACADDR_DATA]);
@@ -1368,9 +1389,14 @@ int macvlan_common_newlink(struct net *src_net, struct net_device *dev,
 	return 0;
 
 unregister_netdev:
+	/* macvlan_uninit would free the macvlan port */
 	unregister_netdevice(dev);
+	return err;
 destroy_macvlan_port:
-	if (create)
+	/* the macvlan port may be freed by macvlan_uninit when fail to register.
+	 * so we destroy the macvlan port only when it's valid.
+	 */
+	if (create && macvlan_port_get_rtnl(lowerdev))
 		macvlan_port_destroy(port->dev);
 	return err;
 }
@@ -1589,7 +1615,7 @@ static int macvlan_device_event(struct notifier_block *unused,
 						struct macvlan_dev,
 						list);
 
-		if (macvlan_sync_address(vlan->dev, dev->dev_addr))
+		if (vlan && macvlan_sync_address(vlan->dev, dev->dev_addr))
 			return NOTIFY_BAD;
 
 		break;

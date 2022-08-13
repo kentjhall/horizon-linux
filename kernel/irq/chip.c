@@ -136,6 +136,7 @@ int irq_set_msi_desc(unsigned int irq, struct msi_desc *entry)
 {
 	return irq_set_msi_desc_off(irq, 0, entry);
 }
+EXPORT_SYMBOL(irq_set_msi_desc);
 
 /**
  *	irq_set_chip_data - set irq chip data for an irq
@@ -729,7 +730,11 @@ void handle_percpu_irq(struct irq_desc *desc)
 {
 	struct irq_chip *chip = irq_desc_get_chip(desc);
 
-	kstat_incr_irqs_this_cpu(desc);
+	/*
+	 * PER CPU interrupts are not serialized. Do not touch
+	 * desc->tot_count.
+	 */
+	__kstat_incr_irqs_this_cpu(desc);
 
 	if (chip->irq_ack)
 		chip->irq_ack(&desc->irq_data);
@@ -758,7 +763,11 @@ void handle_percpu_devid_irq(struct irq_desc *desc)
 	unsigned int irq = irq_desc_get_irq(desc);
 	irqreturn_t res;
 
-	kstat_incr_irqs_this_cpu(desc);
+	/*
+	 * PER CPU interrupts are not serialized. Do not touch
+	 * desc->tot_count.
+	 */
+	__kstat_incr_irqs_this_cpu(desc);
 
 	if (chip->irq_ack)
 		chip->irq_ack(&desc->irq_data);
@@ -877,8 +886,8 @@ irq_set_chained_handler_and_data(unsigned int irq, irq_flow_handler_t handle,
 	if (!desc)
 		return;
 
-	__irq_do_set_handler(desc, handle, 1, NULL);
 	desc->irq_common_data.handler_data = data;
+	__irq_do_set_handler(desc, handle, 1, NULL);
 
 	irq_put_desc_busunlock(desc, flags);
 }
@@ -895,12 +904,14 @@ EXPORT_SYMBOL_GPL(irq_set_chip_and_handler_name);
 
 void irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set)
 {
-	unsigned long flags;
+	unsigned long flags, trigger, tmp;
 	struct irq_desc *desc = irq_get_desc_lock(irq, &flags, 0);
 
 	if (!desc)
 		return;
 	irq_settings_clr_and_set(desc, clr, set);
+
+	trigger = irqd_get_trigger_type(&desc->irq_data);
 
 	irqd_clear(&desc->irq_data, IRQD_NO_BALANCING | IRQD_PER_CPU |
 		   IRQD_TRIGGER_MASK | IRQD_LEVEL | IRQD_MOVE_PCNTXT);
@@ -913,7 +924,11 @@ void irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set)
 	if (irq_settings_is_level(desc))
 		irqd_set(&desc->irq_data, IRQD_LEVEL);
 
-	irqd_set(&desc->irq_data, irq_settings_get_trigger_mask(desc));
+	tmp = irq_settings_get_trigger_mask(desc);
+	if (tmp != IRQ_TYPE_NONE)
+		trigger = tmp;
+
+	irqd_set(&desc->irq_data, trigger);
 
 	irq_put_desc_unlock(desc, flags);
 }
@@ -1128,6 +1143,10 @@ int irq_chip_set_vcpu_affinity_parent(struct irq_data *data, void *vcpu_info)
 int irq_chip_set_wake_parent(struct irq_data *data, unsigned int on)
 {
 	data = data->parent_data;
+
+	if (data->chip->flags & IRQCHIP_SKIP_SET_WAKE)
+		return 0;
+
 	if (data->chip->irq_set_wake)
 		return data->chip->irq_set_wake(data, on);
 

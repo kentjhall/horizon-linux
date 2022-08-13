@@ -232,7 +232,7 @@ static int input_handle_abs_event(struct input_dev *dev,
 
 	if (!is_mt_event) {
 		pold = &dev->absinfo[code].value;
-	} else if (mt) {
+	} else if (mt && (code <= ABS_MT_LAST) && (code >= ABS_MT_FIRST)) {
 		pold = &mt->slots[mt->slot].abs[code - ABS_MT_FIRST];
 	} else {
 		/*
@@ -243,8 +243,10 @@ static int input_handle_abs_event(struct input_dev *dev,
 	}
 
 	if (pold) {
-		*pval = input_defuzz_abs_event(*pval, *pold,
-						dev->absinfo[code].fuzz);
+		if (*pval != dev->absinfo[code].minimum &&
+		    *pval != dev->absinfo[code].maximum)
+			*pval = input_defuzz_abs_event(*pval, *pold,
+						       dev->absinfo[code].fuzz);
 		if (*pold == *pval)
 			return INPUT_IGNORE_EVENT;
 
@@ -850,16 +852,18 @@ static int input_default_setkeycode(struct input_dev *dev,
 		}
 	}
 
-	__clear_bit(*old_keycode, dev->keybit);
-	__set_bit(ke->keycode, dev->keybit);
-
-	for (i = 0; i < dev->keycodemax; i++) {
-		if (input_fetch_keycode(dev, i) == *old_keycode) {
-			__set_bit(*old_keycode, dev->keybit);
-			break; /* Setting the bit twice is useless, so break */
+	if (*old_keycode <= KEY_MAX) {
+		__clear_bit(*old_keycode, dev->keybit);
+		for (i = 0; i < dev->keycodemax; i++) {
+			if (input_fetch_keycode(dev, i) == *old_keycode) {
+				__set_bit(*old_keycode, dev->keybit);
+				/* Setting the bit twice is useless, so break */
+				break;
+			}
 		}
 	}
 
+	__set_bit(ke->keycode, dev->keybit);
 	return 0;
 }
 
@@ -915,9 +919,13 @@ int input_set_keycode(struct input_dev *dev,
 	 * Simulate keyup event if keycode is not present
 	 * in the keymap anymore
 	 */
-	if (test_bit(EV_KEY, dev->evbit) &&
-	    !is_event_supported(old_keycode, dev->keybit, KEY_MAX) &&
-	    __test_and_clear_bit(old_keycode, dev->key)) {
+	if (old_keycode > KEY_MAX) {
+		dev_warn(dev->dev.parent ?: &dev->dev,
+			 "%s: got too big old keycode %#x\n",
+			 __func__, old_keycode);
+	} else if (test_bit(EV_KEY, dev->evbit) &&
+		   !is_event_supported(old_keycode, dev->keybit, KEY_MAX) &&
+		   __test_and_clear_bit(old_keycode, dev->key)) {
 		struct input_value vals[] =  {
 			{ EV_KEY, old_keycode, 0 },
 			input_value_sync
@@ -1144,6 +1152,7 @@ static int input_devices_seq_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "P: Phys=%s\n", dev->phys ? dev->phys : "");
 	seq_printf(seq, "S: Sysfs=%s\n", path ? path : "");
 	seq_printf(seq, "U: Uniq=%s\n", dev->uniq ? dev->uniq : "");
+	seq_printf(seq, "E: Enabled=%d\n", dev->enabled);
 	seq_printf(seq, "H: Handlers=");
 
 	list_for_each_entry(handle, &dev->h_list, d_node)
@@ -1389,12 +1398,51 @@ static ssize_t input_dev_show_properties(struct device *dev,
 }
 static DEVICE_ATTR(properties, S_IRUGO, input_dev_show_properties, NULL);
 
+static ssize_t input_dev_set_enabled(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct input_dev *input_dev = to_input_dev(dev);
+	long en;
+	int ret;
+
+	ret = kstrtoul(buf, 0, &en);
+	if (ret)
+		return -EINVAL;
+
+	if (input_dev->enabled == en)
+		return count;
+	input_dev->enabled = !!en;
+
+	if (en) {
+		if (input_dev->enable)
+			count = input_dev->enable(input_dev);
+	} else {
+		if (input_dev->disable)
+			count = input_dev->disable(input_dev);
+	}
+
+	return count;
+}
+static ssize_t input_dev_show_enabled(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct input_dev *input_dev = to_input_dev(dev);
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 input_dev->enabled);
+}
+
+static DEVICE_ATTR(enabled, S_IWUSR | S_IRUGO, input_dev_show_enabled,
+						input_dev_set_enabled);
+
 static struct attribute *input_dev_attrs[] = {
 	&dev_attr_name.attr,
 	&dev_attr_phys.attr,
 	&dev_attr_uniq.attr,
 	&dev_attr_modalias.attr,
 	&dev_attr_properties.attr,
+	&dev_attr_enabled.attr,
 	NULL
 };
 
@@ -1411,6 +1459,7 @@ static ssize_t input_dev_show_id_##name(struct device *dev,		\
 	return scnprintf(buf, PAGE_SIZE, "%04x\n", input_dev->id.name);	\
 }									\
 static DEVICE_ATTR(name, S_IRUGO, input_dev_show_id_##name, NULL)
+
 
 INPUT_DEV_ID_ATTR(bustype);
 INPUT_DEV_ID_ATTR(vendor);

@@ -178,6 +178,10 @@ enum tcm_sense_reason_table {
 	TCM_LOGICAL_BLOCK_APP_TAG_CHECK_FAILED	= R(0x16),
 	TCM_LOGICAL_BLOCK_REF_TAG_CHECK_FAILED	= R(0x17),
 	TCM_COPY_TARGET_DEVICE_NOT_REACHABLE	= R(0x18),
+	TCM_TOO_MANY_TARGET_DESCS		= R(0x19),
+	TCM_UNSUPPORTED_TARGET_DESC_TYPE_CODE	= R(0x1a),
+	TCM_TOO_MANY_SEGMENT_DESCS		= R(0x1b),
+	TCM_UNSUPPORTED_SEGMENT_DESC_TYPE_CODE	= R(0x1c),
 #undef R
 };
 
@@ -197,6 +201,7 @@ enum tcm_tmreq_table {
 	TMR_LUN_RESET		= 5,
 	TMR_TARGET_WARM_RESET	= 6,
 	TMR_TARGET_COLD_RESET	= 7,
+	TMR_UNKNOWN		= 0xff,
 };
 
 /* fabric independent task management response values */
@@ -296,7 +301,7 @@ struct t10_alua_tg_pt_gp {
 	struct list_head tg_pt_gp_lun_list;
 	struct se_lun *tg_pt_gp_alua_lun;
 	struct se_node_acl *tg_pt_gp_alua_nacl;
-	struct delayed_work tg_pt_gp_transition_work;
+	struct work_struct tg_pt_gp_transition_work;
 	struct completion *tg_pt_gp_transition_complete;
 };
 
@@ -492,6 +497,7 @@ struct se_cmd {
 #define CMD_T_BUSY		(1 << 9)
 #define CMD_T_TAS		(1 << 10)
 #define CMD_T_FABRIC_STOP	(1 << 11)
+#define CMD_T_PRE_EXECUTE	(1 << 12)
 	spinlock_t		t_state_lock;
 	struct kref		cmd_kref;
 	struct completion	t_transport_stop_comp;
@@ -538,6 +544,7 @@ struct se_node_acl {
 	char			initiatorname[TRANSPORT_IQN_LEN];
 	/* Used to signal demo mode created ACL, disabled by default */
 	bool			dynamic_node_acl;
+	bool			dynamic_stop;
 	u32			queue_depth;
 	u32			acl_index;
 	enum target_prot_type	saved_prot_type;
@@ -704,6 +711,7 @@ struct se_lun {
 	u64			unpacked_lun;
 #define SE_LUN_LINK_MAGIC			0xffff7771
 	u32			lun_link_magic;
+	bool			lun_shutdown;
 	bool			lun_access_ro;
 	u32			lun_index;
 
@@ -731,6 +739,7 @@ struct se_lun {
 	struct config_group	lun_group;
 	struct se_port_stat_grps port_stat_grps;
 	struct completion	lun_ref_comp;
+	struct completion	lun_shutdown_comp;
 	struct percpu_ref	lun_ref;
 	struct list_head	lun_dev_link;
 	struct hlist_node	link;

@@ -119,13 +119,23 @@ static unsigned long super_cache_count(struct shrinker *shrink,
 	sb = container_of(shrink, struct super_block, s_shrink);
 
 	/*
-	 * Don't call trylock_super as it is a potential
-	 * scalability bottleneck. The counts could get updated
-	 * between super_cache_count and super_cache_scan anyway.
-	 * Call to super_cache_count with shrinker_rwsem held
-	 * ensures the safety of call to list_lru_shrink_count() and
-	 * s_op->nr_cached_objects().
+	 * We don't call trylock_super() here as it is a scalability bottleneck,
+	 * so we're exposed to partial setup state. The shrinker rwsem does not
+	 * protect filesystem operations backing list_lru_shrink_count() or
+	 * s_op->nr_cached_objects(). Counts can change between
+	 * super_cache_count and super_cache_scan, so we really don't need locks
+	 * here.
+	 *
+	 * However, if we are currently mounting the superblock, the underlying
+	 * filesystem might be in a state of partial construction and hence it
+	 * is dangerous to access it.  trylock_super() uses a MS_BORN check to
+	 * avoid this situation, so do the same here. The memory barrier is
+	 * matched with the one in mount_fs() as we don't hold locks here.
 	 */
+	if (!(sb->s_flags & MS_BORN))
+		return 0;
+	smp_rmb();
+
 	if (sb->s_op && sb->s_op->nr_cached_objects)
 		total_objects = sb->s_op->nr_cached_objects(sb, sc);
 
@@ -470,7 +480,7 @@ struct super_block *sget_userns(struct file_system_type *type,
 	struct super_block *old;
 	int err;
 
-	if (!(flags & MS_KERNMOUNT) &&
+	if (!(flags & (MS_KERNMOUNT|MS_SUBMOUNT)) &&
 	    !(type->fs_flags & FS_USERNS_MOUNT) &&
 	    !capable(CAP_SYS_ADMIN))
 		return ERR_PTR(-EPERM);
@@ -500,7 +510,7 @@ retry:
 	}
 	if (!s) {
 		spin_unlock(&sb_lock);
-		s = alloc_super(type, flags, user_ns);
+		s = alloc_super(type, (flags & ~MS_SUBMOUNT), user_ns);
 		if (!s)
 			return ERR_PTR(-ENOMEM);
 		goto retry;
@@ -519,7 +529,11 @@ retry:
 	hlist_add_head(&s->s_instances, &type->fs_supers);
 	spin_unlock(&sb_lock);
 	get_filesystem(type);
-	register_shrinker(&s->s_shrink);
+	err = register_shrinker(&s->s_shrink);
+	if (err) {
+		deactivate_locked_super(s);
+		s = ERR_PTR(err);
+	}
 	return s;
 }
 
@@ -541,8 +555,15 @@ struct super_block *sget(struct file_system_type *type,
 {
 	struct user_namespace *user_ns = current_user_ns();
 
+	/* We don't yet pass the user namespace of the parent
+	 * mount through to here so always use &init_user_ns
+	 * until that changes.
+	 */
+	if (flags & MS_SUBMOUNT)
+		user_ns = &init_user_ns;
+
 	/* Ensure the requestor has permissions over the target filesystem */
-	if (!(flags & MS_KERNMOUNT) && !ns_capable(user_ns, CAP_SYS_ADMIN))
+	if (!(flags & (MS_KERNMOUNT|MS_SUBMOUNT)) && !ns_capable(user_ns, CAP_SYS_ADMIN))
 		return ERR_PTR(-EPERM);
 
 	return sget_userns(type, test, set, flags, user_ns, data);
@@ -750,7 +771,8 @@ rescan:
 }
 
 /**
- *	do_remount_sb - asks filesystem to change mount options.
+ *	do_remount_sb2 - asks filesystem to change mount options.
+ *	@mnt:   mount we are looking at
  *	@sb:	superblock in question
  *	@flags:	numeric part of options
  *	@data:	the rest of options
@@ -758,7 +780,7 @@ rescan:
  *
  *	Alters the mount options of a mounted file system.
  */
-int do_remount_sb(struct super_block *sb, int flags, void *data, int force)
+int do_remount_sb2(struct vfsmount *mnt, struct super_block *sb, int flags, void *data, int force)
 {
 	int retval;
 	int remount_ro;
@@ -800,7 +822,16 @@ int do_remount_sb(struct super_block *sb, int flags, void *data, int force)
 		}
 	}
 
-	if (sb->s_op->remount_fs) {
+	if (mnt && sb->s_op->remount_fs2) {
+		retval = sb->s_op->remount_fs2(mnt, sb, &flags, data);
+		if (retval) {
+			if (!force)
+				goto cancel_readonly;
+			/* If forced remount, go ahead despite any errors */
+			WARN(1, "forced remount of a %s fs returned %i\n",
+			     sb->s_type->name, retval);
+		}
+	} else if (sb->s_op->remount_fs) {
 		retval = sb->s_op->remount_fs(sb, &flags, data);
 		if (retval) {
 			if (!force)
@@ -832,12 +863,17 @@ cancel_readonly:
 	return retval;
 }
 
+int do_remount_sb(struct super_block *sb, int flags, void *data, int force)
+{
+	return do_remount_sb2(NULL, sb, flags, data, force);
+}
+
 static void do_emergency_remount(struct work_struct *work)
 {
 	struct super_block *sb, *p = NULL;
 
 	spin_lock(&sb_lock);
-	list_for_each_entry(sb, &super_blocks, s_list) {
+	list_for_each_entry_reverse(sb, &super_blocks, s_list) {
 		if (hlist_unhashed(&sb->s_instances))
 			continue;
 		sb->s_count++;
@@ -1008,7 +1044,7 @@ static int set_bdev_super(struct super_block *s, void *data)
 	 * We set the bdi here to the queue backing, file systems can
 	 * overwrite this in ->fill_super()
 	 */
-	s->s_bdi = &bdev_get_queue(s->s_bdev)->backing_dev_info;
+	s->s_bdi = bdev_get_queue(s->s_bdev)->backing_dev_info;
 	return 0;
 }
 
@@ -1157,7 +1193,7 @@ struct dentry *mount_single(struct file_system_type *fs_type,
 EXPORT_SYMBOL(mount_single);
 
 struct dentry *
-mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
+mount_fs(struct file_system_type *type, int flags, const char *name, struct vfsmount *mnt, void *data)
 {
 	struct dentry *root;
 	struct super_block *sb;
@@ -1174,7 +1210,10 @@ mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
 			goto out_free_secdata;
 	}
 
-	root = type->mount(type, flags, name, data);
+	if (type->mount2)
+		root = type->mount2(mnt, type, flags, name, data);
+	else
+		root = type->mount(type, flags, name, data);
 	if (IS_ERR(root)) {
 		error = PTR_ERR(root);
 		goto out_free_secdata;
@@ -1182,6 +1221,14 @@ mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
 	sb = root->d_sb;
 	BUG_ON(!sb);
 	WARN_ON(!sb->s_bdi);
+
+	/*
+	 * Write barrier is for super_cache_count(). We place it before setting
+	 * MS_BORN as the data dependency between the two functions is the
+	 * superblock structure contents that we just set up, not the MS_BORN
+	 * flag.
+	 */
+	smp_wmb();
 	sb->s_flags |= MS_BORN;
 
 	error = security_sb_kern_mount(sb, flags, secdata);
@@ -1225,36 +1272,11 @@ EXPORT_SYMBOL(__sb_end_write);
  */
 int __sb_start_write(struct super_block *sb, int level, bool wait)
 {
-	bool force_trylock = false;
-	int ret = 1;
+	if (!wait)
+		return percpu_down_read_trylock(sb->s_writers.rw_sem + level-1);
 
-#ifdef CONFIG_LOCKDEP
-	/*
-	 * We want lockdep to tell us about possible deadlocks with freezing
-	 * but it's it bit tricky to properly instrument it. Getting a freeze
-	 * protection works as getting a read lock but there are subtle
-	 * problems. XFS for example gets freeze protection on internal level
-	 * twice in some cases, which is OK only because we already hold a
-	 * freeze protection also on higher level. Due to these cases we have
-	 * to use wait == F (trylock mode) which must not fail.
-	 */
-	if (wait) {
-		int i;
-
-		for (i = 0; i < level - 1; i++)
-			if (percpu_rwsem_is_held(sb->s_writers.rw_sem + i)) {
-				force_trylock = true;
-				break;
-			}
-	}
-#endif
-	if (wait && !force_trylock)
-		percpu_down_read(sb->s_writers.rw_sem + level-1);
-	else
-		ret = percpu_down_read_trylock(sb->s_writers.rw_sem + level-1);
-
-	WARN_ON(force_trylock && !ret);
-	return ret;
+	percpu_down_read(sb->s_writers.rw_sem + level-1);
+	return 1;
 }
 EXPORT_SYMBOL(__sb_start_write);
 

@@ -211,7 +211,7 @@ static void tcf_stats_update(struct tc_action *a, u64 bytes, u32 packets,
 	struct tcf_t *tm = &m->tcf_tm;
 
 	_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats), bytes, packets);
-	tm->lastuse = lastuse;
+	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
 }
 
 static int tcf_mirred_dump(struct sk_buff *skb, struct tc_action *a, int bind,
@@ -332,7 +332,11 @@ static int __init mirred_init_module(void)
 		return err;
 
 	pr_info("Mirror/redirect action on\n");
-	return tcf_register_action(&act_mirred_ops, &mirred_net_ops);
+	err = tcf_register_action(&act_mirred_ops, &mirred_net_ops);
+	if (err)
+		unregister_netdevice_notifier(&mirred_device_notifier);
+
+	return err;
 }
 
 static void __exit mirred_cleanup_module(void)

@@ -302,10 +302,12 @@ int pwmchip_add_with_polarity(struct pwm_chip *chip,
 	if (IS_ENABLED(CONFIG_OF))
 		of_pwmchip_add(chip);
 
-	pwmchip_sysfs_export(chip);
-
 out:
 	mutex_unlock(&pwm_lock);
+
+	if (!ret)
+		pwmchip_sysfs_export(chip);
+
 	return ret;
 }
 EXPORT_SYMBOL_GPL(pwmchip_add_with_polarity);
@@ -339,7 +341,7 @@ int pwmchip_remove(struct pwm_chip *chip)
 	unsigned int i;
 	int ret = 0;
 
-	pwmchip_sysfs_unexport_children(chip);
+	pwmchip_sysfs_unexport(chip);
 
 	mutex_lock(&pwm_lock);
 
@@ -358,8 +360,6 @@ int pwmchip_remove(struct pwm_chip *chip)
 		of_pwmchip_remove(chip);
 
 	free_pwms(chip);
-
-	pwmchip_sysfs_unexport(chip);
 
 out:
 	mutex_unlock(&pwm_lock);
@@ -520,6 +520,48 @@ int pwm_apply_state(struct pwm_device *pwm, struct pwm_state *state)
 			}
 
 			pwm->state.enabled = state->enabled;
+		}
+
+		if (state->double_period != pwm->state.double_period) {
+			if (state->double_period > state->period)
+				return -EINVAL;
+
+			if (!pwm->chip->ops->set_double_pulse_period)
+				return -ENOTSUPP;
+
+			err = pwm->chip->ops->set_double_pulse_period(
+					pwm->chip, pwm, state->double_period);
+			if (err)
+				return err;
+
+			pwm->state.double_period = state->double_period;
+		}
+
+		if (state->ramp_time != pwm->state.ramp_time) {
+			if (state->ramp_time > state->duty_cycle)
+				return -EINVAL;
+
+			if (!pwm->chip->ops->set_ramp_time)
+				return -ENOTSUPP;
+
+			err = pwm->chip->ops->set_ramp_time(
+					pwm->chip, pwm, state->ramp_time);
+			if (err)
+				return err;
+
+			pwm->state.ramp_time = state->ramp_time;
+		}
+
+		if (state->capture_win_len != pwm->state.capture_win_len) {
+			if (!pwm->chip->ops->set_capture_window_length)
+				return -ENOTSUPP;
+
+			err = pwm->chip->ops->set_capture_window_length(
+					pwm->chip, pwm, state->capture_win_len);
+			if (err)
+				return err;
+
+			pwm->state.capture_win_len = state->capture_win_len;
 		}
 	}
 
@@ -858,6 +900,7 @@ void pwm_put(struct pwm_device *pwm)
 	if (pwm->chip->ops->free)
 		pwm->chip->ops->free(pwm->chip, pwm);
 
+	pwm_set_chip_data(pwm, NULL);
 	pwm->label = NULL;
 
 	module_put(pwm->chip->ops->owner);

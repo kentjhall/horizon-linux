@@ -83,6 +83,7 @@
 #include <linux/export.h>
 #include <linux/msg.h>
 #include <linux/shm.h>
+#include <linux/bpf.h>
 
 #include "avc.h"
 #include "objsec.h"
@@ -406,18 +407,6 @@ static void superblock_free_security(struct super_block *sb)
 	kfree(sbsec);
 }
 
-/* The file system's label must be initialized prior to use. */
-
-static const char *labeling_behaviors[7] = {
-	"uses xattr",
-	"uses transition SIDs",
-	"uses task SIDs",
-	"uses genfs_contexts",
-	"not configured for labeling",
-	"uses mountpoint labeling",
-	"uses native labeling",
-};
-
 static inline int inode_doinit(struct inode *inode)
 {
 	return inode_doinit_with_dentry(inode, NULL);
@@ -479,19 +468,42 @@ static int may_context_mount_inode_relabel(u32 sid,
 	return rc;
 }
 
+static int selinux_is_genfs_special_handling(struct super_block *sb)
+{
+	/* Special handling. Genfs but also in-core setxattr handler */
+	return	!strcmp(sb->s_type->name, "sysfs") ||
+		!strcmp(sb->s_type->name, "pstore") ||
+		!strcmp(sb->s_type->name, "debugfs") ||
+		!strcmp(sb->s_type->name, "tracefs") ||
+		!strcmp(sb->s_type->name, "rootfs");
+}
+
 static int selinux_is_sblabel_mnt(struct super_block *sb)
 {
 	struct superblock_security_struct *sbsec = sb->s_security;
 
-	return sbsec->behavior == SECURITY_FS_USE_XATTR ||
-		sbsec->behavior == SECURITY_FS_USE_TRANS ||
-		sbsec->behavior == SECURITY_FS_USE_TASK ||
-		sbsec->behavior == SECURITY_FS_USE_NATIVE ||
-		/* Special handling. Genfs but also in-core setxattr handler */
-		!strcmp(sb->s_type->name, "sysfs") ||
-		!strcmp(sb->s_type->name, "pstore") ||
-		!strcmp(sb->s_type->name, "debugfs") ||
-		!strcmp(sb->s_type->name, "rootfs");
+	/*
+	 * IMPORTANT: Double-check logic in this function when adding a new
+	 * SECURITY_FS_USE_* definition!
+	 */
+	BUILD_BUG_ON(SECURITY_FS_USE_MAX != 7);
+
+	switch (sbsec->behavior) {
+	case SECURITY_FS_USE_XATTR:
+	case SECURITY_FS_USE_TRANS:
+	case SECURITY_FS_USE_TASK:
+	case SECURITY_FS_USE_NATIVE:
+		return 1;
+
+	case SECURITY_FS_USE_GENFS:
+		return selinux_is_genfs_special_handling(sb);
+
+	/* Never allow relabeling on context mounts */
+	case SECURITY_FS_USE_MNTPOINT:
+	case SECURITY_FS_USE_NONE:
+	default:
+		return 0;
+	}
 }
 
 static int sb_finish_set_opts(struct super_block *sb)
@@ -527,10 +539,6 @@ static int sb_finish_set_opts(struct super_block *sb)
 			goto out;
 		}
 	}
-
-	if (sbsec->behavior > ARRAY_SIZE(labeling_behaviors))
-		printk(KERN_ERR "SELinux: initialized (dev %s, type %s), unknown behavior\n",
-		       sb->s_id, sb->s_type->name);
 
 	sbsec->flags |= SE_SBINITIALIZED;
 	if (selinux_is_sblabel_mnt(sb))
@@ -813,6 +821,7 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 		sbsec->flags |= SE_SBPROC | SE_SBGENFS;
 
 	if (!strcmp(sb->s_type->name, "debugfs") ||
+	    !strcmp(sb->s_type->name, "tracefs") ||
 	    !strcmp(sb->s_type->name, "sysfs") ||
 	    !strcmp(sb->s_type->name, "pstore"))
 		sbsec->flags |= SE_SBGENFS;
@@ -1761,6 +1770,10 @@ static inline int file_path_has_perm(const struct cred *cred,
 	return inode_has_perm(cred, file_inode(file), av, &ad);
 }
 
+#ifdef CONFIG_BPF_SYSCALL
+static int bpf_fd_pass(struct file *file, u32 sid);
+#endif
+
 /* Check whether a task can use an open file descriptor to
    access an inode in a given way.  Check access to the
    descriptor itself, and then use dentry_has_perm to
@@ -1790,6 +1803,12 @@ static int file_has_perm(const struct cred *cred,
 		if (rc)
 			goto out;
 	}
+
+#ifdef CONFIG_BPF_SYSCALL
+	rc = bpf_fd_pass(file, cred_sid(cred));
+	if (rc)
+		return rc;
+#endif
 
 	/* av is zero if only checking access to the descriptor. */
 	rc = 0;
@@ -2049,8 +2068,9 @@ static inline u32 file_to_av(struct file *file)
 static inline u32 open_file_to_av(struct file *file)
 {
 	u32 av = file_to_av(file);
+	struct inode *inode = file_inode(file);
 
-	if (selinux_policycap_openperm)
+	if (selinux_policycap_openperm && inode->i_sb->s_magic != SOCKFS_MAGIC)
 		av |= FILE__OPEN;
 
 	return av;
@@ -2118,6 +2138,12 @@ static int selinux_binder_transfer_file(struct task_struct *from,
 		if (rc)
 			return rc;
 	}
+
+#ifdef CONFIG_BPF_SYSCALL
+	rc = bpf_fd_pass(file, sid);
+	if (rc)
+		return rc;
+#endif
 
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
@@ -2773,7 +2799,7 @@ static int selinux_sb_kern_mount(struct super_block *sb, int flags, void *data)
 		return rc;
 
 	/* Allow all mounts performed by the kernel */
-	if (flags & MS_KERNMOUNT)
+	if (flags & (MS_KERNMOUNT | MS_SUBMOUNT))
 		return 0;
 
 	ad.type = LSM_AUDIT_DATA_DENTRY;
@@ -3047,6 +3073,7 @@ static int selinux_inode_permission(struct inode *inode, int mask)
 static int selinux_inode_setattr(struct dentry *dentry, struct iattr *iattr)
 {
 	const struct cred *cred = current_cred();
+	struct inode *inode = d_backing_inode(dentry);
 	unsigned int ia_valid = iattr->ia_valid;
 	__u32 av = FILE__WRITE;
 
@@ -3062,8 +3089,10 @@ static int selinux_inode_setattr(struct dentry *dentry, struct iattr *iattr)
 			ATTR_ATIME_SET | ATTR_MTIME_SET | ATTR_TIMES_SET))
 		return dentry_has_perm(cred, dentry, FILE__SETATTR);
 
-	if (selinux_policycap_openperm && (ia_valid & ATTR_SIZE)
-			&& !(ia_valid & ATTR_FILE))
+	if (selinux_policycap_openperm &&
+	    inode->i_sb->s_magic != SOCKFS_MAGIC &&
+	    (ia_valid & ATTR_SIZE) &&
+	    !(ia_valid & ATTR_FILE))
 		av |= FILE__OPEN;
 
 	return dentry_has_perm(cred, dentry, av);
@@ -3277,10 +3306,14 @@ static int selinux_inode_setsecurity(struct inode *inode, const char *name,
 				     const void *value, size_t size, int flags)
 {
 	struct inode_security_struct *isec = inode_security_novalidate(inode);
+	struct superblock_security_struct *sbsec = inode->i_sb->s_security;
 	u32 newsid;
 	int rc;
 
 	if (strcmp(name, XATTR_SELINUX_SUFFIX))
+		return -EOPNOTSUPP;
+
+	if (!(sbsec->flags & SBLABEL_MNT))
 		return -EOPNOTSUPP;
 
 	if (!value || !size)
@@ -4328,10 +4361,18 @@ static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, in
 		u32 sid, node_perm;
 
 		if (family == PF_INET) {
+			if (addrlen < sizeof(struct sockaddr_in)) {
+				err = -EINVAL;
+				goto out;
+			}
 			addr4 = (struct sockaddr_in *)address;
 			snum = ntohs(addr4->sin_port);
 			addrp = (char *)&addr4->sin_addr.s_addr;
 		} else {
+			if (addrlen < SIN6_LEN_RFC2133) {
+				err = -EINVAL;
+				goto out;
+			}
 			addr6 = (struct sockaddr_in6 *)address;
 			snum = ntohs(addr6->sin6_port);
 			addrp = (char *)&addr6->sin6_addr.s6_addr;
@@ -4980,39 +5021,59 @@ static int selinux_tun_dev_open(void *security)
 
 static int selinux_nlmsg_perm(struct sock *sk, struct sk_buff *skb)
 {
-	int err = 0;
-	u32 perm;
+	int rc = 0;
+	unsigned int msg_len;
+	unsigned int data_len = skb->len;
+	unsigned char *data = skb->data;
 	struct nlmsghdr *nlh;
 	struct sk_security_struct *sksec = sk->sk_security;
+	u16 sclass = sksec->sclass;
+	u32 perm;
 
-	if (skb->len < NLMSG_HDRLEN) {
-		err = -EINVAL;
-		goto out;
-	}
-	nlh = nlmsg_hdr(skb);
+	while (data_len >= nlmsg_total_size(0)) {
+		nlh = (struct nlmsghdr *)data;
 
-	err = selinux_nlmsg_lookup(sksec->sclass, nlh->nlmsg_type, &perm);
-	if (err) {
-		if (err == -EINVAL) {
+		/* NOTE: the nlmsg_len field isn't reliably set by some netlink
+		 *       users which means we can't reject skb's with bogus
+		 *       length fields; our solution is to follow what
+		 *       netlink_rcv_skb() does and simply skip processing at
+		 *       messages with length fields that are clearly junk
+		 */
+		if (nlh->nlmsg_len < NLMSG_HDRLEN || nlh->nlmsg_len > data_len)
+			return 0;
+
+		rc = selinux_nlmsg_lookup(sclass, nlh->nlmsg_type, &perm);
+		if (rc == 0) {
+			rc = sock_has_perm(current, sk, perm);
+			if (rc)
+				return rc;
+		} else if (rc == -EINVAL) {
+			/* -EINVAL is a missing msg/perm mapping */
 			pr_warn_ratelimited("SELinux: unrecognized netlink"
-			       " message: protocol=%hu nlmsg_type=%hu sclass=%s"
-			       " pig=%d comm=%s\n",
-			       sk->sk_protocol, nlh->nlmsg_type,
-			       secclass_map[sksec->sclass - 1].name,
-			       task_pid_nr(current), current->comm);
-			if (!selinux_enforcing || security_get_allow_unknown())
-				err = 0;
+				" message: protocol=%hu nlmsg_type=%hu sclass=%s"
+				" pid=%d comm=%s\n",
+				sk->sk_protocol, nlh->nlmsg_type,
+				secclass_map[sclass - 1].name,
+				task_pid_nr(current), current->comm);
+			if (selinux_enforcing && !security_get_allow_unknown())
+				return rc;
+			rc = 0;
+		} else if (rc == -ENOENT) {
+			/* -ENOENT is a missing socket/class mapping, ignore */
+			rc = 0;
+		} else {
+			return rc;
 		}
 
-		/* Ignore */
-		if (err == -ENOENT)
-			err = 0;
-		goto out;
+		/* move to the next message after applying netlink padding */
+		msg_len = NLMSG_ALIGN(nlh->nlmsg_len);
+		if (msg_len >= data_len)
+			return 0;
+		data_len -= msg_len;
+		data += msg_len;
 	}
 
-	err = sock_has_perm(current, sk, perm);
-out:
-	return err;
+	return rc;
 }
 
 #ifdef CONFIG_NETFILTER
@@ -5858,7 +5919,7 @@ static int selinux_setprocattr(struct task_struct *p,
 		return error;
 
 	/* Obtain a SID for the context, if one was specified. */
-	if (size && str[1] && str[1] != '\n') {
+	if (size && str[0] && str[0] != '\n') {
 		if (str[size-1] == '\n') {
 			str[size-1] = 0;
 			size--;
@@ -5988,7 +6049,10 @@ static void selinux_inode_invalidate_secctx(struct inode *inode)
  */
 static int selinux_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen)
 {
-	return selinux_inode_setsecurity(inode, XATTR_SELINUX_SUFFIX, ctx, ctxlen, 0);
+	int rc = selinux_inode_setsecurity(inode, XATTR_SELINUX_SUFFIX,
+					   ctx, ctxlen, 0);
+	/* Do not return error when suppressing label (SBLABEL_MNT not set). */
+	return rc == -EOPNOTSUPP ? 0 : rc;
 }
 
 /*
@@ -6075,6 +6139,139 @@ static int selinux_key_getsecurity(struct key *key, char **_buffer)
 	return rc;
 }
 
+#endif
+
+#ifdef CONFIG_BPF_SYSCALL
+static int selinux_bpf(int cmd, union bpf_attr *attr,
+				     unsigned int size)
+{
+	u32 sid = current_sid();
+	int ret;
+
+	switch (cmd) {
+	case BPF_MAP_CREATE:
+		ret = avc_has_perm(sid, sid, SECCLASS_BPF, BPF__MAP_CREATE,
+				   NULL);
+		break;
+	case BPF_PROG_LOAD:
+		ret = avc_has_perm(sid, sid, SECCLASS_BPF, BPF__PROG_LOAD,
+				   NULL);
+		break;
+	default:
+		ret = 0;
+		break;
+	}
+
+	return ret;
+}
+
+static u32 bpf_map_fmode_to_av(fmode_t fmode)
+{
+	u32 av = 0;
+
+	if (fmode & FMODE_READ)
+		av |= BPF__MAP_READ;
+	if (fmode & FMODE_WRITE)
+		av |= BPF__MAP_WRITE;
+	return av;
+}
+
+/* This function will check the file pass through unix socket or binder to see
+ * if it is a bpf related object. And apply correspinding checks on the bpf
+ * object based on the type. The bpf maps and programs, not like other files and
+ * socket, are using a shared anonymous inode inside the kernel as their inode.
+ * So checking that inode cannot identify if the process have privilege to
+ * access the bpf object and that's why we have to add this additional check in
+ * selinux_file_receive and selinux_binder_transfer_files.
+ */
+static int bpf_fd_pass(struct file *file, u32 sid)
+{
+	struct bpf_security_struct *bpfsec;
+	struct bpf_prog *prog;
+	struct bpf_map *map;
+	int ret;
+
+	if (file->f_op == &bpf_map_fops) {
+		map = file->private_data;
+		bpfsec = map->security;
+		ret = avc_has_perm(sid, bpfsec->sid, SECCLASS_BPF,
+				   bpf_map_fmode_to_av(file->f_mode), NULL);
+		if (ret)
+			return ret;
+	} else if (file->f_op == &bpf_prog_fops) {
+		prog = file->private_data;
+		bpfsec = prog->aux->security;
+		ret = avc_has_perm(sid, bpfsec->sid, SECCLASS_BPF,
+				   BPF__PROG_RUN, NULL);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int selinux_bpf_map(struct bpf_map *map, fmode_t fmode)
+{
+	u32 sid = current_sid();
+	struct bpf_security_struct *bpfsec;
+
+	bpfsec = map->security;
+	return avc_has_perm(sid, bpfsec->sid, SECCLASS_BPF,
+			    bpf_map_fmode_to_av(fmode), NULL);
+}
+
+static int selinux_bpf_prog(struct bpf_prog *prog)
+{
+	u32 sid = current_sid();
+	struct bpf_security_struct *bpfsec;
+
+	bpfsec = prog->aux->security;
+	return avc_has_perm(sid, bpfsec->sid, SECCLASS_BPF,
+			    BPF__PROG_RUN, NULL);
+}
+
+static int selinux_bpf_map_alloc(struct bpf_map *map)
+{
+	struct bpf_security_struct *bpfsec;
+
+	bpfsec = kzalloc(sizeof(*bpfsec), GFP_KERNEL);
+	if (!bpfsec)
+		return -ENOMEM;
+
+	bpfsec->sid = current_sid();
+	map->security = bpfsec;
+
+	return 0;
+}
+
+static void selinux_bpf_map_free(struct bpf_map *map)
+{
+	struct bpf_security_struct *bpfsec = map->security;
+
+	map->security = NULL;
+	kfree(bpfsec);
+}
+
+static int selinux_bpf_prog_alloc(struct bpf_prog_aux *aux)
+{
+	struct bpf_security_struct *bpfsec;
+
+	bpfsec = kzalloc(sizeof(*bpfsec), GFP_KERNEL);
+	if (!bpfsec)
+		return -ENOMEM;
+
+	bpfsec->sid = current_sid();
+	aux->security = bpfsec;
+
+	return 0;
+}
+
+static void selinux_bpf_prog_free(struct bpf_prog_aux *aux)
+{
+	struct bpf_security_struct *bpfsec = aux->security;
+
+	aux->security = NULL;
+	kfree(bpfsec);
+}
 #endif
 
 static struct security_hook_list selinux_hooks[] = {
@@ -6290,6 +6487,16 @@ static struct security_hook_list selinux_hooks[] = {
 	LSM_HOOK_INIT(audit_rule_known, selinux_audit_rule_known),
 	LSM_HOOK_INIT(audit_rule_match, selinux_audit_rule_match),
 	LSM_HOOK_INIT(audit_rule_free, selinux_audit_rule_free),
+#endif
+
+#ifdef CONFIG_BPF_SYSCALL
+	LSM_HOOK_INIT(bpf, selinux_bpf),
+	LSM_HOOK_INIT(bpf_map, selinux_bpf_map),
+	LSM_HOOK_INIT(bpf_prog, selinux_bpf_prog),
+	LSM_HOOK_INIT(bpf_map_alloc_security, selinux_bpf_map_alloc),
+	LSM_HOOK_INIT(bpf_prog_alloc_security, selinux_bpf_prog_alloc),
+	LSM_HOOK_INIT(bpf_map_free_security, selinux_bpf_map_free),
+	LSM_HOOK_INIT(bpf_prog_free_security, selinux_bpf_prog_free),
 #endif
 };
 

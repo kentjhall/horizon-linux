@@ -62,14 +62,36 @@ static inline const struct file_operations *debugfs_real_fops(struct file *filp)
 	return filp->f_path.dentry->d_fsdata;
 }
 
+#define DEFINE_DEBUGFS_ATTRIBUTE(__fops, __get, __set, __fmt)		\
+static int __fops ## _open(struct inode *inode, struct file *file)	\
+{									\
+	__simple_attr_check_format(__fmt, 0ull);			\
+	return simple_attr_open(inode, file, __get, __set, __fmt);	\
+}									\
+static const struct file_operations __fops = {				\
+	.owner	 = THIS_MODULE,						\
+	.open	 = __fops ## _open,					\
+	.release = simple_attr_release,					\
+	.read	 = debugfs_attr_read,					\
+	.write	 = debugfs_attr_write,					\
+	.llseek  = generic_file_llseek,					\
+}
+
+typedef struct vfsmount *(*debugfs_automount_t)(struct dentry *, void *);
+
 #if defined(CONFIG_DEBUG_FS)
 
-struct dentry *debugfs_create_file(const char *name, umode_t mode,
-				   struct dentry *parent, void *data,
-				   const struct file_operations *fops);
+struct dentry *debugfs_lookup(const char *name, struct dentry *parent);
+
 struct dentry *debugfs_create_file_unsafe(const char *name, umode_t mode,
 				   struct dentry *parent, void *data,
 				   const struct file_operations *fops);
+static inline struct dentry *debugfs_create_file(const char *name, umode_t mode,
+				   struct dentry *parent, void *data,
+				   const struct file_operations *fops)
+{
+	return debugfs_create_file_unsafe(name, mode, parent, data, fops);
+}
 
 struct dentry *debugfs_create_file_size(const char *name, umode_t mode,
 					struct dentry *parent, void *data,
@@ -83,7 +105,7 @@ struct dentry *debugfs_create_symlink(const char *name, struct dentry *parent,
 
 struct dentry *debugfs_create_automount(const char *name,
 					struct dentry *parent,
-					struct vfsmount *(*f)(void *),
+					debugfs_automount_t f,
 					void *data);
 
 void debugfs_remove(struct dentry *dentry);
@@ -98,21 +120,6 @@ ssize_t debugfs_attr_read(struct file *file, char __user *buf,
 			size_t len, loff_t *ppos);
 ssize_t debugfs_attr_write(struct file *file, const char __user *buf,
 			size_t len, loff_t *ppos);
-
-#define DEFINE_DEBUGFS_ATTRIBUTE(__fops, __get, __set, __fmt)		\
-static int __fops ## _open(struct inode *inode, struct file *file)	\
-{									\
-	__simple_attr_check_format(__fmt, 0ull);			\
-	return simple_attr_open(inode, file, __get, __set, __fmt);	\
-}									\
-static const struct file_operations __fops = {				\
-	.owner	 = THIS_MODULE,					\
-	.open	 = __fops ## _open,					\
-	.release = simple_attr_release,				\
-	.read	 = debugfs_attr_read,					\
-	.write	 = debugfs_attr_write,					\
-	.llseek  = generic_file_llseek,				\
-}
 
 struct dentry *debugfs_rename(struct dentry *old_dir, struct dentry *old_dentry,
                 struct dentry *new_dir, const char *new_name);
@@ -180,6 +187,12 @@ ssize_t debugfs_write_file_bool(struct file *file, const char __user *user_buf,
  * want to duplicate the design decision mistakes of procfs and devfs again.
  */
 
+static inline struct dentry *debugfs_lookup(const char *name,
+					    struct dentry *parent)
+{
+	return ERR_PTR(-ENODEV);
+}
+
 static inline struct dentry *debugfs_create_file(const char *name, umode_t mode,
 					struct dentry *parent, void *data,
 					const struct file_operations *fops)
@@ -210,7 +223,7 @@ static inline struct dentry *debugfs_create_symlink(const char *name,
 
 static inline struct dentry *debugfs_create_automount(const char *name,
 					struct dentry *parent,
-					struct vfsmount *(*f)(void *),
+					debugfs_automount_t f,
 					void *data)
 {
 	return ERR_PTR(-ENODEV);
@@ -233,8 +246,18 @@ static inline void debugfs_use_file_finish(int srcu_idx)
 	__releases(&debugfs_srcu)
 { }
 
-#define DEFINE_DEBUGFS_ATTRIBUTE(__fops, __get, __set, __fmt)	\
-	static const struct file_operations __fops = { 0 }
+static inline ssize_t debugfs_attr_read(struct file *file, char __user *buf,
+					size_t len, loff_t *ppos)
+{
+	return -ENODEV;
+}
+
+static inline ssize_t debugfs_attr_write(struct file *file,
+					const char __user *buf,
+					size_t len, loff_t *ppos)
+{
+	return -ENODEV;
+}
 
 static inline struct dentry *debugfs_rename(struct dentry *old_dir, struct dentry *old_dentry,
                 struct dentry *new_dir, char *new_name)

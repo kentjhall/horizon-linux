@@ -1,0 +1,19 @@
+DS90UH949 1080p HDMI to FPD-Link III bridge Serializer driver
+
+Required properties:
+- compatible : should be "ti,ds90uh949".
+- reg : i2c regmap address
+- sor-instance : Serial Output Resource instance which should be driving
+                 ds90uh949 bridge chip
+- ti,enable-gpio : GPIO for enabling DS90UH949 chip
+
+Examples:
+        i2c@3160000 {
+                ds90uh949@0e {
+                        compatible = "ti,ds90uh949";
+                        reg = <0x0E>;
+                        status = "okay";
+                        sor-instance = <1>;
+                        ti,enable-gpio = <&tegra_main_gpio TEGRA_MAIN_GPIO(O, 0) 0>;
+                };
+}

@@ -21,6 +21,7 @@ use Getopt::Long qw(:config no_auto_abbrev);
 my $quiet = 0;
 my $tree = 1;
 my $chk_signoff = 1;
+my $ignore_changeid = 0;
 my $chk_patch = 1;
 my $tst_only;
 my $emacs = 0;
@@ -69,6 +70,7 @@ Options:
   -q, --quiet                quiet
   --no-tree                  run without a kernel tree
   --no-signoff               do not check for 'Signed-off-by' line
+  --ignore-changeid          ignore Gerrit Change-Id
   --patch                    treat FILE as patchfile (default)
   --emacs                    emacs compile window format
   --terse                    one line per report
@@ -183,6 +185,7 @@ GetOptions(
 	'q|quiet+'	=> \$quiet,
 	'tree!'		=> \$tree,
 	'signoff!'	=> \$chk_signoff,
+	'ignore-changeid!' => \$ignore_changeid,
 	'patch!'	=> \$chk_patch,
 	'emacs!'	=> \$emacs,
 	'terse!'	=> \$terse,
@@ -761,7 +764,7 @@ sub seed_camelcase_file {
 sub is_maintained_obsolete {
 	my ($filename) = @_;
 
-	return 0 if (!(-e "$root/scripts/get_maintainer.pl"));
+	return 0 if (!$root || !(-e "$root/scripts/get_maintainer.pl"));
 
 	my $status = `perl $root/scripts/get_maintainer.pl --status --nom --nol --nogit --nogit-fallback -f $filename 2>&1`;
 
@@ -2375,8 +2378,8 @@ sub process {
 
 # Check if the commit log has what seems like a diff which can confuse patch
 		if ($in_commit_log && !$commit_log_has_diff &&
-		    (($line =~ m@^\s+diff\b.*a/[\w/]+@ &&
-		      $line =~ m@^\s+diff\b.*a/([\w/]+)\s+b/$1\b@) ||
+		    (($line =~ m@^\s+diff\b.*a/([\w/]+)@ &&
+		      $line =~ m@^\s+diff\b.*a/[\w/]+\s+b/$1\b@) ||
 		     $line =~ m@^\s*(?:\-\-\-\s+a/|\+\+\+\s+b/)@ ||
 		     $line =~ m/^\s*\@\@ \-\d+,\d+ \+\d+,\d+ \@\@/)) {
 			ERROR("DIFF_IN_COMMIT_MSG",
@@ -2400,9 +2403,13 @@ sub process {
 			$in_commit_log = 0;
 		}
 
-# Check if MAINTAINERS is being updated.  If so, there's probably no need to
-# emit the "does MAINTAINERS need updating?" message on file add/move/delete
+# Check if MAINTAINERS and/or NVIDIA-REVIEWERS is being updated.  If so, there's probably no need to
+# emit the "does MAINTAINERS/NVIDIA-REVIEWERS need updating?" message on file add/move/delete
 		if ($line =~ /^\s*MAINTAINERS\s*\|/) {
+			$reported_maintainer_file = 1;
+		}
+
+		if ($line =~ /^\s*NVIDIA-REVIEWERS\s*\|/) {
 			$reported_maintainer_file = 1;
 		}
 
@@ -2490,7 +2497,7 @@ sub process {
 		}
 
 # Check for unwanted Gerrit info
-		if ($in_commit_log && $line =~ /^\s*change-id:/i) {
+		if ($in_commit_log && !$ignore_changeid && $line =~ /^\s*change-id:/i) {
 			ERROR("GERRIT_CHANGE_ID",
 			      "Remove Gerrit Change-Id's before submitting upstream.\n" . $herecurr);
 		}
@@ -2529,6 +2536,7 @@ sub process {
 # Check for git id commit length and improperly formed commit descriptions
 		if ($in_commit_log && !$commit_log_possible_stack_dump &&
 		    $line !~ /^\s*(?:Link|Patchwork|http|https|BugLink):/i &&
+		    $line !~ /^This reverts commit [0-9a-f]{7,40}/ &&
 		    ($line =~ /\bcommit\s+[0-9a-f]{5,}\b/i ||
 		     ($line =~ /(?:\s|^)[0-9a-f]{12,40}(?:[\s"'\(\[]|$)/i &&
 		      $line !~ /[\<\[][0-9a-f]{12,40}[\>\]]/i &&
@@ -2591,7 +2599,7 @@ sub process {
 		      (defined($1) || defined($2))))) {
 			$reported_maintainer_file = 1;
 			WARN("FILE_PATH_CHANGES",
-			     "added, moved or deleted file(s), does MAINTAINERS need updating?\n" . $herecurr);
+			     "added, moved or deleted file(s), does MAINTAINERS and/or NVIDIA-REVIEWERS need updating?\n" . $herecurr);
 		}
 
 # Check for wrappage within a valid hunk of the file
@@ -3499,7 +3507,7 @@ sub process {
 				$fixedline =~ s/\s*=\s*$/ = {/;
 				fix_insert_line($fixlinenr, $fixedline);
 				$fixedline = $line;
-				$fixedline =~ s/^(.\s*){\s*/$1/;
+				$fixedline =~ s/^(.\s*)\{\s*/$1/;
 				fix_insert_line($fixlinenr, $fixedline);
 			}
 		}
@@ -3818,7 +3826,7 @@ sub process {
 			    $fix) {
 				fix_delete_line($fixlinenr, $rawline);
 				my $fixed_line = $rawline;
-				$fixed_line =~ /(^..*$Type\s*$Ident\(.*\)\s*){(.*)$/;
+				$fixed_line =~ /(^..*$Type\s*$Ident\(.*\)\s*)\{(.*)$/;
 				my $line1 = $1;
 				my $line2 = $2;
 				fix_insert_line($fixlinenr, ltrim($line1));
@@ -3840,7 +3848,7 @@ sub process {
 				my $fixedline = rtrim($prevrawline) . " {";
 				fix_insert_line($fixlinenr, $fixedline);
 				$fixedline = $rawline;
-				$fixedline =~ s/^(.\s*){\s*/$1\t/;
+				$fixedline =~ s/^(.\s*)\{\s*/$1\t/;
 				if ($fixedline !~ /^\+\s*$/) {
 					fix_insert_line($fixlinenr, $fixedline);
 				}
@@ -4329,7 +4337,7 @@ sub process {
 			if (ERROR("SPACING",
 				  "space required before the open brace '{'\n" . $herecurr) &&
 			    $fix) {
-				$fixed[$fixlinenr] =~ s/^(\+.*(?:do|\))){/$1 {/;
+				$fixed[$fixlinenr] =~ s/^(\+.*(?:do|\)))\{/$1 {/;
 			}
 		}
 

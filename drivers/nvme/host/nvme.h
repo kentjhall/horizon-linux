@@ -84,7 +84,7 @@ enum nvme_quirks {
  * NVME_QUIRK_DELAY_BEFORE_CHK_RDY quirk enabled. The value (in ms) was
  * found empirically.
  */
-#define NVME_QUIRK_DELAY_AMOUNT		2000
+#define NVME_QUIRK_DELAY_AMOUNT		2300
 
 enum nvme_ctrl_state {
 	NVME_CTRL_NEW,
@@ -121,7 +121,6 @@ struct nvme_ctrl {
 
 	u32 page_size;
 	u32 max_hw_sectors;
-	u32 stripe_size;
 	u16 oncs;
 	u16 vid;
 	atomic_t abort_limit;
@@ -268,6 +267,10 @@ void nvme_queue_async_events(struct nvme_ctrl *ctrl);
 void nvme_stop_queues(struct nvme_ctrl *ctrl);
 void nvme_start_queues(struct nvme_ctrl *ctrl);
 void nvme_kill_queues(struct nvme_ctrl *ctrl);
+void nvme_unfreeze(struct nvme_ctrl *ctrl);
+void nvme_wait_freeze(struct nvme_ctrl *ctrl);
+void nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl, long timeout);
+void nvme_start_freeze(struct nvme_ctrl *ctrl);
 
 #define NVME_QID_ANY -1
 struct request *nvme_alloc_request(struct request_queue *q,

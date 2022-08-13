@@ -22,6 +22,14 @@ menuconfig SND_SOC
 
 if SND_SOC
 
+config NON_RECURSIVE_DAPM
+	def_tristate SND_SOC_TEGRA_VIRT_T210REF_PCM
+	prompt "Non-recursive DAPM implementation"
+	help
+	  Select 'y' to enable non-recursive implementation of DAPM
+	  is_connected_ep function. This should be used if your codec
+	  has a long list of widgets and very long DAPM routes are possible.
+
 config SND_SOC_AC97_BUS
 	bool
 
@@ -77,4 +85,3 @@ source "sound/soc/codecs/Kconfig"
 source "sound/soc/generic/Kconfig"
 
 endif	# SND_SOC
-

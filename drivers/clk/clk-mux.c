@@ -66,17 +66,17 @@ static u8 clk_mux_get_parent(struct clk_hw *hw)
 static int clk_mux_set_parent(struct clk_hw *hw, u8 index)
 {
 	struct clk_mux *mux = to_clk_mux(hw);
-	u32 val;
+	u32 val, tindex = index;
 	unsigned long flags = 0;
 
 	if (mux->table) {
-		index = mux->table[index];
+		tindex = mux->table[index];
 	} else {
 		if (mux->flags & CLK_MUX_INDEX_BIT)
-			index = 1 << index;
+			tindex = 1 << index;
 
 		if (mux->flags & CLK_MUX_INDEX_ONE)
-			index++;
+			tindex = index + 1;
 	}
 
 	if (mux->lock)
@@ -90,7 +90,7 @@ static int clk_mux_set_parent(struct clk_hw *hw, u8 index)
 		val = clk_readl(mux->reg);
 		val &= ~(mux->mask << mux->shift);
 	}
-	val |= index << mux->shift;
+	val |= tindex << mux->shift;
 	clk_writel(val, mux->reg);
 
 	if (mux->lock)

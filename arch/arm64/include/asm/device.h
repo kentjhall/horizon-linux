@@ -16,15 +16,25 @@
 #ifndef __ASM_DEVICE_H
 #define __ASM_DEVICE_H
 
+struct dma_iommu_mapping;
+
 struct dev_archdata {
 	struct dma_map_ops *dma_ops;
 #ifdef CONFIG_IOMMU_API
 	void *iommu;			/* private IOMMU data */
+	struct dma_iommu_mapping *mapping;
 #endif
 	bool dma_coherent;
+	bool dma_noncontig;
 };
 
 struct pdev_archdata {
 };
+
+#ifdef CONFIG_IOMMU_API
+#define to_dma_iommu_mapping(dev) (dev->archdata.mapping)
+#else
+#define to_dma_iommu_mapping(dev) NULL
+#endif
 
 #endif

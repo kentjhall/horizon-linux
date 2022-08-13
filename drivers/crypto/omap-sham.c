@@ -167,8 +167,6 @@ struct omap_sham_hmac_ctx {
 };
 
 struct omap_sham_ctx {
-	struct omap_sham_dev	*dd;
-
 	unsigned long		flags;
 
 	/* fallback stuff */
@@ -455,6 +453,9 @@ static void omap_sham_write_ctrl_omap4(struct omap_sham_dev *dd, size_t length,
 {
 	struct omap_sham_reqctx *ctx = ahash_request_ctx(dd->req);
 	u32 val, mask;
+
+	if (likely(ctx->digcnt))
+		omap_sham_write(dd, SHA_REG_DIGCNT(dd), ctx->digcnt);
 
 	/*
 	 * Setting ALGO_CONST only for the first iteration and
@@ -750,7 +751,10 @@ static int omap_sham_align_sgs(struct scatterlist *sg,
 	if (final)
 		new_len = DIV_ROUND_UP(new_len, bs) * bs;
 	else
-		new_len = new_len / bs * bs;
+		new_len = (new_len - 1) / bs * bs;
+
+	if (nbytes != new_len)
+		list_ok = false;
 
 	while (nbytes > 0 && sg_tmp) {
 		n++;
@@ -846,6 +850,8 @@ static int omap_sham_prepare_request(struct ahash_request *req, bool update)
 			xmit_len = DIV_ROUND_UP(xmit_len, bs) * bs;
 		else
 			xmit_len = xmit_len / bs * bs;
+	} else if (!final) {
+		xmit_len -= bs;
 	}
 
 	hash_later = rctx->total - xmit_len;
@@ -873,14 +879,21 @@ static int omap_sham_prepare_request(struct ahash_request *req, bool update)
 	}
 
 	if (hash_later) {
-		if (req->nbytes) {
-			scatterwalk_map_and_copy(rctx->buffer, req->src,
-						 req->nbytes - hash_later,
-						 hash_later, 0);
-		} else {
+		int offset = 0;
+
+		if (hash_later > req->nbytes) {
 			memcpy(rctx->buffer, rctx->buffer + xmit_len,
-			       hash_later);
+			       hash_later - req->nbytes);
+			offset = hash_later - req->nbytes;
 		}
+
+		if (req->nbytes) {
+			scatterwalk_map_and_copy(rctx->buffer + offset,
+						 req->src,
+						 offset + req->nbytes -
+						 hash_later, hash_later, 0);
+		}
+
 		rctx->bufcnt = hash_later;
 	} else {
 		rctx->bufcnt = 0;
@@ -903,27 +916,35 @@ static int omap_sham_update_dma_stop(struct omap_sham_dev *dd)
 	return 0;
 }
 
+struct omap_sham_dev *omap_sham_find_dev(struct omap_sham_reqctx *ctx)
+{
+	struct omap_sham_dev *dd;
+
+	if (ctx->dd)
+		return ctx->dd;
+
+	spin_lock_bh(&sham.lock);
+	dd = list_first_entry(&sham.dev_list, struct omap_sham_dev, list);
+	list_move_tail(&dd->list, &sham.dev_list);
+	ctx->dd = dd;
+	spin_unlock_bh(&sham.lock);
+
+	return dd;
+}
+
 static int omap_sham_init(struct ahash_request *req)
 {
 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
 	struct omap_sham_ctx *tctx = crypto_ahash_ctx(tfm);
 	struct omap_sham_reqctx *ctx = ahash_request_ctx(req);
-	struct omap_sham_dev *dd = NULL, *tmp;
+	struct omap_sham_dev *dd;
 	int bs = 0;
 
-	spin_lock_bh(&sham.lock);
-	if (!tctx->dd) {
-		list_for_each_entry(tmp, &sham.dev_list, list) {
-			dd = tmp;
-			break;
-		}
-		tctx->dd = dd;
-	} else {
-		dd = tctx->dd;
-	}
-	spin_unlock_bh(&sham.lock);
+	ctx->dd = NULL;
 
-	ctx->dd = dd;
+	dd = omap_sham_find_dev(ctx);
+	if (!dd)
+		return -ENODEV;
 
 	ctx->flags = 0;
 
@@ -1069,7 +1090,7 @@ static void omap_sham_finish_req(struct ahash_request *req, int err)
 
 	if (test_bit(FLAGS_SGS_COPIED, &dd->flags))
 		free_pages((unsigned long)sg_virt(ctx->sg),
-			   get_order(ctx->sg->length));
+			   get_order(ctx->sg->length + ctx->bufcnt));
 
 	if (test_bit(FLAGS_SGS_ALLOCED, &dd->flags))
 		kfree(ctx->sg);
@@ -1130,7 +1151,7 @@ retry:
 	ctx = ahash_request_ctx(req);
 
 	err = omap_sham_prepare_request(req, ctx->op == OP_UPDATE);
-	if (err)
+	if (err || !ctx->total)
 		goto err1;
 
 	dev_dbg(dd->dev, "handling new req, op: %lu, nbytes: %d\n",
@@ -1173,8 +1194,7 @@ err1:
 static int omap_sham_enqueue(struct ahash_request *req, unsigned int op)
 {
 	struct omap_sham_reqctx *ctx = ahash_request_ctx(req);
-	struct omap_sham_ctx *tctx = crypto_tfm_ctx(req->base.tfm);
-	struct omap_sham_dev *dd = tctx->dd;
+	struct omap_sham_dev *dd = ctx->dd;
 
 	ctx->op = op;
 
@@ -1184,16 +1204,15 @@ static int omap_sham_enqueue(struct ahash_request *req, unsigned int op)
 static int omap_sham_update(struct ahash_request *req)
 {
 	struct omap_sham_reqctx *ctx = ahash_request_ctx(req);
-	struct omap_sham_dev *dd = ctx->dd;
+	struct omap_sham_dev *dd = omap_sham_find_dev(ctx);
 
 	if (!req->nbytes)
 		return 0;
 
-	if (ctx->total + req->nbytes < ctx->buflen) {
+	if (ctx->bufcnt + req->nbytes <= ctx->buflen) {
 		scatterwalk_map_and_copy(ctx->buffer + ctx->bufcnt, req->src,
 					 0, req->nbytes, 0);
 		ctx->bufcnt += req->nbytes;
-		ctx->total += req->nbytes;
 		return 0;
 	}
 
@@ -1290,20 +1309,7 @@ static int omap_sham_setkey(struct crypto_ahash *tfm, const u8 *key,
 	struct omap_sham_hmac_ctx *bctx = tctx->base;
 	int bs = crypto_shash_blocksize(bctx->shash);
 	int ds = crypto_shash_digestsize(bctx->shash);
-	struct omap_sham_dev *dd = NULL, *tmp;
 	int err, i;
-
-	spin_lock_bh(&sham.lock);
-	if (!tctx->dd) {
-		list_for_each_entry(tmp, &sham.dev_list, list) {
-			dd = tmp;
-			break;
-		}
-		tctx->dd = dd;
-	} else {
-		dd = tctx->dd;
-	}
-	spin_unlock_bh(&sham.lock);
 
 	err = crypto_shash_setkey(tctx->fallback, key, keylen);
 	if (err)
@@ -1322,7 +1328,7 @@ static int omap_sham_setkey(struct crypto_ahash *tfm, const u8 *key,
 
 	memset(bctx->ipad + keylen, 0, bs - keylen);
 
-	if (!test_bit(FLAGS_AUTO_XOR, &dd->flags)) {
+	if (!test_bit(FLAGS_AUTO_XOR, &sham.flags)) {
 		memcpy(bctx->opad, bctx->ipad, bs);
 
 		for (i = 0; i < bs; i++) {
@@ -2061,6 +2067,7 @@ static int omap_sham_probe(struct platform_device *pdev)
 	}
 
 	dd->flags |= dd->pdata->flags;
+	sham.flags |= dd->pdata->flags;
 
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_set_autosuspend_delay(dev, DEFAULT_AUTOSUSPEND_DELAY);
@@ -2086,6 +2093,9 @@ static int omap_sham_probe(struct platform_device *pdev)
 	spin_unlock(&sham.lock);
 
 	for (i = 0; i < dd->pdata->algs_info_size; i++) {
+		if (dd->pdata->algs_info[i].registered)
+			break;
+
 		for (j = 0; j < dd->pdata->algs_info[i].size; j++) {
 			struct ahash_alg *alg;
 
@@ -2131,9 +2141,11 @@ static int omap_sham_remove(struct platform_device *pdev)
 	list_del(&dd->list);
 	spin_unlock(&sham.lock);
 	for (i = dd->pdata->algs_info_size - 1; i >= 0; i--)
-		for (j = dd->pdata->algs_info[i].registered - 1; j >= 0; j--)
+		for (j = dd->pdata->algs_info[i].registered - 1; j >= 0; j--) {
 			crypto_unregister_ahash(
 					&dd->pdata->algs_info[i].algs_list[j]);
+			dd->pdata->algs_info[i].registered--;
+		}
 	tasklet_kill(&dd->done_task);
 	pm_runtime_disable(&pdev->dev);
 

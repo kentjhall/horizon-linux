@@ -1,7 +1,7 @@
 /*
  * Driver for the NVIDIA Tegra pinmux
  *
- * Copyright (c) 2011, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2019, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -32,6 +32,10 @@ enum tegra_pinconf_param {
 	/* argument: Boolean */
 	TEGRA_PINCONF_PARAM_RCV_SEL,
 	/* argument: Boolean */
+	TEGRA_PINCONF_PARAM_E_IO_HV,
+	/* argument: Boolean */
+	TEGRA_PINCONF_PARAM_LOOPBACK,
+	/* argument: Boolean */
 	TEGRA_PINCONF_PARAM_HIGH_SPEED_MODE,
 	/* argument: Boolean */
 	TEGRA_PINCONF_PARAM_SCHMITT,
@@ -47,6 +51,20 @@ enum tegra_pinconf_param {
 	TEGRA_PINCONF_PARAM_SLEW_RATE_RISING,
 	/* argument: Integer, range is HW-dependant */
 	TEGRA_PINCONF_PARAM_DRIVE_TYPE,
+	/* Set pin to GPIO mode */
+	TEGRA_PINCONF_PARAM_GPIO_MODE,
+	/* argument: Boolean */
+	TEGRA_PINCONF_PARAM_LPDR,
+	/* argument: Boolean */
+	TEGRA_PINCONF_PARAM_PBIAS_BUF,
+	/* argument: Boolean */
+	TEGRA_PINCONF_PARAM_PREEMP,
+	/* argument: Integer, range is HW-dependent */
+	TEGRA_PINCONF_PARAM_RFU_IN,
+	/* argument: Boolean */
+	TEGRA_PINCONF_PARAM_PAD_POWER,
+	/* argument: pinmux settings */
+	TEGRA_PINCONF_PARAM_FUNCTION,
 };
 
 enum tegra_pinconf_pull {
@@ -72,7 +90,7 @@ enum tegra_pinconf_tristate {
  */
 struct tegra_function {
 	const char *name;
-	const char **groups;
+	const char * const *groups;
 	unsigned ngroups;
 };
 
@@ -93,15 +111,16 @@ struct tegra_function {
  * @tri_reg:		Tri-state register offset.
  * @tri_bank:		Tri-state register bank.
  * @tri_bit:		Tri-state register bit.
- * @parked_bit:		Parked register bit. -1 if unsupported.
  * @einput_bit:		Enable-input register bit.
  * @odrain_bit:		Open-drain register bit.
  * @lock_bit:		Lock register bit.
+ * @parked_bit:		Parked register bit.
  * @ioreset_bit:	IO reset register bit.
  * @rcv_sel_bit:	Receiver select bit.
+ * @e_io_hv_bit:	E_IO_HV register bit.
  * @drv_reg:		Drive fields register offset.
- *			This register contains hsm, schmitt, lpmd, drvdn,
- *			drvup, slwr, slwf, and drvtype parameters.
+ *			This register contains the hsm, schmitt, lpmd, drvdn,
+ *			drvup, slwr, and slwf parameters.
  * @drv_bank:		Drive fields register bank.
  * @hsm_bit:		High Speed Mode register bit.
  * @schmitt_bit:	Scmitt register bit.
@@ -115,6 +134,13 @@ struct tegra_function {
  * @slwf_bit:		Slew Falling register bit.
  * @slwf_width:		Slew Falling field width.
  * @drvtype_bit:	Drive type register bit.
+ * @drvtype_width:	Drive type field width.
+ * @pad_bank:		Register bank for the PAD control.
+ * @pad_reg:		Register address for PAD control.
+ * @pad_bit:		PAD control bit.
+ * @lpbk_bank:		Register bank for the Loopback control.
+ * @lpbk_reg:		Register address for Loopback control.
+ * @lpbk_bit:		Loopback register bit
  *
  * -1 in a *_reg field means that feature is unsupported for this group.
  * *_bank and *_reg values are irrelevant when *_reg is -1.
@@ -132,23 +158,30 @@ struct tegra_pingroup {
 	const unsigned *pins;
 	u8 npins;
 	u8 funcs[4];
-	s16 mux_reg;
-	s16 pupd_reg;
-	s16 tri_reg;
-	s16 drv_reg;
+	s32 mux_reg;
+	s32 pupd_reg;
+	s32 tri_reg;
+	s32 drv_reg;
+	s32 parked_reg;
+	s32 pad_reg;
+	s32 lpbk_reg;
 	u32 mux_bank:2;
 	u32 pupd_bank:2;
 	u32 tri_bank:2;
 	u32 drv_bank:2;
+	u32 parked_bank:2;
+	u32 pad_bank:2;
+	u32 lpbk_bank:2;
 	s32 mux_bit:6;
 	s32 pupd_bit:6;
 	s32 tri_bit:6;
-	s32 parked_bit:6;
 	s32 einput_bit:6;
 	s32 odrain_bit:6;
 	s32 lock_bit:6;
+	s32 parked_bit:6;
 	s32 ioreset_bit:6;
 	s32 rcv_sel_bit:6;
+	s32 e_io_hv_bit:6;
 	s32 hsm_bit:6;
 	s32 schmitt_bit:6;
 	s32 lpmd_bit:6;
@@ -156,11 +189,21 @@ struct tegra_pingroup {
 	s32 drvup_bit:6;
 	s32 slwr_bit:6;
 	s32 slwf_bit:6;
+	s32 gpio_bit:6;
+	s32 lpdr_bit:6;
+	s32 pbias_buf_bit:6;
+	s32 preemp_bit:6;
 	s32 drvtype_bit:6;
+	s32 rfu_in_bit:6;
+	s32 lpbk_bit:6;
 	s32 drvdn_width:6;
 	s32 drvup_width:6;
 	s32 slwr_width:6;
 	s32 slwf_width:6;
+	s32 drvtype_width:6;
+	s32 rfu_in_width:6;
+	s32 pad_bit:6;
+	const char *pwr_domain;
 };
 
 /**
@@ -175,6 +218,8 @@ struct tegra_pingroup {
  * @nfunctions:	The numbmer of entries in @functions.
  * @groups:	An array describing all pin groups the pin SoC supports.
  * @ngroups:	The numbmer of entries in @groups.
+ * @input_tristate_enable: Enable tristate in input direction.
+ * @output_input_disable: Enable input mode in output direction.
  */
 struct tegra_pinctrl_soc_data {
 	unsigned ngpios;
@@ -184,11 +229,18 @@ struct tegra_pinctrl_soc_data {
 	unsigned nfunctions;
 	const struct tegra_pingroup *groups;
 	unsigned ngroups;
+	bool is_gpio_reg_support;
+	int (*suspend)(u32 *pg_data);
+	void (*resume)(u32 *pg_data);
 	bool hsm_in_mux;
 	bool schmitt_in_mux;
 	bool drvtype_in_mux;
+	bool input_tristate_enable;
+	bool output_input_disable;
 };
 
 int tegra_pinctrl_probe(struct platform_device *pdev,
 			const struct tegra_pinctrl_soc_data *soc_data);
+int tegra_pinctrl_remove(struct platform_device *pdev);
+
 #endif

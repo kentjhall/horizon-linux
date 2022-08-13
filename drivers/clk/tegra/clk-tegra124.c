@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2014 NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2016 NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -928,6 +928,7 @@ static struct tegra_clk tegra124_clks[tegra_clk_max] __initdata = {
 	[tegra_clk_clk_out_1_mux] = { .dt_id = TEGRA124_CLK_CLK_OUT_1_MUX, .present = true },
 	[tegra_clk_clk_out_2_mux] = { .dt_id = TEGRA124_CLK_CLK_OUT_2_MUX, .present = true },
 	[tegra_clk_clk_out_3_mux] = { .dt_id = TEGRA124_CLK_CLK_OUT_3_MUX, .present = true },
+	[tegra_clk_cec] = { .dt_id = TEGRA124_CLK_CEC, .present = true },
 };
 
 static struct tegra_devclk devclks[] __initdata = {
@@ -1502,6 +1503,7 @@ static void __init tegra124_132_clock_init_post(struct device_node *np)
  */
 static void __init tegra124_clock_init(struct device_node *np)
 {
+	has_ccplex_therm_control = true;
 	tegra124_132_clock_init_pre(np);
 	tegra_clk_apply_init_table = tegra124_clock_apply_init_table;
 	tegra124_132_clock_init_post(np);

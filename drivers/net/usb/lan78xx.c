@@ -30,7 +30,9 @@
 #include <linux/ipv6.h>
 #include <linux/mdio.h>
 #include <net/ip6_checksum.h>
+#include <net/vxlan.h>
 #include <linux/microchipphy.h>
+#include <linux/of_net.h>
 #include "lan78xx.h"
 
 #define DRIVER_AUTHOR	"WOOJUNG HUH <woojung.huh@microchip.com>"
@@ -313,10 +315,6 @@ struct lan78xx_net {
 	struct tasklet_struct	bh;
 	struct delayed_work	wq;
 
-	struct usb_host_endpoint *ep_blkin;
-	struct usb_host_endpoint *ep_blkout;
-	struct usb_host_endpoint *ep_intr;
-
 	int			msg_enable;
 
 	struct urb		*urb_intr;
@@ -441,7 +439,7 @@ static int lan78xx_read_stats(struct lan78xx_net *dev,
 		}
 	} else {
 		netdev_warn(dev->net,
-			    "Failed to read stat ret = 0x%x", ret);
+			    "Failed to read stat ret = %d", ret);
 	}
 
 	kfree(stats);
@@ -873,7 +871,8 @@ static int lan78xx_read_otp(struct lan78xx_net *dev, u32 offset,
 			offset += 0x100;
 		else
 			ret = -EINVAL;
-		ret = lan78xx_read_raw_otp(dev, offset, length, data);
+		if (!ret)
+			ret = lan78xx_read_raw_otp(dev, offset, length, data);
 	}
 
 	return ret;
@@ -1169,6 +1168,8 @@ static int lan78xx_link_reset(struct lan78xx_net *dev)
 			mod_timer(&dev->stat_monitor,
 				  jiffies + STAT_UPDATE_TIMER);
 		}
+
+		tasklet_schedule(&dev->bh);
 	}
 
 	return ret;
@@ -1308,19 +1309,10 @@ static int lan78xx_set_wol(struct net_device *netdev,
 	if (ret < 0)
 		return ret;
 
-	pdata->wol = 0;
-	if (wol->wolopts & WAKE_UCAST)
-		pdata->wol |= WAKE_UCAST;
-	if (wol->wolopts & WAKE_MCAST)
-		pdata->wol |= WAKE_MCAST;
-	if (wol->wolopts & WAKE_BCAST)
-		pdata->wol |= WAKE_BCAST;
-	if (wol->wolopts & WAKE_MAGIC)
-		pdata->wol |= WAKE_MAGIC;
-	if (wol->wolopts & WAKE_PHY)
-		pdata->wol |= WAKE_PHY;
-	if (wol->wolopts & WAKE_ARP)
-		pdata->wol |= WAKE_ARP;
+	if (wol->wolopts & ~WAKE_ALL)
+		return -EINVAL;
+
+	pdata->wol = wol->wolopts;
 
 	device_set_wakeup_enable(&dev->udev->dev, (bool)wol->wolopts);
 
@@ -1650,34 +1642,31 @@ static void lan78xx_init_mac_address(struct lan78xx_net *dev)
 	addr[5] = (addr_hi >> 8) & 0xFF;
 
 	if (!is_valid_ether_addr(addr)) {
-		/* reading mac address from EEPROM or OTP */
-		if ((lan78xx_read_eeprom(dev, EEPROM_MAC_OFFSET, ETH_ALEN,
-					 addr) == 0) ||
-		    (lan78xx_read_otp(dev, EEPROM_MAC_OFFSET, ETH_ALEN,
-				      addr) == 0)) {
-			if (is_valid_ether_addr(addr)) {
-				/* eeprom values are valid so use them */
-				netif_dbg(dev, ifup, dev->net,
-					  "MAC address read from EEPROM");
-			} else {
-				/* generate random MAC */
-				random_ether_addr(addr);
-				netif_dbg(dev, ifup, dev->net,
-					  "MAC address set to random addr");
-			}
-
-			addr_lo = addr[0] | (addr[1] << 8) |
-				  (addr[2] << 16) | (addr[3] << 24);
-			addr_hi = addr[4] | (addr[5] << 8);
-
-			ret = lan78xx_write_reg(dev, RX_ADDRL, addr_lo);
-			ret = lan78xx_write_reg(dev, RX_ADDRH, addr_hi);
+		if (!eth_platform_get_mac_address(&dev->udev->dev, addr)) {
+			/* valid address present in Device Tree */
+			netif_dbg(dev, ifup, dev->net,
+				  "MAC address read from Device Tree");
+		} else if (((lan78xx_read_eeprom(dev, EEPROM_MAC_OFFSET,
+						 ETH_ALEN, addr) == 0) ||
+			    (lan78xx_read_otp(dev, EEPROM_MAC_OFFSET,
+					      ETH_ALEN, addr) == 0)) &&
+			   is_valid_ether_addr(addr)) {
+			/* eeprom values are valid so use them */
+			netif_dbg(dev, ifup, dev->net,
+				  "MAC address read from EEPROM");
 		} else {
 			/* generate random MAC */
 			random_ether_addr(addr);
 			netif_dbg(dev, ifup, dev->net,
 				  "MAC address set to random addr");
 		}
+
+		addr_lo = addr[0] | (addr[1] << 8) |
+			  (addr[2] << 16) | (addr[3] << 24);
+		addr_hi = addr[4] | (addr[5] << 8);
+
+		ret = lan78xx_write_reg(dev, RX_ADDRL, addr_lo);
+		ret = lan78xx_write_reg(dev, RX_ADDRH, addr_hi);
 	}
 
 	ret = lan78xx_write_reg(dev, MAF_LO(0), addr_lo);
@@ -1771,6 +1760,7 @@ static int lan78xx_mdio_init(struct lan78xx_net *dev)
 	dev->mdiobus->read = lan78xx_mdiobus_read;
 	dev->mdiobus->write = lan78xx_mdiobus_write;
 	dev->mdiobus->name = "lan78xx-mdiobus";
+	dev->mdiobus->parent = &dev->udev->dev;
 
 	snprintf(dev->mdiobus->id, MII_BUS_ID_SIZE, "usb-%03d:%03d",
 		 dev->udev->bus->busnum, dev->udev->devnum);
@@ -2022,6 +2012,10 @@ static int lan78xx_set_mac_addr(struct net_device *netdev, void *p)
 	ret = lan78xx_write_reg(dev, RX_ADDRL, addr_lo);
 	ret = lan78xx_write_reg(dev, RX_ADDRH, addr_hi);
 
+	/* Added to support MAC address changes */
+	ret = lan78xx_write_reg(dev, MAF_LO(0), addr_lo);
+	ret = lan78xx_write_reg(dev, MAF_HI(0), addr_hi | MAF_HI_VALID_);
+
 	return 0;
 }
 
@@ -2197,6 +2191,7 @@ static int lan78xx_reset(struct lan78xx_net *dev)
 		buf = DEFAULT_BURST_CAP_SIZE / FS_USB_PKT_SIZE;
 		dev->rx_urb_size = DEFAULT_BURST_CAP_SIZE;
 		dev->rx_qlen = 4;
+		dev->tx_qlen = 4;
 	}
 
 	ret = lan78xx_write_reg(dev, BURST_CAP, buf);
@@ -2409,28 +2404,20 @@ static int lan78xx_stop(struct net_device *net)
 	return 0;
 }
 
-static int lan78xx_linearize(struct sk_buff *skb)
-{
-	return skb_linearize(skb);
-}
-
 static struct sk_buff *lan78xx_tx_prep(struct lan78xx_net *dev,
 				       struct sk_buff *skb, gfp_t flags)
 {
 	u32 tx_cmd_a, tx_cmd_b;
 
-	if (skb_headroom(skb) < TX_OVERHEAD) {
-		struct sk_buff *skb2;
-
-		skb2 = skb_copy_expand(skb, TX_OVERHEAD, 0, flags);
+	if (skb_cow_head(skb, TX_OVERHEAD)) {
 		dev_kfree_skb_any(skb);
-		skb = skb2;
-		if (!skb)
-			return NULL;
+		return NULL;
 	}
 
-	if (lan78xx_linearize(skb) < 0)
+	if (skb_linearize(skb)) {
+		dev_kfree_skb_any(skb);
 		return NULL;
+	}
 
 	tx_cmd_a = (u32)(skb->len & TX_CMD_A_LEN_MASK_) | TX_CMD_A_FCS_;
 
@@ -2563,72 +2550,11 @@ lan78xx_start_xmit(struct sk_buff *skb, struct net_device *net)
 	return NETDEV_TX_OK;
 }
 
-static int
-lan78xx_get_endpoints(struct lan78xx_net *dev, struct usb_interface *intf)
-{
-	int tmp;
-	struct usb_host_interface *alt = NULL;
-	struct usb_host_endpoint *in = NULL, *out = NULL;
-	struct usb_host_endpoint *status = NULL;
-
-	for (tmp = 0; tmp < intf->num_altsetting; tmp++) {
-		unsigned ep;
-
-		in = NULL;
-		out = NULL;
-		status = NULL;
-		alt = intf->altsetting + tmp;
-
-		for (ep = 0; ep < alt->desc.bNumEndpoints; ep++) {
-			struct usb_host_endpoint *e;
-			int intr = 0;
-
-			e = alt->endpoint + ep;
-			switch (e->desc.bmAttributes) {
-			case USB_ENDPOINT_XFER_INT:
-				if (!usb_endpoint_dir_in(&e->desc))
-					continue;
-				intr = 1;
-				/* FALLTHROUGH */
-			case USB_ENDPOINT_XFER_BULK:
-				break;
-			default:
-				continue;
-			}
-			if (usb_endpoint_dir_in(&e->desc)) {
-				if (!intr && !in)
-					in = e;
-				else if (intr && !status)
-					status = e;
-			} else {
-				if (!out)
-					out = e;
-			}
-		}
-		if (in && out)
-			break;
-	}
-	if (!alt || !in || !out)
-		return -EINVAL;
-
-	dev->pipe_in = usb_rcvbulkpipe(dev->udev,
-				       in->desc.bEndpointAddress &
-				       USB_ENDPOINT_NUMBER_MASK);
-	dev->pipe_out = usb_sndbulkpipe(dev->udev,
-					out->desc.bEndpointAddress &
-					USB_ENDPOINT_NUMBER_MASK);
-	dev->ep_intr = status;
-
-	return 0;
-}
-
 static int lan78xx_bind(struct lan78xx_net *dev, struct usb_interface *intf)
 {
 	struct lan78xx_priv *pdata = NULL;
 	int ret;
 	int i;
-
-	ret = lan78xx_get_endpoints(dev, intf);
 
 	dev->data[0] = (unsigned long)kzalloc(sizeof(*pdata), GFP_KERNEL);
 
@@ -2967,6 +2893,7 @@ static void lan78xx_tx_bh(struct lan78xx_net *dev)
 	pkt_cnt = 0;
 	count = 0;
 	length = 0;
+	spin_lock_irqsave(&tqp->lock, flags);
 	for (skb = tqp->next; pkt_cnt < tqp->qlen; skb = skb->next) {
 		if (skb_is_gso(skb)) {
 			if (pkt_cnt) {
@@ -2975,7 +2902,8 @@ static void lan78xx_tx_bh(struct lan78xx_net *dev)
 			}
 			count = 1;
 			length = skb->len - TX_OVERHEAD;
-			skb2 = skb_dequeue(tqp);
+			__skb_unlink(skb, tqp);
+			spin_unlock_irqrestore(&tqp->lock, flags);
 			goto gso_skb;
 		}
 
@@ -2984,6 +2912,7 @@ static void lan78xx_tx_bh(struct lan78xx_net *dev)
 		skb_totallen = skb->len + roundup(skb_totallen, sizeof(u32));
 		pkt_cnt++;
 	}
+	spin_unlock_irqrestore(&tqp->lock, flags);
 
 	/* copy to a single skb */
 	skb = alloc_skb(skb_totallen, GFP_ATOMIC);
@@ -3293,6 +3222,19 @@ static void lan78xx_tx_timeout(struct net_device *net)
 	tasklet_schedule(&dev->bh);
 }
 
+static netdev_features_t lan78xx_features_check(struct sk_buff *skb,
+						struct net_device *netdev,
+						netdev_features_t features)
+{
+	if (skb->len + TX_OVERHEAD > MAX_SINGLE_PACKET_SIZE)
+		features &= ~NETIF_F_GSO_MASK;
+
+	features = vlan_features_check(skb, features);
+	features = vxlan_features_check(skb, features);
+
+	return features;
+}
+
 static const struct net_device_ops lan78xx_netdev_ops = {
 	.ndo_open		= lan78xx_open,
 	.ndo_stop		= lan78xx_stop,
@@ -3306,6 +3248,7 @@ static const struct net_device_ops lan78xx_netdev_ops = {
 	.ndo_set_features	= lan78xx_set_features,
 	.ndo_vlan_rx_add_vid	= lan78xx_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= lan78xx_vlan_rx_kill_vid,
+	.ndo_features_check	= lan78xx_features_check,
 };
 
 static void lan78xx_stat_monitor(unsigned long param)
@@ -3320,6 +3263,7 @@ static void lan78xx_stat_monitor(unsigned long param)
 static int lan78xx_probe(struct usb_interface *intf,
 			 const struct usb_device_id *id)
 {
+	struct usb_host_endpoint *ep_blkin, *ep_blkout, *ep_intr;
 	struct lan78xx_net *dev;
 	struct net_device *netdev;
 	struct usb_device *udev;
@@ -3370,6 +3314,34 @@ static int lan78xx_probe(struct usb_interface *intf,
 
 	mutex_init(&dev->stats.access_lock);
 
+	if (intf->cur_altsetting->desc.bNumEndpoints < 3) {
+		ret = -ENODEV;
+		goto out2;
+	}
+
+	dev->pipe_in = usb_rcvbulkpipe(udev, BULK_IN_PIPE);
+	ep_blkin = usb_pipe_endpoint(udev, dev->pipe_in);
+	if (!ep_blkin || !usb_endpoint_is_bulk_in(&ep_blkin->desc)) {
+		ret = -ENODEV;
+		goto out2;
+	}
+
+	dev->pipe_out = usb_sndbulkpipe(udev, BULK_OUT_PIPE);
+	ep_blkout = usb_pipe_endpoint(udev, dev->pipe_out);
+	if (!ep_blkout || !usb_endpoint_is_bulk_out(&ep_blkout->desc)) {
+		ret = -ENODEV;
+		goto out2;
+	}
+
+	ep_intr = &intf->cur_altsetting->endpoint[2];
+	if (!usb_endpoint_is_int_in(&ep_intr->desc)) {
+		ret = -ENODEV;
+		goto out2;
+	}
+
+	dev->pipe_intr = usb_rcvintpipe(dev->udev,
+					usb_endpoint_num(&ep_intr->desc));
+
 	ret = lan78xx_bind(dev, intf);
 	if (ret < 0)
 		goto out2;
@@ -3377,19 +3349,9 @@ static int lan78xx_probe(struct usb_interface *intf,
 
 	if (netdev->mtu > (dev->hard_mtu - netdev->hard_header_len))
 		netdev->mtu = dev->hard_mtu - netdev->hard_header_len;
+	netif_set_gso_max_size(netdev, MAX_SINGLE_PACKET_SIZE - MAX_HEADER);
 
-	dev->ep_blkin = (intf->cur_altsetting)->endpoint + 0;
-	dev->ep_blkout = (intf->cur_altsetting)->endpoint + 1;
-	dev->ep_intr = (intf->cur_altsetting)->endpoint + 2;
-
-	dev->pipe_in = usb_rcvbulkpipe(udev, BULK_IN_PIPE);
-	dev->pipe_out = usb_sndbulkpipe(udev, BULK_OUT_PIPE);
-
-	dev->pipe_intr = usb_rcvintpipe(dev->udev,
-					dev->ep_intr->desc.bEndpointAddress &
-					USB_ENDPOINT_NUMBER_MASK);
-	period = dev->ep_intr->desc.bInterval;
-
+	period = ep_intr->desc.bInterval;
 	maxp = usb_maxpacket(dev->udev, dev->pipe_intr, 0);
 	buf = kmalloc(maxp, GFP_KERNEL);
 	if (buf) {
@@ -3402,6 +3364,7 @@ static int lan78xx_probe(struct usb_interface *intf,
 			usb_fill_int_urb(dev->urb_intr, dev->udev,
 					 dev->pipe_intr, buf, maxp,
 					 intr_complete, dev, period);
+			dev->urb_intr->transfer_flags |= URB_FREE_BUFFER;
 		}
 	}
 

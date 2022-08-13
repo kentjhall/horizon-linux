@@ -201,7 +201,7 @@ static int asoc_simple_card_dai_init(struct snd_soc_pcm_runtime *rtd)
 	if (ret < 0)
 		return ret;
 
-	ret = asoc_simple_card_init_mic(rtd->card, &priv->hp_jack, PREFIX);
+	ret = asoc_simple_card_init_mic(rtd->card, &priv->mic_jack, PREFIX);
 	if (ret < 0)
 		return ret;
 
@@ -232,13 +232,19 @@ static int asoc_simple_card_dai_link_of(struct device_node *node,
 	snprintf(prop, sizeof(prop), "%scpu", prefix);
 	cpu = of_get_child_by_name(node, prop);
 
+	if (!cpu) {
+		ret = -EINVAL;
+		dev_err(dev, "%s: Can't find %s DT node\n", __func__, prop);
+		goto dai_link_of_err;
+	}
+
 	snprintf(prop, sizeof(prop), "%splat", prefix);
 	plat = of_get_child_by_name(node, prop);
 
 	snprintf(prop, sizeof(prop), "%scodec", prefix);
 	codec = of_get_child_by_name(node, prop);
 
-	if (!cpu || !codec) {
+	if (!codec) {
 		ret = -EINVAL;
 		dev_err(dev, "%s: Can't find %s DT node\n", __func__, prop);
 		goto dai_link_of_err;

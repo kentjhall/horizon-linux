@@ -35,10 +35,10 @@ static inline int should_deliver(const struct net_bridge_port *p,
 
 int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
+	skb_push(skb, ETH_HLEN);
 	if (!is_skb_forwardable(skb->dev, skb))
 		goto drop;
 
-	skb_push(skb, ETH_HLEN);
 	br_drop_fake_rtable(skb);
 
 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
@@ -96,12 +96,11 @@ static void __br_forward(const struct net_bridge_port *to,
 		net = dev_net(indev);
 	} else {
 		if (unlikely(netpoll_tx_running(to->br->dev))) {
-			if (!is_skb_forwardable(skb->dev, skb)) {
+			skb_push(skb, ETH_HLEN);
+			if (!is_skb_forwardable(skb->dev, skb))
 				kfree_skb(skb);
-			} else {
-				skb_push(skb, ETH_HLEN);
+			else
 				br_netpoll_send_skb(to, skb);
-			}
 			return;
 		}
 		br_hook = NF_BR_LOCAL_OUT;
@@ -186,8 +185,9 @@ void br_flood(struct net_bridge *br, struct sk_buff *skb,
 		/* Do not flood unicast traffic to ports that turn it off */
 		if (pkt_type == BR_PKT_UNICAST && !(p->flags & BR_FLOOD))
 			continue;
+		/* Do not flood if mc off, except for traffic we originate */
 		if (pkt_type == BR_PKT_MULTICAST &&
-		    !(p->flags & BR_MCAST_FLOOD))
+		    !(p->flags & BR_MCAST_FLOOD) && skb->dev != br->dev)
 			continue;
 
 		/* Do not flood to ports that enable proxy ARP */

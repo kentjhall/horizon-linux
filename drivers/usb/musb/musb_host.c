@@ -139,6 +139,7 @@ static void musb_h_tx_flush_fifo(struct musb_hw_ep *ep)
 				"Could not flush host TX%d fifo: csr: %04x\n",
 				ep->epnum, csr))
 			return;
+		mdelay(1);
 	}
 }
 
@@ -417,13 +418,7 @@ static void musb_advance_schedule(struct musb *musb, struct urb *urb,
 		}
 	}
 
-	/*
-	 * The pipe must be broken if current urb->status is set, so don't
-	 * start next urb.
-	 * TODO: to minimize the risk of regression, only check urb->status
-	 * for RX, until we have a test case to understand the behavior of TX.
-	 */
-	if ((!status || !is_in) && qh && qh->is_ready) {
+	if (qh != NULL && qh->is_ready) {
 		musb_dbg(musb, "... next ep%d %cX urb %p",
 		    hw_ep->epnum, is_in ? 'R' : 'T', next_urb(qh));
 		musb_start_urb(musb, is_in, qh);
@@ -1028,7 +1023,9 @@ static void musb_bulk_nak_timeout(struct musb *musb, struct musb_hw_ep *ep,
 			/* set tx_reinit and schedule the next qh */
 			ep->tx_reinit = 1;
 		}
-		musb_start_urb(musb, is_in, next_qh);
+
+		if (next_qh)
+			musb_start_urb(musb, is_in, next_qh);
 	}
 }
 
@@ -1497,10 +1494,7 @@ done:
 	 * We need to map sg if the transfer_buffer is
 	 * NULL.
 	 */
-	if (!urb->transfer_buffer)
-		qh->use_sg = true;
-
-	if (qh->use_sg) {
+	if (!urb->transfer_buffer) {
 		/* sg_miter_start is already done in musb_ep_program */
 		if (!sg_miter_next(&qh->sg_miter)) {
 			dev_err(musb->controller, "error: sg list empty\n");
@@ -1508,9 +1502,8 @@ done:
 			status = -EINVAL;
 			goto done;
 		}
-		urb->transfer_buffer = qh->sg_miter.addr;
 		length = min_t(u32, length, qh->sg_miter.length);
-		musb_write_fifo(hw_ep, length, urb->transfer_buffer);
+		musb_write_fifo(hw_ep, length, qh->sg_miter.addr);
 		qh->sg_miter.consumed = length;
 		sg_miter_stop(&qh->sg_miter);
 	} else {
@@ -1518,11 +1511,6 @@ done:
 	}
 
 	qh->segsize = length;
-
-	if (qh->use_sg) {
-		if (offset + length >= urb->transfer_buffer_length)
-			qh->use_sg = false;
-	}
 
 	musb_ep_select(mbase, epnum);
 	musb_writew(epio, MUSB_TXCSR,
@@ -2043,8 +2031,10 @@ finish:
 	urb->actual_length += xfer_len;
 	qh->offset += xfer_len;
 	if (done) {
-		if (qh->use_sg)
+		if (qh->use_sg) {
 			qh->use_sg = false;
+			urb->transfer_buffer = NULL;
+		}
 
 		if (urb->status == -EINPROGRESS)
 			urb->status = status;
@@ -2374,12 +2364,11 @@ static int musb_cleanup_urb(struct urb *urb, struct musb_qh *qh)
 	int			is_in = usb_pipein(urb->pipe);
 	int			status = 0;
 	u16			csr;
+	struct dma_channel	*dma = NULL;
 
 	musb_ep_select(regs, hw_end);
 
 	if (is_dma_capable()) {
-		struct dma_channel	*dma;
-
 		dma = is_in ? ep->rx_channel : ep->tx_channel;
 		if (dma) {
 			status = ep->musb->dma_controller->channel_abort(dma);
@@ -2395,10 +2384,9 @@ static int musb_cleanup_urb(struct urb *urb, struct musb_qh *qh)
 		/* giveback saves bulk toggle */
 		csr = musb_h_flush_rxfifo(ep, 0);
 
-		/* REVISIT we still get an irq; should likely clear the
-		 * endpoint's irq status here to avoid bogus irqs.
-		 * clearing that status is platform-specific...
-		 */
+		/* clear the endpoint's irq status here to avoid bogus irqs */
+		if (is_dma_capable() && dma)
+			musb_platform_clear_ep_rxintr(musb, ep->epnum);
 	} else if (ep->epnum) {
 		musb_h_tx_flush_fifo(ep);
 		csr = musb_readw(epio, MUSB_TXCSR);
@@ -2559,8 +2547,11 @@ static int musb_bus_suspend(struct usb_hcd *hcd)
 {
 	struct musb	*musb = hcd_to_musb(hcd);
 	u8		devctl;
+	int		ret;
 
-	musb_port_suspend(musb, true);
+	ret = musb_port_suspend(musb, true);
+	if (ret)
+		return ret;
 
 	if (!is_host_active(musb))
 		return 0;
@@ -2782,10 +2773,11 @@ int musb_host_setup(struct musb *musb, int power_budget)
 	int ret;
 	struct usb_hcd *hcd = musb->hcd;
 
-	MUSB_HST_MODE(musb);
-	musb->xceiv->otg->default_a = 1;
-	musb->xceiv->otg->state = OTG_STATE_A_IDLE;
-
+	if (musb->port_mode == MUSB_PORT_MODE_HOST) {
+		MUSB_HST_MODE(musb);
+		musb->xceiv->otg->default_a = 1;
+		musb->xceiv->otg->state = OTG_STATE_A_IDLE;
+	}
 	otg_set_host(musb->xceiv->otg, &hcd->self);
 	hcd->self.otg_port = 1;
 	musb->xceiv->otg->host = &hcd->self;

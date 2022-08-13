@@ -34,6 +34,7 @@
 #ifdef CONFIG_PPC
 #include <asm/machdep.h>
 #endif
+#include <linux/pm_runtime.h>
 #include "sdhci-pltfm.h"
 
 unsigned int sdhci_pltfm_clk_get_max_clock(struct sdhci_host *host)
@@ -208,24 +209,91 @@ int sdhci_pltfm_unregister(struct platform_device *pdev)
 }
 EXPORT_SYMBOL_GPL(sdhci_pltfm_unregister);
 
+#ifdef CONFIG_PM
+static int sdhci_pltfm_runtime_suspend(struct device *dev)
+{
+	struct sdhci_host *host = dev_get_drvdata(dev);
+	int ret = 0;
+
+	if (host->ops && host->ops->runtime_suspend)
+		ret = host->ops->runtime_suspend(host);
+
+	return ret;
+}
+
+static int sdhci_pltfm_runtime_resume(struct device *dev)
+{
+	struct sdhci_host *host = dev_get_drvdata(dev);
+	int ret = 0;
+
+	if (host->ops && host->ops->runtime_resume)
+		ret = host->ops->runtime_resume(host);
+
+	return ret;
+}
+#endif /* defined(CONFIG_PM) */
+
 #ifdef CONFIG_PM_SLEEP
 static int sdhci_pltfm_suspend(struct device *dev)
 {
 	struct sdhci_host *host = dev_get_drvdata(dev);
+	int ret = 0;
 
-	return sdhci_suspend_host(host);
+#ifdef CONFIG_PM
+	if (pm_runtime_status_suspended(dev))
+		sdhci_pltfm_runtime_resume(dev);
+
+	/* disable runtime pm */
+	if (pm_runtime_enabled(dev))
+		pm_runtime_disable(dev);
+#endif
+
+	ret = sdhci_suspend_host(host);
+	if (ret) {
+		dev_err(dev, "suspend failed err %d\n", ret);
+		return ret;
+	}
+
+	if (host->ops && host->ops->suspend) {
+		ret = host->ops->suspend(host);
+		if (ret) {
+			dev_err(dev, "platform suspend failed %d\n", ret);
+			sdhci_resume_host(host);
+		}
+	}
+
+	return ret;
 }
 
 static int sdhci_pltfm_resume(struct device *dev)
 {
 	struct sdhci_host *host = dev_get_drvdata(dev);
+	int ret = 0;
+
+	if (host->ops && host->ops->resume) {
+		ret = host->ops->resume(host);
+		if (ret)
+			dev_err(dev, "platform resume failed %d\n", ret);
+	}
 
 	return sdhci_resume_host(host);
 }
-#endif
+
+static void sdhci_pltfm_complete(struct device *dev)
+{
+	struct sdhci_host *host = dev_get_drvdata(dev);
+
+	if (host->ops && host->ops->complete)
+		host->ops->complete(host);
+}
+
+#endif /* defined(CONFIG_PM_SLEEP) */
 
 const struct dev_pm_ops sdhci_pltfm_pmops = {
+	.complete = sdhci_pltfm_complete,
 	SET_SYSTEM_SLEEP_PM_OPS(sdhci_pltfm_suspend, sdhci_pltfm_resume)
+	SET_RUNTIME_PM_OPS(sdhci_pltfm_runtime_suspend,
+		sdhci_pltfm_runtime_resume, NULL)
 };
 EXPORT_SYMBOL_GPL(sdhci_pltfm_pmops);
 

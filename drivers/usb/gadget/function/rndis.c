@@ -202,6 +202,9 @@ static int gen_ndis_query_resp(struct rndis_params *params, u32 OID, u8 *buf,
 	outbuf = (__le32 *)&resp[1];
 	resp->InformationBufferOffset = cpu_to_le32(16);
 
+	if (!params->dev)
+		return -ENODEV;
+
 	net = params->dev;
 	stats = dev_get_stats(net, &temp);
 
@@ -250,10 +253,8 @@ static int gen_ndis_query_resp(struct rndis_params *params, u32 OID, u8 *buf,
 	/* mandatory */
 	case RNDIS_OID_GEN_MAXIMUM_FRAME_SIZE:
 		pr_debug("%s: RNDIS_OID_GEN_MAXIMUM_FRAME_SIZE\n", __func__);
-		if (params->dev) {
-			*outbuf = cpu_to_le32(params->dev->mtu);
-			retval = 0;
-		}
+		*outbuf = cpu_to_le32(params->dev->mtu);
+		retval = 0;
 		break;
 
 	/* mandatory */
@@ -270,19 +271,15 @@ static int gen_ndis_query_resp(struct rndis_params *params, u32 OID, u8 *buf,
 	/* mandatory */
 	case RNDIS_OID_GEN_TRANSMIT_BLOCK_SIZE:
 		pr_debug("%s: RNDIS_OID_GEN_TRANSMIT_BLOCK_SIZE\n", __func__);
-		if (params->dev) {
-			*outbuf = cpu_to_le32(params->dev->mtu);
-			retval = 0;
-		}
+		*outbuf = cpu_to_le32(params->dev->mtu);
+		retval = 0;
 		break;
 
 	/* mandatory */
 	case RNDIS_OID_GEN_RECEIVE_BLOCK_SIZE:
 		pr_debug("%s: RNDIS_OID_GEN_RECEIVE_BLOCK_SIZE\n", __func__);
-		if (params->dev) {
-			*outbuf = cpu_to_le32(params->dev->mtu);
-			retval = 0;
-		}
+		*outbuf = cpu_to_le32(params->dev->mtu);
+		retval = 0;
 		break;
 
 	/* mandatory */
@@ -409,21 +406,17 @@ static int gen_ndis_query_resp(struct rndis_params *params, u32 OID, u8 *buf,
 	/* mandatory */
 	case RNDIS_OID_802_3_PERMANENT_ADDRESS:
 		pr_debug("%s: RNDIS_OID_802_3_PERMANENT_ADDRESS\n", __func__);
-		if (params->dev) {
-			length = ETH_ALEN;
-			memcpy(outbuf, params->host_mac, length);
-			retval = 0;
-		}
+		length = ETH_ALEN;
+		memcpy(outbuf, params->host_mac, length);
+		retval = 0;
 		break;
 
 	/* mandatory */
 	case RNDIS_OID_802_3_CURRENT_ADDRESS:
 		pr_debug("%s: RNDIS_OID_802_3_CURRENT_ADDRESS\n", __func__);
-		if (params->dev) {
-			length = ETH_ALEN;
-			memcpy(outbuf, params->host_mac, length);
-			retval = 0;
-		}
+		length = ETH_ALEN;
+		memcpy(outbuf, params->host_mac, length);
+		retval = 0;
 		break;
 
 	/* mandatory */

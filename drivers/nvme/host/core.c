@@ -1043,7 +1043,7 @@ static int nvme_pr_reserve(struct block_device *bdev, u64 key,
 static int nvme_pr_preempt(struct block_device *bdev, u64 old, u64 new,
 		enum pr_type type, bool abort)
 {
-	u32 cdw10 = nvme_pr_type(type) << 8 | abort ? 2 : 1;
+	u32 cdw10 = nvme_pr_type(type) << 8 | (abort ? 2 : 1);
 	return nvme_pr_command(bdev, cdw10, old, new, nvme_cmd_resv_acquire);
 }
 
@@ -1055,7 +1055,7 @@ static int nvme_pr_clear(struct block_device *bdev, u64 key)
 
 static int nvme_pr_release(struct block_device *bdev, u64 key, enum pr_type type)
 {
-	u32 cdw10 = nvme_pr_type(type) << 8 | key ? 1 << 3 : 0;
+	u32 cdw10 = nvme_pr_type(type) << 8 | (key ? 1 << 3 : 0);
 	return nvme_pr_command(bdev, cdw10, key, 0, nvme_cmd_resv_release);
 }
 
@@ -1122,12 +1122,7 @@ int nvme_disable_ctrl(struct nvme_ctrl *ctrl, u64 cap)
 	if (ret)
 		return ret;
 
-	/* Checking for ctrl->tagset is a trick to avoid sleeping on module
-	 * load, since we only need the quirk on reset_controller. Notice
-	 * that the HGST device needs this delay only in firmware activation
-	 * procedure; unfortunately we have no (easy) way to verify this.
-	 */
-	if ((ctrl->quirks & NVME_QUIRK_DELAY_BEFORE_CHK_RDY) && ctrl->tagset)
+	if (ctrl->quirks & NVME_QUIRK_DELAY_BEFORE_CHK_RDY)
 		msleep(NVME_QUIRK_DELAY_AMOUNT);
 
 	return nvme_wait_ready(ctrl, cap, false);
@@ -1209,8 +1204,9 @@ static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
 		blk_queue_max_hw_sectors(q, ctrl->max_hw_sectors);
 		blk_queue_max_segments(q, min_t(u32, max_segments, USHRT_MAX));
 	}
-	if (ctrl->stripe_size)
-		blk_queue_chunk_sectors(q, ctrl->stripe_size >> 9);
+	if ((ctrl->quirks & NVME_QUIRK_STRIPE_SIZE) &&
+	    is_power_of_2(ctrl->max_hw_sectors))
+		blk_queue_chunk_sectors(q, ctrl->max_hw_sectors);
 	blk_queue_virt_boundary(q, ctrl->page_size - 1);
 	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
 		vwc = true;
@@ -1265,19 +1261,6 @@ int nvme_init_identify(struct nvme_ctrl *ctrl)
 		max_hw_sectors = UINT_MAX;
 	ctrl->max_hw_sectors =
 		min_not_zero(ctrl->max_hw_sectors, max_hw_sectors);
-
-	if ((ctrl->quirks & NVME_QUIRK_STRIPE_SIZE) && id->vs[3]) {
-		unsigned int max_hw_sectors;
-
-		ctrl->stripe_size = 1 << (id->vs[3] + page_shift);
-		max_hw_sectors = ctrl->stripe_size >> (page_shift - 9);
-		if (ctrl->max_hw_sectors) {
-			ctrl->max_hw_sectors = min(max_hw_sectors,
-							ctrl->max_hw_sectors);
-		} else {
-			ctrl->max_hw_sectors = max_hw_sectors;
-		}
-	}
 
 	nvme_set_queue_limits(ctrl, ctrl->admin_q);
 	ctrl->sgls = le32_to_cpu(id->sgls);
@@ -1637,7 +1620,8 @@ static struct nvme_ns *nvme_find_get_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	mutex_lock(&ctrl->namespaces_mutex);
 	list_for_each_entry(ns, &ctrl->namespaces, list) {
 		if (ns->ns_id == nsid) {
-			kref_get(&ns->kref);
+			if (!kref_get_unless_zero(&ns->kref))
+				continue;
 			ret = ns;
 			break;
 		}
@@ -1743,7 +1727,6 @@ static void nvme_ns_remove(struct nvme_ns *ns)
 		sysfs_remove_group(&disk_to_dev(ns->disk)->kobj,
 					&nvme_ns_attr_group);
 		del_gendisk(ns->disk);
-		blk_mq_abort_requeue_list(ns->queue);
 		blk_cleanup_queue(ns->queue);
 	}
 
@@ -1782,7 +1765,8 @@ static int nvme_scan_ns_list(struct nvme_ctrl *ctrl, unsigned nn)
 {
 	struct nvme_ns *ns;
 	__le32 *ns_list;
-	unsigned i, j, nsid, prev = 0, num_lists = DIV_ROUND_UP(nn, 1024);
+	unsigned i, j, nsid, prev = 0;
+	unsigned num_lists = DIV_ROUND_UP_ULL((u64)nn, 1024);
 	int ret = 0;
 
 	ns_list = kzalloc(0x1000, GFP_KERNEL);
@@ -2057,21 +2041,81 @@ void nvme_kill_queues(struct nvme_ctrl *ctrl)
 	struct nvme_ns *ns;
 
 	mutex_lock(&ctrl->namespaces_mutex);
+
+	/* Forcibly start all queues to avoid having stuck requests */
+	if (ctrl->admin_q)
+		blk_mq_start_hw_queues(ctrl->admin_q);
+
 	list_for_each_entry(ns, &ctrl->namespaces, list) {
 		/*
 		 * Revalidating a dead namespace sets capacity to 0. This will
 		 * end buffered writers dirtying pages that can't be synced.
 		 */
-		if (ns->disk && !test_and_set_bit(NVME_NS_DEAD, &ns->flags))
-			revalidate_disk(ns->disk);
-
+		if (!ns->disk || test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+			continue;
+		revalidate_disk(ns->disk);
 		blk_set_queue_dying(ns->queue);
-		blk_mq_abort_requeue_list(ns->queue);
-		blk_mq_start_stopped_hw_queues(ns->queue, true);
+
+		/*
+		 * Forcibly start all queues to avoid having stuck requests.
+		 * Note that we must ensure the queues are not stopped
+		 * when the final removal happens.
+		 */
+		blk_mq_start_hw_queues(ns->queue);
+
+		/* draining requests in requeue list */
+		blk_mq_kick_requeue_list(ns->queue);
 	}
 	mutex_unlock(&ctrl->namespaces_mutex);
 }
 EXPORT_SYMBOL_GPL(nvme_kill_queues);
+
+void nvme_unfreeze(struct nvme_ctrl *ctrl)
+{
+	struct nvme_ns *ns;
+
+	mutex_lock(&ctrl->namespaces_mutex);
+	list_for_each_entry(ns, &ctrl->namespaces, list)
+		blk_mq_unfreeze_queue(ns->queue);
+	mutex_unlock(&ctrl->namespaces_mutex);
+}
+EXPORT_SYMBOL_GPL(nvme_unfreeze);
+
+void nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl, long timeout)
+{
+	struct nvme_ns *ns;
+
+	mutex_lock(&ctrl->namespaces_mutex);
+	list_for_each_entry(ns, &ctrl->namespaces, list) {
+		timeout = blk_mq_freeze_queue_wait_timeout(ns->queue, timeout);
+		if (timeout <= 0)
+			break;
+	}
+	mutex_unlock(&ctrl->namespaces_mutex);
+}
+EXPORT_SYMBOL_GPL(nvme_wait_freeze_timeout);
+
+void nvme_wait_freeze(struct nvme_ctrl *ctrl)
+{
+	struct nvme_ns *ns;
+
+	mutex_lock(&ctrl->namespaces_mutex);
+	list_for_each_entry(ns, &ctrl->namespaces, list)
+		blk_mq_freeze_queue_wait(ns->queue);
+	mutex_unlock(&ctrl->namespaces_mutex);
+}
+EXPORT_SYMBOL_GPL(nvme_wait_freeze);
+
+void nvme_start_freeze(struct nvme_ctrl *ctrl)
+{
+	struct nvme_ns *ns;
+
+	mutex_lock(&ctrl->namespaces_mutex);
+	list_for_each_entry(ns, &ctrl->namespaces, list)
+		blk_mq_freeze_queue_start(ns->queue);
+	mutex_unlock(&ctrl->namespaces_mutex);
+}
+EXPORT_SYMBOL_GPL(nvme_start_freeze);
 
 void nvme_stop_queues(struct nvme_ctrl *ctrl)
 {

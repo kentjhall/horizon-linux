@@ -256,7 +256,6 @@ monotonic_raw:
 	seqcnt_check fail=monotonic_raw
 
 	/* All computations are done with left-shifted nsecs. */
-	lsl	x14, x14, x12
 	get_nsec_per_sec res=x9
 	lsl	x9, x9, x12
 
@@ -302,15 +301,16 @@ ENTRY(__kernel_clock_getres)
 	ccmp	w0, #CLOCK_MONOTONIC_RAW, #0x4, ne
 	b.ne	1f
 
-	ldr	x2, 5f
+	adr	vdso_data, _vdso_data
+	ldr	w2, [vdso_data, #CLOCK_REALTIME_RES]
 	b	2f
 1:
 	cmp	w0, #CLOCK_REALTIME_COARSE
 	ccmp	w0, #CLOCK_MONOTONIC_COARSE, #0x4, ne
 	b.ne	4f
-	ldr	x2, 6f
+	ldr	x2, 5f
 2:
-	cbz	w1, 3f
+	cbz	x1, 3f
 	stp	xzr, x2, [x1]
 
 3:	/* res == NULL. */
@@ -322,8 +322,6 @@ ENTRY(__kernel_clock_getres)
 	svc	#0
 	ret
 5:
-	.quad	CLOCK_REALTIME_RES
-6:
 	.quad	CLOCK_COARSE_RES
 	.cfi_endproc
 ENDPROC(__kernel_clock_getres)

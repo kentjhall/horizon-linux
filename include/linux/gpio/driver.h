@@ -15,6 +15,7 @@ struct device_node;
 struct seq_file;
 struct gpio_device;
 struct module;
+enum gpiod_flags;
 
 #ifdef CONFIG_GPIOLIB
 
@@ -45,6 +46,8 @@ enum single_ended_mode {
  *	(same as GPIOF_DIR_XXX), or negative error
  * @direction_input: configures signal "offset" as input, or returns error
  * @direction_output: configures signal "offset" as output, or returns error
+ * @timestamp_control: enables signal "offset" for timestamping
+ * @timestamp_read: read timestamp value for given signal "offset"
  * @get: returns value for signal "offset", 0=low, 1=high, or negative error
  * @set: assigns output value for signal "offset"
  * @set_multiple: assigns output values for multiple signals defined by "mask"
@@ -143,6 +146,10 @@ struct gpio_chip {
 						unsigned offset);
 	int			(*direction_output)(struct gpio_chip *chip,
 						unsigned offset, int value);
+	int			(*timestamp_control)(struct gpio_chip *chip,
+						unsigned offset, int enable);
+	int			(*timestamp_read)(struct gpio_chip *chip,
+						unsigned offset, u64 *ts);
 	int			(*get)(struct gpio_chip *chip,
 						unsigned offset);
 	void			(*set)(struct gpio_chip *chip,
@@ -156,6 +163,13 @@ struct gpio_chip {
 	int			(*set_single_ended)(struct gpio_chip *chip,
 						unsigned offset,
 						enum single_ended_mode mode);
+
+	int			(*suspend_configure)(struct gpio_chip *chip,
+						     unsigned offset,
+						     enum gpiod_flags dflags);
+
+	int			(*is_enabled)(struct gpio_chip *chip,
+						unsigned offset);
 
 	int			(*to_irq)(struct gpio_chip *chip,
 						unsigned offset);

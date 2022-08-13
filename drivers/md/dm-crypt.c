@@ -108,6 +108,11 @@ struct iv_tcw_private {
 	u8 *whitening;
 };
 
+struct crypto_completion {
+	struct completion restart;
+	int req_err;
+};
+
 /*
  * Crypt: maps a linear range of a block device
  * and encrypts / decrypts at the same time.
@@ -259,6 +264,28 @@ static int crypt_iv_plain64_gen(struct crypt_config *cc, u8 *iv,
 	return 0;
 }
 
+static void crypt_complete(struct crypto_async_request *req, int err)
+{
+	struct crypto_completion *done = req->data;
+
+	if (err != -EINPROGRESS) {
+		done->req_err = err;
+		complete(&done->restart);
+	}
+}
+
+static int async_hash_op(struct ahash_request *req,
+				struct crypto_completion *tr,
+				int ret)
+{
+	if (ret == -EBUSY || ret == -EINPROGRESS) {
+		wait_for_completion(&tr->restart);
+		reinit_completion(&tr->restart);
+		ret = tr->req_err;
+	}
+	return ret;
+}
+
 /* Initialise ESSIV - compute salt but no local memory allocations */
 static int crypt_iv_essiv_init(struct crypt_config *cc)
 {
@@ -266,14 +293,16 @@ static int crypt_iv_essiv_init(struct crypt_config *cc)
 	AHASH_REQUEST_ON_STACK(req, essiv->hash_tfm);
 	struct scatterlist sg;
 	struct crypto_cipher *essiv_tfm;
+	struct crypto_completion hash_complete;
 	int err;
 
 	sg_init_one(&sg, cc->key, cc->key_size);
 	ahash_request_set_tfm(req, essiv->hash_tfm);
-	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
+	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypt_complete, &hash_complete);
+	init_completion(&hash_complete.restart);
 	ahash_request_set_crypt(req, &sg, essiv->salt, cc->key_size);
 
-	err = crypto_ahash_digest(req);
+	err = async_hash_op(req, &hash_complete, crypto_ahash_digest(req));
 	ahash_request_zero(req);
 	if (err)
 		return err;
@@ -1503,12 +1532,15 @@ static int crypt_set_key(struct crypt_config *cc, char *key)
 	if (!cc->key_size && strcmp(key, "-"))
 		goto out;
 
+	/* clear the flag since following operations may invalidate previously valid key */
+	clear_bit(DM_CRYPT_KEY_VALID, &cc->flags);
+
 	if (cc->key_size && crypt_decode_key(cc->key, key, cc->key_size) < 0)
 		goto out;
 
-	set_bit(DM_CRYPT_KEY_VALID, &cc->flags);
-
 	r = crypt_setkey_allcpus(cc);
+	if (!r)
+		set_bit(DM_CRYPT_KEY_VALID, &cc->flags);
 
 out:
 	/* Hex key string not needed after here, so wipe it. */
@@ -1863,16 +1895,24 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	ret = -ENOMEM;
-	cc->io_queue = alloc_workqueue("kcryptd_io", WQ_MEM_RECLAIM, 1);
+	cc->io_queue = alloc_workqueue("kcryptd_io",
+				       WQ_HIGHPRI |
+				       WQ_MEM_RECLAIM,
+				       1);
 	if (!cc->io_queue) {
 		ti->error = "Couldn't create kcryptd io queue";
 		goto bad;
 	}
 
 	if (test_bit(DM_CRYPT_SAME_CPU, &cc->flags))
-		cc->crypt_queue = alloc_workqueue("kcryptd", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 1);
+		cc->crypt_queue = alloc_workqueue("kcryptd",
+						  WQ_HIGHPRI |
+						  WQ_MEM_RECLAIM, 1);
 	else
-		cc->crypt_queue = alloc_workqueue("kcryptd", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND,
+		cc->crypt_queue = alloc_workqueue("kcryptd",
+						  WQ_HIGHPRI |
+						  WQ_MEM_RECLAIM |
+						  WQ_UNBOUND,
 						  num_online_cpus());
 	if (!cc->crypt_queue) {
 		ti->error = "Couldn't create kcryptd queue";

@@ -318,6 +318,9 @@ struct hdac_bus {
 	/* i915 component interface */
 	struct i915_audio_component *audio_component;
 	int i915_power_refcount;
+
+	/* WAR for SDO limitation */
+	bool avoid_compact_sdo_bw;
 };
 
 int snd_hdac_bus_init(struct hdac_bus *bus, struct device *dev,
@@ -432,6 +435,7 @@ struct hdac_stream {
 	bool prepared:1;
 	bool no_period_wakeup:1;
 	bool locked:1;
+	bool stripe:1;
 
 	/* timestamp */
 	unsigned long start_wallclk;	/* start + minimum wallclk */
@@ -439,6 +443,7 @@ struct hdac_stream {
 	struct timecounter  tc;
 	struct cyclecounter cc;
 	int delay_negative_threshold;
+	int stripe_ctl;
 
 	struct list_head list;
 #ifdef CONFIG_SND_HDA_DSP_LOADER
@@ -470,6 +475,8 @@ void snd_hdac_stream_sync(struct hdac_stream *azx_dev, bool start,
 			  unsigned int streams);
 void snd_hdac_stream_timecounter_init(struct hdac_stream *azx_dev,
 				      unsigned int streams);
+int snd_hdac_get_stream_stripe_ctl(struct hdac_bus *bus,
+				struct snd_pcm_substream *substream);
 /*
  * macros for easy use
  */

@@ -113,6 +113,9 @@ iomap_write_begin(struct inode *inode, loff_t pos, unsigned len, unsigned flags,
 
 	BUG_ON(pos + len > iomap->offset + iomap->length);
 
+	if (fatal_signal_pending(current))
+		return -EINTR;
+
 	page = grab_cache_page_write_begin(inode->i_mapping, index, flags);
 	if (!page)
 		return -ENOMEM;
@@ -278,7 +281,7 @@ iomap_dirty_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
 		unsigned long bytes;	/* Bytes to write to page */
 
 		offset = (pos & (PAGE_SIZE - 1));
-		bytes = min_t(unsigned long, PAGE_SIZE - offset, length);
+		bytes = min_t(loff_t, PAGE_SIZE - offset, length);
 
 		rpage = __iomap_read_page(inode, pos);
 		if (IS_ERR(rpage))
@@ -373,7 +376,7 @@ iomap_zero_range_actor(struct inode *inode, loff_t pos, loff_t count,
 		unsigned offset, bytes;
 
 		offset = pos & (PAGE_SIZE - 1); /* Within page */
-		bytes = min_t(unsigned, PAGE_SIZE - offset, count);
+		bytes = min_t(loff_t, PAGE_SIZE - offset, count);
 
 		if (IS_DAX(inode))
 			status = iomap_dax_zero(pos, offset, bytes, iomap);
@@ -416,8 +419,8 @@ int
 iomap_truncate_page(struct inode *inode, loff_t pos, bool *did_zero,
 		struct iomap_ops *ops)
 {
-	unsigned blocksize = (1 << inode->i_blkbits);
-	unsigned off = pos & (blocksize - 1);
+	unsigned int blocksize = i_blocksize(inode);
+	unsigned int off = pos & (blocksize - 1);
 
 	/* Block boundary? Nothing to do */
 	if (!off)

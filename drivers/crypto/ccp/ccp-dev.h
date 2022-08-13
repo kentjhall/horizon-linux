@@ -109,9 +109,8 @@
 #define INT_COMPLETION			0x1
 #define INT_ERROR			0x2
 #define INT_QUEUE_STOPPED		0x4
-#define ALL_INTERRUPTS			(INT_COMPLETION| \
-					 INT_ERROR| \
-					 INT_QUEUE_STOPPED)
+#define	INT_EMPTY_QUEUE			0x8
+#define SUPPORTED_INTERRUPTS		(INT_COMPLETION | INT_ERROR)
 
 #define LSB_REGION_WIDTH		5
 #define MAX_LSB_CNT			8
@@ -188,6 +187,7 @@
 #define CCP_AES_CTX_SB_COUNT		1
 
 #define CCP_XTS_AES_KEY_SB_COUNT	1
+#define CCP5_XTS_AES_KEY_SB_COUNT	2
 #define CCP_XTS_AES_CTX_SB_COUNT	1
 
 #define CCP_SHA_SB_COUNT		1
@@ -238,6 +238,7 @@ struct ccp_dma_chan {
 	struct ccp_device *ccp;
 
 	spinlock_t lock;
+	struct list_head created;
 	struct list_head pending;
 	struct list_head active;
 	struct list_head complete;
@@ -332,7 +333,10 @@ struct ccp_device {
 	void *dev_specific;
 	int (*get_irq)(struct ccp_device *ccp);
 	void (*free_irq)(struct ccp_device *ccp);
+	unsigned int qim;
 	unsigned int irq;
+	bool use_tasklet;
+	struct tasklet_struct irq_tasklet;
 
 	/* I/O area used for device communication. The register mapping
 	 * starts at an offset into the mapped bar.
@@ -440,6 +444,7 @@ struct ccp_sg_workarea {
 	int nents;
 
 	struct scatterlist *dma_sg;
+	struct scatterlist *dma_sg_head;
 	struct device *dma_dev;
 	unsigned int dma_count;
 	enum dma_data_direction dma_dir;
@@ -466,9 +471,11 @@ struct ccp_aes_op {
 	enum ccp_aes_type type;
 	enum ccp_aes_mode mode;
 	enum ccp_aes_action action;
+	unsigned int size;
 };
 
 struct ccp_xts_aes_op {
+	enum ccp_aes_type type;
 	enum ccp_aes_action action;
 	enum ccp_xts_aes_unit_size unit_size;
 };
@@ -601,7 +608,7 @@ void ccp_platform_exit(void);
 void ccp_add_device(struct ccp_device *ccp);
 void ccp_del_device(struct ccp_device *ccp);
 
-extern void ccp_log_error(struct ccp_device *, int);
+extern void ccp_log_error(struct ccp_device *, unsigned int);
 
 struct ccp_device *ccp_alloc_struct(struct device *dev);
 bool ccp_queues_suspended(struct ccp_device *ccp);

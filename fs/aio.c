@@ -40,6 +40,7 @@
 #include <linux/ramfs.h>
 #include <linux/percpu-refcount.h>
 #include <linux/mount.h>
+#include <linux/nospec.h>
 
 #include <asm/kmap_types.h>
 #include <asm/uaccess.h>
@@ -68,9 +69,9 @@ struct aio_ring {
 #define AIO_RING_PAGES	8
 
 struct kioctx_table {
-	struct rcu_head	rcu;
-	unsigned	nr;
-	struct kioctx	*table[];
+	struct rcu_head		rcu;
+	unsigned		nr;
+	struct kioctx __rcu	*table[];
 };
 
 struct kioctx_cpu {
@@ -115,7 +116,8 @@ struct kioctx {
 	struct page		**ring_pages;
 	long			nr_pages;
 
-	struct work_struct	free_work;
+	struct rcu_head		free_rcu;
+	struct work_struct	free_work;	/* see free_ioctx() */
 
 	/*
 	 * signals when all in-flight requests are done
@@ -329,7 +331,7 @@ static int aio_ring_mremap(struct vm_area_struct *vma)
 	for (i = 0; i < table->nr; i++) {
 		struct kioctx *ctx;
 
-		ctx = table->table[i];
+		ctx = rcu_dereference(table->table[i]);
 		if (ctx && ctx->aio_ring_file == file) {
 			if (!atomic_read(&ctx->dead)) {
 				ctx->user_id = ctx->mmap_base = vma->vm_start;
@@ -372,6 +374,14 @@ static int aio_migratepage(struct address_space *mapping, struct page *new,
 	unsigned long flags;
 	pgoff_t idx;
 	int rc;
+
+	/*
+	 * We cannot support the _NO_COPY case here, because copy needs to
+	 * happen under the ctx->completion_lock. That does not work with the
+	 * migration workflow of MIGRATE_SYNC_NO_COPY.
+	 */
+	if (mode == MIGRATE_SYNC_NO_COPY)
+		return -EINVAL;
 
 	rc = 0;
 
@@ -581,6 +591,12 @@ static int kiocb_cancel(struct aio_kiocb *kiocb)
 	return cancel(&kiocb->common);
 }
 
+/*
+ * free_ioctx() should be RCU delayed to synchronize against the RCU
+ * protected lookup_ioctx() and also needs process context to call
+ * aio_free_ring(), so the double bouncing through kioctx->free_rcu and
+ * ->free_work.
+ */
 static void free_ioctx(struct work_struct *work)
 {
 	struct kioctx *ctx = container_of(work, struct kioctx, free_work);
@@ -594,6 +610,14 @@ static void free_ioctx(struct work_struct *work)
 	kmem_cache_free(kioctx_cachep, ctx);
 }
 
+static void free_ioctx_rcufn(struct rcu_head *head)
+{
+	struct kioctx *ctx = container_of(head, struct kioctx, free_rcu);
+
+	INIT_WORK(&ctx->free_work, free_ioctx);
+	schedule_work(&ctx->free_work);
+}
+
 static void free_ioctx_reqs(struct percpu_ref *ref)
 {
 	struct kioctx *ctx = container_of(ref, struct kioctx, reqs);
@@ -602,8 +626,8 @@ static void free_ioctx_reqs(struct percpu_ref *ref)
 	if (ctx->rq_wait && atomic_dec_and_test(&ctx->rq_wait->count))
 		complete(&ctx->rq_wait->comp);
 
-	INIT_WORK(&ctx->free_work, free_ioctx);
-	schedule_work(&ctx->free_work);
+	/* Synchronize against RCU protected table->table[] dereferences */
+	call_rcu(&ctx->free_rcu, free_ioctx_rcufn);
 }
 
 /*
@@ -621,9 +645,8 @@ static void free_ioctx_users(struct percpu_ref *ref)
 	while (!list_empty(&ctx->active_reqs)) {
 		req = list_first_entry(&ctx->active_reqs,
 				       struct aio_kiocb, ki_list);
-
-		list_del_init(&req->ki_list);
 		kiocb_cancel(req);
+		list_del_init(&req->ki_list);
 	}
 
 	spin_unlock_irq(&ctx->ctx_lock);
@@ -644,9 +667,9 @@ static int ioctx_add_table(struct kioctx *ctx, struct mm_struct *mm)
 	while (1) {
 		if (table)
 			for (i = 0; i < table->nr; i++)
-				if (!table->table[i]) {
+				if (!rcu_access_pointer(table->table[i])) {
 					ctx->id = i;
-					table->table[i] = ctx;
+					rcu_assign_pointer(table->table[i], ctx);
 					spin_unlock(&mm->ioctx_lock);
 
 					/* While kioctx setup is in progress,
@@ -821,11 +844,11 @@ static int kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
 	}
 
 	table = rcu_dereference_raw(mm->ioctx_table);
-	WARN_ON(ctx != table->table[ctx->id]);
-	table->table[ctx->id] = NULL;
+	WARN_ON(ctx != rcu_access_pointer(table->table[ctx->id]));
+	RCU_INIT_POINTER(table->table[ctx->id], NULL);
 	spin_unlock(&mm->ioctx_lock);
 
-	/* percpu_ref_kill() will do the necessary call_rcu() */
+	/* free_ioctx_reqs() will do the necessary RCU synchronization */
 	wake_up_all(&ctx->wait);
 
 	/*
@@ -867,7 +890,8 @@ void exit_aio(struct mm_struct *mm)
 
 	skipped = 0;
 	for (i = 0; i < table->nr; ++i) {
-		struct kioctx *ctx = table->table[i];
+		struct kioctx *ctx =
+			rcu_dereference_protected(table->table[i], true);
 
 		if (!ctx) {
 			skipped++;
@@ -1056,10 +1080,11 @@ static struct kioctx *lookup_ioctx(unsigned long ctx_id)
 	if (!table || id >= table->nr)
 		goto out;
 
-	ctx = table->table[id];
+	id = array_index_nospec(id, table->nr);
+	ctx = rcu_dereference(table->table[id]);
 	if (ctx && ctx->user_id == ctx_id) {
-		percpu_ref_get(&ctx->users);
-		ret = ctx;
+		if (percpu_ref_tryget_live(&ctx->users))
+			ret = ctx;
 	}
 out:
 	rcu_read_unlock();
@@ -1085,7 +1110,8 @@ static void aio_complete(struct kiocb *kiocb, long res, long res2)
 		 * Tell lockdep we inherited freeze protection from submission
 		 * thread.
 		 */
-		__sb_writers_acquired(file_inode(file)->i_sb, SB_FREEZE_WRITE);
+		if (S_ISREG(file_inode(file)->i_mode))
+			__sb_writers_acquired(file_inode(file)->i_sb, SB_FREEZE_WRITE);
 		file_end_write(file);
 	}
 
@@ -1492,7 +1518,8 @@ static ssize_t aio_write(struct kiocb *req, struct iocb *iocb, bool vectored,
 		 * by telling it the lock got released so that it doesn't
 		 * complain about held lock when we return to userspace.
 		 */
-		__sb_writers_release(file_inode(file)->i_sb, SB_FREEZE_WRITE);
+		if (S_ISREG(file_inode(file)->i_mode))
+			__sb_writers_release(file_inode(file)->i_sb, SB_FREEZE_WRITE);
 	}
 	kfree(iovec);
 	return ret;

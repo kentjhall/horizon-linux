@@ -160,6 +160,7 @@ struct spi_device {
 #define	SPI_TX_QUAD	0x200			/* transmit with 4 wires */
 #define	SPI_RX_DUAL	0x400			/* receive with 2 wires */
 #define	SPI_RX_QUAD	0x800			/* receive with 4 wires */
+#define	SPI_LSBYTE_FIRST	0x1000		/* per-word bytes-on-wire */
 	int			irq;
 	void			*controller_state;
 	void			*controller_data;
@@ -564,6 +565,7 @@ struct spi_master {
 	void			*dummy_tx;
 
 	int (*fw_translate_cs)(struct spi_master *master, unsigned cs);
+	int (*spi_cs_low)(struct spi_device *spi, bool state);
 };
 
 static inline void *spi_master_get_devdata(struct spi_master *master)
@@ -601,6 +603,8 @@ extern void spi_finalize_current_transfer(struct spi_master *master);
 /* the spi driver core manages memory for the spi_master classdev */
 extern struct spi_master *
 spi_alloc_master(struct device *host, unsigned size);
+extern struct spi_master *
+devm_spi_alloc_master(struct device *dev, unsigned int size);
 
 extern int spi_register_master(struct spi_master *master);
 extern int devm_spi_register_master(struct device *dev,
@@ -1313,5 +1317,12 @@ spi_transfer_is_last(struct spi_master *master, struct spi_transfer *xfer)
 {
 	return list_is_last(&xfer->transfer_list, &master->cur_msg->transfers);
 }
+
+/**
+ * spi_cs_low - set chip select pin state
+ * @spi: device for which chip select pin state to be set
+ * state: if true chip select pin will be kept low else high
+ */
+extern int spi_cs_low(struct spi_device *spi, bool state);
 
 #endif /* __LINUX_SPI_H */

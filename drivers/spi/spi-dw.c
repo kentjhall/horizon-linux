@@ -107,7 +107,10 @@ static const struct file_operations dw_spi_regs_ops = {
 
 static int dw_spi_debugfs_init(struct dw_spi *dws)
 {
-	dws->debugfs = debugfs_create_dir("dw_spi", NULL);
+	char name[128];
+
+	snprintf(name, 128, "dw_spi-%s", dev_name(&dws->master->dev));
+	dws->debugfs = debugfs_create_dir(name, NULL);
 	if (!dws->debugfs)
 		return -ENOMEM;
 
@@ -177,9 +180,11 @@ static inline u32 rx_max(struct dw_spi *dws)
 
 static void dw_writer(struct dw_spi *dws)
 {
-	u32 max = tx_max(dws);
+	u32 max;
 	u16 txw = 0;
 
+	spin_lock(&dws->buf_lock);
+	max = tx_max(dws);
 	while (max--) {
 		/* Set the tx word if the transfer's original "tx" is not null */
 		if (dws->tx_end - dws->len) {
@@ -191,13 +196,16 @@ static void dw_writer(struct dw_spi *dws)
 		dw_write_io_reg(dws, DW_SPI_DR, txw);
 		dws->tx += dws->n_bytes;
 	}
+	spin_unlock(&dws->buf_lock);
 }
 
 static void dw_reader(struct dw_spi *dws)
 {
-	u32 max = rx_max(dws);
+	u32 max;
 	u16 rxw;
 
+	spin_lock(&dws->buf_lock);
+	max = rx_max(dws);
 	while (max--) {
 		rxw = dw_read_io_reg(dws, DW_SPI_DR);
 		/* Care rx only if the transfer's original "rx" is not null */
@@ -209,6 +217,7 @@ static void dw_reader(struct dw_spi *dws)
 		}
 		dws->rx += dws->n_bytes;
 	}
+	spin_unlock(&dws->buf_lock);
 }
 
 static void int_error_stop(struct dw_spi *dws, const char *msg)
@@ -281,18 +290,23 @@ static int dw_spi_transfer_one(struct spi_master *master,
 {
 	struct dw_spi *dws = spi_master_get_devdata(master);
 	struct chip_data *chip = spi_get_ctldata(spi);
+	unsigned long flags;
 	u8 imask = 0;
 	u16 txlevel = 0;
 	u32 cr0;
 	int ret;
 
 	dws->dma_mapped = 0;
-
+	spin_lock_irqsave(&dws->buf_lock, flags);
 	dws->tx = (void *)transfer->tx_buf;
 	dws->tx_end = dws->tx + transfer->len;
 	dws->rx = transfer->rx_buf;
 	dws->rx_end = dws->rx + transfer->len;
 	dws->len = transfer->len;
+	spin_unlock_irqrestore(&dws->buf_lock, flags);
+
+	/* Ensure dw->rx and dw->rx_end are visible */
+	smp_mb();
 
 	spi_enable_chip(dws, 0);
 
@@ -370,11 +384,8 @@ static int dw_spi_transfer_one(struct spi_master *master,
 
 	spi_enable_chip(dws, 1);
 
-	if (dws->dma_mapped) {
-		ret = dws->dma_ops->dma_transfer(dws, transfer);
-		if (ret < 0)
-			return ret;
-	}
+	if (dws->dma_mapped)
+		return dws->dma_ops->dma_transfer(dws, transfer);
 
 	if (chip->poll_mode)
 		return poll_transfer(dws);
@@ -484,6 +495,9 @@ int dw_spi_add_host(struct device *dev, struct dw_spi *dws)
 	dws->dma_inited = 0;
 	dws->dma_addr = (dma_addr_t)(dws->paddr + DW_SPI_DR);
 	snprintf(dws->name, sizeof(dws->name), "dw_spi%d", dws->bus_num);
+	spin_lock_init(&dws->buf_lock);
+
+	spi_master_set_devdata(master, dws);
 
 	ret = request_irq(dws->irq, dw_spi_irq, IRQF_SHARED, dws->name, master);
 	if (ret < 0) {
@@ -516,8 +530,7 @@ int dw_spi_add_host(struct device *dev, struct dw_spi *dws)
 		}
 	}
 
-	spi_master_set_devdata(master, dws);
-	ret = devm_spi_register_master(dev, master);
+	ret = spi_register_master(master);
 	if (ret) {
 		dev_err(&master->dev, "problem registering spi master\n");
 		goto err_dma_exit;
@@ -540,6 +553,8 @@ EXPORT_SYMBOL_GPL(dw_spi_add_host);
 void dw_spi_remove_host(struct dw_spi *dws)
 {
 	dw_spi_debugfs_remove(dws);
+
+	spi_unregister_master(dws->master);
 
 	if (dws->dma_ops && dws->dma_ops->dma_exit)
 		dws->dma_ops->dma_exit(dws);

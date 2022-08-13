@@ -1,6 +1,8 @@
 /*
  *  linux/include/linux/mmc/core.h
  *
+ * Copyright (C) 2015-2017, NVIDIA CORPORATION.  All rights reserved.
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
@@ -48,6 +50,7 @@ struct mmc_command {
 #define MMC_RSP_NONE	(0)
 #define MMC_RSP_R1	(MMC_RSP_PRESENT|MMC_RSP_CRC|MMC_RSP_OPCODE)
 #define MMC_RSP_R1B	(MMC_RSP_PRESENT|MMC_RSP_CRC|MMC_RSP_OPCODE|MMC_RSP_BUSY)
+#define MMC_RSP_R1B_CQ	(MMC_RSP_PRESENT|MMC_RSP_136)
 #define MMC_RSP_R2	(MMC_RSP_PRESENT|MMC_RSP_136|MMC_RSP_CRC)
 #define MMC_RSP_R3	(MMC_RSP_PRESENT)
 #define MMC_RSP_R4	(MMC_RSP_PRESENT)
@@ -134,6 +137,7 @@ struct mmc_request {
 	struct mmc_command	*cmd;
 	struct mmc_data		*data;
 	struct mmc_command	*stop;
+	struct mmc_command	*task_mgmt;
 
 	struct completion	completion;
 	struct completion	cmd_completion;
@@ -142,15 +146,25 @@ struct mmc_request {
 
 	/* Allow other commands during this ongoing data transfer or busy wait */
 	bool			cap_cmd_during_tfr;
+	struct mmc_cmdq_req	*cmdq_req;
+	struct request		*req; /* associated block request */
+	ktime_t			io_start;
+#ifdef CONFIG_BLOCK
+	int			lat_hist_enabled;
+#endif
 };
 
 struct mmc_card;
 struct mmc_async_req;
+struct mmc_cmdq_req;
 
 extern int mmc_stop_bkops(struct mmc_card *);
 extern int mmc_read_bkops_status(struct mmc_card *);
 extern struct mmc_async_req *mmc_start_req(struct mmc_host *,
 					   struct mmc_async_req *, int *);
+extern int mmc_cmdq_start_req(struct mmc_host *host,
+		struct mmc_cmdq_req *cmdq_req);
+extern void mmc_blk_cmdq_req_done(struct mmc_request *mrq);
 extern int mmc_interrupt_hpi(struct mmc_card *);
 extern void mmc_wait_for_req(struct mmc_host *, struct mmc_request *);
 extern void mmc_wait_for_req_done(struct mmc_host *host,
@@ -164,6 +178,17 @@ extern void mmc_start_bkops(struct mmc_card *card, bool from_exception);
 extern int mmc_switch(struct mmc_card *, u8, u8, u8, unsigned int);
 extern int mmc_send_tuning(struct mmc_host *host, u32 opcode, int *cmd_error);
 extern int mmc_get_ext_csd(struct mmc_card *card, u8 **new_ext_csd);
+extern int __mmc_switch_cmdq_mode(struct mmc_command *cmd, u8 set, u8 index,
+		u8 value, unsigned int timeout_ms,
+		bool use_busy_signal, bool ignore_timeout);
+extern int mmc_cmdq_halt(struct mmc_host *host, bool enable);
+extern void mmc_cmdq_post_req(struct mmc_host *host, struct mmc_request *mrq,
+		int err);
+extern int mmc_cmdq_discard_task(struct mmc_host *host, u32 tag, bool all);
+extern int mmc_cmdq_support_qbr(struct mmc_host *host);
+extern void mmc_wait_hw_cmdq_empty(struct mmc_host *host);
+extern void mmc_cmdq_pause(struct mmc_card *card, bool pause);
+extern int mmc_cmdq_initiate_halt(struct mmc_host *host, bool halt);
 
 #define MMC_ERASE_ARG		0x00000000
 #define MMC_SECURE_ERASE_ARG	0x80000000
@@ -204,6 +229,16 @@ extern void mmc_put_card(struct mmc_card *card);
 extern int mmc_flush_cache(struct mmc_card *);
 
 extern int mmc_detect_card_removed(struct mmc_host *host);
+extern void mmc_prepare_mrq(struct mmc_card *card,
+	struct mmc_request *mrq, struct scatterlist *sg,
+	unsigned int sg_len, unsigned int dev_addr, unsigned int blocks,
+	unsigned int blksz, int write);
+extern int mmc_wait_busy(struct mmc_card *card);
+extern int mmc_check_result(struct mmc_request *mrq);
+extern int mmc_simple_transfer(struct mmc_card *card,
+	struct scatterlist *sg, unsigned int sg_len, unsigned int dev_addr,
+	unsigned int blocks, unsigned int blksz, int write);
+
 
 /**
  *	mmc_claim_host - exclusively claim a host
@@ -219,5 +254,26 @@ static inline void mmc_claim_host(struct mmc_host *host)
 struct device_node;
 extern u32 mmc_vddrange_to_ocrmask(int vdd_min, int vdd_max);
 extern int mmc_of_parse_voltage(struct device_node *np, u32 *mask);
+/*
+ * eMMC5.0 Field Firmware Update (FFU) opcodes
+*/
+#define MMC_FFU_INVOKE_OP 302
+
+#define MMC_FFU_MODE_SET 0x1
+#define MMC_FFU_MODE_NORMAL 0x0
+#define MMC_FFU_INSTALL_SET 0x2
+
+#ifdef CONFIG_MMC_FFU
+#define MMC_FFU_FEATURES 0x1
+#define FFU_FEATURES(ffu_features) (ffu_features & MMC_FFU_FEATURES)
+
+int mmc_ffu_invoke(struct mmc_card *card, const char *name);
+
+#else
+static inline int mmc_ffu_invoke(struct mmc_card *card, const char *name)
+{
+             return -ENOSYS;
+}
+#endif
 
 #endif /* LINUX_MMC_CORE_H */

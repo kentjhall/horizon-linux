@@ -62,8 +62,13 @@ static inline unsigned int tcp_optlen(const struct sk_buff *skb)
 
 /* TCP Fast Open Cookie as stored in memory */
 struct tcp_fastopen_cookie {
+	union {
+		u8	val[TCP_FASTOPEN_COOKIE_MAX];
+#if IS_ENABLED(CONFIG_IPV6)
+		struct in6_addr addr;
+#endif
+	};
 	s8	len;
-	u8	val[TCP_FASTOPEN_COOKIE_MAX];
 	bool	exp;	/* In RFC6994 experimental option format */
 };
 
@@ -213,8 +218,12 @@ struct tcp_sock {
 		u8 reord;    /* reordering detected */
 	} rack;
 	u16	advmss;		/* Advertised MSS			*/
+	u8	tlp_retrans:1,	/* TLP is a retransmission */
+		unused_1:7;
 	u8	rate_app_limited:1,  /* rate_{delivered,interval_us} limited? */
-		unused:7;
+		fastopen_connect:1, /* FASTOPEN_CONNECT sockopt */
+		is_sack_reneg:1,    /* in recovery from loss with SACK reneg? */
+		unused:5;
 	u8	nonagle     : 4,/* Disable Nagle algorithm?             */
 		thin_lto    : 1,/* Use linear timeouts for thin streams */
 		thin_dupack : 1,/* Fast retransmit on first dupack      */
@@ -228,7 +237,7 @@ struct tcp_sock {
 		syn_data_acked:1,/* data in SYN is acked by SYN-ACK */
 		save_syn:1,	/* Save headers of SYN packet */
 		is_cwnd_limited:1;/* forward progress limited by snd_cwnd? */
-	u32	tlp_high_seq;	/* snd_nxt at the time of TLP retransmit. */
+	u32	tlp_high_seq;	/* snd_nxt at the time of TLP */
 
 /* RTT measurement */
 	u32	srtt_us;	/* smoothed round trip time << 3 in usecs */
@@ -331,7 +340,7 @@ struct tcp_sock {
 
 /* Receiver queue space */
 	struct {
-		int	space;
+		u32	space;
 		u32	seq;
 		u32	time;
 	} rcvq_space;
@@ -426,5 +435,8 @@ static inline void tcp_saved_syn_free(struct tcp_sock *tp)
 	kfree(tp->saved_syn);
 	tp->saved_syn = NULL;
 }
+
+int tcp_skb_shift(struct sk_buff *to, struct sk_buff *from, int pcount,
+		  int shiftlen);
 
 #endif	/* _LINUX_TCP_H */

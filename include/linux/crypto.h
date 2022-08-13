@@ -4,13 +4,14 @@
  * Copyright (c) 2002 James Morris <jmorris@intercode.com.au>
  * Copyright (c) 2002 David S. Miller (davem@redhat.com)
  * Copyright (c) 2005 Herbert Xu <herbert@gondor.apana.org.au>
+ * Copyright (c) 2018 NVIDIA Corporation. All Rights Reserved.
  *
  * Portions derived from Cryptoapi, by Alexander Kjeldaas <astor@fast.no>
  * and Nettle, by Niels Möller.
- * 
+ *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option) 
+ * Software Foundation; either version 2 of the License, or (at your option)
  * any later version.
  *
  */
@@ -24,6 +25,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/completion.h>
 
 /*
  * Autoloaded crypto modules should only use a prefixed name to avoid allowing
@@ -103,8 +105,21 @@
 #define CRYPTO_ALG_INTERNAL		0x00002000
 
 /*
+ * Set if the algorithm has a ->setkey() method but can be used without
+ * calling it first, i.e. there is a default key.
+ */
+#define CRYPTO_ALG_OPTIONAL_KEY		0x00004000
+
+/*
+ * Don't trigger module loading
+ */
+#define CRYPTO_NOLOAD			0x00008000
+
+/*
  * Transform masks and values (for crt_flags).
  */
+#define CRYPTO_TFM_NEED_KEY		0x00000001
+
 #define CRYPTO_TFM_REQ_MASK		0x000fff00
 #define CRYPTO_TFM_RES_MASK		0xfff00000
 
@@ -465,6 +480,45 @@ struct crypto_alg {
 } CRYPTO_MINALIGN_ATTR;
 
 /*
+ * A helper struct for waiting for completion of async crypto ops
+ */
+struct crypto_wait {
+	struct completion completion;
+	int err;
+};
+
+/*
+ * Macro for declaring a crypto op async wait object on stack
+ */
+#define DECLARE_CRYPTO_WAIT(_wait) \
+	struct crypto_wait _wait = { \
+		COMPLETION_INITIALIZER_ONSTACK((_wait).completion), 0 }
+
+/*
+ * Async ops completion helper functioons
+ */
+void crypto_req_done(struct crypto_async_request *req, int err);
+
+static inline int crypto_wait_req(int err, struct crypto_wait *wait)
+{
+	switch (err) {
+	case -EINPROGRESS:
+	case -EBUSY:
+		wait_for_completion(&wait->completion);
+		reinit_completion(&wait->completion);
+		err = wait->err;
+		break;
+	};
+
+	return err;
+}
+
+static inline void crypto_init_wait(struct crypto_wait *wait)
+{
+	init_completion(&wait->completion);
+}
+
+/*
  * Algorithm registration interface.
  */
 int crypto_register_alg(struct crypto_alg *alg);
@@ -586,10 +640,10 @@ struct crypto_attr_u32 {
 	u32 num;
 };
 
-/* 
+/*
  * Transform user interface.
  */
- 
+
 struct crypto_tfm *crypto_alloc_base(const char *alg_name, u32 type, u32 mask);
 void crypto_destroy_tfm(void *mem, struct crypto_tfm *tfm);
 
@@ -599,6 +653,8 @@ static inline void crypto_free_tfm(struct crypto_tfm *tfm)
 }
 
 int alg_test(const char *driver, const char *alg, u32 type, u32 mask);
+
+int alg_hash_test(const char *driver, const char *alg, u32 type, u32 mask, bool skip_partial_test);
 
 /*
  * Transform helpers which query the underlying algorithm.

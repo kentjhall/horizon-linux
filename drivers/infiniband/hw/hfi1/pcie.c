@@ -162,9 +162,6 @@ int hfi1_pcie_ddinit(struct hfi1_devdata *dd, struct pci_dev *pdev)
 	unsigned long len;
 	resource_size_t addr;
 
-	dd->pcidev = pdev;
-	pci_set_drvdata(pdev, dd);
-
 	addr = pci_resource_start(pdev, 0);
 	len = pci_resource_len(pdev, 0);
 
@@ -380,7 +377,9 @@ int pcie_speeds(struct hfi1_devdata *dd)
 	/*
 	 * bus->max_bus_speed is set from the bridge's linkcap Max Link Speed
 	 */
-	if (parent && dd->pcidev->bus->max_bus_speed != PCIE_SPEED_8_0GT) {
+	if (parent &&
+	    (dd->pcidev->bus->max_bus_speed == PCIE_SPEED_2_5GT ||
+	     dd->pcidev->bus->max_bus_speed == PCIE_SPEED_5_0GT)) {
 		dd_dev_info(dd, "Parent PCIe bridge does not support Gen3\n");
 		dd->link_gen3_capable = 0;
 	}
@@ -673,12 +672,12 @@ MODULE_PARM_DESC(pcie_retry, "Driver will try this many times to reach requested
 
 #define UNSET_PSET 255
 #define DEFAULT_DISCRETE_PSET 2	/* discrete HFI */
-#define DEFAULT_MCP_PSET 4	/* MCP HFI */
+#define DEFAULT_MCP_PSET 6	/* MCP HFI */
 static uint pcie_pset = UNSET_PSET;
 module_param(pcie_pset, uint, S_IRUGO);
 MODULE_PARM_DESC(pcie_pset, "PCIe Eq Pset value to use, range is 0-10");
 
-static uint pcie_ctle = 1; /* discrete on, integrated off */
+static uint pcie_ctle = 3; /* discrete on, integrated on */
 module_param(pcie_ctle, uint, S_IRUGO);
 MODULE_PARM_DESC(pcie_ctle, "PCIe static CTLE mode, bit 0 - discrete on/off, bit 1 - integrated on/off");
 

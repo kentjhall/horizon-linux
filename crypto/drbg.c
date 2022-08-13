@@ -1133,10 +1133,12 @@ static inline void drbg_dealloc_state(struct drbg_state *drbg)
 {
 	if (!drbg)
 		return;
-	kzfree(drbg->V);
+	kzfree(drbg->Vbuf);
 	drbg->Vbuf = NULL;
-	kzfree(drbg->C);
+	drbg->V = NULL;
+	kzfree(drbg->Cbuf);
 	drbg->Cbuf = NULL;
+	drbg->C = NULL;
 	kzfree(drbg->scratchpadbuf);
 	drbg->scratchpadbuf = NULL;
 	drbg->reseed_ctr = 0;
@@ -1617,10 +1619,17 @@ static int drbg_kcapi_hash(struct drbg_state *drbg, unsigned char *outval,
 {
 	struct sdesc *sdesc = (struct sdesc *)drbg->priv_data;
 	struct drbg_string *input = NULL;
+	int ret;
 
 	crypto_shash_init(&sdesc->shash);
-	list_for_each_entry(input, in, list)
-		crypto_shash_update(&sdesc->shash, input->buf, input->len);
+	list_for_each_entry(input, in, list) {
+		ret = crypto_shash_update(&sdesc->shash, input->buf,
+				input->len);
+		if (ret) {
+			pr_info("DRBG:crypto_shash_update failed: %d\n", ret);
+			return ret;
+		}
+	}
 	return crypto_shash_final(&sdesc->shash, outval);
 }
 #endif /* (CONFIG_CRYPTO_DRBG_HASH || CONFIG_CRYPTO_DRBG_HMAC) */
@@ -1691,6 +1700,7 @@ static int drbg_init_sym_kernel(struct drbg_state *drbg)
 		return PTR_ERR(sk_tfm);
 	}
 	drbg->ctr_handle = sk_tfm;
+	init_completion(&drbg->ctr_completion);
 
 	req = skcipher_request_alloc(sk_tfm, GFP_KERNEL);
 	if (!req) {
@@ -1768,9 +1778,8 @@ static int drbg_kcapi_sym_ctr(struct drbg_state *drbg,
 			break;
 		case -EINPROGRESS:
 		case -EBUSY:
-			ret = wait_for_completion_interruptible(
-				&drbg->ctr_completion);
-			if (!ret && !drbg->ctr_async_err) {
+			wait_for_completion(&drbg->ctr_completion);
+			if (!drbg->ctr_async_err) {
 				reinit_completion(&drbg->ctr_completion);
 				break;
 			}

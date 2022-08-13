@@ -151,6 +151,13 @@ static void netvsc_destroy_buf(struct hv_device *device)
 				       sizeof(struct nvsp_message),
 				       (unsigned long)revoke_packet,
 				       VM_PKT_DATA_INBAND, 0);
+		/* If the failure is because the channel is rescinded;
+		 * ignore the failure since we cannot send on a rescinded
+		 * channel. This would allow us to properly cleanup
+		 * even when the channel is rescinded.
+		 */
+		if (device->channel->rescind)
+			ret = 0;
 		/*
 		 * If we failed here, we might as well return and
 		 * have a leak rather than continue and a bugchk
@@ -211,6 +218,15 @@ static void netvsc_destroy_buf(struct hv_device *device)
 				       sizeof(struct nvsp_message),
 				       (unsigned long)revoke_packet,
 				       VM_PKT_DATA_INBAND, 0);
+
+		/* If the failure is because the channel is rescinded;
+		 * ignore the failure since we cannot send on a rescinded
+		 * channel. This would allow us to properly cleanup
+		 * even when the channel is rescinded.
+		 */
+		if (device->channel->rescind)
+			ret = 0;
+
 		/* If we failed here, we might as well return and
 		 * have a leak rather than continue and a bugchk
 		 */
@@ -1288,6 +1304,9 @@ void netvsc_channel_cb(void *context)
 	ndev = hv_get_drvdata(device);
 	buffer = get_per_channel_state(channel);
 
+	/* commit_rd_index() -> hv_signal_on_read() needs this. */
+	init_cached_read_index(channel);
+
 	do {
 		desc = get_next_pkt_raw(channel);
 		if (desc != NULL) {
@@ -1340,6 +1359,9 @@ void netvsc_channel_cb(void *context)
 
 			bufferlen = bytes_recvd;
 		}
+
+		init_cached_read_index(channel);
+
 	} while (1);
 
 	if (bufferlen > NETVSC_PACKET_SIZE)

@@ -23,8 +23,6 @@
 #endif
 #endif
 
-#define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
-
 #ifdef __GNUC__
 #define TYPEOF(x) (__typeof__(x))
 #else
@@ -76,7 +74,6 @@
 #include <sys/ttydefaults.h>
 #include <api/fs/tracing_path.h>
 #include <termios.h>
-#include <linux/bitops.h>
 #include <termios.h>
 #include "strlist.h"
 

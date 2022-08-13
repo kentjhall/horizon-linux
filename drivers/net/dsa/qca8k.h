@@ -40,6 +40,7 @@
 						((0x8 + (x & 0x3)) << 22)
 #define   QCA8K_PORT_PAD_RGMII_RX_DELAY(x)		\
 						((0x10 + (x & 0x3)) << 20)
+#define   QCA8K_MAX_DELAY				3
 #define   QCA8K_PORT_PAD_RGMII_RX_DELAY_EN		BIT(24)
 #define   QCA8K_PORT_PAD_SGMII_EN			BIT(7)
 #define QCA8K_REG_MODULE_EN				0x030
@@ -51,8 +52,10 @@
 #define QCA8K_GOL_MAC_ADDR0				0x60
 #define QCA8K_GOL_MAC_ADDR1				0x64
 #define QCA8K_REG_PORT_STATUS(_i)			(0x07c + (_i) * 4)
-#define   QCA8K_PORT_STATUS_SPEED			GENMASK(2, 0)
-#define   QCA8K_PORT_STATUS_SPEED_S			0
+#define   QCA8K_PORT_STATUS_SPEED			GENMASK(1, 0)
+#define   QCA8K_PORT_STATUS_SPEED_10			0
+#define   QCA8K_PORT_STATUS_SPEED_100			0x1
+#define   QCA8K_PORT_STATUS_SPEED_1000			0x2
 #define   QCA8K_PORT_STATUS_TXMAC			BIT(2)
 #define   QCA8K_PORT_STATUS_RXMAC			BIT(3)
 #define   QCA8K_PORT_STATUS_TXFLOW			BIT(4)
@@ -167,6 +170,7 @@ struct qca8k_priv {
 	struct ar8xxx_port_status port_sts[QCA8K_NUM_PORTS];
 	struct dsa_switch *ds;
 	struct mutex reg_mutex;
+	struct device *dev;
 };
 
 struct qca8k_mib_desc {

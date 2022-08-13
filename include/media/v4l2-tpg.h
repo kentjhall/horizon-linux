@@ -96,7 +96,7 @@ struct tpg_data {
 	/* Source frame size */
 	unsigned			src_width, src_height;
 	/* Buffer height */
-	unsigned			buf_height;
+	unsigned			buf_height[TPG_MAX_PLANES];
 	/* Scaled output frame size */
 	unsigned			scaled_width;
 	u32				field;
@@ -148,6 +148,7 @@ struct tpg_data {
 	bool				interleaved;
 	u8				vdownsampling[TPG_MAX_PLANES];
 	u8				hdownsampling[TPG_MAX_PLANES];
+	u8				packedpixels[TPG_MAX_PLANES];
 	/*
 	 * horizontal positions must be ANDed with this value to enforce
 	 * correct boundaries for packed YUYV values.
@@ -209,7 +210,7 @@ void tpg_fill_plane_buffer(struct tpg_data *tpg, v4l2_std_id std,
 			   unsigned p, u8 *vbuf);
 void tpg_fillbuffer(struct tpg_data *tpg, v4l2_std_id std,
 		    unsigned p, u8 *vbuf);
-bool tpg_s_fourcc(struct tpg_data *tpg, u32 fourcc);
+bool tpg_s_fourcc(struct tpg_data *tpg, u32 fourcc, u32 metadata_height);
 void tpg_s_crop_compose(struct tpg_data *tpg, const struct v4l2_rect *crop,
 		const struct v4l2_rect *compose);
 
@@ -380,11 +381,21 @@ static inline unsigned tpg_g_twopixelsize(const struct tpg_data *tpg, unsigned p
 	return tpg->twopixelsize[plane];
 }
 
+static inline unsigned tpg_g_packedpixels(const struct tpg_data *tpg, unsigned plane)
+{
+	return tpg->packedpixels[plane];
+}
+
 static inline unsigned tpg_hdiv(const struct tpg_data *tpg,
 				  unsigned plane, unsigned x)
 {
-	return ((x / tpg->hdownsampling[plane]) & tpg->hmask[plane]) *
-		tpg->twopixelsize[plane] / 2;
+	if (tpg->packedpixels[plane] > 1)
+		return ((((x / tpg->hdownsampling[plane]) & tpg->hmask[plane]) *
+			tpg->twopixelsize[plane]) /
+			(2 * tpg->packedpixels[plane]));
+	else
+		return ((x / tpg->hdownsampling[plane]) & tpg->hmask[plane]) *
+			(tpg->twopixelsize[plane] / 2);
 }
 
 static inline unsigned tpg_hscale(const struct tpg_data *tpg, unsigned x)
@@ -459,13 +470,19 @@ static inline unsigned tpg_calc_plane_size(const struct tpg_data *tpg, unsigned 
 	if (plane >= tpg_g_planes(tpg))
 		return 0;
 
-	return tpg_g_bytesperline(tpg, plane) * tpg->buf_height /
+	return tpg_g_bytesperline(tpg, plane) * tpg->buf_height[plane] /
 	       tpg->vdownsampling[plane];
 }
 
-static inline void tpg_s_buf_height(struct tpg_data *tpg, unsigned h)
+static inline unsigned tpg_g_buf_height(struct tpg_data *tpg, unsigned plane)
 {
-	tpg->buf_height = h;
+	return tpg->buf_height[plane];
+}
+
+static inline void tpg_s_buf_height(struct tpg_data *tpg,
+					unsigned p, unsigned h)
+{
+	tpg->buf_height[p] = h;
 }
 
 static inline void tpg_s_field(struct tpg_data *tpg, unsigned field, bool alternate)

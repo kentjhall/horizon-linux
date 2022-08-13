@@ -868,7 +868,7 @@ int bnx2x_vfpf_set_mcast(struct net_device *dev)
 	struct bnx2x *bp = netdev_priv(dev);
 	struct vfpf_set_q_filters_tlv *req = &bp->vf2pf_mbox->req.set_q_filters;
 	struct pfvf_general_resp_tlv *resp = &bp->vf2pf_mbox->resp.general_resp;
-	int rc, i = 0;
+	int rc = 0, i = 0;
 	struct netdev_hw_addr *ha;
 
 	if (bp->state != BNX2X_STATE_OPEN) {
@@ -883,21 +883,20 @@ int bnx2x_vfpf_set_mcast(struct net_device *dev)
 	/* Get Rx mode requested */
 	DP(NETIF_MSG_IFUP, "dev->flags = %x\n", dev->flags);
 
+	/* We support PFVF_MAX_MULTICAST_PER_VF mcast addresses tops */
+	if (netdev_mc_count(dev) > PFVF_MAX_MULTICAST_PER_VF) {
+		DP(NETIF_MSG_IFUP,
+		   "VF supports not more than %d multicast MAC addresses\n",
+		   PFVF_MAX_MULTICAST_PER_VF);
+		rc = -EINVAL;
+		goto out;
+	}
+
 	netdev_for_each_mc_addr(ha, dev) {
 		DP(NETIF_MSG_IFUP, "Adding mcast MAC: %pM\n",
 		   bnx2x_mc_addr(ha));
 		memcpy(req->multicast[i], bnx2x_mc_addr(ha), ETH_ALEN);
 		i++;
-	}
-
-	/* We support four PFVF_MAX_MULTICAST_PER_VF mcast
-	  * addresses tops
-	  */
-	if (i >= PFVF_MAX_MULTICAST_PER_VF) {
-		DP(NETIF_MSG_IFUP,
-		   "VF supports not more than %d multicast MAC addresses\n",
-		   PFVF_MAX_MULTICAST_PER_VF);
-		return -EINVAL;
 	}
 
 	req->n_multicast = i;
@@ -924,7 +923,7 @@ int bnx2x_vfpf_set_mcast(struct net_device *dev)
 out:
 	bnx2x_vfpf_finalize(bp, &req->first_tlv);
 
-	return 0;
+	return rc;
 }
 
 /* request pf to add a vlan for the vf */
@@ -2095,6 +2094,18 @@ static void bnx2x_vf_mbx_request(struct bnx2x *bp, struct bnx2x_virtf *vf,
 				  struct bnx2x_vf_mbx *mbx)
 {
 	int i;
+
+	if (vf->state == VF_LOST) {
+		/* Just ack the FW and return if VFs are lost
+		 * in case of parity error. VFs are supposed to be timedout
+		 * on waiting for PF response.
+		 */
+		DP(BNX2X_MSG_IOV,
+		   "VF 0x%x lost, not handling the request\n", vf->abs_vfid);
+
+		storm_memset_vf_mbx_ack(bp, vf->abs_vfid);
+		return;
+	}
 
 	/* check if tlv type is known */
 	if (bnx2x_tlv_supported(mbx->first_tlv.tl.type)) {

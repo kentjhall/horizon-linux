@@ -82,6 +82,7 @@ nfs_file_release(struct inode *inode, struct file *filp)
 	dprintk("NFS: release(%pD2)\n", filp);
 
 	nfs_inc_stats(inode, NFSIOS_VFSRELEASE);
+	inode_dio_wait(inode);
 	nfs_file_clear_open_context(filp);
 	return 0;
 }
@@ -374,7 +375,7 @@ static int nfs_write_end(struct file *file, struct address_space *mapping,
 	 */
 	if (!PageUptodate(page)) {
 		unsigned pglen = nfs_page_length(page);
-		unsigned end = offset + len;
+		unsigned end = offset + copied;
 
 		if (pglen == 0) {
 			zero_user_segments(page, 0, offset,
@@ -636,11 +637,11 @@ ssize_t nfs_file_write(struct kiocb *iocb, struct iov_iter *from)
 	if (result <= 0)
 		goto out;
 
-	result = generic_write_sync(iocb, result);
-	if (result < 0)
-		goto out;
 	written = result;
 	iocb->ki_pos += written;
+	result = generic_write_sync(iocb, written);
+	if (result < 0)
+		goto out;
 
 	/* Return error values */
 	if (nfs_need_check_write(file, inode)) {
@@ -757,7 +758,7 @@ do_setlk(struct file *filp, int cmd, struct file_lock *fl, int is_local)
 	 */
 	nfs_sync_mapping(filp->f_mapping);
 	if (!NFS_PROTO(inode)->have_delegation(inode, FMODE_READ))
-		nfs_zap_mapping(inode, filp->f_mapping);
+		nfs_zap_caches(inode);
 out:
 	return status;
 }

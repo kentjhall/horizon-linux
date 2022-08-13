@@ -263,7 +263,7 @@ static void tcpnv_acked(struct sock *sk, const struct ack_sample *sample)
 
 	/* rate in 100's bits per second */
 	rate64 = ((u64)sample->in_flight) * 8000000;
-	rate = (u32)div64_u64(rate64, (u64)(avg_rtt * 100));
+	rate = (u32)div64_u64(rate64, (u64)(avg_rtt ?: 1) * 100);
 
 	/* Remember the maximum rate seen during this RTT
 	 * Note: It may be more than one RTT. This function should be
@@ -338,7 +338,7 @@ static void tcpnv_acked(struct sock *sk, const struct ack_sample *sample)
 		 */
 		cwnd_by_slope = (u32)
 			div64_u64(((u64)ca->nv_rtt_max_rate) * ca->nv_min_rtt,
-				  (u64)(80000 * tp->mss_cache));
+				  80000ULL * tp->mss_cache);
 		max_win = cwnd_by_slope + nv_pad;
 
 		/* If cwnd > max_win, decrease cwnd

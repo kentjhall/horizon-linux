@@ -30,6 +30,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/page_idle.h>
 #include <linux/shmem_fs.h>
+#include <linux/page_owner.h>
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
@@ -542,7 +543,8 @@ static int __do_huge_pmd_anonymous_page(struct fault_env *fe, struct page *page,
 
 	VM_BUG_ON_PAGE(!PageCompound(page), page);
 
-	if (mem_cgroup_try_charge(page, vma->vm_mm, gfp, &memcg, true)) {
+	if (mem_cgroup_try_charge(page, vma->vm_mm, gfp | __GFP_NORETRY, &memcg,
+				  true)) {
 		put_page(page);
 		count_vm_event(THP_FAULT_FALLBACK);
 		return VM_FAULT_FALLBACK;
@@ -609,19 +611,25 @@ static int __do_huge_pmd_anonymous_page(struct fault_env *fe, struct page *page,
  */
 static inline gfp_t alloc_hugepage_direct_gfpmask(struct vm_area_struct *vma)
 {
+	gfp_t gfp = GFP_TRANSHUGE_LIGHT;
 	bool vma_madvised = !!(vma->vm_flags & VM_HUGEPAGE);
 
 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG,
 				&transparent_hugepage_flags) && vma_madvised)
-		return GFP_TRANSHUGE;
+		gfp = GFP_TRANSHUGE;
 	else if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_FLAG,
 						&transparent_hugepage_flags))
-		return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
+		gfp = GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
 	else if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG,
 						&transparent_hugepage_flags))
-		return GFP_TRANSHUGE | (vma_madvised ? 0 : __GFP_NORETRY);
+		gfp = GFP_TRANSHUGE | (vma_madvised ? 0 : __GFP_NORETRY);
 
-	return GFP_TRANSHUGE_LIGHT;
+	/* Disable movable allocations to avoid fallback to CMA.
+	 * Unmovable allocations can fallback to movable anyway.
+	 */
+	gfp &= ~__GFP_MOVABLE;
+
+	return gfp;
 }
 
 /* Caller must hold page table lock. */
@@ -659,7 +667,6 @@ int do_huge_pmd_anonymous_page(struct fault_env *fe)
 			transparent_hugepage_use_zero_page()) {
 		pgtable_t pgtable;
 		struct page *zero_page;
-		bool set;
 		int ret;
 		pgtable = pte_alloc_one(vma->vm_mm, haddr);
 		if (unlikely(!pgtable))
@@ -672,22 +679,21 @@ int do_huge_pmd_anonymous_page(struct fault_env *fe)
 		}
 		fe->ptl = pmd_lock(vma->vm_mm, fe->pmd);
 		ret = 0;
-		set = false;
 		if (pmd_none(*fe->pmd)) {
 			if (userfaultfd_missing(vma)) {
 				spin_unlock(fe->ptl);
+				pte_free(vma->vm_mm, pgtable);
 				ret = handle_userfault(fe, VM_UFFD_MISSING);
 				VM_BUG_ON(ret & VM_FAULT_FALLBACK);
 			} else {
 				set_huge_zero_page(pgtable, vma->vm_mm, vma,
 						   haddr, fe->pmd, zero_page);
 				spin_unlock(fe->ptl);
-				set = true;
 			}
-		} else
+		} else {
 			spin_unlock(fe->ptl);
-		if (!set)
 			pte_free(vma->vm_mm, pgtable);
+		}
 		return ret;
 	}
 	gfp = alloc_hugepage_direct_gfpmask(vma);
@@ -745,20 +751,15 @@ int vmf_insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
 EXPORT_SYMBOL_GPL(vmf_insert_pfn_pmd);
 
 static void touch_pmd(struct vm_area_struct *vma, unsigned long addr,
-		pmd_t *pmd)
+		pmd_t *pmd, int flags)
 {
 	pmd_t _pmd;
 
-	/*
-	 * We should set the dirty bit only for FOLL_WRITE but for now
-	 * the dirty bit in the pmd is meaningless.  And if the dirty
-	 * bit will become meaningful and we'll only set it with
-	 * FOLL_WRITE, an atomic set_bit will be required on the pmd to
-	 * set the young bit, instead of the current set_pmd_at.
-	 */
-	_pmd = pmd_mkyoung(pmd_mkdirty(*pmd));
+	_pmd = pmd_mkyoung(*pmd);
+	if (flags & FOLL_WRITE)
+		_pmd = pmd_mkdirty(_pmd);
 	if (pmdp_set_access_flags(vma, addr & HPAGE_PMD_MASK,
-				pmd, _pmd,  1))
+				pmd, _pmd, flags & FOLL_WRITE))
 		update_mmu_cache_pmd(vma, addr, pmd);
 }
 
@@ -772,6 +773,12 @@ struct page *follow_devmap_pmd(struct vm_area_struct *vma, unsigned long addr,
 
 	assert_spin_locked(pmd_lockptr(mm, pmd));
 
+	/*
+	 * When we COW a devmap PMD entry, we split it into PTEs, so we should
+	 * not be in this function with `flags & FOLL_COW` set.
+	 */
+	WARN_ONCE(flags & FOLL_COW, "mm: In follow_devmap_pmd with FOLL_COW set");
+
 	if (flags & FOLL_WRITE && !pmd_write(*pmd))
 		return NULL;
 
@@ -781,7 +788,7 @@ struct page *follow_devmap_pmd(struct vm_area_struct *vma, unsigned long addr,
 		return NULL;
 
 	if (flags & FOLL_TOUCH)
-		touch_pmd(vma, addr, pmd);
+		touch_pmd(vma, addr, pmd, flags);
 
 	/*
 	 * device mapped pages can only be returned if the
@@ -872,15 +879,17 @@ void huge_pmd_set_accessed(struct fault_env *fe, pmd_t orig_pmd)
 {
 	pmd_t entry;
 	unsigned long haddr;
+	bool write = fe->flags & FAULT_FLAG_WRITE;
 
 	fe->ptl = pmd_lock(fe->vma->vm_mm, fe->pmd);
 	if (unlikely(!pmd_same(*fe->pmd, orig_pmd)))
 		goto unlock;
 
 	entry = pmd_mkyoung(orig_pmd);
+	if (write)
+		entry = pmd_mkdirty(entry);
 	haddr = fe->address & HPAGE_PMD_MASK;
-	if (pmdp_set_access_flags(fe->vma, haddr, fe->pmd, entry,
-				fe->flags & FAULT_FLAG_WRITE))
+	if (pmdp_set_access_flags(fe->vma, haddr, fe->pmd, entry, write))
 		update_mmu_cache_pmd(fe->vma, fe->address, fe->pmd);
 
 unlock:
@@ -1057,7 +1066,7 @@ alloc:
 	}
 
 	if (unlikely(mem_cgroup_try_charge(new_page, vma->vm_mm,
-					huge_gfp, &memcg, true))) {
+				huge_gfp | __GFP_NORETRY, &memcg, true))) {
 		put_page(new_page);
 		split_huge_pmd(vma, fe->pmd, fe->address);
 		if (page)
@@ -1116,6 +1125,16 @@ out_unlock:
 	return ret;
 }
 
+/*
+ * FOLL_FORCE can write to even unwritable pmd's, but only
+ * after we've gone through a COW cycle and they are dirty.
+ */
+static inline bool can_follow_write_pmd(pmd_t pmd, unsigned int flags)
+{
+	return pmd_write(pmd) ||
+	       ((flags & FOLL_FORCE) && (flags & FOLL_COW) && pmd_dirty(pmd));
+}
+
 struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
 				   unsigned long addr,
 				   pmd_t *pmd,
@@ -1126,7 +1145,7 @@ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
 
 	assert_spin_locked(pmd_lockptr(mm, pmd));
 
-	if (flags & FOLL_WRITE && !pmd_write(*pmd))
+	if (flags & FOLL_WRITE && !can_follow_write_pmd(*pmd, flags))
 		goto out;
 
 	/* Avoid dumping huge zero page */
@@ -1140,7 +1159,7 @@ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
 	page = pmd_page(*pmd);
 	VM_BUG_ON_PAGE(!PageHead(page) && !is_zone_device_page(page), page);
 	if (flags & FOLL_TOUCH)
-		touch_pmd(vma, addr, pmd);
+		touch_pmd(vma, addr, pmd, flags);
 	if ((flags & FOLL_MLOCK) && (vma->vm_flags & VM_LOCKED)) {
 		/*
 		 * We don't mlock() pte-mapped THPs. This way we can avoid
@@ -1209,8 +1228,11 @@ int do_huge_pmd_numa_page(struct fault_env *fe, pmd_t pmd)
 	 */
 	if (unlikely(pmd_trans_migrating(*fe->pmd))) {
 		page = pmd_page(*fe->pmd);
+		if (!get_page_unless_zero(page))
+			goto out_unlock;
 		spin_unlock(fe->ptl);
 		wait_on_page_locked(page);
+		put_page(page);
 		goto out;
 	}
 
@@ -1242,9 +1264,12 @@ int do_huge_pmd_numa_page(struct fault_env *fe, pmd_t pmd)
 
 	/* Migration could have started since the pmd_trans_migrating check */
 	if (!page_locked) {
+		page_nid = -1;
+		if (!get_page_unless_zero(page))
+			goto out_unlock;
 		spin_unlock(fe->ptl);
 		wait_on_page_locked(page);
-		page_nid = -1;
+		put_page(page);
 		goto out;
 	}
 
@@ -1349,8 +1374,8 @@ bool madvise_free_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		get_page(page);
 		spin_unlock(ptl);
 		split_huge_page(page);
-		put_page(page);
 		unlock_page(page);
+		put_page(page);
 		goto out_unlocked;
 	}
 
@@ -1362,8 +1387,7 @@ bool madvise_free_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		deactivate_page(page);
 
 	if (pmd_young(orig_pmd) || pmd_dirty(orig_pmd)) {
-		orig_pmd = pmdp_huge_get_and_clear_full(tlb->mm, addr, pmd,
-			tlb->fullmm);
+		pmdp_invalidate(vma, addr, pmd);
 		orig_pmd = pmd_mkold(orig_pmd);
 		orig_pmd = pmd_mkclean(orig_pmd);
 
@@ -1426,7 +1450,7 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 
 bool move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
 		  unsigned long new_addr, unsigned long old_end,
-		  pmd_t *old_pmd, pmd_t *new_pmd, bool *need_flush)
+		  pmd_t *old_pmd, pmd_t *new_pmd)
 {
 	spinlock_t *old_ptl, *new_ptl;
 	pmd_t pmd;
@@ -1457,7 +1481,7 @@ bool move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
 		if (new_ptl != old_ptl)
 			spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
 		pmd = pmdp_huge_get_and_clear(mm, old_addr, old_pmd);
-		if (pmd_present(pmd) && pmd_dirty(pmd))
+		if (pmd_present(pmd))
 			force_flush = true;
 		VM_BUG_ON(!pmd_none(*new_pmd));
 
@@ -1468,12 +1492,10 @@ bool move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
 			pgtable_trans_huge_deposit(mm, new_pmd, pgtable);
 		}
 		set_pmd_at(mm, new_addr, new_pmd, pmd_mksoft_dirty(pmd));
-		if (new_ptl != old_ptl)
-			spin_unlock(new_ptl);
 		if (force_flush)
 			flush_tlb_range(vma, old_addr, old_addr + PMD_SIZE);
-		else
-			*need_flush = true;
+		if (new_ptl != old_ptl)
+			spin_unlock(new_ptl);
 		spin_unlock(old_ptl);
 		return true;
 	}
@@ -1491,37 +1513,69 @@ int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	spinlock_t *ptl;
-	int ret = 0;
+	pmd_t entry;
+	bool preserve_write;
+	int ret;
 
 	ptl = __pmd_trans_huge_lock(pmd, vma);
-	if (ptl) {
-		pmd_t entry;
-		bool preserve_write = prot_numa && pmd_write(*pmd);
-		ret = 1;
+	if (!ptl)
+		return 0;
 
-		/*
-		 * Avoid trapping faults against the zero page. The read-only
-		 * data is likely to be read-cached on the local CPU and
-		 * local/remote hits to the zero page are not interesting.
-		 */
-		if (prot_numa && is_huge_zero_pmd(*pmd)) {
-			spin_unlock(ptl);
-			return ret;
-		}
+	preserve_write = prot_numa && pmd_write(*pmd);
+	ret = 1;
 
-		if (!prot_numa || !pmd_protnone(*pmd)) {
-			entry = pmdp_huge_get_and_clear_notify(mm, addr, pmd);
-			entry = pmd_modify(entry, newprot);
-			if (preserve_write)
-				entry = pmd_mkwrite(entry);
-			ret = HPAGE_PMD_NR;
-			set_pmd_at(mm, addr, pmd, entry);
-			BUG_ON(vma_is_anonymous(vma) && !preserve_write &&
-					pmd_write(entry));
-		}
-		spin_unlock(ptl);
-	}
+	/*
+	 * Avoid trapping faults against the zero page. The read-only
+	 * data is likely to be read-cached on the local CPU and
+	 * local/remote hits to the zero page are not interesting.
+	 */
+	if (prot_numa && is_huge_zero_pmd(*pmd))
+		goto unlock;
 
+	if (prot_numa && pmd_protnone(*pmd))
+		goto unlock;
+
+	/*
+	 * In case prot_numa, we are under down_read(mmap_sem). It's critical
+	 * to not clear pmd intermittently to avoid race with MADV_DONTNEED
+	 * which is also under down_read(mmap_sem):
+	 *
+	 *	CPU0:				CPU1:
+	 *				change_huge_pmd(prot_numa=1)
+	 *				 pmdp_huge_get_and_clear_notify()
+	 * madvise_dontneed()
+	 *  zap_pmd_range()
+	 *   pmd_trans_huge(*pmd) == 0 (without ptl)
+	 *   // skip the pmd
+	 *				 set_pmd_at();
+	 *				 // pmd is re-established
+	 *
+	 * The race makes MADV_DONTNEED miss the huge pmd and don't clear it
+	 * which may break userspace.
+	 *
+	 * pmdp_invalidate() is required to make sure we don't miss
+	 * dirty/young flags set by hardware.
+	 */
+	entry = *pmd;
+	pmdp_invalidate(vma, addr, pmd);
+
+	/*
+	 * Recover dirty/young flags.  It relies on pmdp_invalidate to not
+	 * corrupt them.
+	 */
+	if (pmd_dirty(*pmd))
+		entry = pmd_mkdirty(entry);
+	if (pmd_young(*pmd))
+		entry = pmd_mkyoung(entry);
+
+	entry = pmd_modify(entry, newprot);
+	if (preserve_write)
+		entry = pmd_mkwrite(entry);
+	ret = HPAGE_PMD_NR;
+	set_pmd_at(mm, addr, pmd, entry);
+	BUG_ON(vma_is_anonymous(vma) && !preserve_write && pmd_write(entry));
+unlock:
+	spin_unlock(ptl);
 	return ret;
 }
 
@@ -1591,6 +1645,8 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		if (vma_is_dax(vma))
 			return;
 		page = pmd_page(_pmd);
+		if (!PageDirty(page) && pmd_dirty(_pmd))
+			set_page_dirty(page);
 		if (!PageReferenced(page) && pmd_young(_pmd))
 			SetPageReferenced(page);
 		page_remove_rmap(page, true);
@@ -1703,6 +1759,8 @@ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 	spinlock_t *ptl;
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long haddr = address & HPAGE_PMD_MASK;
+	bool was_locked = false;
+	pmd_t _pmd;
 
 	mmu_notifier_invalidate_range_start(mm, haddr, haddr + HPAGE_PMD_SIZE);
 	ptl = pmd_lock(mm, pmd);
@@ -1712,11 +1770,32 @@ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 	 * pmd against. Otherwise we can end up replacing wrong page.
 	 */
 	VM_BUG_ON(freeze && !page);
-	if (page && page != pmd_page(*pmd))
-	        goto out;
+	if (page) {
+		VM_WARN_ON_ONCE(!PageLocked(page));
+		was_locked = true;
+		if (page != pmd_page(*pmd))
+			goto out;
+	}
 
+repeat:
 	if (pmd_trans_huge(*pmd)) {
-		page = pmd_page(*pmd);
+		if (!page) {
+			page = pmd_page(*pmd);
+			if (unlikely(!trylock_page(page))) {
+				get_page(page);
+				_pmd = *pmd;
+				spin_unlock(ptl);
+				lock_page(page);
+				spin_lock(ptl);
+				if (unlikely(!pmd_same(*pmd, _pmd))) {
+					unlock_page(page);
+					put_page(page);
+					page = NULL;
+					goto repeat;
+				}
+				put_page(page);
+			}
+		}
 		if (PageMlocked(page))
 			clear_page_mlock(page);
 	} else if (!pmd_devmap(*pmd))
@@ -1724,6 +1803,8 @@ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 	__split_huge_pmd_locked(vma, pmd, haddr, freeze);
 out:
 	spin_unlock(ptl);
+	if (!was_locked && page)
+		unlock_page(page);
 	mmu_notifier_invalidate_range_end(mm, haddr, haddr + HPAGE_PMD_SIZE);
 }
 
@@ -1788,7 +1869,7 @@ void vma_adjust_trans_huge(struct vm_area_struct *vma,
 	}
 }
 
-static void freeze_page(struct page *page)
+static void unmap_page(struct page *page)
 {
 	enum ttu_flags ttu_flags = TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS |
 		TTU_RMAP_LOCKED;
@@ -1811,7 +1892,7 @@ static void freeze_page(struct page *page)
 	VM_BUG_ON_PAGE(ret, page + i - 1);
 }
 
-static void unfreeze_page(struct page *page)
+static void remap_page(struct page *page)
 {
 	int i;
 
@@ -1825,26 +1906,13 @@ static void __split_huge_page_tail(struct page *head, int tail,
 	struct page *page_tail = head + tail;
 
 	VM_BUG_ON_PAGE(atomic_read(&page_tail->_mapcount) != -1, page_tail);
-	VM_BUG_ON_PAGE(page_ref_count(page_tail) != 0, page_tail);
 
 	/*
-	 * tail_page->_refcount is zero and not changing from under us. But
-	 * get_page_unless_zero() may be running from under us on the
-	 * tail_page. If we used atomic_set() below instead of atomic_inc() or
-	 * atomic_add(), we would then run atomic_set() concurrently with
-	 * get_page_unless_zero(), and atomic_set() is implemented in C not
-	 * using locked ops. spin_unlock on x86 sometime uses locked ops
-	 * because of PPro errata 66, 92, so unless somebody can guarantee
-	 * atomic_set() here would be safe on all archs (and not only on x86),
-	 * it's safer to use atomic_inc()/atomic_add().
+	 * Clone page flags before unfreezing refcount.
+	 *
+	 * After successful get_page_unless_zero() might follow flags change,
+	 * for exmaple lock_page() which set PG_waiters.
 	 */
-	if (PageAnon(head)) {
-		page_ref_inc(page_tail);
-	} else {
-		/* Additional pin to radix tree */
-		page_ref_add(page_tail, 2);
-	}
-
 	page_tail->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
 	page_tail->flags |= (head->flags &
 			((1L << PG_referenced) |
@@ -1856,45 +1924,48 @@ static void __split_huge_page_tail(struct page *head, int tail,
 			 (1L << PG_unevictable) |
 			 (1L << PG_dirty)));
 
-	/*
-	 * After clearing PageTail the gup refcount can be released.
-	 * Page flags also must be visible before we make the page non-compound.
-	 */
+	/* ->mapping in first tail page is compound_mapcount */
+	VM_BUG_ON_PAGE(tail > 2 && page_tail->mapping != TAIL_MAPPING,
+			page_tail);
+	page_tail->mapping = head->mapping;
+	page_tail->index = head->index + tail;
+
+	/* Page flags must be visible before we make the page non-compound. */
 	smp_wmb();
 
+	/*
+	 * Clear PageTail before unfreezing page refcount.
+	 *
+	 * After successful get_page_unless_zero() might follow put_page()
+	 * which needs correct compound_head().
+	 */
 	clear_compound_head(page_tail);
+
+	/* Finally unfreeze refcount. Additional reference from page cache. */
+	page_ref_unfreeze(page_tail, 1 + (!PageAnon(head) ||
+					  PageSwapCache(head)));
 
 	if (page_is_young(head))
 		set_page_young(page_tail);
 	if (page_is_idle(head))
 		set_page_idle(page_tail);
 
-	/* ->mapping in first tail page is compound_mapcount */
-	VM_BUG_ON_PAGE(tail > 2 && page_tail->mapping != TAIL_MAPPING,
-			page_tail);
-	page_tail->mapping = head->mapping;
-
-	page_tail->index = head->index + tail;
 	page_cpupid_xchg_last(page_tail, page_cpupid_last(head));
 	lru_add_page_tail(head, page_tail, lruvec, list);
 }
 
 static void __split_huge_page(struct page *page, struct list_head *list,
-		unsigned long flags)
+		pgoff_t end, unsigned long flags)
 {
 	struct page *head = compound_head(page);
 	struct zone *zone = page_zone(head);
 	struct lruvec *lruvec;
-	pgoff_t end = -1;
 	int i;
 
 	lruvec = mem_cgroup_page_lruvec(head, zone->zone_pgdat);
 
 	/* complete memcg works before add pages to LRU */
 	mem_cgroup_split_huge_fixup(head);
-
-	if (!PageAnon(page))
-		end = DIV_ROUND_UP(i_size_read(head->mapping->host), PAGE_SIZE);
 
 	for (i = HPAGE_PMD_NR - 1; i >= 1; i--) {
 		__split_huge_page_tail(head, i, lruvec, list);
@@ -1909,6 +1980,9 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 	}
 
 	ClearPageCompound(head);
+
+	split_page_owner(head, HPAGE_PMD_ORDER);
+
 	/* See comment in __split_huge_page_tail() */
 	if (PageAnon(head)) {
 		page_ref_inc(head);
@@ -1920,7 +1994,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 
 	spin_unlock_irqrestore(zone_lru_lock(page_zone(head)), flags);
 
-	unfreeze_page(head);
+	remap_page(head);
 
 	for (i = 0; i < HPAGE_PMD_NR; i++) {
 		struct page *subpage = head + i;
@@ -2048,8 +2122,9 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 	int count, mapcount, extra_pins, ret;
 	bool mlocked;
 	unsigned long flags;
+	pgoff_t end;
 
-	VM_BUG_ON_PAGE(is_huge_zero_page(page), page);
+	VM_BUG_ON_PAGE(is_huge_zero_page(head), head);
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
 	VM_BUG_ON_PAGE(!PageCompound(page), page);
@@ -2069,6 +2144,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 			goto out;
 		}
 		extra_pins = 0;
+		end = -1;
 		mapping = NULL;
 		anon_vma_lock_write(anon_vma);
 	} else {
@@ -2084,10 +2160,19 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 		extra_pins = HPAGE_PMD_NR;
 		anon_vma = NULL;
 		i_mmap_lock_read(mapping);
+
+		/*
+		 *__split_huge_page() may need to trim off pages beyond EOF:
+		 * but on 32-bit, i_size_read() takes an irq-unsafe seqlock,
+		 * which cannot be nested inside the page tree lock. So note
+		 * end now: i_size itself may be changed at any moment, but
+		 * head page lock is good enough to serialize the trimming.
+		 */
+		end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
 	}
 
 	/*
-	 * Racy check if we can split the page, before freeze_page() will
+	 * Racy check if we can split the page, before unmap_page() will
 	 * split PMDs
 	 */
 	if (total_mapcount(head) != page_count(head) - extra_pins - 1) {
@@ -2096,7 +2181,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 	}
 
 	mlocked = PageMlocked(page);
-	freeze_page(head);
+	unmap_page(head);
 	VM_BUG_ON_PAGE(compound_mapcount(head), head);
 
 	/* Make sure the page is not on per-CPU pagevec as it takes pin */
@@ -2133,7 +2218,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 		if (mapping)
 			__dec_node_page_state(page, NR_SHMEM_THPS);
 		spin_unlock(&pgdata->split_queue_lock);
-		__split_huge_page(page, list, flags);
+		__split_huge_page(page, list, end, flags);
 		ret = 0;
 	} else {
 		if (IS_ENABLED(CONFIG_DEBUG_VM) && mapcount) {
@@ -2148,7 +2233,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 fail:		if (mapping)
 			spin_unlock(&mapping->tree_lock);
 		spin_unlock_irqrestore(zone_lru_lock(page_zone(head)), flags);
-		unfreeze_page(head);
+		remap_page(head);
 		ret = -EBUSY;
 	}
 
@@ -2229,11 +2314,13 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
 
 	list_for_each_safe(pos, next, &list) {
 		page = list_entry((void *)pos, struct page, mapping);
-		lock_page(page);
+		if (!trylock_page(page))
+			goto next;
 		/* split_huge_page() removes page from list on success */
 		if (!split_huge_page(page))
 			split++;
 		unlock_page(page);
+next:
 		put_page(page);
 	}
 

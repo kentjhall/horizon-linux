@@ -253,9 +253,9 @@ line starts with a keyword (except help texts). The following keywords
 end a menu entry:
 - config
 - menuconfig
-- choice/endchoice
+- choice/append_choice/endchoice
 - comment
-- menu/endmenu
+- menu/append_menu/endmenu
 - if/endif
 - source
 The first five also start the definition of a menu entry.
@@ -339,6 +339,19 @@ definitions of that choice. If a [symbol] is associated to the choice,
 then you may define the same choice (ie. with the same entries) in another
 place.
 
+Appending to a choice:
+
+	"append_choice" [symbol]
+	<choice block>
+	"endchoice"
+
+This adds extra choices to an existing choice. The choice being appended to
+must be an exact peer in the Kconfig parsing hierarchy as the append_choice
+statement. This typically means that both the choice and append_choice
+statement must be in the same file (or an overlay for it). Watch out for any
+if/endif statements that affect the parsing hierarchy and prevent finding
+the original choice that append_choice attempts to append to.
+
 comment:
 
 	"comment" <prompt>
@@ -358,6 +371,19 @@ menu:
 This defines a menu block, see "Menu structure" above for more
 information. The only possible options are dependencies and "visible"
 attributes.
+
+Appending to a menu:
+
+	"append_menu" <prompt>
+	<menu block>
+	"endmenu"
+
+This adds extra menu items to an existing menu. The menu being appended to
+must be an exact peer in the Kconfig parsing hierarchy as the append_menu
+statement. This typically means that both the menu and append_menu statement
+must be in the same file (or an overlay for it). Watch out for any if/endif
+statements that affect the parsing hierarchy and prevent finding the original
+menu that append_menu attempts to append to.
 
 if:
 

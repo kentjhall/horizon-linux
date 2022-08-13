@@ -12,6 +12,8 @@
  * Copyright (C) 2008 Google, Inc.
  * Author: Mike Lockwood <lockwood@android.com>
  *
+ * Copyright (C) 2018-2019 NVIDIA Corporation. All rights reserved.
+ *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
  * may be copied, distributed, and modified under those terms.
@@ -72,13 +74,32 @@
 #define EXTCON_DISP_VGA		43	/* Video Graphics Array */
 #define EXTCON_DISP_DP		44	/* Display Port */
 #define EXTCON_DISP_HMD		45	/* Head-Mounted Display */
+#define EXTCON_DISP_AUDIO_AUX0	46	/* Audio for SOR 0 */
+#define EXTCON_DISP_AUDIO_AUX1	47	/* Audio for SOR 1 */
+#define EXTCON_DISP_AUDIO_AUX2	48	/* Audio for SOR 2 */
+#define EXTCON_DISP_AUDIO_AUX3	49	/* Audio for SOR 3 */
+#define EXTCON_DISP_DSIHPD	50	/* DSI with hotplug support */
+#define EXTCON_DISP_HDMI2	51	/* High-Definition Multimedia Interface, the 2nd port */
 
 /* Miscellaneous external connector */
 #define EXTCON_DOCK		60
 #define EXTCON_JIG		61
 #define EXTCON_MECHANICAL	62
 
-#define EXTCON_NUM		63
+#define EXTCON_USB_QC2		63
+#define EXTCON_USB_MAXIM	64
+#define EXTCON_USB_APPLE_500mA	65
+#define EXTCON_USB_APPLE_1A	66
+#define EXTCON_USB_APPLE_2A	67
+#define EXTCON_USB_ACA_NV	68
+#define EXTCON_USB_ACA_RIDA	69
+#define EXTCON_USB_ACA_RIDB	70
+#define EXTCON_USB_ACA_RIDC	71
+#define EXTCON_USB_Y_CABLE	72
+#define EXTCON_USB_PD		73
+#define EXTCON_AC_ADAPTOR	74
+
+#define EXTCON_NUM		75
 
 /*
  * Define the property of supported external connectors.
@@ -143,6 +164,7 @@
  *
  */
 #define EXTCON_PROP_DISP_HPD		150
+#define EXTCON_PROP_DISP_DP_LANE	151
 
 /* Properties of EXTCON_TYPE_DISP. */
 #define EXTCON_PROP_DISP_MIN		150
@@ -206,6 +228,10 @@ struct extcon_dev {
 	int max_supported;
 	spinlock_t lock;	/* could be called by irq handler */
 	u32 state;
+	u32 last_state_in_suspend;
+	bool uevent_in_suspend;
+	bool is_suspend;
+	struct notifier_block pm_nb;
 
 	/* /sys/class/extcon/.../cable.n/... */
 	struct device_type extcon_dev_type;
@@ -230,6 +256,8 @@ extern int devm_extcon_dev_register(struct device *dev,
 extern void devm_extcon_dev_unregister(struct device *dev,
 				       struct extcon_dev *edev);
 extern struct extcon_dev *extcon_get_extcon_dev(const char *extcon_name);
+extern struct extcon_dev *extcon_get_extcon_dev_by_cable(struct device *dev,
+			const char *cable_name);
 
 /*
  * Following APIs control the memory of extcon device.
@@ -395,6 +423,13 @@ static inline int extcon_set_property_capability(struct extcon_dev *edev,
 }
 
 static inline struct extcon_dev *extcon_get_extcon_dev(const char *extcon_name)
+{
+	return NULL;
+}
+
+static inline struct extcon_dev *extcon_get_extcon_dev_by_cable(
+		struct device *dev, const char *cable_name)
+
 {
 	return NULL;
 }

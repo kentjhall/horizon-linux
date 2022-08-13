@@ -173,6 +173,9 @@ extern bool single_task_running(void);
 extern unsigned long nr_iowait(void);
 extern unsigned long nr_iowait_cpu(int cpu);
 extern void get_iowait_load(unsigned long *nr_waiters, unsigned long *load);
+#ifdef CONFIG_CPU_QUIET
+extern u64 nr_running_integral(unsigned int cpu);
+#endif
 
 extern void calc_global_load(unsigned long ticks);
 
@@ -314,6 +317,15 @@ extern char ___assert_task_state[1 - 2*!!(
 
 /* Task command name length */
 #define TASK_COMM_LEN 16
+
+enum task_event {
+	PUT_PREV_TASK   = 0,
+	PICK_NEXT_TASK  = 1,
+	TASK_WAKE       = 2,
+	TASK_MIGRATE    = 3,
+	TASK_UPDATE     = 4,
+	IRQ_UPDATE	= 5,
+};
 
 #include <linux/spinlock.h>
 
@@ -527,6 +539,7 @@ static inline int get_dumpable(struct mm_struct *mm)
 #define MMF_OOM_SKIP		21	/* mm is of no interest for the OOM killer */
 #define MMF_UNSTABLE		22	/* mm is unstable for copy_from_user */
 #define MMF_HUGE_ZERO_PAGE	23      /* mm has ever used the global huge zero page */
+#define MMF_OOM_REAP_QUEUED	26	/* mm was queued for oom_reaper */
 
 #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK)
 
@@ -830,6 +843,16 @@ struct signal_struct {
 
 #define SIGNAL_UNKILLABLE	0x00000040 /* for init: ignore fatal signals */
 
+#define SIGNAL_STOP_MASK (SIGNAL_CLD_MASK | SIGNAL_STOP_STOPPED | \
+			  SIGNAL_STOP_CONTINUED)
+
+static inline void signal_set_stop_flags(struct signal_struct *sig,
+					 unsigned int flags)
+{
+	WARN_ON(sig->flags & (SIGNAL_GROUP_EXIT|SIGNAL_GROUP_COREDUMP));
+	sig->flags = (sig->flags & ~SIGNAL_STOP_MASK) | flags;
+}
+
 /* If true, all threads except ->group_exit_task have pending SIGKILL */
 static inline int signal_group_exit(const struct signal_struct *sig)
 {
@@ -972,6 +995,14 @@ enum cpu_idle_type {
 #define SCHED_CAPACITY_SHIFT	SCHED_FIXEDPOINT_SHIFT
 #define SCHED_CAPACITY_SCALE	(1L << SCHED_CAPACITY_SHIFT)
 
+struct sched_capacity_reqs {
+	unsigned long cfs;
+	unsigned long rt;
+	unsigned long dl;
+
+	unsigned long total;
+};
+
 /*
  * Wake-queues are lists of tasks with a pending wakeup, whose
  * callers have already marked the task as woken internally,
@@ -1035,6 +1066,7 @@ extern void wake_up_q(struct wake_q_head *head);
 #define SD_PREFER_SIBLING	0x1000	/* Prefer to place tasks in a sibling domain */
 #define SD_OVERLAP		0x2000	/* sched_domains of this level overlap */
 #define SD_NUMA			0x4000	/* cross-node balancing */
+#define SD_SHARE_CAP_STATES	0x8000  /* Domain members share capacity state */
 
 #ifdef CONFIG_SCHED_SMT
 static inline int cpu_smt_flags(void)
@@ -1067,7 +1099,56 @@ struct sched_domain_attr {
 
 extern int sched_domain_level_max;
 
+struct capacity_state {
+	unsigned long cap;	/* compute capacity */
+	unsigned long power;	/* power consumption at this compute capacity */
+};
+
+struct idle_state {
+	unsigned long power;	 /* power consumption in this idle state */
+};
+
+struct sched_group_energy {
+	unsigned int nr_idle_states;	/* number of idle states */
+	struct idle_state *idle_states;	/* ptr to idle state array */
+	unsigned int nr_cap_states;	/* number of capacity states */
+	struct capacity_state *cap_states; /* ptr to capacity state array */
+};
+
+unsigned long capacity_curr_of(int cpu);
+
 struct sched_group;
+
+struct eas_stats {
+	/* select_idle_sibling() stats */
+	u64 sis_attempts;
+	u64 sis_idle;
+	u64 sis_cache_affine;
+	u64 sis_suff_cap;
+	u64 sis_idle_cpu;
+	u64 sis_count;
+
+	/* select_energy_cpu_brute() stats */
+	u64 secb_attempts;
+	u64 secb_sync;
+	u64 secb_idle_bt;
+	u64 secb_insuff_cap;
+	u64 secb_no_nrg_sav;
+	u64 secb_nrg_sav;
+	u64 secb_count;
+
+	/* find_best_target() stats */
+	u64 fbt_attempts;
+	u64 fbt_no_cpu;
+	u64 fbt_no_sd;
+	u64 fbt_pref_idle;
+	u64 fbt_count;
+
+	/* cas */
+	/* select_task_rq_fair() stats */
+	u64 cas_attempts;
+	u64 cas_count;
+};
 
 struct sched_domain_shared {
 	atomic_t	ref;
@@ -1137,6 +1218,8 @@ struct sched_domain {
 	unsigned int ttwu_wake_remote;
 	unsigned int ttwu_move_affine;
 	unsigned int ttwu_move_balance;
+
+	struct eas_stats eas_stats;
 #endif
 #ifdef CONFIG_SCHED_DEBUG
 	char *name;
@@ -1174,6 +1257,8 @@ bool cpus_share_cache(int this_cpu, int that_cpu);
 
 typedef const struct cpumask *(*sched_domain_mask_f)(int cpu);
 typedef int (*sched_domain_flags_f)(void);
+typedef
+const struct sched_group_energy *(*sched_domain_energy_f)(int cpu);
 
 #define SDTL_OVERLAP	0x01
 
@@ -1187,6 +1272,7 @@ struct sd_data {
 struct sched_domain_topology_level {
 	sched_domain_mask_f mask;
 	sched_domain_flags_f sd_flags;
+	sched_domain_energy_f energy;
 	int		    flags;
 	int		    numa_level;
 	struct sd_data      data;
@@ -1295,8 +1381,18 @@ struct load_weight {
  */
 struct sched_avg {
 	u64 last_update_time, load_sum;
-	u32 util_sum, period_contrib;
-	unsigned long load_avg, util_avg;
+	u32 util_sum, util_fast_sum, period_contrib;
+	unsigned long load_avg, util_avg, util_fast_avg;
+#ifdef CONFIG_TASK_WEIGHT
+	u32 scaling_sum, scaling_fast_sum;
+	unsigned long scaling_avg, scaling_fast_avg;
+	/*
+	 * The weight applied to frequency scaling when this task
+	 * is part of actively requesting PELT frequencies.
+	 * Fixed point with 10 bit fraction.
+	 */
+	unsigned int weight;
+#endif
 };
 
 #ifdef CONFIG_SCHEDSTATS
@@ -1332,6 +1428,70 @@ struct sched_statistics {
 	u64			nr_wakeups_affine_attempts;
 	u64			nr_wakeups_passive;
 	u64			nr_wakeups_idle;
+
+	/* select_idle_sibling() */
+	u64			nr_wakeups_sis_attempts;
+	u64			nr_wakeups_sis_idle;
+	u64			nr_wakeups_sis_cache_affine;
+	u64			nr_wakeups_sis_suff_cap;
+	u64			nr_wakeups_sis_idle_cpu;
+	u64			nr_wakeups_sis_count;
+
+	/* energy_aware_wake_cpu() */
+	u64			nr_wakeups_secb_attempts;
+	u64			nr_wakeups_secb_sync;
+	u64			nr_wakeups_secb_idle_bt;
+	u64			nr_wakeups_secb_insuff_cap;
+	u64			nr_wakeups_secb_no_nrg_sav;
+	u64			nr_wakeups_secb_nrg_sav;
+	u64			nr_wakeups_secb_count;
+
+	/* find_best_target() */
+	u64			nr_wakeups_fbt_attempts;
+	u64			nr_wakeups_fbt_no_cpu;
+	u64			nr_wakeups_fbt_no_sd;
+	u64			nr_wakeups_fbt_pref_idle;
+	u64			nr_wakeups_fbt_count;
+
+	/* cas */
+	/* select_task_rq_fair() */
+	u64			nr_wakeups_cas_attempts;
+	u64			nr_wakeups_cas_count;
+};
+#endif
+
+#ifdef CONFIG_SCHED_WALT
+#define RAVG_HIST_SIZE_MAX  5
+
+/* ravg represents frequency scaled cpu-demand of tasks */
+struct ravg {
+	/*
+	 * 'mark_start' marks the beginning of an event (task waking up, task
+	 * starting to execute, task being preempted) within a window
+	 *
+	 * 'sum' represents how runnable a task has been within current
+	 * window. It incorporates both running time and wait time and is
+	 * frequency scaled.
+	 *
+	 * 'sum_history' keeps track of history of 'sum' seen over previous
+	 * RAVG_HIST_SIZE windows. Windows where task was entirely sleeping are
+	 * ignored.
+	 *
+	 * 'demand' represents maximum sum seen over previous
+	 * sysctl_sched_ravg_hist_size windows. 'demand' could drive frequency
+	 * demand for tasks.
+	 *
+	 * 'curr_window' represents task's contribution to cpu busy time
+	 * statistics (rq->curr_runnable_sum) in current window
+	 *
+	 * 'prev_window' represents task's contribution to cpu busy time
+	 * statistics (rq->prev_runnable_sum) in previous window
+	 */
+	u64 mark_start;
+	u32 sum, demand;
+	u32 sum_history[RAVG_HIST_SIZE_MAX];
+	u32 curr_window, prev_window;
+	u16 active_windows;
 };
 #endif
 
@@ -1402,6 +1562,7 @@ struct sched_dl_entity {
 	u64 dl_deadline;	/* relative deadline of each instance	*/
 	u64 dl_period;		/* separation of two instances (period) */
 	u64 dl_bw;		/* dl_runtime / dl_deadline		*/
+	u64 dl_density;		/* dl_runtime / dl_deadline		*/
 
 	/*
 	 * Actual scheduling parameters. Initialized with the values above,
@@ -1505,6 +1666,16 @@ struct task_struct {
 	const struct sched_class *sched_class;
 	struct sched_entity se;
 	struct sched_rt_entity rt;
+#ifdef CONFIG_SCHED_WALT
+	struct ravg ravg;
+	/*
+	 * 'init_load_pct' represents the initial task load assigned to children
+	 * of this task
+	 */
+	u32 init_load_pct;
+	u64 last_sleep_ts;
+#endif
+
 #ifdef CONFIG_CGROUP_SCHED
 	struct task_group *sched_task_group;
 #endif
@@ -1548,7 +1719,7 @@ struct task_struct {
 
 	struct mm_struct *mm, *active_mm;
 	/* per-thread vma caching */
-	u32 vmacache_seqnum;
+	u64 vmacache_seqnum;
 	struct vm_area_struct *vmacache[VMACACHE_SIZE];
 #if defined(SPLIT_RSS_COUNTING)
 	struct task_rss_stat	rss_stat;
@@ -1583,6 +1754,10 @@ struct task_struct {
 #endif
 #ifdef CONFIG_COMPAT_BRK
 	unsigned brk_randomized:1;
+#endif
+#ifdef CONFIG_CGROUPS
+	/* disallow userland-initiated cgroup migration */
+	unsigned no_cgroup_migration:1;
 #endif
 
 	unsigned long atomic_flags; /* Flags needing atomic access. */
@@ -1629,6 +1804,10 @@ struct task_struct {
 
 	cputime_t utime, stime, utimescaled, stimescaled;
 	cputime_t gtime;
+#ifdef CONFIG_CPU_FREQ_TIMES
+	u64 *time_in_state;
+	unsigned int max_state;
+#endif
 	struct prev_cputime prev_cputime;
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
 	seqcount_t vtime_seqcount;
@@ -1656,6 +1835,7 @@ struct task_struct {
 	struct list_head cpu_timers[3];
 
 /* process credentials */
+	const struct cred __rcu *ptracer_cred; /* Tracer's credentials at attach */
 	const struct cred __rcu *real_cred; /* objective and real subjective task
 					 * credentials (COW) */
 	const struct cred __rcu *cred;	/* effective (overridable) subjective task
@@ -1703,8 +1883,8 @@ struct task_struct {
 	struct seccomp seccomp;
 
 /* Thread group tracking */
-   	u32 parent_exec_id;
-   	u32 self_exec_id;
+	u64 parent_exec_id;
+	u64 self_exec_id;
 /* Protection of (de-)allocation: mm, files, fs, tty, keyrings, mems_allowed,
  * mempolicy */
 	spinlock_t alloc_lock;
@@ -2027,7 +2207,7 @@ static inline bool in_vfork(struct task_struct *tsk)
 extern void task_numa_fault(int last_node, int node, int pages, int flags);
 extern pid_t task_numa_group_id(struct task_struct *p);
 extern void set_numabalancing_state(bool enabled);
-extern void task_numa_free(struct task_struct *p);
+extern void task_numa_free(struct task_struct *p, bool final);
 extern bool should_numa_migrate_memory(struct task_struct *p, struct page *page,
 					int src_nid, int dst_cpu);
 #else
@@ -2042,7 +2222,7 @@ static inline pid_t task_numa_group_id(struct task_struct *p)
 static inline void set_numabalancing_state(bool enabled)
 {
 }
-static inline void task_numa_free(struct task_struct *p)
+static inline void task_numa_free(struct task_struct *p, bool final)
 {
 }
 static inline bool should_numa_migrate_memory(struct task_struct *p,
@@ -2117,31 +2297,8 @@ static inline pid_t task_tgid_nr(struct task_struct *tsk)
 	return tsk->tgid;
 }
 
-pid_t task_tgid_nr_ns(struct task_struct *tsk, struct pid_namespace *ns);
-
-static inline pid_t task_tgid_vnr(struct task_struct *tsk)
-{
-	return pid_vnr(task_tgid(tsk));
-}
-
 
 static inline int pid_alive(const struct task_struct *p);
-static inline pid_t task_ppid_nr_ns(const struct task_struct *tsk, struct pid_namespace *ns)
-{
-	pid_t pid = 0;
-
-	rcu_read_lock();
-	if (pid_alive(tsk))
-		pid = task_tgid_nr_ns(rcu_dereference(tsk->real_parent), ns);
-	rcu_read_unlock();
-
-	return pid;
-}
-
-static inline pid_t task_ppid_nr(const struct task_struct *tsk)
-{
-	return task_ppid_nr_ns(tsk, &init_pid_ns);
-}
 
 static inline pid_t task_pgrp_nr_ns(struct task_struct *tsk,
 					struct pid_namespace *ns)
@@ -2164,6 +2321,33 @@ static inline pid_t task_session_nr_ns(struct task_struct *tsk,
 static inline pid_t task_session_vnr(struct task_struct *tsk)
 {
 	return __task_pid_nr_ns(tsk, PIDTYPE_SID, NULL);
+}
+
+static inline pid_t task_tgid_nr_ns(struct task_struct *tsk, struct pid_namespace *ns)
+{
+	return __task_pid_nr_ns(tsk, __PIDTYPE_TGID, ns);
+}
+
+static inline pid_t task_tgid_vnr(struct task_struct *tsk)
+{
+	return __task_pid_nr_ns(tsk, __PIDTYPE_TGID, NULL);
+}
+
+static inline pid_t task_ppid_nr_ns(const struct task_struct *tsk, struct pid_namespace *ns)
+{
+	pid_t pid = 0;
+
+	rcu_read_lock();
+	if (pid_alive(tsk))
+		pid = task_tgid_nr_ns(rcu_dereference(tsk->real_parent), ns);
+	rcu_read_unlock();
+
+	return pid;
+}
+
+static inline pid_t task_ppid_nr(const struct task_struct *tsk)
+{
+	return task_ppid_nr_ns(tsk, &init_pid_ns);
 }
 
 /* obsolete, do not use */
@@ -2334,6 +2518,10 @@ static inline void memalloc_noio_restore(unsigned int flags)
 #define PFA_SPREAD_PAGE  1      /* Spread page cache over cpuset */
 #define PFA_SPREAD_SLAB  2      /* Spread some slab caches over cpuset */
 #define PFA_LMK_WAITING  3      /* Lowmemorykiller is waiting */
+#define PFA_SPEC_SSB_DISABLE		4	/* Speculative Store Bypass disabled */
+#define PFA_SPEC_SSB_FORCE_DISABLE	5	/* Speculative Store Bypass force disabled*/
+#define PFA_SPEC_IB_DISABLE		6	/* Indirect branch speculation restricted */
+#define PFA_SPEC_IB_FORCE_DISABLE	7	/* Indirect branch speculation permanently restricted */
 
 
 #define TASK_PFA_TEST(name, func)					\
@@ -2359,6 +2547,20 @@ TASK_PFA_CLEAR(SPREAD_SLAB, spread_slab)
 
 TASK_PFA_TEST(LMK_WAITING, lmk_waiting)
 TASK_PFA_SET(LMK_WAITING, lmk_waiting)
+
+TASK_PFA_TEST(SPEC_SSB_DISABLE, spec_ssb_disable)
+TASK_PFA_SET(SPEC_SSB_DISABLE, spec_ssb_disable)
+TASK_PFA_CLEAR(SPEC_SSB_DISABLE, spec_ssb_disable)
+
+TASK_PFA_TEST(SPEC_SSB_FORCE_DISABLE, spec_ssb_force_disable)
+TASK_PFA_SET(SPEC_SSB_FORCE_DISABLE, spec_ssb_force_disable)
+
+TASK_PFA_TEST(SPEC_IB_DISABLE, spec_ib_disable)
+TASK_PFA_SET(SPEC_IB_DISABLE, spec_ib_disable)
+TASK_PFA_CLEAR(SPEC_IB_DISABLE, spec_ib_disable)
+
+TASK_PFA_TEST(SPEC_IB_FORCE_DISABLE, spec_ib_force_disable)
+TASK_PFA_SET(SPEC_IB_FORCE_DISABLE, spec_ib_force_disable)
 
 /*
  * task->jobctl flags
@@ -2894,6 +3096,23 @@ static inline void mmdrop_async(struct mm_struct *mm)
 	}
 }
 
+/*
+ * This has to be called after a get_task_mm()/mmget_not_zero()
+ * followed by taking the mmap_sem for writing before modifying the
+ * vmas or anything the coredump pretends not to change from under it.
+ *
+ * NOTE: find_extend_vma() called from GUP context is the only place
+ * that can modify the "mm" (notably the vm_start/end) under mmap_sem
+ * for reading and outside the context of the process, so it is also
+ * the only case that holds the mmap_sem for reading that must call
+ * this function. Generally if the mmap_sem is hold for reading
+ * there's no need of this check after get_task_mm()/mmget_not_zero().
+ *
+ * This function can be obsoleted and the check can be removed, after
+ * the coredump code will hold the mmap_sem for writing before
+ * invoking the ->core_dump methods.
+ */
+
 static inline bool mmget_not_zero(struct mm_struct *mm)
 {
 	return atomic_inc_not_zero(&mm->mm_users);
@@ -2970,7 +3189,11 @@ static inline void set_task_comm(struct task_struct *tsk, const char *from)
 {
 	__set_task_comm(tsk, from, false);
 }
-extern char *get_task_comm(char *to, struct task_struct *tsk);
+extern char *__get_task_comm(char *to, size_t len, struct task_struct *tsk);
+#define get_task_comm(buf, tsk) ({			\
+	BUILD_BUG_ON(sizeof(buf) != TASK_COMM_LEN);	\
+	__get_task_comm(buf, sizeof(buf), tsk);		\
+})
 
 #ifdef CONFIG_SMP
 void scheduler_ipi(void);
@@ -3508,6 +3731,10 @@ static inline void set_task_cpu(struct task_struct *p, unsigned int cpu)
 
 #endif /* CONFIG_SMP */
 
+#if defined(CONFIG_TASK_WEIGHT) || defined(CONFIG_CGROUP_SCHEDTUNE)
+extern void task_decayed_load(struct task_struct *p, struct sched_avg *avg);
+#endif
+
 extern long sched_setaffinity(pid_t pid, const struct cpumask *new_mask);
 extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
 
@@ -3538,6 +3765,11 @@ static inline void inc_syscw(struct task_struct *tsk)
 {
 	tsk->ioac.syscw++;
 }
+
+static inline void inc_syscfs(struct task_struct *tsk)
+{
+	tsk->ioac.syscfs++;
+}
 #else
 static inline void add_rchar(struct task_struct *tsk, ssize_t amt)
 {
@@ -3552,6 +3784,9 @@ static inline void inc_syscr(struct task_struct *tsk)
 }
 
 static inline void inc_syscw(struct task_struct *tsk)
+{
+}
+static inline void inc_syscfs(struct task_struct *tsk)
 {
 }
 #endif

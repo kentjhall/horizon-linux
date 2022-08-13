@@ -441,6 +441,8 @@ static int pcs_get_function(struct pinctrl_dev *pctldev, unsigned pin,
 	unsigned fselector;
 
 	/* If pin is not described in DTS & enabled, mux_setting is NULL. */
+	if (!pdesc)
+		return -EINVAL;
 	setting = pdesc->mux_setting;
 	if (!setting)
 		return -ENOTSUPP;
@@ -807,19 +809,24 @@ static int pcs_add_pin(struct pcs_device *pcs, unsigned offset,
  */
 static int pcs_allocate_pin_table(struct pcs_device *pcs)
 {
-	int mux_bytes, nr_pins, i;
+	int mux_bytes, nr_pins = 0, i;
 	int num_pins_in_register = 0;
 
 	mux_bytes = pcs->width / BITS_PER_BYTE;
 
 	if (pcs->bits_per_mux) {
 		pcs->bits_per_pin = fls(pcs->fmask);
-		nr_pins = (pcs->size * BITS_PER_BYTE) / pcs->bits_per_pin;
-		num_pins_in_register = pcs->width / pcs->bits_per_pin;
+		if (pcs->bits_per_pin) {
+			nr_pins = (pcs->size * BITS_PER_BYTE) /
+					pcs->bits_per_pin;
+			num_pins_in_register = pcs->width / pcs->bits_per_pin;
+		}
 	} else {
 		nr_pins = pcs->size / mux_bytes;
 	}
 
+	if (!nr_pins)
+		return -EINVAL;
 	dev_dbg(pcs->dev, "allocating %i pins\n", nr_pins);
 	pcs->pins.pa = devm_kzalloc(pcs->dev,
 				sizeof(*pcs->pins.pa) * nr_pins,
@@ -1078,7 +1085,7 @@ static int pcs_parse_pinconf(struct pcs_device *pcs, struct device_node *np,
 
 	/* If pinconf isn't supported, don't parse properties in below. */
 	if (!PCS_HAS_PINCONF)
-		return 0;
+		return -ENOTSUPP;
 
 	/* cacluate how much properties are supported in current node */
 	for (i = 0; i < ARRAY_SIZE(prop2); i++) {
@@ -1090,7 +1097,7 @@ static int pcs_parse_pinconf(struct pcs_device *pcs, struct device_node *np,
 			nconfs++;
 	}
 	if (!nconfs)
-		return 0;
+		return -ENOTSUPP;
 
 	func->conf = devm_kzalloc(pcs->dev,
 				  sizeof(struct pcs_conf_vals) * nconfs,
@@ -1203,9 +1210,12 @@ static int pcs_parse_one_pinctrl_entry(struct pcs_device *pcs,
 
 	if (PCS_HAS_PINCONF) {
 		res = pcs_parse_pinconf(pcs, np, function, map);
-		if (res)
+		if (res == 0)
+			*num_maps = 2;
+		else if (res == -ENOTSUPP)
+			*num_maps = 1;
+		else
 			goto free_pingroups;
-		*num_maps = 2;
 	} else {
 		*num_maps = 1;
 	}

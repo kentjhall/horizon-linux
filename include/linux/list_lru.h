@@ -44,12 +44,14 @@ struct list_lru_node {
 	/* for cgroup aware lrus points to per cgroup lists, otherwise NULL */
 	struct list_lru_memcg	*memcg_lrus;
 #endif
+	long nr_items;
 } ____cacheline_aligned_in_smp;
 
 struct list_lru {
 	struct list_lru_node	*node;
 #if defined(CONFIG_MEMCG) && !defined(CONFIG_SLOB)
 	struct list_head	list;
+	bool			memcg_aware;
 #endif
 };
 

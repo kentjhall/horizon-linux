@@ -850,7 +850,7 @@ qed_hw_init_pf_doorbell_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 						   NULL) +
 		       qed_cxt_get_proto_cid_count(p_hwfn, PROTOCOLID_ETH,
 						   NULL);
-	norm_regsize = roundup(QED_PF_DEMS_SIZE * non_pwm_conn, 4096);
+	norm_regsize = roundup(QED_PF_DEMS_SIZE * non_pwm_conn, PAGE_SIZE);
 	min_addr_reg1 = norm_regsize / 4096;
 	pwm_regsize = db_bar_size - norm_regsize;
 
@@ -877,7 +877,7 @@ qed_hw_init_pf_doorbell_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 		/* Either EDPM is mandatory, or we are attempting to allocate a
 		 * WID per CPU.
 		 */
-		n_cpus = num_active_cpus();
+		n_cpus = num_present_cpus();
 		rc = qed_hw_init_dpi_size(p_hwfn, p_ptt, pwm_regsize, n_cpus);
 	}
 
@@ -1627,6 +1627,9 @@ static int qed_hw_get_nvm_info(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 	default:
 		DP_NOTICE(p_hwfn, "Unknown Speed in 0x%08x\n", link_temp);
 	}
+
+	p_hwfn->mcp_info->link_capabilities.default_speed_autoneg =
+		link->speed.autoneg;
 
 	link_temp &= NVM_CFG1_PORT_DRV_FLOW_CONTROL_MASK;
 	link_temp >>= NVM_CFG1_PORT_DRV_FLOW_CONTROL_OFFSET;
@@ -2732,7 +2735,8 @@ int qed_configure_vport_wfq(struct qed_dev *cdev, u16 vp_id, u32 rate)
 }
 
 /* API to configure WFQ from mcp link change */
-void qed_configure_vp_wfq_on_link_change(struct qed_dev *cdev, u32 min_pf_rate)
+void qed_configure_vp_wfq_on_link_change(struct qed_dev *cdev,
+					 struct qed_ptt *p_ptt, u32 min_pf_rate)
 {
 	int i;
 
@@ -2746,8 +2750,7 @@ void qed_configure_vp_wfq_on_link_change(struct qed_dev *cdev, u32 min_pf_rate)
 	for_each_hwfn(cdev, i) {
 		struct qed_hwfn *p_hwfn = &cdev->hwfns[i];
 
-		__qed_configure_vp_wfq_on_link_change(p_hwfn,
-						      p_hwfn->p_dpc_ptt,
+		__qed_configure_vp_wfq_on_link_change(p_hwfn, p_ptt,
 						      min_pf_rate);
 	}
 }

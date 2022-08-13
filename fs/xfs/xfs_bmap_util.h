@@ -28,7 +28,20 @@ struct xfs_mount;
 struct xfs_trans;
 struct xfs_bmalloca;
 
+#ifdef CONFIG_XFS_RT
 int	xfs_bmap_rtalloc(struct xfs_bmalloca *ap);
+#else /* !CONFIG_XFS_RT */
+/*
+ * Attempts to allocate RT extents when RT is disable indicates corruption and
+ * should trigger a shutdown.
+ */
+static inline int
+xfs_bmap_rtalloc(struct xfs_bmalloca *ap)
+{
+	return -EFSCORRUPTED;
+}
+#endif /* CONFIG_XFS_RT */
+
 int	xfs_bmap_eof(struct xfs_inode *ip, xfs_fileoff_t endoff,
 		     int whichfork, int *eof);
 int	xfs_bmap_punch_delalloc_range(struct xfs_inode *ip,
@@ -63,8 +76,7 @@ int	xfs_insert_file_space(struct xfs_inode *, xfs_off_t offset,
 
 /* EOF block manipulation functions */
 bool	xfs_can_free_eofblocks(struct xfs_inode *ip, bool force);
-int	xfs_free_eofblocks(struct xfs_mount *mp, struct xfs_inode *ip,
-			   bool need_iolock);
+int	xfs_free_eofblocks(struct xfs_inode *ip);
 
 int	xfs_swap_extents(struct xfs_inode *ip, struct xfs_inode *tip,
 			 struct xfs_swapext *sx);

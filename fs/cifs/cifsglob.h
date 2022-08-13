@@ -241,8 +241,10 @@ struct smb_version_operations {
 	/* verify the message */
 	int (*check_message)(char *, unsigned int, struct TCP_Server_Info *);
 	bool (*is_oplock_break)(char *, struct TCP_Server_Info *);
-	void (*downgrade_oplock)(struct TCP_Server_Info *,
-					struct cifsInodeInfo *, bool);
+	int (*handle_cancelled_mid)(char *, struct TCP_Server_Info *);
+	void (*downgrade_oplock)(struct TCP_Server_Info *server,
+				 struct cifsInodeInfo *cinode, __u32 oplock,
+				 unsigned int epoch, bool *purge_cache);
 	/* process transaction2 response */
 	bool (*check_trans2)(struct mid_q_entry *, struct TCP_Server_Info *,
 			     char *, int);
@@ -364,6 +366,8 @@ struct smb_version_operations {
 	unsigned int (*calc_smb_size)(void *);
 	/* check for STATUS_PENDING and process it in a positive case */
 	bool (*is_status_pending)(char *, struct TCP_Server_Info *, int);
+	/* check for STATUS_NETWORK_SESSION_EXPIRED */
+	bool (*is_session_expired)(char *);
 	/* send oplock break response */
 	int (*oplock_response)(struct cifs_tcon *, struct cifs_fid *,
 			       struct cifsInodeInfo *);
@@ -646,6 +650,8 @@ struct TCP_Server_Info {
 	unsigned int	max_read;
 	unsigned int	max_write;
 	__u8		preauth_hash[512];
+	struct delayed_work reconnect; /* reconnect workqueue job */
+	struct mutex reconnect_mutex; /* prevent simultaneous reconnects */
 #endif /* CONFIG_CIFS_SMB2 */
 	unsigned long echo_interval;
 };
@@ -849,6 +855,7 @@ cap_unix(struct cifs_ses *ses)
 struct cifs_tcon {
 	struct list_head tcon_list;
 	int tc_count;
+	struct list_head rlist; /* reconnect list */
 	struct list_head openFileList;
 	spinlock_t open_file_lock; /* protects list above */
 	struct cifs_ses *ses;	/* pointer to session associated with */
@@ -922,11 +929,11 @@ struct cifs_tcon {
 	bool broken_posix_open; /* e.g. Samba server versions < 3.3.2, 3.2.9 */
 	bool broken_sparse_sup; /* if server or share does not support sparse */
 	bool need_reconnect:1; /* connection reset, tid now invalid */
+	bool need_reopen_files:1; /* need to reopen tcon file handles */
 	bool use_resilient:1; /* use resilient instead of durable handles */
 	bool use_persistent:1; /* use persistent instead of durable handles */
 #ifdef CONFIG_CIFS_SMB2
 	bool print:1;		/* set if connection to printer share */
-	bool bad_network_name:1; /* set if ret status STATUS_BAD_NETWORK_NAME */
 	__le32 capabilities;
 	__u32 share_flags;
 	__u32 maximal_access;
@@ -1074,6 +1081,8 @@ struct cifsFileInfo {
 	unsigned int f_flags;
 	bool invalidHandle:1;	/* file closed via session abend */
 	bool oplock_break_cancelled:1;
+	unsigned int oplock_epoch; /* epoch from the lease break */
+	__u32 oplock_level; /* oplock/lease level from the lease break */
 	int count;
 	spinlock_t file_info_lock; /* protects four flag/count fields above */
 	struct mutex fh_mutex; /* prevents reopen race after dead ses*/
@@ -1151,6 +1160,7 @@ cifsFileInfo_get_locked(struct cifsFileInfo *cifs_file)
 }
 
 struct cifsFileInfo *cifsFileInfo_get(struct cifsFileInfo *cifs_file);
+void _cifsFileInfo_put(struct cifsFileInfo *cifs_file, bool wait_oplock_hdlr);
 void cifsFileInfo_put(struct cifsFileInfo *cifs_file);
 
 #define CIFS_CACHE_READ_FLG	1
@@ -1171,6 +1181,11 @@ void cifsFileInfo_put(struct cifsFileInfo *cifs_file);
 struct cifsInodeInfo {
 	bool can_cache_brlcks;
 	struct list_head llist;	/* locks helb by this inode */
+	/*
+	 * NOTE: Some code paths call down_read(lock_sem) twice, so
+	 * we must always use use cifs_down_write() instead of down_write()
+	 * for this semaphore to avoid deadlocks.
+	 */
 	struct rw_semaphore lock_sem;	/* protect the fields above */
 	/* BB add in lists for dirty pages i.e. write caching info for oplock */
 	struct list_head openFileList;
@@ -1179,7 +1194,7 @@ struct cifsInodeInfo {
 	unsigned int epoch;		/* used to track lease state changes */
 #define CIFS_INODE_PENDING_OPLOCK_BREAK   (0) /* oplock break in progress */
 #define CIFS_INODE_PENDING_WRITERS	  (1) /* Writes in progress */
-#define CIFS_INODE_DOWNGRADE_OPLOCK_TO_L2 (2) /* Downgrade oplock to L2 */
+#define CIFS_INODE_FLAG_UNUSED		  (2) /* Unused flag */
 #define CIFS_INO_DELETE_PENDING		  (3) /* delete pending on server */
 #define CIFS_INO_INVALID_MAPPING	  (4) /* pagecache is invalid */
 #define CIFS_INO_LOCK			  (5) /* lock bit for synchronization */
@@ -1311,10 +1326,17 @@ struct mid_q_entry {
 	void *callback_data;	  /* general purpose pointer for callback */
 	void *resp_buf;		/* pointer to received SMB header */
 	int mid_state;	/* wish this were enum but can not pass to wait_event */
+	unsigned int mid_flags;
 	__le16 command;		/* smb command code */
 	bool large_buf:1;	/* if valid response, is pointer to large buf */
 	bool multiRsp:1;	/* multiple trans2 responses for one request  */
 	bool multiEnd:1;	/* both received */
+};
+
+struct close_cancelled_open {
+	struct cifs_fid         fid;
+	struct cifs_tcon        *tcon;
+	struct work_struct      work;
 };
 
 /*	Make code in transport.c a little cleaner by moving
@@ -1399,6 +1421,7 @@ struct dfs_info3_param {
 #define CIFS_FATTR_NEED_REVAL		0x4
 #define CIFS_FATTR_INO_COLLISION	0x8
 #define CIFS_FATTR_UNKNOWN_NLINK	0x10
+#define CIFS_FATTR_FAKE_ROOT_INO	0x20
 
 struct cifs_fattr {
 	u32		cf_flags;
@@ -1447,6 +1470,9 @@ static inline void free_dfs_info_array(struct dfs_info3_param *param,
 #define   MID_RETRY_NEEDED      8 /* session closed while this request out */
 #define   MID_RESPONSE_MALFORMED 0x10
 #define   MID_SHUTDOWN		 0x20
+
+/* Flags */
+#define   MID_WAIT_CANCELLED	 1 /* Cancelled while waiting for response */
 
 /* Types of response buffer returned from SendReceive2 */
 #define   CIFS_NO_BUFFER        0    /* Response buffer not returned */
@@ -1634,9 +1660,11 @@ GLOBAL_EXTERN spinlock_t gidsidlock;
 #endif /* CONFIG_CIFS_ACL */
 
 void cifs_oplock_break(struct work_struct *work);
+void cifs_queue_oplock_break(struct cifsFileInfo *cfile);
 
 extern const struct slow_work_ops cifs_oplock_break_ops;
 extern struct workqueue_struct *cifsiod_wq;
+extern struct workqueue_struct *cifsoplockd_wq;
 extern __u32 cifs_lock_secret;
 
 extern mempool_t *cifs_mid_poolp;

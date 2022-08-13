@@ -117,6 +117,18 @@ required to provide the ramp delay with property "maxim,ramp-rate-setting". The
 ramp rate can be provided by the regulator-ramp-delay which will be used for
 ramp time calculation for voltage change as well as for device configuration.
 
+There is anothe name of these properties to reduce the property name
+length to meet ePAPR specs. The another name is without vendor as
+follows:
+	maxim,active-fps-source -> active-fps-source
+	maxim,active-fps-power-up-slot -> active-fps-power-up-slot
+	maxim,active-fps-power-down-slot -> active-fps-power-down-slot
+	maxim,suspend-fps-source -> suspend-fps-source
+	maxim,suspend-fps-power-up-slot -> suspend-fps-power-up-slot
+	maxim,suspend-fps-power-down-slot -> suspend-fps-power-down-slot
+	maxim,ramp-rate-setting -> ramp-rate-setting
+	maxim,power-ok-control -> power-ok-control
+
 Example:
 --------
 #include <dt-bindings/mfd/max77620.h>

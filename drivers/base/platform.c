@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2002-3 Patrick Mochel
  * Copyright (c) 2002-3 Open Source Development Labs
+ * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
  *
  * This file is released under the GPLv2
  *
@@ -27,6 +28,8 @@
 #include <linux/clk/clk-conf.h>
 #include <linux/limits.h>
 #include <linux/property.h>
+#include <linux/kmemleak.h>
+#include <linux/types.h>
 
 #include "base.h"
 #include "power/power.h"
@@ -67,7 +70,7 @@ void __weak arch_setup_pdev_archdata(struct platform_device *pdev)
 struct resource *platform_get_resource(struct platform_device *dev,
 				       unsigned int type, unsigned int num)
 {
-	int i;
+	u32 i;
 
 	for (i = 0; i < dev->num_resources; i++) {
 		struct resource *r = &dev->resource[i];
@@ -152,7 +155,7 @@ struct resource *platform_get_resource_byname(struct platform_device *dev,
 					      unsigned int type,
 					      const char *name)
 {
-	int i;
+	u32 i;
 
 	for (i = 0; i < dev->num_resources; i++) {
 		struct resource *r = &dev->resource[i];
@@ -349,7 +352,8 @@ EXPORT_SYMBOL_GPL(platform_device_add_properties);
  */
 int platform_device_add(struct platform_device *pdev)
 {
-	int i, ret;
+	u32 i;
+	int ret;
 
 	if (!pdev)
 		return -EINVAL;
@@ -415,7 +419,7 @@ int platform_device_add(struct platform_device *pdev)
 		pdev->id = PLATFORM_DEVID_AUTO;
 	}
 
-	while (--i >= 0) {
+	while (i--) {
 		struct resource *r = &pdev->resource[i];
 		if (r->parent)
 			release_resource(r);
@@ -436,7 +440,7 @@ EXPORT_SYMBOL_GPL(platform_device_add);
  */
 void platform_device_del(struct platform_device *pdev)
 {
-	int i;
+	u32 i;
 
 	if (pdev) {
 		device_remove_properties(&pdev->dev);
@@ -515,6 +519,8 @@ struct platform_device *platform_device_register_full(
 			kmalloc(sizeof(*pdev->dev.dma_mask), GFP_KERNEL);
 		if (!pdev->dev.dma_mask)
 			goto err;
+
+		kmemleak_ignore(pdev->dev.dma_mask);
 
 		*pdev->dev.dma_mask = pdevinfo->dma_mask;
 		pdev->dev.coherent_dma_mask = pdevinfo->dma_mask;
@@ -609,6 +615,15 @@ static void platform_drv_shutdown(struct device *_dev)
 		drv->shutdown(dev);
 }
 
+static void platform_drv_late_shutdown(struct device *_dev)
+{
+	struct platform_driver *drv = to_platform_driver(_dev->driver);
+	struct platform_device *dev = to_platform_device(_dev);
+
+	if (drv->late_shutdown)
+		drv->late_shutdown(dev);
+}
+
 /**
  * __platform_driver_register - register a driver for platform-level devices
  * @drv: platform driver structure
@@ -622,6 +637,7 @@ int __platform_driver_register(struct platform_driver *drv,
 	drv->driver.probe = platform_drv_probe;
 	drv->driver.remove = platform_drv_remove;
 	drv->driver.shutdown = platform_drv_shutdown;
+	drv->driver.late_shutdown = platform_drv_late_shutdown;
 
 	return driver_register(&drv->driver);
 }
@@ -687,6 +703,8 @@ int __init_or_module __platform_driver_probe(struct platform_driver *drv,
 	/* temporary section violation during probe() */
 	drv->probe = probe;
 	retval = code = __platform_driver_register(drv, module);
+	if (retval)
+		return retval;
 
 	/*
 	 * Fixup that section violation, being paranoid about code scanning
@@ -856,9 +874,10 @@ static ssize_t driver_override_store(struct device *dev,
 				     const char *buf, size_t count)
 {
 	struct platform_device *pdev = to_platform_device(dev);
-	char *driver_override, *old = pdev->driver_override, *cp;
+	char *driver_override, *old, *cp;
 
-	if (count > PATH_MAX)
+	/* We need to keep extra room for a newline */
+	if (count >= (PAGE_SIZE - 1))
 		return -EINVAL;
 
 	driver_override = kstrndup(buf, count, GFP_KERNEL);
@@ -869,12 +888,15 @@ static ssize_t driver_override_store(struct device *dev,
 	if (cp)
 		*cp = '\0';
 
+	device_lock(dev);
+	old = pdev->driver_override;
 	if (strlen(driver_override)) {
 		pdev->driver_override = driver_override;
 	} else {
 		kfree(driver_override);
 		pdev->driver_override = NULL;
 	}
+	device_unlock(dev);
 
 	kfree(old);
 
@@ -885,8 +907,12 @@ static ssize_t driver_override_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
 {
 	struct platform_device *pdev = to_platform_device(dev);
+	ssize_t len;
 
-	return sprintf(buf, "%s\n", pdev->driver_override);
+	device_lock(dev);
+	len = sprintf(buf, "%s\n", pdev->driver_override);
+	device_unlock(dev);
+	return len;
 }
 static DEVICE_ATTR_RW(driver_override);
 
@@ -1153,8 +1179,10 @@ u64 dma_get_required_mask(struct device *dev)
 
 	if (!high_totalram) {
 		/* convert to mask just covering totalram */
-		low_totalram = (1 << (fls(low_totalram) - 1));
-		low_totalram += low_totalram - 1;
+		if (low_totalram) {
+			low_totalram = (1 << (fls(low_totalram) - 1));
+			low_totalram += low_totalram - 1;
+		}
 		mask = low_totalram;
 	} else {
 		high_totalram = (1 << (fls(high_totalram) - 1));

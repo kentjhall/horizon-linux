@@ -255,7 +255,7 @@ struct kmem_cache *find_mergeable(size_t size, size_t align,
 {
 	struct kmem_cache *s;
 
-	if (slab_nomerge || (flags & SLAB_NEVER_MERGE))
+	if (slab_nomerge)
 		return NULL;
 
 	if (ctor)
@@ -265,6 +265,9 @@ struct kmem_cache *find_mergeable(size_t size, size_t align,
 	align = calculate_alignment(flags, align, size);
 	size = ALIGN(size, align);
 	flags = kmem_cache_flags(size, flags, name, NULL);
+
+	if (flags & SLAB_NEVER_MERGE)
+		return NULL;
 
 	list_for_each_entry_reverse(s, &slab_caches, list) {
 		if (slab_unmergeable(s))
@@ -455,6 +458,9 @@ EXPORT_SYMBOL(kmem_cache_create);
 static int shutdown_cache(struct kmem_cache *s,
 		struct list_head *release, bool *need_rcu_barrier)
 {
+	/* free asan quarantined objects */
+	kasan_cache_shutdown(s);
+
 	if (__kmem_cache_shutdown(s) != 0)
 		return -EBUSY;
 
@@ -573,6 +579,29 @@ void memcg_deactivate_kmem_caches(struct mem_cgroup *memcg)
 	get_online_cpus();
 	get_online_mems();
 
+#ifdef CONFIG_SLUB
+	/*
+	 * In case of SLUB, we need to disable empty slab caching to
+	 * avoid pinning the offline memory cgroup by freeable kmem
+	 * pages charged to it. SLAB doesn't need this, as it
+	 * periodically purges unused slabs.
+	 */
+	mutex_lock(&slab_mutex);
+	list_for_each_entry(s, &slab_caches, list) {
+		c = is_root_cache(s) ? cache_from_memcg_idx(s, idx) : NULL;
+		if (c) {
+			c->cpu_partial = 0;
+			c->min_partial = 0;
+		}
+	}
+	mutex_unlock(&slab_mutex);
+	/*
+	 * kmem_cache->cpu_partial is checked locklessly (see
+	 * put_cpu_partial()). Make sure the change is visible.
+	 */
+	synchronize_sched();
+#endif
+
 	mutex_lock(&slab_mutex);
 	list_for_each_entry(s, &slab_caches, list) {
 		if (!is_root_cache(s))
@@ -584,7 +613,7 @@ void memcg_deactivate_kmem_caches(struct mem_cgroup *memcg)
 		if (!c)
 			continue;
 
-		__kmem_cache_shrink(c, true);
+		__kmem_cache_shrink(c);
 		arr->entries[idx] = NULL;
 	}
 	mutex_unlock(&slab_mutex);
@@ -715,7 +744,6 @@ void kmem_cache_destroy(struct kmem_cache *s)
 	get_online_cpus();
 	get_online_mems();
 
-	kasan_cache_destroy(s);
 	mutex_lock(&slab_mutex);
 
 	s->refcount--;
@@ -755,7 +783,7 @@ int kmem_cache_shrink(struct kmem_cache *cachep)
 	get_online_cpus();
 	get_online_mems();
 	kasan_cache_shrink(cachep);
-	ret = __kmem_cache_shrink(cachep, false);
+	ret = __kmem_cache_shrink(cachep);
 	put_online_mems();
 	put_online_cpus();
 	return ret;
@@ -857,18 +885,18 @@ struct kmem_cache *kmalloc_slab(size_t size, gfp_t flags)
 {
 	int index;
 
-	if (unlikely(size > KMALLOC_MAX_SIZE)) {
-		WARN_ON_ONCE(!(flags & __GFP_NOWARN));
-		return NULL;
-	}
-
 	if (size <= 192) {
 		if (!size)
 			return ZERO_SIZE_PTR;
 
 		index = size_index[size_index_elem(size)];
-	} else
+	} else {
+		if (unlikely(size > KMALLOC_MAX_CACHE_SIZE)) {
+			WARN_ON(1);
+			return NULL;
+		}
 		index = fls(size - 1);
+	}
 
 #ifdef CONFIG_ZONE_DMA
 	if (unlikely((flags & GFP_DMA)))
@@ -1319,7 +1347,7 @@ void kzfree(const void *p)
 	if (unlikely(ZERO_OR_NULL_PTR(mem)))
 		return;
 	ks = ksize(mem);
-	memset(mem, 0, ks);
+	memzero_explicit(mem, ks);
 	kfree(mem);
 }
 EXPORT_SYMBOL(kzfree);

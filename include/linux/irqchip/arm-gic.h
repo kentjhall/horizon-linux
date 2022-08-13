@@ -2,6 +2,7 @@
  *  include/linux/irqchip/arm-gic.h
  *
  *  Copyright (C) 2002 ARM Limited, All Rights Reserved.
+ *  Copyright (C) 2017-2019, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -23,6 +24,11 @@
 #define GIC_CPU_DEACTIVATE		0x1000
 
 #define GICC_ENABLE			0x1
+#define GICC_ENABLE_GRP0		0x1
+#define GICC_ENABLE_GRP1		0x2
+#define GICC_ACK_CTRL			0x4
+#define GICC_FIQ_EN			0x8
+#define GICC_CBPR			0x10
 #define GICC_INT_PRI_THRESHOLD		0xf0
 
 #define GIC_CPU_CTRL_EOImodeNS		(1 << 9)
@@ -30,6 +36,8 @@
 #define GICC_IAR_INT_ID_MASK		0x3ff
 #define GICC_INT_SPURIOUS		1023
 #define GICC_DIS_BYPASS_MASK		0x1e0
+
+#define GICC_IAR_INT_ID_MASK            0x3ff
 
 #define GIC_DIST_CTRL			0x000
 #define GIC_DIST_CTR			0x004
@@ -49,6 +57,8 @@
 #define GIC_DIST_SGI_PENDING_SET	0xf20
 
 #define GICD_ENABLE			0x1
+#define GICD_ENABLE_GRP0		0x1
+#define GICD_ENABLE_GRP1		0x2
 #define GICD_DISABLE			0x0
 #define GICD_INT_ACTLOW_LVLTRIG		0x0
 #define GICD_INT_EN_CLR_X32		0xffffffff
@@ -103,12 +113,25 @@
 struct device_node;
 struct gic_chip_data;
 
+struct gic_data {
+	const struct gic_clk_data *clk_data;
+	bool supports_routing;
+	u32 num_interfaces;
+	bool is_hv;
+};
+
 void gic_cascade_irq(unsigned int gic_nr, unsigned int irq);
 int gic_cpu_if_down(unsigned int gic_nr);
 void gic_cpu_save(struct gic_chip_data *gic);
 void gic_cpu_restore(struct gic_chip_data *gic);
 void gic_dist_save(struct gic_chip_data *gic);
 void gic_dist_restore(struct gic_chip_data *gic);
+
+bool gic_irq_is_pending(struct gic_chip_data *gic, int irq);
+bool gic_irq_is_active(struct gic_chip_data *gic, int irq);
+int gic_route_interrupt(struct gic_chip_data *gic, int irq, u32 cpu);
+void gic_clear_pending(struct gic_chip_data *gic, int irq);
+void gic_clear_active(struct gic_chip_data *gic, int irq);
 
 /*
  * Subdrivers that need some preparatory work can initialize their

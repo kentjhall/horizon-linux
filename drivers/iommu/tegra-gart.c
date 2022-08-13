@@ -1,7 +1,7 @@
 /*
  * IOMMU API for GART in Tegra20
  *
- * Copyright (c) 2010-2012, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2010-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -63,20 +63,10 @@ struct gart_device {
 	struct device		*dev;
 };
 
-struct gart_domain {
-	struct iommu_domain domain;		/* generic domain handle */
-	struct gart_device *gart;		/* link to gart device   */
-};
-
 static struct gart_device *gart_handle; /* unique for a system */
 
 #define GART_PTE(_pfn)						\
 	(GART_ENTRY_PHYS_ADDR_VALID | ((_pfn) << PAGE_SHIFT))
-
-static struct gart_domain *to_gart_domain(struct iommu_domain *dom)
-{
-	return container_of(dom, struct gart_domain, domain);
-}
 
 /*
  * Any interaction between any block on PPSB and a block on APB or AHB
@@ -166,10 +156,19 @@ static inline bool gart_iova_range_valid(struct gart_device *gart,
 static int gart_iommu_attach_dev(struct iommu_domain *domain,
 				 struct device *dev)
 {
-	struct gart_domain *gart_domain = to_gart_domain(domain);
-	struct gart_device *gart = gart_domain->gart;
+	struct gart_device *gart;
 	struct gart_client *client, *c;
 	int err = 0;
+
+	gart = dev_get_drvdata(dev->parent);
+	if (!gart)
+		return -EINVAL;
+	domain->priv = gart;
+
+	domain->geometry.aperture_start = gart->iovmm_base;
+	domain->geometry.aperture_end   = gart->iovmm_base +
+					gart->page_count * GART_PAGE_SIZE - 1;
+	domain->geometry.force_aperture = true;
 
 	client = devm_kzalloc(gart->dev, sizeof(*c), GFP_KERNEL);
 	if (!client)
@@ -199,8 +198,7 @@ fail:
 static void gart_iommu_detach_dev(struct iommu_domain *domain,
 				  struct device *dev)
 {
-	struct gart_domain *gart_domain = to_gart_domain(domain);
-	struct gart_device *gart = gart_domain->gart;
+	struct gart_device *gart = domain->priv;
 	struct gart_client *c;
 
 	spin_lock(&gart->client_lock);
@@ -218,55 +216,33 @@ out:
 	spin_unlock(&gart->client_lock);
 }
 
-static struct iommu_domain *gart_iommu_domain_alloc(unsigned type)
+static int gart_iommu_domain_init(struct iommu_domain *domain)
 {
-	struct gart_domain *gart_domain;
-	struct gart_device *gart;
-
-	if (type != IOMMU_DOMAIN_UNMANAGED)
-		return NULL;
-
-	gart = gart_handle;
-	if (!gart)
-		return NULL;
-
-	gart_domain = kzalloc(sizeof(*gart_domain), GFP_KERNEL);
-	if (!gart_domain)
-		return NULL;
-
-	gart_domain->gart = gart;
-	gart_domain->domain.geometry.aperture_start = gart->iovmm_base;
-	gart_domain->domain.geometry.aperture_end = gart->iovmm_base +
-					gart->page_count * GART_PAGE_SIZE - 1;
-	gart_domain->domain.geometry.force_aperture = true;
-
-	return &gart_domain->domain;
+	return 0;
 }
 
-static void gart_iommu_domain_free(struct iommu_domain *domain)
+static void gart_iommu_domain_destroy(struct iommu_domain *domain)
 {
-	struct gart_domain *gart_domain = to_gart_domain(domain);
-	struct gart_device *gart = gart_domain->gart;
+	struct gart_device *gart = domain->priv;
 
-	if (gart) {
-		spin_lock(&gart->client_lock);
-		if (!list_empty(&gart->client)) {
-			struct gart_client *c;
+	if (!gart)
+		return;
 
-			list_for_each_entry(c, &gart->client, list)
-				gart_iommu_detach_dev(domain, c->dev);
-		}
-		spin_unlock(&gart->client_lock);
+	spin_lock(&gart->client_lock);
+	if (!list_empty(&gart->client)) {
+		struct gart_client *c;
+
+		list_for_each_entry(c, &gart->client, list)
+			gart_iommu_detach_dev(domain, c->dev);
 	}
-
-	kfree(gart_domain);
+	spin_unlock(&gart->client_lock);
+	domain->priv = NULL;
 }
 
 static int gart_iommu_map(struct iommu_domain *domain, unsigned long iova,
 			  phys_addr_t pa, size_t bytes, int prot)
 {
-	struct gart_domain *gart_domain = to_gart_domain(domain);
-	struct gart_device *gart = gart_domain->gart;
+	struct gart_device *gart = domain->priv;
 	unsigned long flags;
 	unsigned long pfn;
 
@@ -289,8 +265,7 @@ static int gart_iommu_map(struct iommu_domain *domain, unsigned long iova,
 static size_t gart_iommu_unmap(struct iommu_domain *domain, unsigned long iova,
 			       size_t bytes)
 {
-	struct gart_domain *gart_domain = to_gart_domain(domain);
-	struct gart_device *gart = gart_domain->gart;
+	struct gart_device *gart = domain->priv;
 	unsigned long flags;
 
 	if (!gart_iova_range_valid(gart, iova, bytes))
@@ -306,8 +281,7 @@ static size_t gart_iommu_unmap(struct iommu_domain *domain, unsigned long iova,
 static phys_addr_t gart_iommu_iova_to_phys(struct iommu_domain *domain,
 					   dma_addr_t iova)
 {
-	struct gart_domain *gart_domain = to_gart_domain(domain);
-	struct gart_device *gart = gart_domain->gart;
+	struct gart_device *gart = domain->priv;
 	unsigned long pte;
 	phys_addr_t pa;
 	unsigned long flags;
@@ -336,12 +310,11 @@ static bool gart_iommu_capable(enum iommu_cap cap)
 
 static const struct iommu_ops gart_iommu_ops = {
 	.capable	= gart_iommu_capable,
-	.domain_alloc	= gart_iommu_domain_alloc,
-	.domain_free	= gart_iommu_domain_free,
+	.domain_init	= gart_iommu_domain_init,
+	.domain_destroy	= gart_iommu_domain_destroy,
 	.attach_dev	= gart_iommu_attach_dev,
 	.detach_dev	= gart_iommu_detach_dev,
 	.map		= gart_iommu_map,
-	.map_sg		= default_iommu_map_sg,
 	.unmap		= gart_iommu_unmap,
 	.iova_to_phys	= gart_iommu_iova_to_phys,
 	.pgsize_bitmap	= GART_IOMMU_PGSIZES,
@@ -422,7 +395,7 @@ static int tegra_gart_probe(struct platform_device *pdev)
 	do_gart_setup(gart, NULL);
 
 	gart_handle = gart;
-
+	bus_set_iommu(&platform_bus_type, &gart_iommu_ops);
 	return 0;
 }
 
@@ -452,7 +425,8 @@ static struct platform_driver tegra_gart_driver = {
 	.probe		= tegra_gart_probe,
 	.remove		= tegra_gart_remove,
 	.driver = {
-		.name	= "tegra-gart",
+		.owner	= THIS_MODULE,
+		.name	= "tegra_gart",
 		.pm	= &tegra_gart_pm_ops,
 		.of_match_table = tegra_gart_of_match,
 	},

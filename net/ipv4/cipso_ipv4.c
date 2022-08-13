@@ -667,7 +667,8 @@ static int cipso_v4_map_lvl_valid(const struct cipso_v4_doi *doi_def, u8 level)
 	case CIPSO_V4_MAP_PASS:
 		return 0;
 	case CIPSO_V4_MAP_TRANS:
-		if (doi_def->map.std->lvl.cipso[level] < CIPSO_V4_INV_LVL)
+		if ((level < doi_def->map.std->lvl.cipso_size) &&
+		    (doi_def->map.std->lvl.cipso[level] < CIPSO_V4_INV_LVL))
 			return 0;
 		break;
 	}
@@ -1271,7 +1272,8 @@ static int cipso_v4_parsetag_rbm(const struct cipso_v4_doi *doi_def,
 			return ret_val;
 		}
 
-		secattr->flags |= NETLBL_SECATTR_MLS_CAT;
+		if (secattr->attr.mls.cat)
+			secattr->flags |= NETLBL_SECATTR_MLS_CAT;
 	}
 
 	return 0;
@@ -1452,7 +1454,8 @@ static int cipso_v4_parsetag_rng(const struct cipso_v4_doi *doi_def,
 			return ret_val;
 		}
 
-		secattr->flags |= NETLBL_SECATTR_MLS_CAT;
+		if (secattr->attr.mls.cat)
+			secattr->flags |= NETLBL_SECATTR_MLS_CAT;
 	}
 
 	return 0;
@@ -1512,7 +1515,7 @@ static int cipso_v4_parsetag_loc(const struct cipso_v4_doi *doi_def,
  *
  * Description:
  * Parse the packet's IP header looking for a CIPSO option.  Returns a pointer
- * to the start of the CIPSO option on success, NULL if one if not found.
+ * to the start of the CIPSO option on success, NULL if one is not found.
  *
  */
 unsigned char *cipso_v4_optptr(const struct sk_buff *skb)
@@ -1522,10 +1525,21 @@ unsigned char *cipso_v4_optptr(const struct sk_buff *skb)
 	int optlen;
 	int taglen;
 
-	for (optlen = iph->ihl*4 - sizeof(struct iphdr); optlen > 0; ) {
+	for (optlen = iph->ihl*4 - sizeof(struct iphdr); optlen > 1; ) {
+		switch (optptr[0]) {
+		case IPOPT_END:
+			return NULL;
+		case IPOPT_NOOP:
+			taglen = 1;
+			break;
+		default:
+			taglen = optptr[1];
+		}
+		if (!taglen || taglen > optlen)
+			return NULL;
 		if (optptr[0] == IPOPT_CIPSO)
 			return optptr;
-		taglen = optptr[1];
+
 		optlen -= taglen;
 		optptr += taglen;
 	}
@@ -1587,6 +1601,10 @@ int cipso_v4_validate(const struct sk_buff *skb, unsigned char **option)
 				goto validate_return_locked;
 			}
 
+		if (opt_iter + 1 == opt_len) {
+			err_offset = opt_iter;
+			goto validate_return_locked;
+		}
 		tag_len = tag[1];
 		if (tag_len > (opt_len - opt_iter)) {
 			err_offset = opt_iter + 1;
@@ -1720,13 +1738,31 @@ validate_return:
  */
 void cipso_v4_error(struct sk_buff *skb, int error, u32 gateway)
 {
+	unsigned char optbuf[sizeof(struct ip_options) + 40];
+	struct ip_options *opt = (struct ip_options *)optbuf;
+	int res;
+
 	if (ip_hdr(skb)->protocol == IPPROTO_ICMP || error != -EACCES)
 		return;
 
+	/*
+	 * We might be called above the IP layer,
+	 * so we can not use icmp_send and IPCB here.
+	 */
+
+	memset(opt, 0, sizeof(struct ip_options));
+	opt->optlen = ip_hdr(skb)->ihl*4 - sizeof(struct iphdr);
+	rcu_read_lock();
+	res = __ip_options_compile(dev_net(skb->dev), opt, skb, NULL);
+	rcu_read_unlock();
+
+	if (res)
+		return;
+
 	if (gateway)
-		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_NET_ANO, 0);
+		__icmp_send(skb, ICMP_DEST_UNREACH, ICMP_NET_ANO, 0, opt);
 	else
-		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_HOST_ANO, 0);
+		__icmp_send(skb, ICMP_DEST_UNREACH, ICMP_HOST_ANO, 0, opt);
 }
 
 /**
@@ -1939,7 +1975,7 @@ int cipso_v4_req_setattr(struct request_sock *req,
 	buf = NULL;
 
 	req_inet = inet_rsk(req);
-	opt = xchg(&req_inet->opt, opt);
+	opt = xchg((__force struct ip_options_rcu **)&req_inet->ireq_opt, opt);
 	if (opt)
 		kfree_rcu(opt, rcu);
 
@@ -1961,11 +1997,13 @@ req_setattr_failure:
  * values on failure.
  *
  */
-static int cipso_v4_delopt(struct ip_options_rcu **opt_ptr)
+static int cipso_v4_delopt(struct ip_options_rcu __rcu **opt_ptr)
 {
+	struct ip_options_rcu *opt = rcu_dereference_protected(*opt_ptr, 1);
 	int hdr_delta = 0;
-	struct ip_options_rcu *opt = *opt_ptr;
 
+	if (!opt || opt->opt.cipso == 0)
+		return 0;
 	if (opt->opt.srr || opt->opt.rr || opt->opt.ts || opt->opt.router_alert) {
 		u8 cipso_len;
 		u8 cipso_off;
@@ -2027,14 +2065,10 @@ static int cipso_v4_delopt(struct ip_options_rcu **opt_ptr)
  */
 void cipso_v4_sock_delattr(struct sock *sk)
 {
-	int hdr_delta;
-	struct ip_options_rcu *opt;
 	struct inet_sock *sk_inet;
+	int hdr_delta;
 
 	sk_inet = inet_sk(sk);
-	opt = rcu_dereference_protected(sk_inet->inet_opt, 1);
-	if (!opt || opt->opt.cipso == 0)
-		return;
 
 	hdr_delta = cipso_v4_delopt(&sk_inet->inet_opt);
 	if (sk_inet->is_icsk && hdr_delta > 0) {
@@ -2054,15 +2088,7 @@ void cipso_v4_sock_delattr(struct sock *sk)
  */
 void cipso_v4_req_delattr(struct request_sock *req)
 {
-	struct ip_options_rcu *opt;
-	struct inet_request_sock *req_inet;
-
-	req_inet = inet_rsk(req);
-	opt = req_inet->opt;
-	if (!opt || opt->opt.cipso == 0)
-		return;
-
-	cipso_v4_delopt(&req_inet->opt);
+	cipso_v4_delopt(&inet_rsk(req)->ireq_opt);
 }
 
 /**

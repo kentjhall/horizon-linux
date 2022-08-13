@@ -22,16 +22,14 @@ static int usb_serial_device_match(struct device *dev,
 	struct usb_serial_driver *driver;
 	const struct usb_serial_port *port;
 
+	if (!dev)
+		return -ENODEV;
 	/*
 	 * drivers are already assigned to ports in serial_probe so it's
 	 * a simple check here.
 	 */
 	port = to_usb_serial_port(dev);
-	if (!port)
-		return 0;
-
 	driver = to_usb_serial_driver(drv);
-
 	if (driver == port->serial->type)
 		return 1;
 
@@ -46,9 +44,10 @@ static int usb_serial_device_probe(struct device *dev)
 	int retval = 0;
 	int minor;
 
-	port = to_usb_serial_port(dev);
-	if (!port)
+	if (!dev)
 		return -ENODEV;
+
+	port = to_usb_serial_port(dev);
 
 	/* make sure suspend/resume doesn't race against port_probe */
 	retval = usb_autopm_get_interface(port->serial->interface);
@@ -94,10 +93,10 @@ static int usb_serial_device_remove(struct device *dev)
 	int minor;
 	int autopm_err;
 
-	port = to_usb_serial_port(dev);
-	if (!port)
+	if (!dev)
 		return -ENODEV;
 
+	port = to_usb_serial_port(dev);
 	/*
 	 * Make sure suspend/resume doesn't race against port_remove.
 	 *

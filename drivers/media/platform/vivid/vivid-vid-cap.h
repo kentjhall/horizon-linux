@@ -67,5 +67,6 @@ int vidioc_enum_framesizes(struct file *file, void *fh, struct v4l2_frmsizeenum 
 int vidioc_enum_frameintervals(struct file *file, void *priv, struct v4l2_frmivalenum *fival);
 int vivid_vid_cap_g_parm(struct file *file, void *priv, struct v4l2_streamparm *parm);
 int vivid_vid_cap_s_parm(struct file *file, void *priv, struct v4l2_streamparm *parm);
+void vivid_update_timeperframe(struct vivid_dev *dev, u32 frame_length);
 
 #endif

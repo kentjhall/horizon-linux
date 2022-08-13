@@ -274,7 +274,6 @@ int sst_dma_new(struct sst_dsp *sst)
 	struct sst_pdata *sst_pdata = sst->pdata;
 	struct sst_dma *dma;
 	struct resource mem;
-	const char *dma_dev_name;
 	int ret = 0;
 
 	if (sst->pdata->resindex_dma_base == -1)
@@ -285,7 +284,6 @@ int sst_dma_new(struct sst_dsp *sst)
 	* is attached to the ADSP IP. */
 	switch (sst->pdata->dma_engine) {
 	case SST_DMA_TYPE_DW:
-		dma_dev_name = "dw_dmac";
 		break;
 	default:
 		dev_err(sst->dev, "error: invalid DMA engine %d\n",
@@ -1254,11 +1252,15 @@ struct sst_dsp *sst_dsp_new(struct device *dev,
 		goto irq_err;
 
 	err = sst_dma_new(sst);
-	if (err)
-		dev_warn(dev, "sst_dma_new failed %d\n", err);
+	if (err)  {
+		dev_err(dev, "sst_dma_new failed %d\n", err);
+		goto dma_err;
+	}
 
 	return sst;
 
+dma_err:
+	free_irq(sst->irq, sst);
 irq_err:
 	if (sst->ops->free)
 		sst->ops->free(sst);

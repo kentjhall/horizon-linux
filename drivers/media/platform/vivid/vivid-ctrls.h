@@ -31,4 +31,6 @@ int vivid_create_controls(struct vivid_dev *dev, bool show_ccs_cap,
 		bool has_sdtv, bool has_hdmi);
 void vivid_free_controls(struct vivid_dev *dev);
 
+int vivid_update_sensorprops(struct vivid_dev *dev);
+
 #endif

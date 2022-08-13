@@ -33,6 +33,7 @@
  */
 extern void (*pm_power_off)(void);
 extern void (*pm_power_off_prepare)(void);
+extern void (*pm_power_reset)(void);
 
 struct device; /* we have a circular dep with device.h */
 #ifdef CONFIG_VT_CONSOLE_SLEEP

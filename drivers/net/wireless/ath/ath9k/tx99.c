@@ -56,11 +56,6 @@ static struct sk_buff *ath9k_build_tx99_skb(struct ath_softc *sc)
 	struct sk_buff *skb;
 	struct ath_vif *avp;
 
-	if (!sc->tx99_vif)
-		return NULL;
-
-	avp = (struct ath_vif *)sc->tx99_vif->drv_priv;
-
 	skb = alloc_skb(len, GFP_KERNEL);
 	if (!skb)
 		return NULL;
@@ -77,7 +72,10 @@ static struct sk_buff *ath9k_build_tx99_skb(struct ath_softc *sc)
 	memcpy(hdr->addr2, hw->wiphy->perm_addr, ETH_ALEN);
 	memcpy(hdr->addr3, hw->wiphy->perm_addr, ETH_ALEN);
 
-	hdr->seq_ctrl |= cpu_to_le16(avp->seq_no);
+	if (sc->tx99_vif) {
+		avp = (struct ath_vif *) sc->tx99_vif->drv_priv;
+		hdr->seq_ctrl |= cpu_to_le16(avp->seq_no);
+	}
 
 	tx_info = IEEE80211_SKB_CB(skb);
 	memset(tx_info, 0, sizeof(*tx_info));
@@ -179,6 +177,9 @@ static ssize_t write_file_tx99(struct file *file, const char __user *user_buf,
 	ssize_t len;
 	int r;
 
+	if (count < 1)
+		return -EINVAL;
+
 	if (sc->cur_chan->nvifs > 1)
 		return -EOPNOTSUPP;
 
@@ -186,25 +187,32 @@ static ssize_t write_file_tx99(struct file *file, const char __user *user_buf,
 	if (copy_from_user(buf, user_buf, len))
 		return -EFAULT;
 
+	buf[len] = '\0';
+
 	if (strtobool(buf, &start))
 		return -EINVAL;
 
+	mutex_lock(&sc->mutex);
+
 	if (start == sc->tx99_state) {
 		if (!start)
-			return count;
+			goto out;
 		ath_dbg(common, XMIT, "Resetting TX99\n");
 		ath9k_tx99_deinit(sc);
 	}
 
 	if (!start) {
 		ath9k_tx99_deinit(sc);
-		return count;
+		goto out;
 	}
 
 	r = ath9k_tx99_init(sc);
-	if (r)
+	if (r) {
+		mutex_unlock(&sc->mutex);
 		return r;
-
+	}
+out:
+	mutex_unlock(&sc->mutex);
 	return count;
 }
 

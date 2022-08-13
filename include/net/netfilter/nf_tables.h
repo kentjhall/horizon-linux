@@ -87,9 +87,40 @@ struct nft_regs {
 	};
 };
 
+/* Store/load an u16 or u8 integer to/from the u32 data register.
+ *
+ * Note, when using concatenations, register allocation happens at 32-bit
+ * level. So for store instruction, pad the rest part with zero to avoid
+ * garbage values.
+ */
+
+static inline void nft_reg_store16(u32 *dreg, u16 val)
+{
+	*dreg = 0;
+	*(u16 *)dreg = val;
+}
+
+static inline void nft_reg_store8(u32 *dreg, u8 val)
+{
+	*dreg = 0;
+	*(u8 *)dreg = val;
+}
+
+static inline u16 nft_reg_load16(u32 *sreg)
+{
+	return *(u16 *)sreg;
+}
+
+static inline u8 nft_reg_load8(u32 *sreg)
+{
+	return *(u8 *)sreg;
+}
+
 static inline void nft_data_copy(u32 *dst, const struct nft_data *src,
 				 unsigned int len)
 {
+	if (len % NFT_REG32_SIZE)
+		dst[len / NFT_REG32_SIZE] = 0;
 	memcpy(dst, src, len);
 }
 
@@ -676,7 +707,8 @@ struct nft_expr_ops {
  */
 struct nft_expr {
 	const struct nft_expr_ops	*ops;
-	unsigned char			data[];
+	unsigned char			data[]
+		__attribute__((aligned(__alignof__(u64))));
 };
 
 static inline void *nft_expr_priv(const struct nft_expr *expr)

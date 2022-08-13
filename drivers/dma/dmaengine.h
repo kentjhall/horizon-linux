@@ -170,4 +170,11 @@ dmaengine_desc_callback_valid(struct dmaengine_desc_callback *cb)
 	return (cb->callback) ? true : false;
 }
 
+static inline void dma_set_bytes_transferred(struct dma_tx_state *state,
+	u64 total_bytes_transferred)
+{
+	if (state)
+		state->total_bytes_transferred = total_bytes_transferred;
+}
+
 #endif

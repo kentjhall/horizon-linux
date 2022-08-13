@@ -28,11 +28,17 @@ static inline const struct iommu_ops *of_iommu_configure(struct device *dev,
 {
 	return NULL;
 }
+static inline void of_map_iommu_direct_regions(struct device *dev)
+{
+
+}
 
 #endif	/* CONFIG_OF_IOMMU */
 
 void of_iommu_set_ops(struct device_node *np, const struct iommu_ops *ops);
 const struct iommu_ops *of_iommu_get_ops(struct device_node *np);
+
+void of_map_iommu_direct_regions(struct device *dev);
 
 extern struct of_device_id __iommu_of_table;
 

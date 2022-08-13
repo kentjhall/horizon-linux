@@ -1,4 +1,5 @@
 #include <linux/perf_event.h>
+#include <linux/nospec.h>
 #include <asm/intel-family.h>
 
 enum perf_msr_id {
@@ -60,8 +61,8 @@ static bool test_intel(int idx)
 	case INTEL_FAM6_BROADWELL_GT3E:
 	case INTEL_FAM6_BROADWELL_X:
 
-	case INTEL_FAM6_ATOM_SILVERMONT1:
-	case INTEL_FAM6_ATOM_SILVERMONT2:
+	case INTEL_FAM6_ATOM_SILVERMONT:
+	case INTEL_FAM6_ATOM_SILVERMONT_X:
 	case INTEL_FAM6_ATOM_AIRMONT:
 		if (idx == PERF_MSR_SMI)
 			return true;
@@ -136,9 +137,6 @@ static int msr_event_init(struct perf_event *event)
 	if (event->attr.type != event->pmu->type)
 		return -ENOENT;
 
-	if (cfg >= PERF_MSR_EVENT_MAX)
-		return -EINVAL;
-
 	/* unsupported modes and filters */
 	if (event->attr.exclude_user   ||
 	    event->attr.exclude_kernel ||
@@ -148,6 +146,11 @@ static int msr_event_init(struct perf_event *event)
 	    event->attr.exclude_guest  ||
 	    event->attr.sample_period) /* no sampling */
 		return -EINVAL;
+
+	if (cfg >= PERF_MSR_EVENT_MAX)
+		return -EINVAL;
+
+	cfg = array_index_nospec((unsigned long)cfg, PERF_MSR_EVENT_MAX);
 
 	if (!msr[cfg].attr)
 		return -EINVAL;

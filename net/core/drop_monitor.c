@@ -80,6 +80,7 @@ static struct sk_buff *reset_per_cpu_data(struct per_cpu_dm_data *data)
 	struct nlattr *nla;
 	struct sk_buff *skb;
 	unsigned long flags;
+	void *msg_header;
 
 	al = sizeof(struct net_dm_alert_msg);
 	al += dm_hit_limit * sizeof(struct net_dm_drop_point);
@@ -87,20 +88,40 @@ static struct sk_buff *reset_per_cpu_data(struct per_cpu_dm_data *data)
 
 	skb = genlmsg_new(al, GFP_KERNEL);
 
-	if (skb) {
-		genlmsg_put(skb, 0, 0, &net_drop_monitor_family,
-				0, NET_DM_CMD_ALERT);
-		nla = nla_reserve(skb, NLA_UNSPEC,
-				  sizeof(struct net_dm_alert_msg));
-		msg = nla_data(nla);
-		memset(msg, 0, al);
-	} else {
-		mod_timer(&data->send_timer, jiffies + HZ / 10);
-	}
+	if (!skb)
+		goto err;
 
+	msg_header = genlmsg_put(skb, 0, 0, &net_drop_monitor_family,
+				 0, NET_DM_CMD_ALERT);
+	if (!msg_header) {
+		nlmsg_free(skb);
+		skb = NULL;
+		goto err;
+	}
+	nla = nla_reserve(skb, NLA_UNSPEC,
+			  sizeof(struct net_dm_alert_msg));
+	if (!nla) {
+		nlmsg_free(skb);
+		skb = NULL;
+		goto err;
+	}
+	msg = nla_data(nla);
+	memset(msg, 0, al);
+	goto out;
+
+err:
+	mod_timer(&data->send_timer, jiffies + HZ / 10);
+out:
 	spin_lock_irqsave(&data->lock, flags);
 	swap(data->skb, skb);
 	spin_unlock_irqrestore(&data->lock, flags);
+
+	if (skb) {
+		struct nlmsghdr *nlh = (struct nlmsghdr *)skb->data;
+		struct genlmsghdr *gnlh = (struct genlmsghdr *)nlmsg_data(nlh);
+
+		genlmsg_end(skb, genlmsg_data(gnlh));
+	}
 
 	return skb;
 }
@@ -138,6 +159,7 @@ static void sched_send_work(unsigned long _data)
 static void trace_drop_common(struct sk_buff *skb, void *location)
 {
 	struct net_dm_alert_msg *msg;
+	struct net_dm_drop_point *point;
 	struct nlmsghdr *nlh;
 	struct nlattr *nla;
 	int i;
@@ -156,11 +178,13 @@ static void trace_drop_common(struct sk_buff *skb, void *location)
 	nlh = (struct nlmsghdr *)dskb->data;
 	nla = genlmsg_data(nlmsg_data(nlh));
 	msg = nla_data(nla);
+	point = msg->points;
 	for (i = 0; i < msg->entries; i++) {
-		if (!memcmp(&location, msg->points[i].pc, sizeof(void *))) {
-			msg->points[i].count++;
+		if (!memcmp(&location, &point->pc, sizeof(void *))) {
+			point->count++;
 			goto out;
 		}
+		point++;
 	}
 	if (msg->entries == dm_hit_limit)
 		goto out;
@@ -169,8 +193,8 @@ static void trace_drop_common(struct sk_buff *skb, void *location)
 	 */
 	__nla_reserve_nohdr(dskb, sizeof(struct net_dm_drop_point));
 	nla->nla_len += NLA_ALIGN(sizeof(struct net_dm_drop_point));
-	memcpy(msg->points[msg->entries].pc, &location, sizeof(void *));
-	msg->points[msg->entries].count = 1;
+	memcpy(point->pc, &location, sizeof(void *));
+	point->count = 1;
 	msg->entries++;
 
 	if (!timer_pending(&data->send_timer)) {

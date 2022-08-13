@@ -115,7 +115,7 @@ static ssize_t hidraw_send_report(struct file *file, const char __user *buffer, 
 	unsigned int minor = iminor(file_inode(file));
 	struct hid_device *dev;
 	__u8 *buf;
-	int ret = 0;
+	long ret = 0;
 
 	if (!hidraw_table[minor] || !hidraw_table[minor]->exist) {
 		ret = -ENODEV;
@@ -192,6 +192,11 @@ static ssize_t hidraw_get_report(struct file *file, char __user *buffer, size_t 
 	int ret = 0, len;
 	unsigned char report_number;
 
+	if (!hidraw_table[minor] || !hidraw_table[minor]->exist) {
+		ret = -ENODEV;
+		goto out;
+	}
+
 	dev = hidraw_table[minor]->hid;
 
 	if (!dev->ll_driver->raw_request) {
@@ -252,13 +257,14 @@ out:
 static unsigned int hidraw_poll(struct file *file, poll_table *wait)
 {
 	struct hidraw_list *list = file->private_data;
+	unsigned int mask = POLLOUT | POLLWRNORM; /* hidraw is always writable */
 
 	poll_wait(file, &list->hidraw->wait, wait);
 	if (list->head != list->tail)
-		return POLLIN | POLLRDNORM;
+		mask |= POLLIN | POLLRDNORM;
 	if (!list->hidraw->exist)
-		return POLLERR | POLLHUP;
-	return 0;
+		mask |= POLLERR | POLLHUP;
+	return mask;
 }
 
 static int hidraw_open(struct inode *inode, struct file *file)
@@ -373,7 +379,7 @@ static long hidraw_ioctl(struct file *file, unsigned int cmd,
 
 	mutex_lock(&minors_lock);
 	dev = hidraw_table[minor];
-	if (!dev) {
+	if (!dev || !dev->exist) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -491,6 +497,7 @@ int hidraw_report_event(struct hid_device *hid, u8 *data, int len)
 		if (new_head == list->tail)
 			continue;
 
+		kfree(list->buffer[list->head].value);
 		if (!(list->buffer[list->head].value = kmemdup(data, len, GFP_ATOMIC))) {
 			ret = -ENOMEM;
 			break;

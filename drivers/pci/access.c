@@ -185,17 +185,13 @@ EXPORT_SYMBOL(pci_bus_set_ops);
 static DECLARE_WAIT_QUEUE_HEAD(pci_cfg_wait);
 
 static noinline void pci_wait_cfg(struct pci_dev *dev)
+	__must_hold(&pci_lock)
 {
-	DECLARE_WAITQUEUE(wait, current);
-
-	__add_wait_queue(&pci_cfg_wait, &wait);
 	do {
-		set_current_state(TASK_UNINTERRUPTIBLE);
 		raw_spin_unlock_irq(&pci_lock);
-		schedule();
+		wait_event(pci_cfg_wait, !dev->block_cfg_access);
 		raw_spin_lock_irq(&pci_lock);
 	} while (dev->block_cfg_access);
-	__remove_wait_queue(&pci_cfg_wait, &wait);
 }
 
 /* Returns 0 on success, negative values indicate error. */
@@ -672,8 +668,9 @@ void pci_cfg_access_unlock(struct pci_dev *dev)
 	WARN_ON(!dev->block_cfg_access);
 
 	dev->block_cfg_access = 0;
-	wake_up_all(&pci_cfg_wait);
 	raw_spin_unlock_irqrestore(&pci_lock, flags);
+
+	wake_up_all(&pci_cfg_wait);
 }
 EXPORT_SYMBOL_GPL(pci_cfg_access_unlock);
 

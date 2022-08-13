@@ -344,6 +344,26 @@ static inline bool css_tryget_online(struct cgroup_subsys_state *css)
 }
 
 /**
+ * css_is_dying - test whether the specified css is dying
+ * @css: target css
+ *
+ * Test whether @css is in the process of offlining or already offline.  In
+ * most cases, ->css_online() and ->css_offline() callbacks should be
+ * enough; however, the actual offline operations are RCU delayed and this
+ * test returns %true also when @css is scheduled to be offlined.
+ *
+ * This is useful, for example, when the use case requires synchronous
+ * behavior with respect to cgroup removal.  cgroup removal schedules css
+ * offlining but the css can seem alive while the operation is being
+ * delayed.  If the delay affects user visible semantics, this test can be
+ * used to resolve the situation.
+ */
+static inline bool css_is_dying(struct cgroup_subsys_state *css)
+{
+	return !(css->flags & CSS_NO_REF) && percpu_ref_is_dying(&css->refcnt);
+}
+
+/**
  * css_put - put a css reference
  * @css: target css
  *
@@ -442,7 +462,7 @@ static inline struct cgroup_subsys_state *task_css(struct task_struct *task,
  *
  * Find the css for the (@task, @subsys_id) combination, increment a
  * reference on and return it.  This function is guaranteed to return a
- * valid css.
+ * valid css.  The returned css may already have been offlined.
  */
 static inline struct cgroup_subsys_state *
 task_get_css(struct task_struct *task, int subsys_id)
@@ -452,7 +472,13 @@ task_get_css(struct task_struct *task, int subsys_id)
 	rcu_read_lock();
 	while (true) {
 		css = task_css(task, subsys_id);
-		if (likely(css_tryget_online(css)))
+		/*
+		 * Can't use css_tryget_online() here.  A task which has
+		 * PF_EXITING set may stay associated with an offline css.
+		 * If such task calls this function, css_tryget_online()
+		 * will keep failing.
+		 */
+		if (likely(css_tryget(css)))
 			break;
 		cpu_relax();
 	}
@@ -570,6 +596,25 @@ static inline void pr_cont_cgroup_path(struct cgroup *cgrp)
 	pr_cont_kernfs_path(cgrp->kn);
 }
 
+static inline void cgroup_init_kthreadd(void)
+{
+	/*
+	 * kthreadd is inherited by all kthreads, keep it in the root so
+	 * that the new kthreads are guaranteed to stay in the root until
+	 * initialization is finished.
+	 */
+	current->no_cgroup_migration = 1;
+}
+
+static inline void cgroup_kthread_ready(void)
+{
+	/*
+	 * This kthread finished initialization.  The creator should have
+	 * set PF_NO_SETAFFINITY if this kthread should stay in the root.
+	 */
+	current->no_cgroup_migration = 0;
+}
+
 #else /* !CONFIG_CGROUPS */
 
 struct cgroup_subsys_state;
@@ -590,6 +635,8 @@ static inline void cgroup_free(struct task_struct *p) {}
 
 static inline int cgroup_init_early(void) { return 0; }
 static inline int cgroup_init(void) { return 0; }
+static inline void cgroup_init_kthreadd(void) {}
+static inline void cgroup_kthread_ready(void) {}
 
 static inline bool task_under_cgroup_hierarchy(struct task_struct *task,
 					       struct cgroup *ancestor)
@@ -610,6 +657,7 @@ extern spinlock_t cgroup_sk_update_lock;
 
 void cgroup_sk_alloc_disable(void);
 void cgroup_sk_alloc(struct sock_cgroup_data *skcd);
+void cgroup_sk_clone(struct sock_cgroup_data *skcd);
 void cgroup_sk_free(struct sock_cgroup_data *skcd);
 
 static inline struct cgroup *sock_cgroup_ptr(struct sock_cgroup_data *skcd)
@@ -623,7 +671,7 @@ static inline struct cgroup *sock_cgroup_ptr(struct sock_cgroup_data *skcd)
 	 */
 	v = READ_ONCE(skcd->val);
 
-	if (v & 1)
+	if (v & 3)
 		return &cgrp_dfl_root.cgrp;
 
 	return (struct cgroup *)(unsigned long)v ?: &cgrp_dfl_root.cgrp;
@@ -635,6 +683,7 @@ static inline struct cgroup *sock_cgroup_ptr(struct sock_cgroup_data *skcd)
 #else	/* CONFIG_CGROUP_DATA */
 
 static inline void cgroup_sk_alloc(struct sock_cgroup_data *skcd) {}
+static inline void cgroup_sk_clone(struct sock_cgroup_data *skcd) {}
 static inline void cgroup_sk_free(struct sock_cgroup_data *skcd) {}
 
 #endif	/* CONFIG_CGROUP_DATA */

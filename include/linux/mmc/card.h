@@ -1,6 +1,8 @@
 /*
  *  linux/include/linux/mmc/card.h
  *
+ *  Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
@@ -14,6 +16,8 @@
 #include <linux/mmc/core.h>
 #include <linux/mod_devicetable.h>
 
+#define MMC_CARD_CMDQ_BLK_SIZE 512
+#define MAX_CARDS_NUM 4
 struct mmc_cid {
 	unsigned int		manfid;
 	char			prod_name[8];
@@ -82,6 +86,7 @@ struct mmc_ext_csd {
 	bool			hpi_en;			/* HPI enablebit */
 	bool			hpi;			/* HPI support bit */
 	unsigned int		hpi_cmd;		/* cmd used as HPI */
+	bool			ffu_mode_op;		/* FFU mode operation */
 	bool			bkops;		/* background support bit */
 	bool			man_bkops_en;	/* manual bkops enable bit */
 	unsigned int            data_sector_size;       /* 512 bytes or 4KB */
@@ -119,6 +124,12 @@ struct mmc_ext_csd {
 	u8			raw_pwr_cl_ddr_200_360;	/* 253 */
 	u8			raw_bkops_status;	/* 246 */
 	u8			raw_sectors[4];		/* 212 - 4 bytes */
+	u8			pre_eol_info;		/* 267 */
+	u8			device_life_time_est_typ_a;	/* 268 */
+	u8			device_life_time_est_typ_b;	/* 269 */
+	u8			cmdq_mode_en;		/* 15 */
+	u8			cmdq_depth;		/* 307 */
+	u8			cmdq_support;		/* 308 */
 
 	unsigned int            feature_support;
 #define MMC_DISCARD_FEATURE	BIT(0)                  /* CMD38 feature */
@@ -157,6 +168,7 @@ struct sd_switch_caps {
 #define UHS_SDR50_BUS_SPEED	2
 #define UHS_SDR104_BUS_SPEED	3
 #define UHS_DDR50_BUS_SPEED	4
+#define UHS_HS400_BUS_SPEED	5
 
 #define SD_MODE_HIGH_SPEED	(1 << HIGH_SPEED_BUS_SPEED)
 #define SD_MODE_UHS_SDR12	(1 << UHS_SDR12_BUS_SPEED)
@@ -264,6 +276,11 @@ struct mmc_card {
 #define MMC_CARD_REMOVED	(1<<4)		/* card has been removed */
 #define MMC_STATE_DOING_BKOPS	(1<<5)		/* card is doing BKOPS */
 #define MMC_STATE_SUSPENDED	(1<<6)		/* card is suspended */
+#define MMC_STATE_CMDQ		(1<<8)		/* card is in cmd queue mode */
+#define MMC_STATE_SLEEP		(1<<9)		/* card is in sleep mode */
+#define MMC_STATE_CMDQ_HALT	(1<<10)		/* card is in cmd queue halt mode */
+#define MMC_STATE_CMDQ_PAUSE	(1<<11)
+#define MMC_STATE_ULTRAHIGHSPEED (1<<12) /* card is in ultra high speed mode*/
 	unsigned int		quirks; 	/* card quirks */
 #define MMC_QUIRK_LENIENT_FN0	(1<<0)		/* allow SDIO FN0 writes outside of the VS CCCR range */
 #define MMC_QUIRK_BLKSZ_FOR_BYTE_MODE (1<<1)	/* use func->cur_blksize */
@@ -288,6 +305,7 @@ struct mmc_card {
  	unsigned int		pref_erase;	/* in sectors */
 	unsigned int		eg_boundary;	/* don't cross erase-group boundaries */
  	u8			erased_byte;	/* value of erased bytes */
+	u8			speed_class;	/* speed class of the card */
 
 	u32			raw_cid[4];	/* raw card CID */
 	u32			raw_csd[4];	/* raw card CSD */
@@ -316,6 +334,7 @@ struct mmc_card {
 	struct dentry		*debugfs_root;
 	struct mmc_part	part[MMC_NUM_PHY_PARTITION]; /* physical partitions */
 	unsigned int    nr_parts;
+	bool			cmdq_init;	/* cmdq init done */
 };
 
 /*
@@ -452,7 +471,12 @@ static inline void __maybe_unused remove_quirk(struct mmc_card *card, int data)
 #define mmc_card_ext_capacity(c) ((c)->state & MMC_CARD_SDXC)
 #define mmc_card_removed(c)	((c) && ((c)->state & MMC_CARD_REMOVED))
 #define mmc_card_doing_bkops(c)	((c)->state & MMC_STATE_DOING_BKOPS)
+#define mmc_sd_card_uhs(c)  ((c)->state & MMC_STATE_ULTRAHIGHSPEED)
 #define mmc_card_suspended(c)	((c)->state & MMC_STATE_SUSPENDED)
+#define mmc_card_cmdq(c)   ((c)->state & MMC_STATE_CMDQ)
+#define mmc_card_cmdq_halt(c)   ((c)->state & MMC_STATE_CMDQ_HALT)
+#define mmc_card_cmdq_pause(c)   ((c)->state & MMC_STATE_CMDQ_PAUSE)
+#define mmc_card_in_sleep(c)	((c)->state & MMC_STATE_SLEEP)
 
 #define mmc_card_set_present(c)	((c)->state |= MMC_STATE_PRESENT)
 #define mmc_card_set_readonly(c) ((c)->state |= MMC_STATE_READONLY)
@@ -460,9 +484,19 @@ static inline void __maybe_unused remove_quirk(struct mmc_card *card, int data)
 #define mmc_card_set_ext_capacity(c) ((c)->state |= MMC_CARD_SDXC)
 #define mmc_card_set_removed(c) ((c)->state |= MMC_CARD_REMOVED)
 #define mmc_card_set_doing_bkops(c)	((c)->state |= MMC_STATE_DOING_BKOPS)
+#define mmc_card_set_sleep(c)	((c)->state |= MMC_STATE_SLEEP)
 #define mmc_card_clr_doing_bkops(c)	((c)->state &= ~MMC_STATE_DOING_BKOPS)
 #define mmc_card_set_suspended(c) ((c)->state |= MMC_STATE_SUSPENDED)
 #define mmc_card_clr_suspended(c) ((c)->state &= ~MMC_STATE_SUSPENDED)
+#define mmc_card_set_cmdq(c)       ((c)->state |= MMC_STATE_CMDQ)
+#define mmc_card_clr_cmdq(c)       ((c)->state &= ~MMC_STATE_CMDQ)
+#define mmc_card_clr_sleep(c)	((c)->state &= ~MMC_STATE_SLEEP)
+#define mmc_sd_card_set_uhs(c)	((c)->state &= ~MMC_STATE_ULTRAHIGHSPEED)
+#define mmc_card_set_cmdq_halt(c)       ((c)->state |= MMC_STATE_CMDQ_HALT)
+#define mmc_card_clr_cmdq_halt(c)       ((c)->state &= ~MMC_STATE_CMDQ_HALT)
+#define mmc_card_set_cmdq_pause(c)       ((c)->state |= MMC_STATE_CMDQ_PAUSE)
+#define mmc_card_clr_cmdq_pause(c)       ((c)->state &= ~MMC_STATE_CMDQ_PAUSE)
+#define mmc_card_clr_sleep(c)	((c)->state &= ~MMC_STATE_SLEEP)
 
 /*
  * Quirk add/remove for MMC products.
@@ -553,10 +587,11 @@ struct mmc_driver {
 	void (*shutdown)(struct mmc_card *);
 };
 
+extern struct mmc_card *mmc_cards[MAX_CARDS_NUM];
+
 extern int mmc_register_driver(struct mmc_driver *);
 extern void mmc_unregister_driver(struct mmc_driver *);
 
 extern void mmc_fixup_device(struct mmc_card *card,
 			     const struct mmc_fixup *table);
-
 #endif /* LINUX_MMC_CARD_H */

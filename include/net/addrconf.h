@@ -20,6 +20,8 @@
 #define ADDRCONF_TIMER_FUZZ		(HZ / 4)
 #define ADDRCONF_TIMER_FUZZ_MAX		(HZ)
 
+#define ADDRCONF_NOTIFY_PRIORITY	0
+
 #include <linux/in.h>
 #include <linux/in6.h>
 
@@ -204,8 +206,10 @@ struct ipv6_stub {
 				 const struct in6_addr *addr);
 	int (*ipv6_sock_mc_drop)(struct sock *sk, int ifindex,
 				 const struct in6_addr *addr);
-	int (*ipv6_dst_lookup)(struct net *net, struct sock *sk,
-			       struct dst_entry **dst, struct flowi6 *fl6);
+	struct dst_entry *(*ipv6_dst_lookup_flow)(struct net *net,
+						  const struct sock *sk,
+						  struct flowi6 *fl6,
+						  const struct in6_addr *final_dst);
 	void (*udpv6_encap_enable)(void);
 	void (*ndisc_send_na)(struct net_device *dev, const struct in6_addr *daddr,
 			      const struct in6_addr *solicited_addr,
@@ -242,6 +246,8 @@ static inline bool ipv6_is_mld(struct sk_buff *skb, int nexthdr, int offset)
 void addrconf_prefix_rcv(struct net_device *dev,
 			 u8 *opt, int len, bool sllao);
 
+u32 addrconf_rt_table(const struct net_device *dev, u32 default_table);
+
 /*
  *	anycast prototypes (anycast.c)
  */
@@ -249,6 +255,7 @@ int ipv6_sock_ac_join(struct sock *sk, int ifindex,
 		      const struct in6_addr *addr);
 int ipv6_sock_ac_drop(struct sock *sk, int ifindex,
 		      const struct in6_addr *addr);
+void __ipv6_sock_ac_close(struct sock *sk);
 void ipv6_sock_ac_close(struct sock *sk);
 
 int __ipv6_dev_ac_inc(struct inet6_dev *idev, const struct in6_addr *addr);

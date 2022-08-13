@@ -470,12 +470,31 @@ void mlx4_init_quotas(struct mlx4_dev *dev)
 		priv->mfunc.master.res_tracker.res_alloc[RES_MPT].quota[pf];
 }
 
-static int get_max_gauranteed_vfs_counter(struct mlx4_dev *dev)
+static int
+mlx4_calc_res_counter_guaranteed(struct mlx4_dev *dev,
+				 struct resource_allocator *res_alloc,
+				 int vf)
 {
-	/* reduce the sink counter */
-	return (dev->caps.max_counters - 1 -
-		(MLX4_PF_COUNTERS_PER_PORT * MLX4_MAX_PORTS))
-		/ MLX4_MAX_PORTS;
+	struct mlx4_active_ports actv_ports;
+	int ports, counters_guaranteed;
+
+	/* For master, only allocate according to the number of phys ports */
+	if (vf == mlx4_master_func_num(dev))
+		return MLX4_PF_COUNTERS_PER_PORT * dev->caps.num_ports;
+
+	/* calculate real number of ports for the VF */
+	actv_ports = mlx4_get_active_ports(dev, vf);
+	ports = bitmap_weight(actv_ports.ports, dev->caps.num_ports);
+	counters_guaranteed = ports * MLX4_VF_COUNTERS_PER_PORT;
+
+	/* If we do not have enough counters for this VF, do not
+	 * allocate any for it. '-1' to reduce the sink counter.
+	 */
+	if ((res_alloc->res_reserved + counters_guaranteed) >
+	    (dev->caps.max_counters - 1))
+		return 0;
+
+	return counters_guaranteed;
 }
 
 int mlx4_init_resource_tracker(struct mlx4_dev *dev)
@@ -483,7 +502,6 @@ int mlx4_init_resource_tracker(struct mlx4_dev *dev)
 	struct mlx4_priv *priv = mlx4_priv(dev);
 	int i, j;
 	int t;
-	int max_vfs_guarantee_counter = get_max_gauranteed_vfs_counter(dev);
 
 	priv->mfunc.master.res_tracker.slave_list =
 		kzalloc(dev->num_slaves * sizeof(struct slave_list),
@@ -600,16 +618,8 @@ int mlx4_init_resource_tracker(struct mlx4_dev *dev)
 				break;
 			case RES_COUNTER:
 				res_alloc->quota[t] = dev->caps.max_counters;
-				if (t == mlx4_master_func_num(dev))
-					res_alloc->guaranteed[t] =
-						MLX4_PF_COUNTERS_PER_PORT *
-						MLX4_MAX_PORTS;
-				else if (t <= max_vfs_guarantee_counter)
-					res_alloc->guaranteed[t] =
-						MLX4_VF_COUNTERS_PER_PORT *
-						MLX4_MAX_PORTS;
-				else
-					res_alloc->guaranteed[t] = 0;
+				res_alloc->guaranteed[t] =
+					mlx4_calc_res_counter_guaranteed(dev, res_alloc, t);
 				res_alloc->res_free -= res_alloc->guaranteed[t];
 				break;
 			default:
@@ -2677,13 +2687,13 @@ static int qp_get_mtt_size(struct mlx4_qp_context *qpc)
 	int total_pages;
 	int total_mem;
 	int page_offset = (be32_to_cpu(qpc->params2) >> 6) & 0x3f;
+	int tot;
 
 	sq_size = 1 << (log_sq_size + log_sq_sride + 4);
 	rq_size = (srq|rss|xrc) ? 0 : (1 << (log_rq_size + log_rq_stride + 4));
 	total_mem = sq_size + rq_size;
-	total_pages =
-		roundup_pow_of_two((total_mem + (page_offset << 6)) >>
-				   page_shift);
+	tot = (total_mem + (page_offset << 6)) >> page_shift;
+	total_pages = !tot ? 1 : roundup_pow_of_two(tot);
 
 	return total_pages;
 }
@@ -2916,7 +2926,7 @@ int mlx4_RST2INIT_QP_wrapper(struct mlx4_dev *dev, int slave,
 	u32 srqn = qp_get_srqn(qpc) & 0xffffff;
 	int use_srq = (qp_get_srqn(qpc) >> 24) & 1;
 	struct res_srq *srq;
-	int local_qpn = be32_to_cpu(qpc->local_qpn) & 0xffffff;
+	int local_qpn = vhcr->in_modifier & 0xffffff;
 
 	err = adjust_qp_sched_queue(dev, slave, qpc, inbox);
 	if (err)
@@ -2980,6 +2990,9 @@ int mlx4_RST2INIT_QP_wrapper(struct mlx4_dev *dev, int slave,
 		put_res(dev, slave, srqn, RES_SRQ);
 		qp->srq = srq;
 	}
+
+	/* Save param3 for dynamic changes from VST back to VGT */
+	qp->param3 = qpc->param3;
 	put_res(dev, slave, rcqn, RES_CQ);
 	put_res(dev, slave, mtt_base, RES_MTT);
 	res_end_move(dev, slave, RES_QP, qpn);
@@ -3772,7 +3785,6 @@ int mlx4_INIT2RTR_QP_wrapper(struct mlx4_dev *dev, int slave,
 	int qpn = vhcr->in_modifier & 0x7fffff;
 	struct res_qp *qp;
 	u8 orig_sched_queue;
-	__be32	orig_param3 = qpc->param3;
 	u8 orig_vlan_control = qpc->pri_path.vlan_control;
 	u8 orig_fvl_rx = qpc->pri_path.fvl_rx;
 	u8 orig_pri_path_fl = qpc->pri_path.fl;
@@ -3814,7 +3826,6 @@ out:
 	 */
 	if (!err) {
 		qp->sched_queue = orig_sched_queue;
-		qp->param3	= orig_param3;
 		qp->vlan_control = orig_vlan_control;
 		qp->fvl_rx	=  orig_fvl_rx;
 		qp->pri_path_fl = orig_pri_path_fl;
@@ -4164,22 +4175,6 @@ static int validate_eth_header_mac(int slave, struct _rule_hw *eth_header,
 	return 0;
 }
 
-static void handle_eth_header_mcast_prio(struct mlx4_net_trans_rule_hw_ctrl *ctrl,
-					 struct _rule_hw *eth_header)
-{
-	if (is_multicast_ether_addr(eth_header->eth.dst_mac) ||
-	    is_broadcast_ether_addr(eth_header->eth.dst_mac)) {
-		struct mlx4_net_trans_rule_hw_eth *eth =
-			(struct mlx4_net_trans_rule_hw_eth *)eth_header;
-		struct _rule_hw *next_rule = (struct _rule_hw *)(eth + 1);
-		bool last_rule = next_rule->size == 0 && next_rule->id == 0 &&
-			next_rule->rsvd == 0;
-
-		if (last_rule)
-			ctrl->prio = cpu_to_be16(MLX4_DOMAIN_NIC);
-	}
-}
-
 /*
  * In case of missing eth header, append eth header with a MAC address
  * assigned to the VF.
@@ -4363,10 +4358,7 @@ int mlx4_QP_FLOW_STEERING_ATTACH_wrapper(struct mlx4_dev *dev, int slave,
 	header_id = map_hw_to_sw_id(be16_to_cpu(rule_header->id));
 
 	if (header_id == MLX4_NET_TRANS_RULE_ID_ETH)
-		handle_eth_header_mcast_prio(ctrl, rule_header);
-
-	if (slave == dev->caps.function)
-		goto execute;
+		mlx4_handle_eth_header_mcast_prio(ctrl, rule_header);
 
 	switch (header_id) {
 	case MLX4_NET_TRANS_RULE_ID_ETH:
@@ -4394,7 +4386,6 @@ int mlx4_QP_FLOW_STEERING_ATTACH_wrapper(struct mlx4_dev *dev, int slave,
 		goto err_put_qp;
 	}
 
-execute:
 	err = mlx4_cmd_imm(dev, inbox->dma, &vhcr->out_param,
 			   vhcr->in_modifier, 0,
 			   MLX4_QP_FLOW_STEERING_ATTACH, MLX4_CMD_TIME_CLASS_A,
@@ -4473,6 +4464,7 @@ int mlx4_QP_FLOW_STEERING_DETACH_wrapper(struct mlx4_dev *dev, int slave,
 	struct res_qp *rqp;
 	struct res_fs_rule *rrule;
 	u64 mirr_reg_id;
+	int qpn;
 
 	if (dev->caps.steering_mode !=
 	    MLX4_STEERING_MODE_DEVICE_MANAGED)
@@ -4489,10 +4481,11 @@ int mlx4_QP_FLOW_STEERING_DETACH_wrapper(struct mlx4_dev *dev, int slave,
 	}
 	mirr_reg_id = rrule->mirr_rule_id;
 	kfree(rrule->mirr_mbox);
+	qpn = rrule->qpn;
 
 	/* Release the rule form busy state before removal */
 	put_res(dev, slave, vhcr->in_param, RES_FS_RULE);
-	err = get_res(dev, slave, rrule->qpn, RES_QP, &rqp);
+	err = get_res(dev, slave, qpn, RES_QP, &rqp);
 	if (err)
 		return err;
 
@@ -4517,7 +4510,7 @@ int mlx4_QP_FLOW_STEERING_DETACH_wrapper(struct mlx4_dev *dev, int slave,
 	if (!err)
 		atomic_dec(&rqp->ref_count);
 out:
-	put_res(dev, slave, rrule->qpn, RES_QP);
+	put_res(dev, slave, qpn, RES_QP);
 	return err;
 }
 
@@ -5065,6 +5058,7 @@ static void rem_slave_fs_rule(struct mlx4_dev *dev, int slave)
 						 &tracker->res_tree[RES_FS_RULE]);
 					list_del(&fs_rule->com.list);
 					spin_unlock_irq(mlx4_tlock(dev));
+					kfree(fs_rule->mirr_mbox);
 					kfree(fs_rule);
 					state = 0;
 					break;
@@ -5231,6 +5225,13 @@ void mlx4_delete_all_resources_for_slave(struct mlx4_dev *dev, int slave)
 	mutex_unlock(&priv->mfunc.master.res_tracker.slave_list[slave].mutex);
 }
 
+static void update_qos_vpp(struct mlx4_update_qp_context *ctx,
+			   struct mlx4_vf_immed_vlan_work *work)
+{
+	ctx->qp_mask |= cpu_to_be64(1ULL << MLX4_UPD_QP_MASK_QOS_VPP);
+	ctx->qp_context.qos_vport = work->qos_vport;
+}
+
 void mlx4_vf_immed_vlan_work_handler(struct work_struct *_work)
 {
 	struct mlx4_vf_immed_vlan_work *work =
@@ -5345,11 +5346,10 @@ void mlx4_vf_immed_vlan_work_handler(struct work_struct *_work)
 					qp->sched_queue & 0xC7;
 				upd_context->qp_context.pri_path.sched_queue |=
 					((work->qos & 0x7) << 3);
-				upd_context->qp_mask |=
-					cpu_to_be64(1ULL <<
-						    MLX4_UPD_QP_MASK_QOS_VPP);
-				upd_context->qp_context.qos_vport =
-					work->qos_vport;
+
+				if (dev->caps.flags2 &
+				    MLX4_DEV_CAP_FLAG2_QOS_VPP)
+					update_qos_vpp(upd_context, work);
 			}
 
 			err = mlx4_cmd(dev, mailbox->dma,

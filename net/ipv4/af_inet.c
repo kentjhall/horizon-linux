@@ -89,6 +89,7 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/random.h>
 #include <linux/slab.h>
+#include <linux/netfilter/xt_qtaguid.h>
 
 #include <asm/uaccess.h>
 
@@ -121,6 +122,30 @@
 #endif
 #include <net/l3mdev.h>
 
+#ifdef CONFIG_ANDROID_PARANOID_NETWORK
+#include <linux/android_aid.h>
+
+static inline int current_has_network(void)
+{
+	return in_egroup_p(AID_INET) || capable(CAP_NET_RAW);
+}
+
+static inline int net_bind_service_capable(struct user_namespace *ns)
+{
+	return in_egroup_p(AID_NET_BIND_SERVICE) ||
+		ns_capable(ns, CAP_NET_BIND_SERVICE);
+}
+#else
+static inline int current_has_network(void)
+{
+	return 1;
+}
+
+static inline int net_bind_service_capable(struct user_namespace *ns)
+{
+	return ns_capable(ns, CAP_NET_BIND_SERVICE);
+}
+#endif
 
 /* The inetsw table contains everything that inet_create needs to
  * build a new socket.
@@ -255,6 +280,9 @@ static int inet_create(struct net *net, struct socket *sock, int protocol,
 	if (protocol < 0 || protocol >= IPPROTO_MAX)
 		return -EINVAL;
 
+	if (!current_has_network())
+		return -EACCES;
+
 	sock->state = SS_UNCONNECTED;
 
 	/* Look for the requested type/protocol pair. */
@@ -303,8 +331,7 @@ lookup_protocol:
 	}
 
 	err = -EPERM;
-	if (sock->type == SOCK_RAW && !kern &&
-	    !ns_capable(net->user_ns, CAP_NET_RAW))
+	if (sock->type == SOCK_RAW && !kern && !capable(CAP_NET_RAW))
 		goto out_rcu_unlock;
 
 	sock->ops = answer->ops;
@@ -397,6 +424,9 @@ int inet_release(struct socket *sock)
 	if (sk) {
 		long timeout;
 
+#ifdef CONFIG_NETFILTER_XT_MATCH_QTAGUID
+		qtaguid_untag(sock, true);
+#endif
 		/* Applications forget to leave groups before exiting */
 		ip_mc_drop_socket(sk);
 
@@ -470,7 +500,7 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	snum = ntohs(addr->sin_port);
 	err = -EACCES;
 	if (snum && snum < PROT_SOCK &&
-	    !ns_capable(net->user_ns, CAP_NET_BIND_SERVICE))
+	    !net_bind_service_capable(net->user_ns))
 		goto out;
 
 	/*      We keep a pair of addresses. rcv_saddr is the one
@@ -566,13 +596,24 @@ int __inet_stream_connect(struct socket *sock, struct sockaddr *uaddr,
 	int err;
 	long timeo;
 
-	if (addr_len < sizeof(uaddr->sa_family))
-		return -EINVAL;
+	/*
+	 * uaddr can be NULL and addr_len can be 0 if:
+	 * sk is a TCP fastopen active socket and
+	 * TCP_FASTOPEN_CONNECT sockopt is set and
+	 * we already have a valid cookie for this socket.
+	 * In this case, user can call write() after connect().
+	 * write() will invoke tcp_sendmsg_fastopen() which calls
+	 * __inet_stream_connect().
+	 */
+	if (uaddr) {
+		if (addr_len < sizeof(uaddr->sa_family))
+			return -EINVAL;
 
-	if (uaddr->sa_family == AF_UNSPEC) {
-		err = sk->sk_prot->disconnect(sk, flags);
-		sock->state = err ? SS_DISCONNECTING : SS_UNCONNECTED;
-		goto out;
+		if (uaddr->sa_family == AF_UNSPEC) {
+			err = sk->sk_prot->disconnect(sk, flags);
+			sock->state = err ? SS_DISCONNECTING : SS_UNCONNECTED;
+			goto out;
+		}
 	}
 
 	switch (sock->state) {
@@ -583,7 +624,10 @@ int __inet_stream_connect(struct socket *sock, struct sockaddr *uaddr,
 		err = -EISCONN;
 		goto out;
 	case SS_CONNECTING:
-		err = -EALREADY;
+		if (inet_sk(sk)->defer_connect)
+			err = -EINPROGRESS;
+		else
+			err = -EALREADY;
 		/* Fall out of switch with err, set for this state */
 		break;
 	case SS_UNCONNECTED:
@@ -596,6 +640,9 @@ int __inet_stream_connect(struct socket *sock, struct sockaddr *uaddr,
 			goto out;
 
 		sock->state = SS_CONNECTING;
+
+		if (!err && inet_sk(sk)->defer_connect)
+			goto out;
 
 		/* Just entered SS_CONNECTING state; the only
 		 * difference is that return value in non-blocking
@@ -1015,7 +1062,7 @@ static struct inet_protosw inetsw_array[] =
 		.type =       SOCK_DGRAM,
 		.protocol =   IPPROTO_ICMP,
 		.prot =       &ping_prot,
-		.ops =        &inet_dgram_ops,
+		.ops =        &inet_sockraw_ops,
 		.flags =      INET_PROTOSW_REUSE,
        },
 
@@ -1277,6 +1324,7 @@ struct sk_buff *inet_gso_segment(struct sk_buff *skb,
 		if (encap)
 			skb_reset_inner_headers(skb);
 		skb->network_header = (u8 *)iph - skb->head;
+		skb_reset_mac_len(skb);
 	} while ((skb = skb->next));
 
 out:
@@ -1460,8 +1508,10 @@ int inet_gro_complete(struct sk_buff *skb, int nhoff)
 	int proto = iph->protocol;
 	int err = -ENOSYS;
 
-	if (skb->encapsulation)
+	if (skb->encapsulation) {
+		skb_set_inner_protocol(skb, cpu_to_be16(ETH_P_IP));
 		skb_set_inner_network_header(skb, nhoff);
+	}
 
 	csum_replace2(&iph->check, iph->tot_len, newlen);
 	iph->tot_len = newlen;
@@ -1690,6 +1740,13 @@ static __net_init int inet_init_net(struct net *net)
 	net->ipv4.sysctl_ip_default_ttl = IPDEFTTL;
 	net->ipv4.sysctl_ip_dynaddr = 0;
 	net->ipv4.sysctl_ip_early_demux = 1;
+
+	/* Some igmp sysctl, whose values are always used */
+	net->ipv4.sysctl_igmp_max_memberships = 20;
+	net->ipv4.sysctl_igmp_max_msf = 10;
+	/* IGMP reports for link-local multicast groups are enabled by default */
+	net->ipv4.sysctl_igmp_llm_reports = 1;
+	net->ipv4.sysctl_igmp_qrv = 2;
 
 	return 0;
 }

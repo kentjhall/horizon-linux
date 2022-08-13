@@ -200,6 +200,7 @@ void device_unblock_probing(void)
 	defer_all_probes = false;
 	driver_deferred_probe_trigger();
 }
+EXPORT_SYMBOL_GPL(device_unblock_probing);
 
 /**
  * deferred_probe_initcall() - Enable probing of deferred devices
@@ -341,7 +342,11 @@ static int really_probe(struct device *dev, struct device_driver *drv)
 	atomic_inc(&probe_count);
 	pr_debug("bus: '%s': %s: probing driver %s with device %s\n",
 		 drv->bus->name, __func__, drv->name, dev_name(dev));
-	WARN_ON(!list_empty(&dev->devres_head));
+	if (!list_empty(&dev->devres_head)) {
+		dev_crit(dev, "Resources present before probing\n");
+		ret = -EBUSY;
+		goto done;
+	}
 
 re_probe:
 	dev->driver = drv;
@@ -362,14 +367,6 @@ re_probe:
 		if (ret)
 			goto probe_failed;
 	}
-
-	/*
-	 * Ensure devices are listed in devices_kset in correct order
-	 * It's important to move Dev to the end of devices_kset before
-	 * calling .probe, because it could be recursive and parent Dev
-	 * should always go first
-	 */
-	devices_kset_move_last(dev);
 
 	if (dev->bus->probe) {
 		ret = dev->bus->probe(dev);
@@ -451,7 +448,7 @@ pinctrl_bind_failed:
 	ret = 0;
 done:
 	atomic_dec(&probe_count);
-	wake_up(&probe_waitqueue);
+	wake_up_all(&probe_waitqueue);
 	return ret;
 }
 

@@ -215,16 +215,21 @@ static irqreturn_t ms5611_trigger_handler(int irq, void *p)
 	struct iio_poll_func *pf = p;
 	struct iio_dev *indio_dev = pf->indio_dev;
 	struct ms5611_state *st = iio_priv(indio_dev);
-	s32 buf[4]; /* s32 (pressure) + s32 (temp) + 2 * s32 (timestamp) */
+	/* Ensure buffer elements are naturally aligned */
+	struct {
+		s32 channels[2];
+		s64 ts __aligned(8);
+	} scan;
 	int ret;
 
 	mutex_lock(&st->lock);
-	ret = ms5611_read_temp_and_pressure(indio_dev, &buf[1], &buf[0]);
+	ret = ms5611_read_temp_and_pressure(indio_dev, &scan.channels[1],
+					    &scan.channels[0]);
 	mutex_unlock(&st->lock);
 	if (ret < 0)
 		goto err;
 
-	iio_push_to_buffers_with_timestamp(indio_dev, buf,
+	iio_push_to_buffers_with_timestamp(indio_dev, &scan,
 					   iio_get_time_ns(indio_dev));
 
 err:
@@ -308,6 +313,7 @@ static int ms5611_write_raw(struct iio_dev *indio_dev,
 {
 	struct ms5611_state *st = iio_priv(indio_dev);
 	const struct ms5611_osr *osr = NULL;
+	int ret;
 
 	if (mask != IIO_CHAN_INFO_OVERSAMPLING_RATIO)
 		return -EINVAL;
@@ -321,12 +327,11 @@ static int ms5611_write_raw(struct iio_dev *indio_dev,
 	if (!osr)
 		return -EINVAL;
 
-	mutex_lock(&st->lock);
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
 
-	if (iio_buffer_enabled(indio_dev)) {
-		mutex_unlock(&st->lock);
-		return -EBUSY;
-	}
+	mutex_lock(&st->lock);
 
 	if (chan->type == IIO_TEMP)
 		st->temp_osr = osr;
@@ -334,6 +339,8 @@ static int ms5611_write_raw(struct iio_dev *indio_dev,
 		st->pressure_osr = osr;
 
 	mutex_unlock(&st->lock);
+	iio_device_release_direct_mode(indio_dev);
+
 	return 0;
 }
 

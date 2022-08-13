@@ -58,6 +58,8 @@ static int __init fm10k_init_module(void)
 	/* create driver workqueue */
 	fm10k_workqueue = alloc_workqueue("%s", WQ_MEM_RECLAIM, 0,
 					  fm10k_driver_name);
+	if (!fm10k_workqueue)
+		return -ENOMEM;
 
 	fm10k_dbg_init();
 
@@ -1225,7 +1227,7 @@ static bool fm10k_clean_tx_irq(struct fm10k_q_vector *q_vector,
 			break;
 
 		/* prevent any other reads prior to eop_desc */
-		read_barrier_depends();
+		smp_rmb();
 
 		/* if DD is not set pending work has not been completed */
 		if (!(eop_desc->flags & FM10K_TXD_FLAG_DONE))

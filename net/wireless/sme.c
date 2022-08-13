@@ -39,6 +39,7 @@ struct cfg80211_conn {
 		CFG80211_CONN_ASSOCIATING,
 		CFG80211_CONN_ASSOC_FAILED,
 		CFG80211_CONN_DEAUTH,
+		CFG80211_CONN_ABANDON,
 		CFG80211_CONN_CONNECTED,
 	} state;
 	u8 bssid[ETH_ALEN], prev_bssid[ETH_ALEN];
@@ -206,6 +207,8 @@ static int cfg80211_conn_do_work(struct wireless_dev *wdev)
 		cfg80211_mlme_deauth(rdev, wdev->netdev, params->bssid,
 				     NULL, 0,
 				     WLAN_REASON_DEAUTH_LEAVING, false);
+		/* fall through */
+	case CFG80211_CONN_ABANDON:
 		/* free directly, disconnected event already sent */
 		cfg80211_sme_free(wdev);
 		return 0;
@@ -423,6 +426,17 @@ void cfg80211_sme_assoc_timeout(struct wireless_dev *wdev)
 	schedule_work(&rdev->conn_work);
 }
 
+void cfg80211_sme_abandon_assoc(struct wireless_dev *wdev)
+{
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wdev->wiphy);
+
+	if (!wdev->conn)
+		return;
+
+	wdev->conn->state = CFG80211_CONN_ABANDON;
+	schedule_work(&rdev->conn_work);
+}
+
 static int cfg80211_sme_get_conn_ies(struct wireless_dev *wdev,
 				     const u8 *ies, size_t ies_len,
 				     const u8 **out_ies, size_t *out_ies_len)
@@ -491,11 +505,6 @@ static int cfg80211_sme_connect(struct wireless_dev *wdev,
 		return -EOPNOTSUPP;
 
 	if (wdev->current_bss) {
-		if (!prev_bssid)
-			return -EALREADY;
-		if (prev_bssid &&
-		    !ether_addr_equal(prev_bssid, wdev->current_bss->pub.bssid))
-			return -ENOTCONN;
 		cfg80211_unhold_bss(wdev->current_bss);
 		cfg80211_put_bss(wdev->wiphy, &wdev->current_bss->pub);
 		wdev->current_bss = NULL;
@@ -1011,10 +1020,34 @@ int cfg80211_connect(struct cfg80211_registered_device *rdev,
 
 	ASSERT_WDEV_LOCK(wdev);
 
-	if (WARN_ON(wdev->connect_keys)) {
-		kzfree(wdev->connect_keys);
-		wdev->connect_keys = NULL;
+	/*
+	 * If we have an ssid_len, we're trying to connect or are
+	 * already connected, so reject a new SSID unless it's the
+	 * same (which is the case for re-association.)
+	 */
+	if (wdev->ssid_len &&
+	    (wdev->ssid_len != connect->ssid_len ||
+	     memcmp(wdev->ssid, connect->ssid, wdev->ssid_len)))
+		return -EALREADY;
+
+	/*
+	 * If connected, reject (re-)association unless prev_bssid
+	 * matches the current BSSID.
+	 */
+	if (wdev->current_bss) {
+		if (!prev_bssid)
+			return -EALREADY;
+		if (!ether_addr_equal(prev_bssid, wdev->current_bss->pub.bssid))
+			return -ENOTCONN;
 	}
+
+	/*
+	 * Reject if we're in the process of connecting with WEP,
+	 * this case isn't very interesting and trying to handle
+	 * it would make the code much more complex.
+	 */
+	if (wdev->connect_keys)
+		return -EINPROGRESS;
 
 	cfg80211_oper_and_ht_capa(&connect->ht_capa_mask,
 				  rdev->wiphy.ht_capa_mod_mask);
@@ -1066,7 +1099,12 @@ int cfg80211_connect(struct cfg80211_registered_device *rdev,
 
 	if (err) {
 		wdev->connect_keys = NULL;
-		wdev->ssid_len = 0;
+		/*
+		 * This could be reassoc getting refused, don't clear
+		 * ssid_len in that case.
+		 */
+		if (!wdev->current_bss)
+			wdev->ssid_len = 0;
 		return err;
 	}
 
@@ -1090,6 +1128,14 @@ int cfg80211_disconnect(struct cfg80211_registered_device *rdev,
 		cfg80211_mlme_down(rdev, dev);
 	else if (wdev->current_bss)
 		err = rdev_disconnect(rdev, dev, reason);
+
+	/*
+	 * Clear ssid_len unless we actually were fully connected,
+	 * in which case cfg80211_disconnected() will take care of
+	 * this later.
+	 */
+	if (!wdev->current_bss)
+		wdev->ssid_len = 0;
 
 	return err;
 }

@@ -18,6 +18,7 @@
 #include <linux/leds.h>
 #include <linux/spinlock.h>
 #include <linux/notifier.h>
+#include <linux/types.h>
 
 /*
  * All voltages, currents, charges, energies, time and temperatures in uV,
@@ -148,10 +149,18 @@ enum power_supply_property {
 	POWER_SUPPLY_PROP_SCOPE,
 	POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT,
 	POWER_SUPPLY_PROP_CALIBRATE,
+	/* Local extensions */
+	POWER_SUPPLY_PROP_USB_HC,
+	POWER_SUPPLY_PROP_USB_OTG,
+	POWER_SUPPLY_PROP_CHARGE_ENABLED,
+	/* Local extensions of type int64_t */
+	POWER_SUPPLY_PROP_CHARGE_COUNTER_EXT,
 	/* Properties of type `const char *' */
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_MANUFACTURER,
 	POWER_SUPPLY_PROP_SERIAL_NUMBER,
+	POWER_SUPPLY_PROP_CHARGER_STANDARD,
+	POWER_SUPPLY_PROP_CHARGER_TYPE,
 };
 
 enum power_supply_type {
@@ -175,6 +184,7 @@ enum power_supply_notifier_events {
 union power_supply_propval {
 	int intval;
 	const char *strval;
+	int64_t int64val;
 };
 
 struct device_node;
@@ -249,6 +259,7 @@ struct power_supply {
 	spinlock_t changed_lock;
 	bool changed;
 	bool initialized;
+	bool removing;
 	atomic_t use_cnt;
 #ifdef CONFIG_THERMAL
 	struct thermal_zone_device *tzd;

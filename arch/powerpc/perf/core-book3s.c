@@ -401,8 +401,12 @@ static __u64 power_pmu_bhrb_to(u64 addr)
 	int ret;
 	__u64 target;
 
-	if (is_kernel_addr(addr))
-		return branch_target((unsigned int *)addr);
+	if (is_kernel_addr(addr)) {
+		if (probe_kernel_read(&instr, (void *)addr, sizeof(instr)))
+			return 0;
+
+		return branch_target(&instr);
+	}
 
 	/* Userspace: need copy instruction here then translate it */
 	pagefault_disable();
@@ -442,6 +446,16 @@ static void power_pmu_bhrb_read(struct cpu_hw_events *cpuhw)
 
 			if (!addr)
 				/* invalid entry */
+				continue;
+
+			/*
+			 * BHRB rolling buffer could very much contain the kernel
+			 * addresses at this point. Check the privileges before
+			 * exporting it to userspace (avoid exposure of regions
+			 * where we could have speculative execution)
+			 */
+			if (perf_paranoid_kernel() && !capable(CAP_SYS_ADMIN) &&
+				is_kernel_addr(addr))
 				continue;
 
 			/* Branches are read most recent first (ie. mfbhrb 0 is
@@ -1184,6 +1198,7 @@ static void power_pmu_disable(struct pmu *pmu)
 		 */
 		write_mmcr0(cpuhw, val);
 		mb();
+		isync();
 
 		/*
 		 * Disable instruction sampling if it was enabled
@@ -1192,12 +1207,26 @@ static void power_pmu_disable(struct pmu *pmu)
 			mtspr(SPRN_MMCRA,
 			      cpuhw->mmcr[2] & ~MMCRA_SAMPLE_ENABLE);
 			mb();
+			isync();
 		}
 
 		cpuhw->disabled = 1;
 		cpuhw->n_added = 0;
 
 		ebb_switch_out(mmcr0);
+
+#ifdef CONFIG_PPC64
+		/*
+		 * These are readable by userspace, may contain kernel
+		 * addresses and are not switched by context switch, so clear
+		 * them now to avoid leaking anything to userspace in general
+		 * including to another process.
+		 */
+		if (ppmu->flags & PPMU_ARCH_207S) {
+			mtspr(SPRN_SDAR, 0);
+			mtspr(SPRN_SIAR, 0);
+		}
+#endif
 	}
 
 	local_irq_restore(flags);
@@ -1377,7 +1406,7 @@ static int collect_events(struct perf_event *group, int max_count,
 	int n = 0;
 	struct perf_event *event;
 
-	if (!is_software_event(group)) {
+	if (group->pmu->task_ctx_nr == perf_hw_context) {
 		if (n >= max_count)
 			return -1;
 		ctrs[n] = group;
@@ -1385,7 +1414,7 @@ static int collect_events(struct perf_event *group, int max_count,
 		events[n++] = group->hw.config;
 	}
 	list_for_each_entry(event, &group->sibling_list, group_entry) {
-		if (!is_software_event(event) &&
+		if (event->pmu->task_ctx_nr == perf_hw_context &&
 		    event->state != PERF_EVENT_STATE_OFF) {
 			if (n >= max_count)
 				return -1;
@@ -1771,6 +1800,7 @@ static int power_pmu_event_init(struct perf_event *event)
 	int n;
 	int err;
 	struct cpu_hw_events *cpuhw;
+	u64 bhrb_filter;
 
 	if (!ppmu)
 		return -ENOENT;
@@ -1867,13 +1897,14 @@ static int power_pmu_event_init(struct perf_event *event)
 	err = power_check_constraints(cpuhw, events, cflags, n + 1);
 
 	if (has_branch_stack(event)) {
-		cpuhw->bhrb_filter = ppmu->bhrb_filter_map(
+		bhrb_filter = ppmu->bhrb_filter_map(
 					event->attr.branch_sample_type);
 
-		if (cpuhw->bhrb_filter == -1) {
+		if (bhrb_filter == -1) {
 			put_cpu_var(cpu_hw_events);
 			return -EOPNOTSUPP;
 		}
+		cpuhw->bhrb_filter = bhrb_filter;
 	}
 
 	put_cpu_var(cpu_hw_events);
@@ -1992,6 +2023,16 @@ static void record_and_restart(struct perf_event *event, unsigned long val,
 	perf_event_update_userpage(event);
 
 	/*
+	 * Due to hardware limitation, sometimes SIAR could sample a kernel
+	 * address even when freeze on supervisor state (kernel) is set in
+	 * MMCR2. Check attr.exclude_kernel and address to drop the sample in
+	 * these cases.
+	 */
+	if (event->attr.exclude_kernel && record)
+		if (is_kernel_addr(mfspr(SPRN_SIAR)))
+			record = 0;
+
+	/*
 	 * Finally record data if requested.
 	 */
 	if (record) {
@@ -2010,6 +2051,10 @@ static void record_and_restart(struct perf_event *event, unsigned long val,
 		}
 
 		if (perf_event_overflow(event, &data, regs))
+			power_pmu_stop(event, 0);
+	} else if (period) {
+		/* Account for interrupt in case of invalid SIAR */
+		if (perf_event_account_interrupt(event))
 			power_pmu_stop(event, 0);
 	}
 }

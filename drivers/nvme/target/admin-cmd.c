@@ -47,9 +47,11 @@ static u16 nvmet_get_smart_log_nsid(struct nvmet_req *req,
 	}
 
 	host_reads = part_stat_read(ns->bdev->bd_part, ios[READ]);
-	data_units_read = part_stat_read(ns->bdev->bd_part, sectors[READ]);
+	data_units_read = DIV_ROUND_UP(part_stat_read(ns->bdev->bd_part,
+		sectors[READ]), 1000);
 	host_writes = part_stat_read(ns->bdev->bd_part, ios[WRITE]);
-	data_units_written = part_stat_read(ns->bdev->bd_part, sectors[WRITE]);
+	data_units_written = DIV_ROUND_UP(part_stat_read(ns->bdev->bd_part,
+		sectors[WRITE]), 1000);
 
 	put_unaligned_le64(host_reads, &slog->host_reads[0]);
 	put_unaligned_le64(data_units_read, &slog->data_units_read[0]);
@@ -75,11 +77,11 @@ static u16 nvmet_get_smart_log_all(struct nvmet_req *req,
 	rcu_read_lock();
 	list_for_each_entry_rcu(ns, &ctrl->subsys->namespaces, dev_link) {
 		host_reads += part_stat_read(ns->bdev->bd_part, ios[READ]);
-		data_units_read +=
-			part_stat_read(ns->bdev->bd_part, sectors[READ]);
+		data_units_read += DIV_ROUND_UP(
+			part_stat_read(ns->bdev->bd_part, sectors[READ]), 1000);
 		host_writes += part_stat_read(ns->bdev->bd_part, ios[WRITE]);
-		data_units_written +=
-			part_stat_read(ns->bdev->bd_part, sectors[WRITE]);
+		data_units_written += DIV_ROUND_UP(
+			part_stat_read(ns->bdev->bd_part, sectors[WRITE]), 1000);
 
 	}
 	rcu_read_unlock();
@@ -166,11 +168,21 @@ out:
 	nvmet_req_complete(req, status);
 }
 
+static void copy_and_pad(char *dst, int dst_len, const char *src, int src_len)
+{
+	int len = min(src_len, dst_len);
+
+	memcpy(dst, src, len);
+	if (dst_len > len)
+		memset(dst + len, ' ', dst_len - len);
+}
+
 static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 {
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	struct nvme_id_ctrl *id;
 	u16 status = 0;
+	const char model[] = "Linux";
 
 	id = kzalloc(sizeof(*id), GFP_KERNEL);
 	if (!id) {
@@ -183,13 +195,10 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 	id->ssvid = 0;
 
 	memset(id->sn, ' ', sizeof(id->sn));
-	snprintf(id->sn, sizeof(id->sn), "%llx", ctrl->serial);
-
-	memset(id->mn, ' ', sizeof(id->mn));
-	strncpy((char *)id->mn, "Linux", sizeof(id->mn));
-
-	memset(id->fr, ' ', sizeof(id->fr));
-	strncpy((char *)id->fr, UTS_RELEASE, sizeof(id->fr));
+	bin2hex(id->sn, &ctrl->subsys->serial,
+		min(sizeof(ctrl->subsys->serial), sizeof(id->sn) / 2));
+	copy_and_pad(id->mn, sizeof(id->mn), model, sizeof(model) - 1);
+	copy_and_pad(id->fr, sizeof(id->fr), UTS_RELEASE, strlen(UTS_RELEASE));
 
 	id->rab = 6;
 
@@ -381,7 +390,6 @@ static void nvmet_execute_set_features(struct nvmet_req *req)
 {
 	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
 	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10[0]);
-	u64 val;
 	u32 val32;
 	u16 status = 0;
 
@@ -391,8 +399,7 @@ static void nvmet_execute_set_features(struct nvmet_req *req)
 			(subsys->max_qid - 1) | ((subsys->max_qid - 1) << 16));
 		break;
 	case NVME_FEAT_KATO:
-		val = le64_to_cpu(req->cmd->prop_set.value);
-		val32 = val & 0xffff;
+		val32 = le32_to_cpu(req->cmd->common.cdw10[1]);
 		req->sq->ctrl->kato = DIV_ROUND_UP(val32, 1000);
 		nvmet_set_result(req, req->sq->ctrl->kato);
 		break;

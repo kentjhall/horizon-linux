@@ -576,7 +576,7 @@ int ubifs_jnl_update(struct ubifs_info *c, const struct inode *dir,
 	/* Make sure to also account for extended attributes */
 	len += host_ui->data_len;
 
-	dent = kmalloc(len, GFP_NOFS);
+	dent = kzalloc(len, GFP_NOFS);
 	if (!dent)
 		return -ENOMEM;
 
@@ -661,6 +661,11 @@ int ubifs_jnl_update(struct ubifs_info *c, const struct inode *dir,
 	spin_lock(&ui->ui_lock);
 	ui->synced_i_size = ui->ui_size;
 	spin_unlock(&ui->ui_lock);
+	if (xent) {
+		spin_lock(&host_ui->ui_lock);
+		host_ui->synced_i_size = host_ui->ui_size;
+		spin_unlock(&host_ui->ui_lock);
+	}
 	mark_inode_clean(c, ui);
 	mark_inode_clean(c, host_ui);
 	return 0;
@@ -952,7 +957,7 @@ int ubifs_jnl_xrename(struct ubifs_info *c, const struct inode *fst_dir,
 	if (twoparents)
 		len += plen;
 
-	dent1 = kmalloc(len, GFP_NOFS);
+	dent1 = kzalloc(len, GFP_NOFS);
 	if (!dent1)
 		return -ENOMEM;
 
@@ -1102,7 +1107,7 @@ int ubifs_jnl_rename(struct ubifs_info *c, const struct inode *old_dir,
 	len = aligned_dlen1 + aligned_dlen2 + ALIGN(ilen, 8) + ALIGN(plen, 8);
 	if (move)
 		len += plen;
-	dent = kmalloc(len, GFP_NOFS);
+	dent = kzalloc(len, GFP_NOFS);
 	if (!dent)
 		return -ENOMEM;
 
@@ -1344,7 +1349,16 @@ int ubifs_jnl_truncate(struct ubifs_info *c, const struct inode *inode,
 		else if (err)
 			goto out_free;
 		else {
-			if (le32_to_cpu(dn->size) <= dlen)
+			int dn_len = le32_to_cpu(dn->size);
+
+			if (dn_len <= 0 || dn_len > UBIFS_BLOCK_SIZE) {
+				ubifs_err(c, "bad data node (block %u, inode %lu)",
+					  blk, inode->i_ino);
+				ubifs_dump_node(c, dn);
+				goto out_free;
+			}
+
+			if (dn_len <= dlen)
 				dlen = 0; /* Nothing to do */
 			else {
 				int compr_type = le16_to_cpu(dn->compr_type);
@@ -1466,7 +1480,7 @@ int ubifs_jnl_delete_xattr(struct ubifs_info *c, const struct inode *host,
 	hlen = host_ui->data_len + UBIFS_INO_NODE_SZ;
 	len = aligned_xlen + UBIFS_INO_NODE_SZ + ALIGN(hlen, 8);
 
-	xent = kmalloc(len, GFP_NOFS);
+	xent = kzalloc(len, GFP_NOFS);
 	if (!xent)
 		return -ENOMEM;
 
@@ -1573,7 +1587,7 @@ int ubifs_jnl_change_xattr(struct ubifs_info *c, const struct inode *inode,
 	aligned_len1 = ALIGN(len1, 8);
 	aligned_len = aligned_len1 + ALIGN(len2, 8);
 
-	ino = kmalloc(aligned_len, GFP_NOFS);
+	ino = kzalloc(aligned_len, GFP_NOFS);
 	if (!ino)
 		return -ENOMEM;
 

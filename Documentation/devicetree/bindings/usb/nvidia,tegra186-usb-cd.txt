@@ -1,0 +1,29 @@
+Device tree binding for NVIDIA Tegra USB charger detection driver (USB_CD)
+============================
+
+The Tegra USB charger detection driver supports BC1.2 protocol for various USB
+charger detection.
+
+Required properties:
+--------------------
+ - compatible: For Tegra186, must contain "nvidia,tegra186-usb-cd".
+
+Required properties for Tegra186:
+---------------------------------
+ - phys: Must contain a single entry for the UTMI phy of OTG port
+ - phy-names: Must be "otg-phy".
+
+Optional properties:
+--------------------
+- dcp-current-limit-ua : Charging current limit for DCP in uA
+- qc2-current-limit-ua : Charging current limit for QC2 in uA
+
+Example:
+--------
+    usb_cd {
+        compatible = "nvidia,tegra186-usb-cd";
+
+        phys = <&padctl TEGRA_PADCTL_PHY_UTMI_P(0)>;
+        phy-names = "otg-phy";
+
+    };

@@ -1,0 +1,15 @@
+*.cmd
+.tmp_versions
+Module.symvers
+*.ko
+*.mod.c
+modules.order
+pahole??
+pahole*.txt
+copyto
+*.o
+__pycache__
+.project.sl
+cscope.out
+tags
+*.o.d

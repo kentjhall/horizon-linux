@@ -208,6 +208,7 @@ rpcrdma_update_connect_private(struct rpcrdma_xprt *r_xprt,
 
 	/* Default settings for RPC-over-RDMA Version One */
 	r_xprt->rx_ia.ri_reminv_expected = false;
+	r_xprt->rx_ia.ri_implicit_roundup = xprt_rdma_pad_optimize;
 	rsize = RPCRDMA_V1_DEF_INLINE_SIZE;
 	wsize = RPCRDMA_V1_DEF_INLINE_SIZE;
 
@@ -215,6 +216,7 @@ rpcrdma_update_connect_private(struct rpcrdma_xprt *r_xprt,
 	    pmsg->cp_magic == rpcrdma_cmp_magic &&
 	    pmsg->cp_version == RPCRDMA_CMP_VERSION) {
 		r_xprt->rx_ia.ri_reminv_expected = true;
+		r_xprt->rx_ia.ri_implicit_roundup = true;
 		rsize = rpcrdma_decode_buffer_size(pmsg->cp_send_size);
 		wsize = rpcrdma_decode_buffer_size(pmsg->cp_recv_size);
 	}
@@ -223,8 +225,8 @@ rpcrdma_update_connect_private(struct rpcrdma_xprt *r_xprt,
 		cdata->inline_rsize = rsize;
 	if (wsize < cdata->inline_wsize)
 		cdata->inline_wsize = wsize;
-	pr_info("rpcrdma: max send %u, max recv %u\n",
-		cdata->inline_wsize, cdata->inline_rsize);
+	dprintk("RPC:       %s: max send %u, max recv %u\n",
+		__func__, cdata->inline_wsize, cdata->inline_rsize);
 	rpcrdma_set_max_header_sizes(r_xprt);
 }
 
@@ -477,18 +479,20 @@ rpcrdma_ia_close(struct rpcrdma_ia *ia)
  */
 int
 rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
-				struct rpcrdma_create_data_internal *cdata)
+		  struct rpcrdma_create_data_internal *cdata)
 {
 	struct rpcrdma_connect_private *pmsg = &ep->rep_cm_private;
+	unsigned int max_qp_wr, max_sge;
 	struct ib_cq *sendcq, *recvcq;
-	unsigned int max_qp_wr;
 	int rc;
 
-	if (ia->ri_device->attrs.max_sge < RPCRDMA_MAX_SEND_SGES) {
-		dprintk("RPC:       %s: insufficient sge's available\n",
-			__func__);
+	max_sge = min_t(unsigned int, ia->ri_device->attrs.max_sge,
+			RPCRDMA_MAX_SEND_SGES);
+	if (max_sge < RPCRDMA_MIN_SEND_SGES) {
+		pr_warn("rpcrdma: HCA provides only %d send SGEs\n", max_sge);
 		return -ENOMEM;
 	}
+	ia->ri_max_send_sges = max_sge - RPCRDMA_MIN_SEND_SGES;
 
 	if (ia->ri_device->attrs.max_qp_wr <= RPCRDMA_BACKWARD_WRS) {
 		dprintk("RPC:       %s: insufficient wqe's available\n",
@@ -513,7 +517,7 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
 	ep->rep_attr.cap.max_recv_wr = cdata->max_requests;
 	ep->rep_attr.cap.max_recv_wr += RPCRDMA_BACKWARD_WRS;
 	ep->rep_attr.cap.max_recv_wr += 1;	/* drain cqe */
-	ep->rep_attr.cap.max_send_sge = RPCRDMA_MAX_SEND_SGES;
+	ep->rep_attr.cap.max_send_sge = max_sge;
 	ep->rep_attr.cap.max_recv_sge = 1;
 	ep->rep_attr.cap.max_inline_data = 0;
 	ep->rep_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
@@ -532,7 +536,7 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
 	ep->rep_cqinit = ep->rep_attr.cap.max_send_wr/2 - 1;
 	if (ep->rep_cqinit <= 2)
 		ep->rep_cqinit = 0;	/* always signal? */
-	INIT_CQCOUNT(ep);
+	rpcrdma_init_cqcount(ep, 0);
 	init_waitqueue_head(&ep->rep_connect_wait);
 	INIT_DELAYED_WORK(&ep->rep_connect_worker, rpcrdma_connect_worker);
 
@@ -887,10 +891,17 @@ rpcrdma_create_req(struct rpcrdma_xprt *r_xprt)
 	return req;
 }
 
-struct rpcrdma_rep *
-rpcrdma_create_rep(struct rpcrdma_xprt *r_xprt)
+/**
+ * rpcrdma_create_rep - Allocate an rpcrdma_rep object
+ * @r_xprt: controlling transport
+ *
+ * Returns 0 on success or a negative errno on failure.
+ */
+int
+ rpcrdma_create_rep(struct rpcrdma_xprt *r_xprt)
 {
 	struct rpcrdma_create_data_internal *cdata = &r_xprt->rx_data;
+	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
 	struct rpcrdma_rep *rep;
 	int rc;
@@ -915,12 +926,18 @@ rpcrdma_create_rep(struct rpcrdma_xprt *r_xprt)
 	rep->rr_recv_wr.wr_cqe = &rep->rr_cqe;
 	rep->rr_recv_wr.sg_list = &rep->rr_rdmabuf->rg_iov;
 	rep->rr_recv_wr.num_sge = 1;
-	return rep;
+
+	spin_lock(&buf->rb_lock);
+	list_add(&rep->rr_list, &buf->rb_recv_bufs);
+	spin_unlock(&buf->rb_lock);
+	return 0;
 
 out_free:
 	kfree(rep);
 out:
-	return ERR_PTR(rc);
+	dprintk("RPC:       %s: reply buffer %d alloc failed\n",
+		__func__, rc);
+	return rc;
 }
 
 int
@@ -963,17 +980,10 @@ rpcrdma_buffer_create(struct rpcrdma_xprt *r_xprt)
 	}
 
 	INIT_LIST_HEAD(&buf->rb_recv_bufs);
-	for (i = 0; i < buf->rb_max_requests + RPCRDMA_MAX_BC_REQUESTS; i++) {
-		struct rpcrdma_rep *rep;
-
-		rep = rpcrdma_create_rep(r_xprt);
-		if (IS_ERR(rep)) {
-			dprintk("RPC:       %s: reply buffer %d alloc failed\n",
-				__func__, i);
-			rc = PTR_ERR(rep);
+	for (i = 0; i <= buf->rb_max_requests; i++) {
+		rc = rpcrdma_create_rep(r_xprt);
+		if (rc)
 			goto out;
-		}
-		list_add(&rep->rr_list, &buf->rb_recv_bufs);
 	}
 
 	return 0;
@@ -1050,6 +1060,7 @@ void
 rpcrdma_buffer_destroy(struct rpcrdma_buffer *buf)
 {
 	cancel_delayed_work_sync(&buf->rb_recovery_worker);
+	cancel_delayed_work_sync(&buf->rb_refresh_worker);
 
 	while (!list_empty(&buf->rb_recv_bufs)) {
 		struct rpcrdma_rep *rep;
@@ -1311,13 +1322,7 @@ rpcrdma_ep_post(struct rpcrdma_ia *ia,
 	dprintk("RPC:       %s: posting %d s/g entries\n",
 		__func__, send_wr->num_sge);
 
-	if (DECR_CQCOUNT(ep) > 0)
-		send_wr->send_flags = 0;
-	else { /* Provider must take a send completion every now and then */
-		INIT_CQCOUNT(ep);
-		send_wr->send_flags = IB_SEND_SIGNALED;
-	}
-
+	rpcrdma_set_signaled(ep, send_wr);
 	rc = ib_post_send(ia->ri_id->qp, send_wr, &send_wr_fail);
 	if (rc)
 		goto out_postsend_err;

@@ -26,11 +26,11 @@ dma_cookie_t vchan_tx_submit(struct dma_async_tx_descriptor *tx)
 	unsigned long flags;
 	dma_cookie_t cookie;
 
-	spin_lock_irqsave(&vc->lock, flags);
+	raw_spin_lock_irqsave(&vc->lock, flags);
 	cookie = dma_cookie_assign(tx);
 
 	list_move_tail(&vd->node, &vc->desc_submitted);
-	spin_unlock_irqrestore(&vc->lock, flags);
+	raw_spin_unlock_irqrestore(&vc->lock, flags);
 
 	dev_dbg(vc->chan.device->dev, "vchan %p: txd %p[%x]: submitted\n",
 		vc, vd, cookie);
@@ -55,9 +55,9 @@ int vchan_tx_desc_free(struct dma_async_tx_descriptor *tx)
 	struct virt_dma_desc *vd = to_virt_desc(tx);
 	unsigned long flags;
 
-	spin_lock_irqsave(&vc->lock, flags);
+	raw_spin_lock_irqsave(&vc->lock, flags);
 	list_del(&vd->node);
-	spin_unlock_irqrestore(&vc->lock, flags);
+	raw_spin_unlock_irqrestore(&vc->lock, flags);
 
 	dev_dbg(vc->chan.device->dev, "vchan %p: txd %p[%x]: freeing\n",
 		vc, vd, vd->tx.cookie);
@@ -90,7 +90,7 @@ static void vchan_complete(unsigned long arg)
 	struct dmaengine_desc_callback cb;
 	LIST_HEAD(head);
 
-	spin_lock_irq(&vc->lock);
+	raw_spin_lock_irq(&vc->lock);
 	list_splice_tail_init(&vc->desc_completed, &head);
 	vd = vc->cyclic;
 	if (vd) {
@@ -99,7 +99,7 @@ static void vchan_complete(unsigned long arg)
 	} else {
 		memset(&cb, 0, sizeof(cb));
 	}
-	spin_unlock_irq(&vc->lock);
+	raw_spin_unlock_irq(&vc->lock);
 
 	dmaengine_desc_callback_invoke(&cb, NULL);
 
@@ -137,7 +137,7 @@ void vchan_init(struct virt_dma_chan *vc, struct dma_device *dmadev)
 {
 	dma_cookie_init(&vc->chan);
 
-	spin_lock_init(&vc->lock);
+	raw_spin_lock_init(&vc->lock);
 	INIT_LIST_HEAD(&vc->desc_allocated);
 	INIT_LIST_HEAD(&vc->desc_submitted);
 	INIT_LIST_HEAD(&vc->desc_issued);

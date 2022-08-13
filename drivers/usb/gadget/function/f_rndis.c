@@ -91,8 +91,10 @@ static inline struct f_rndis *func_to_rndis(struct usb_function *f)
 /* peak (theoretical) bulk transfer rate in bits-per-second */
 static unsigned int bitrate(struct usb_gadget *g)
 {
+	if (gadget_is_superspeed(g) && g->speed >= USB_SPEED_SUPER_PLUS)
+		return 4250000000U;
 	if (gadget_is_superspeed(g) && g->speed == USB_SPEED_SUPER)
-		return 13 * 1024 * 8 * 1000 * 8;
+		return 3750000000U;
 	else if (gadget_is_dualspeed(g) && g->speed == USB_SPEED_HIGH)
 		return 13 * 512 * 8 * 1000 * 8;
 	else
@@ -622,6 +624,7 @@ static void rndis_disable(struct usb_function *f)
 	gether_disconnect(&rndis->port);
 
 	usb_ep_disable(rndis->notify);
+	rndis->notify->desc = NULL;
 }
 
 /*-------------------------------------------------------------------------*/
@@ -892,6 +895,7 @@ static void rndis_free_inst(struct usb_function_instance *f)
 			free_netdev(opts->net);
 	}
 
+	kfree(opts->rndis_interf_group);	/* single VLA chunk */
 	kfree(opts);
 }
 
@@ -900,6 +904,7 @@ static struct usb_function_instance *rndis_alloc_inst(void)
 	struct f_rndis_opts *opts;
 	struct usb_os_desc *descs[1];
 	char *names[1];
+	struct config_group *rndis_interf_group;
 
 	opts = kzalloc(sizeof(*opts), GFP_KERNEL);
 	if (!opts)
@@ -908,7 +913,7 @@ static struct usb_function_instance *rndis_alloc_inst(void)
 
 	mutex_init(&opts->lock);
 	opts->func_inst.free_func_inst = rndis_free_inst;
-	opts->net = gether_setup_default();
+	opts->net = gether_setup_name_default("rndis");
 	if (IS_ERR(opts->net)) {
 		struct net_device *net = opts->net;
 		kfree(opts);
@@ -920,8 +925,14 @@ static struct usb_function_instance *rndis_alloc_inst(void)
 	names[0] = "rndis";
 	config_group_init_type_name(&opts->func_inst.group, "",
 				    &rndis_func_type);
-	usb_os_desc_prepare_interf_dir(&opts->func_inst.group, 1, descs,
-				       names, THIS_MODULE);
+	rndis_interf_group =
+		usb_os_desc_prepare_interf_dir(&opts->func_inst.group, 1, descs,
+					       names, THIS_MODULE);
+	if (IS_ERR(rndis_interf_group)) {
+		rndis_free_inst(&opts->func_inst);
+		return ERR_CAST(rndis_interf_group);
+	}
+	opts->rndis_interf_group = rndis_interf_group;
 
 	return &opts->func_inst;
 }

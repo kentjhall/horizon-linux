@@ -208,8 +208,8 @@ static void fast_imageblit(const struct fb_image *image, struct fb_info *p,
 	}
 
 	for (i = ppw-1; i--; ) {
-		fgx <<= bpp;
-		bgx <<= bpp;
+		fgx <<= (bpp & 0x1f);
+		bgx <<= (bpp & 0x1f);
 		fgx |= fgcolor;
 		bgx |= bgcolor;
 	}

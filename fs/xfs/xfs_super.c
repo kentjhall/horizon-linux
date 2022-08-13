@@ -872,8 +872,15 @@ xfs_init_mount_workqueues(
 	if (!mp->m_eofblocks_workqueue)
 		goto out_destroy_log;
 
+	mp->m_sync_workqueue = alloc_workqueue("xfs-sync/%s", WQ_FREEZABLE, 0,
+					       mp->m_fsname);
+	if (!mp->m_sync_workqueue)
+		goto out_destroy_eofb;
+
 	return 0;
 
+out_destroy_eofb:
+	destroy_workqueue(mp->m_eofblocks_workqueue);
 out_destroy_log:
 	destroy_workqueue(mp->m_log_workqueue);
 out_destroy_reclaim:
@@ -894,6 +901,7 @@ STATIC void
 xfs_destroy_mount_workqueues(
 	struct xfs_mount	*mp)
 {
+	destroy_workqueue(mp->m_sync_workqueue);
 	destroy_workqueue(mp->m_eofblocks_workqueue);
 	destroy_workqueue(mp->m_log_workqueue);
 	destroy_workqueue(mp->m_reclaim_workqueue);
@@ -948,7 +956,7 @@ xfs_fs_destroy_inode(
 	XFS_STATS_INC(ip->i_mount, vn_remove);
 
 	if (xfs_is_reflink_inode(ip)) {
-		error = xfs_reflink_cancel_cow_range(ip, 0, NULLFILEOFF);
+		error = xfs_reflink_cancel_cow_range(ip, 0, NULLFILEOFF, true);
 		if (error && !XFS_FORCED_SHUTDOWN(ip->i_mount))
 			xfs_warn(ip->i_mount,
 "Error %d while evicting CoW blocks for inode %llu.",
@@ -1206,7 +1214,7 @@ xfs_test_remount_options(
 	tmp_mp->m_super = sb;
 	error = xfs_parseargs(tmp_mp, options);
 	xfs_free_fsname(tmp_mp);
-	kfree(tmp_mp);
+	kmem_free(tmp_mp);
 
 	return error;
 }
@@ -1666,6 +1674,7 @@ xfs_fs_fill_super(
  out_close_devices:
 	xfs_close_devices(mp);
  out_free_fsname:
+	sb->s_fs_info = NULL;
 	xfs_free_fsname(mp);
 	kfree(mp);
  out:
@@ -1683,6 +1692,10 @@ xfs_fs_put_super(
 {
 	struct xfs_mount	*mp = XFS_M(sb);
 
+	/* if ->fill_super failed, we have no mount to tear down */
+	if (!sb->s_fs_info)
+		return;
+
 	xfs_notice(mp, "Unmounting Filesystem");
 	xfs_filestream_unmount(mp);
 	xfs_unmountfs(mp);
@@ -1692,6 +1705,8 @@ xfs_fs_put_super(
 	xfs_destroy_percpu_counters(mp);
 	xfs_destroy_mount_workqueues(mp);
 	xfs_close_devices(mp);
+
+	sb->s_fs_info = NULL;
 	xfs_free_fsname(mp);
 	kfree(mp);
 }
@@ -1711,6 +1726,9 @@ xfs_fs_nr_cached_objects(
 	struct super_block	*sb,
 	struct shrink_control	*sc)
 {
+	/* Paranoia: catch incorrect calls during mount setup or teardown */
+	if (WARN_ON_ONCE(!sb->s_fs_info))
+		return 0;
 	return xfs_reclaim_inodes_count(XFS_M(sb));
 }
 

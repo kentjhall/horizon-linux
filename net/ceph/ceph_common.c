@@ -45,19 +45,6 @@ bool libceph_compatible(void *data)
 }
 EXPORT_SYMBOL(libceph_compatible);
 
-/*
- * find filename portion of a path (/foo/bar/baz -> baz)
- */
-const char *ceph_file_part(const char *s, int len)
-{
-	const char *e = s + len;
-
-	while (e != s && *(e-1) != '/')
-		e--;
-	return e;
-}
-EXPORT_SYMBOL(ceph_file_part);
-
 const char *ceph_msg_type_name(int type)
 {
 	switch (type) {
@@ -699,7 +686,6 @@ int __ceph_open_session(struct ceph_client *client, unsigned long started)
 }
 EXPORT_SYMBOL(__ceph_open_session);
 
-
 int ceph_open_session(struct ceph_client *client)
 {
 	int ret;
@@ -715,6 +701,23 @@ int ceph_open_session(struct ceph_client *client)
 }
 EXPORT_SYMBOL(ceph_open_session);
 
+int ceph_wait_for_latest_osdmap(struct ceph_client *client,
+				unsigned long timeout)
+{
+	u64 newest_epoch;
+	int ret;
+
+	ret = ceph_monc_get_version(&client->monc, "osdmap", &newest_epoch);
+	if (ret)
+		return ret;
+
+	if (client->osdc.osdmap->epoch >= newest_epoch)
+		return 0;
+
+	ceph_osdc_maybe_request_map(&client->osdc);
+	return ceph_monc_wait_osdmap(&client->monc, newest_epoch, timeout);
+}
+EXPORT_SYMBOL(ceph_wait_for_latest_osdmap);
 
 static int __init init_ceph_lib(void)
 {

@@ -314,6 +314,7 @@ struct ath10k_peer {
 	struct ieee80211_vif *vif;
 	struct ieee80211_sta *sta;
 
+	bool removed;
 	int vdev_id;
 	u8 addr[ETH_ALEN];
 	DECLARE_BITMAP(peer_ids, ATH10K_MAX_NUM_PEER_IDS);
@@ -557,10 +558,8 @@ enum ath10k_fw_features {
 	 */
 	ATH10K_FW_FEATURE_BTCOEX_PARAM = 14,
 
-	/* Older firmware with HTT delivers incorrect tx status for null func
-	 * frames to driver, but this fixed in 10.2 and 10.4 firmware versions.
-	 * Also this workaround results in reporting of incorrect null func
-	 * status for 10.4. This flag is used to skip the workaround.
+	/* Unused flag and proven to be not working, enable this if you want
+	 * to experiment sending NULL func data frames in HTT TX
 	 */
 	ATH10K_FW_FEATURE_SKIP_NULL_FUNC_WAR = 15,
 
@@ -812,6 +811,7 @@ struct ath10k {
 
 	struct completion install_key_done;
 
+	int last_wmi_vdev_start_status;
 	struct completion vdev_setup_done;
 
 	struct workqueue_struct *workqueue;

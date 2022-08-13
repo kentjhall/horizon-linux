@@ -4,7 +4,8 @@
  *
  * Copyright (C) 2010 Ricardo Martins <rasm@fe.up.pt>
  * Copyright (C) 2011 James Nuss <jamesnuss@nanometrics.ca>
- *
+ * Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or
@@ -119,6 +120,9 @@ static int pps_gpio_probe(struct platform_device *pdev)
 
 		if (of_get_property(np, "assert-falling-edge", NULL))
 			data->assert_falling_edge = true;
+
+		if (of_get_property(np, "capture-clear", NULL))
+			data->capture_clear = true;
 	}
 
 	/* GPIO setup */

@@ -17,7 +17,10 @@
 #ifndef __ASM_ARC_UDELAY_H
 #define __ASM_ARC_UDELAY_H
 
+#include <asm-generic/types.h>
 #include <asm/param.h>		/* HZ */
+
+extern unsigned long loops_per_jiffy;
 
 static inline void __delay(unsigned long loops)
 {
@@ -26,7 +29,9 @@ static inline void __delay(unsigned long loops)
 	"	lp  1f			\n"
 	"	nop			\n"
 	"1:				\n"
-	: : "r"(loops));
+	:
+        : "r"(loops)
+        : "lp_count");
 }
 
 extern void __bad_udelay(void);

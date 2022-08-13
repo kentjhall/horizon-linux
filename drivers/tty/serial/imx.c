@@ -532,7 +532,7 @@ static void imx_dma_tx(struct imx_port *sport)
 
 	sport->tx_bytes = uart_circ_chars_pending(xmit);
 
-	if (xmit->tail < xmit->head) {
+	if (xmit->tail < xmit->head || xmit->head == 0) {
 		sport->dma_tx_nents = 1;
 		sg_init_one(sgl, xmit->buf + xmit->tail, sport->tx_bytes);
 	} else {
@@ -548,7 +548,7 @@ static void imx_dma_tx(struct imx_port *sport)
 		dev_err(dev, "DMA mapping error for TX.\n");
 		return;
 	}
-	desc = dmaengine_prep_slave_sg(chan, sgl, sport->dma_tx_nents,
+	desc = dmaengine_prep_slave_sg(chan, sgl, ret,
 					DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
 	if (!desc) {
 		dma_unmap_sg(dev, sgl, sport->dma_tx_nents,
@@ -1316,19 +1316,10 @@ static int imx_startup(struct uart_port *port)
 	if (!is_imx1_uart(sport)) {
 		temp = readl(sport->port.membase + UCR3);
 
-		/*
-		 * The effect of RI and DCD differs depending on the UFCR_DCEDTE
-		 * bit. In DCE mode they control the outputs, in DTE mode they
-		 * enable the respective irqs. At least the DCD irq cannot be
-		 * cleared on i.MX25 at least, so it's not usable and must be
-		 * disabled. I don't have test hardware to check if RI has the
-		 * same problem but I consider this likely so it's disabled for
-		 * now, too.
-		 */
-		temp |= IMX21_UCR3_RXDMUXSEL | UCR3_ADNIMP |
-			UCR3_DTRDEN | UCR3_RI | UCR3_DCD;
+		temp |= UCR3_DTRDEN | UCR3_RI | UCR3_DCD;
 
 		if (sport->dte_mode)
+			/* disable broken interrupts */
 			temp &= ~(UCR3_RI | UCR3_DCD);
 
 		writel(temp, sport->port.membase + UCR3);
@@ -1583,8 +1574,6 @@ imx_set_termios(struct uart_port *port, struct ktermios *termios,
 
 	ufcr = readl(sport->port.membase + UFCR);
 	ufcr = (ufcr & (~UFCR_RFDIV)) | UFCR_RFDIV_REG(div);
-	if (sport->dte_mode)
-		ufcr |= UFCR_DCEDTE;
 	writel(ufcr, sport->port.membase + UFCR);
 
 	writel(num, sport->port.membase + UBIR);
@@ -1798,16 +1787,6 @@ imx_console_write(struct console *co, const char *s, unsigned int count)
 	unsigned int ucr1;
 	unsigned long flags = 0;
 	int locked = 1;
-	int retval;
-
-	retval = clk_enable(sport->clk_per);
-	if (retval)
-		return;
-	retval = clk_enable(sport->clk_ipg);
-	if (retval) {
-		clk_disable(sport->clk_per);
-		return;
-	}
 
 	if (sport->port.sysrq)
 		locked = 0;
@@ -1843,9 +1822,6 @@ imx_console_write(struct console *co, const char *s, unsigned int count)
 
 	if (locked)
 		spin_unlock_irqrestore(&sport->port.lock, flags);
-
-	clk_disable(sport->clk_ipg);
-	clk_disable(sport->clk_per);
 }
 
 /*
@@ -1946,15 +1922,14 @@ imx_console_setup(struct console *co, char *options)
 
 	retval = uart_set_options(&sport->port, co, baud, parity, bits, flow);
 
-	clk_disable(sport->clk_ipg);
 	if (retval) {
-		clk_unprepare(sport->clk_ipg);
+		clk_disable_unprepare(sport->clk_ipg);
 		goto error_console;
 	}
 
-	retval = clk_prepare(sport->clk_per);
+	retval = clk_prepare_enable(sport->clk_per);
 	if (retval)
-		clk_disable_unprepare(sport->clk_ipg);
+		clk_unprepare(sport->clk_ipg);
 
 error_console:
 	return retval;
@@ -2091,6 +2066,12 @@ static int serial_imx_probe(struct platform_device *pdev)
 	else if (ret < 0)
 		return ret;
 
+	if (sport->port.line >= ARRAY_SIZE(imx_ports)) {
+		dev_err(&pdev->dev, "serial%d out of range\n",
+			sport->port.line);
+		return -EINVAL;
+	}
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(base))
@@ -2149,6 +2130,37 @@ static int serial_imx_probe(struct platform_device *pdev)
 		 UCR1_TXMPTYEN | UCR1_RTSDEN);
 	writel_relaxed(reg, sport->port.membase + UCR1);
 
+	if (!is_imx1_uart(sport) && sport->dte_mode) {
+		/*
+		 * The DCEDTE bit changes the direction of DSR, DCD, DTR and RI
+		 * and influences if UCR3_RI and UCR3_DCD changes the level of RI
+		 * and DCD (when they are outputs) or enables the respective
+		 * irqs. So set this bit early, i.e. before requesting irqs.
+		 */
+		reg = readl(sport->port.membase + UFCR);
+		if (!(reg & UFCR_DCEDTE))
+			writel(reg | UFCR_DCEDTE, sport->port.membase + UFCR);
+
+		/*
+		 * Disable UCR3_RI and UCR3_DCD irqs. They are also not
+		 * enabled later because they cannot be cleared
+		 * (confirmed on i.MX25) which makes them unusable.
+		 */
+		writel(IMX21_UCR3_RXDMUXSEL | UCR3_ADNIMP | UCR3_DSR,
+		       sport->port.membase + UCR3);
+
+	} else {
+		unsigned long ucr3 = UCR3_DSR;
+
+		reg = readl(sport->port.membase + UFCR);
+		if (reg & UFCR_DCEDTE)
+			writel(reg & ~UFCR_DCEDTE, sport->port.membase + UFCR);
+
+		if (!is_imx1_uart(sport))
+			ucr3 |= IMX21_UCR3_RXDMUXSEL | UCR3_ADNIMP;
+		writel(ucr3, sport->port.membase + UCR3);
+	}
+
 	clk_disable_unprepare(sport->clk_ipg);
 
 	/*
@@ -2168,6 +2180,14 @@ static int serial_imx_probe(struct platform_device *pdev)
 				       dev_name(&pdev->dev), sport);
 		if (ret) {
 			dev_err(&pdev->dev, "failed to request tx irq: %d\n",
+				ret);
+			return ret;
+		}
+
+		ret = devm_request_irq(&pdev->dev, rtsirq, imx_rtsint, 0,
+				       dev_name(&pdev->dev), sport);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to request rts irq: %d\n",
 				ret);
 			return ret;
 		}
@@ -2239,12 +2259,14 @@ static void serial_imx_enable_wakeup(struct imx_port *sport, bool on)
 		val &= ~UCR3_AWAKEN;
 	writel(val, sport->port.membase + UCR3);
 
-	val = readl(sport->port.membase + UCR1);
-	if (on)
-		val |= UCR1_RTSDEN;
-	else
-		val &= ~UCR1_RTSDEN;
-	writel(val, sport->port.membase + UCR1);
+	if (sport->have_rtscts) {
+		val = readl(sport->port.membase + UCR1);
+		if (on)
+			val |= UCR1_RTSDEN;
+		else
+			val &= ~UCR1_RTSDEN;
+		writel(val, sport->port.membase + UCR1);
+	}
 }
 
 static int imx_serial_port_suspend_noirq(struct device *dev)

@@ -130,6 +130,12 @@ void __init acpi_nvs_nosave_s3(void)
 	nvs_nosave_s3 = true;
 }
 
+static int __init init_nvs_save_s3(const struct dmi_system_id *d)
+{
+	nvs_nosave_s3 = false;
+	return 0;
+}
+
 /*
  * ACPI 1.0 wants us to execute _PTS before suspending devices, so we allow the
  * user to request that behavior by using the 'acpi_old_suspend_ordering'
@@ -324,6 +330,27 @@ static struct dmi_system_id acpisleep_dmi_table[] __initdata = {
 		DMI_MATCH(DMI_PRODUCT_NAME, "K54HR"),
 		},
 	},
+	{
+	.callback = init_nvs_save_s3,
+	.ident = "Asus 1025C",
+	.matches = {
+		DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
+		DMI_MATCH(DMI_PRODUCT_NAME, "1025C"),
+		},
+	},
+	/*
+	 * https://bugzilla.kernel.org/show_bug.cgi?id=189431
+	 * Lenovo G50-45 is a platform later than 2012, but needs nvs memory
+	 * saving during S3.
+	 */
+	{
+	.callback = init_nvs_save_s3,
+	.ident = "Lenovo G50-45",
+	.matches = {
+		DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		DMI_MATCH(DMI_PRODUCT_NAME, "80E3"),
+		},
+	},
 	{},
 };
 
@@ -455,6 +482,7 @@ static void acpi_pm_start(u32 acpi_state)
  */
 static void acpi_pm_end(void)
 {
+	acpi_turn_off_unused_power_resources();
 	acpi_scan_lock_release();
 	/*
 	 * This is necessary in case acpi_pm_finish() is not called during a

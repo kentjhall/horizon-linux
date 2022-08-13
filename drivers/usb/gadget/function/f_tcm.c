@@ -751,12 +751,13 @@ static int uasp_alloc_stream_res(struct f_uas *fu, struct uas_stream *stream)
 		goto err_sts;
 
 	return 0;
+
 err_sts:
-	usb_ep_free_request(fu->ep_status, stream->req_status);
-	stream->req_status = NULL;
-err_out:
 	usb_ep_free_request(fu->ep_out, stream->req_out);
 	stream->req_out = NULL;
+err_out:
+	usb_ep_free_request(fu->ep_in, stream->req_in);
+	stream->req_in = NULL;
 out:
 	return -ENOMEM;
 }
@@ -1073,7 +1074,7 @@ static struct usbg_cmd *usbg_get_cmd(struct f_uas *fu,
 	struct usbg_cmd *cmd;
 	int tag;
 
-	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, GFP_ATOMIC);
+	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
 	if (tag < 0)
 		return ERR_PTR(-ENOMEM);
 

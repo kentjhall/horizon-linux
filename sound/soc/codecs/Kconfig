@@ -266,8 +266,15 @@ config SND_SOC_AD193X_SPI
 	select SND_SOC_AD193X
 
 config SND_SOC_AD193X_I2C
-	tristate
+	tristate "AD193X_I2C codec driver"
 	select SND_SOC_AD193X
+	default n
+	---help---
+	AD193X_I2C codec driver
+
+	Say Y here to compile the AD193X codec driver into the kernel or say M
+	to compile it as a module.
+
 
 config SND_SOC_AD1980
 	select REGMAP_AC97
@@ -723,6 +730,10 @@ config SND_SOC_RT5677_SPI
 	tristate
 	default SND_SOC_RT5677 && SPI
 
+config SND_SOC_RT5659
+	tristate "Realtek RT5659 audio codec driver"
+	depends on I2C
+
 #Freescale sgtl5000 codec
 config SND_SOC_SGTL5000
 	tristate "Freescale SGTL5000 CODEC"
@@ -1088,5 +1099,7 @@ config SND_SOC_NAU8825
 config SND_SOC_TPA6130A2
 	tristate "Texas Instruments TPA6130A2 headphone amplifier"
 	depends on I2C
+
+source "sound/soc/codecs/tas2557/Kconfig"
 
 endmenu

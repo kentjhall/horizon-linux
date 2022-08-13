@@ -834,7 +834,9 @@ static int adf7242_rx(struct adf7242_local *lp)
 	int ret;
 	u8 lqi, len_u8, *data;
 
-	adf7242_read_reg(lp, 0, &len_u8);
+	ret = adf7242_read_reg(lp, 0, &len_u8);
+	if (ret)
+		return ret;
 
 	len = len_u8;
 
@@ -888,7 +890,7 @@ static struct ieee802154_ops adf7242_ops = {
 	.set_cca_ed_level = adf7242_set_cca_ed_level,
 };
 
-static void adf7242_debug(u8 irq1)
+static void adf7242_debug(struct adf7242_local *lp, u8 irq1)
 {
 #ifdef DEBUG
 	u8 stat;
@@ -932,7 +934,7 @@ static irqreturn_t adf7242_isr(int irq, void *data)
 		dev_err(&lp->spi->dev, "%s :ERROR IRQ1 = 0x%X\n",
 			__func__, irq1);
 
-	adf7242_debug(irq1);
+	adf7242_debug(lp, irq1);
 
 	xmit = test_bit(FLAG_XMIT, &lp->flags);
 

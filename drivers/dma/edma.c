@@ -1143,10 +1143,23 @@ static struct dma_async_tx_descriptor *edma_prep_dma_memcpy(
 	struct edma_desc *edesc;
 	struct device *dev = chan->device->dev;
 	struct edma_chan *echan = to_edma_chan(chan);
-	unsigned int width, pset_len;
+	unsigned int width, pset_len, array_size;
 
 	if (unlikely(!echan || !len))
 		return NULL;
+
+	/* Align the array size (acnt block) with the transfer properties */
+	switch (__ffs((src | dest | len))) {
+	case 0:
+		array_size = SZ_32K - 1;
+		break;
+	case 1:
+		array_size = SZ_32K - 2;
+		break;
+	default:
+		array_size = SZ_32K - 4;
+		break;
+	}
 
 	if (len < SZ_64K) {
 		/*
@@ -1169,7 +1182,7 @@ static struct dma_async_tx_descriptor *edma_prep_dma_memcpy(
 		 * When the full_length is multibple of 32767 one slot can be
 		 * used to complete the transfer.
 		 */
-		width = SZ_32K - 1;
+		width = array_size;
 		pset_len = rounddown(len, width);
 		/* One slot is enough for lengths multiple of (SZ_32K -1) */
 		if (unlikely(pset_len == len))
@@ -1217,7 +1230,7 @@ static struct dma_async_tx_descriptor *edma_prep_dma_memcpy(
 		}
 		dest += pset_len;
 		src += pset_len;
-		pset_len = width = len % (SZ_32K - 1);
+		pset_len = width = len % array_size;
 
 		ret = edma_config_pset(chan, &edesc->pset[1], src, dest, 1,
 				       width, pset_len, DMA_MEM_TO_MEM);
@@ -2255,9 +2268,6 @@ static int edma_probe(struct platform_device *pdev)
 
 	ecc->default_queue = info->default_queue;
 
-	for (i = 0; i < ecc->num_slots; i++)
-		edma_write_slot(ecc, i, &dummy_paramset);
-
 	if (info->rsv) {
 		/* Set the reserved slots in inuse list */
 		rsv_slots = info->rsv->rsv_slots;
@@ -2268,6 +2278,12 @@ static int edma_probe(struct platform_device *pdev)
 				edma_set_bits(off, ln, ecc->slot_inuse);
 			}
 		}
+	}
+
+	for (i = 0; i < ecc->num_slots; i++) {
+		/* Reset only unused - not reserved - paRAM slots */
+		if (!test_bit(i, ecc->slot_inuse))
+			edma_write_slot(ecc, i, &dummy_paramset);
 	}
 
 	/* Clear the xbar mapped channels in unused list */
@@ -2324,8 +2340,10 @@ static int edma_probe(struct platform_device *pdev)
 
 		ecc->tc_list = devm_kcalloc(dev, ecc->num_tc,
 					    sizeof(*ecc->tc_list), GFP_KERNEL);
-		if (!ecc->tc_list)
-			return -ENOMEM;
+		if (!ecc->tc_list) {
+			ret = -ENOMEM;
+			goto err_reg1;
+		}
 
 		for (i = 0;; i++) {
 			ret = of_parse_phandle_with_fixed_args(node, "ti,tptcs",

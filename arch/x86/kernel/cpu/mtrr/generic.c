@@ -166,9 +166,6 @@ static u8 mtrr_type_lookup_variable(u64 start, u64 end, u64 *partial_end,
 	*repeat = 0;
 	*uniform = 1;
 
-	/* Make end inclusive instead of exclusive */
-	end--;
-
 	prev_match = MTRR_TYPE_INVALID;
 	for (i = 0; i < num_var_ranges; ++i) {
 		unsigned short start_state, end_state, inclusive;
@@ -259,6 +256,9 @@ u8 mtrr_type_lookup(u64 start, u64 end, u8 *uniform)
 	u8 type, prev_type, is_uniform = 1, dummy;
 	int repeat;
 	u64 partial_end;
+
+	/* Make end inclusive instead of exclusive */
+	end--;
 
 	if (!mtrr_state_set)
 		return MTRR_TYPE_INVALID;
@@ -859,7 +859,7 @@ int generic_validate_add_page(unsigned long base, unsigned long size,
 	 */
 	if (is_cpu(INTEL) && boot_cpu_data.x86 == 6 &&
 	    boot_cpu_data.x86_model == 1 &&
-	    boot_cpu_data.x86_mask <= 7) {
+	    boot_cpu_data.x86_stepping <= 7) {
 		if (base & ((1 << (22 - PAGE_SHIFT)) - 1)) {
 			pr_warn("mtrr: base(0x%lx000) is not 4 MiB aligned\n", base);
 			return -EINVAL;

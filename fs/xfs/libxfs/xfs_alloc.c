@@ -95,10 +95,7 @@ unsigned int
 xfs_alloc_set_aside(
 	struct xfs_mount	*mp)
 {
-	unsigned int		blocks;
-
-	blocks = 4 + (mp->m_sb.sb_agcount * XFS_ALLOC_AGFL_RESERVE);
-	return blocks;
+	return mp->m_sb.sb_agcount * (XFS_ALLOC_AGFL_RESERVE + 4);
 }
 
 /*
@@ -365,33 +362,9 @@ xfs_alloc_fix_len(
 		return;
 	ASSERT(rlen >= args->minlen && rlen <= args->maxlen);
 	ASSERT(rlen % args->prod == args->mod);
+	ASSERT(args->pag->pagf_freeblks + args->pag->pagf_flcount >=
+		rlen + args->minleft);
 	args->len = rlen;
-}
-
-/*
- * Fix up length if there is too little space left in the a.g.
- * Return 1 if ok, 0 if too little, should give up.
- */
-STATIC int
-xfs_alloc_fix_minleft(
-	xfs_alloc_arg_t	*args)		/* allocation argument structure */
-{
-	xfs_agf_t	*agf;		/* a.g. freelist header */
-	int		diff;		/* free space difference */
-
-	if (args->minleft == 0)
-		return 1;
-	agf = XFS_BUF_TO_AGF(args->agbp);
-	diff = be32_to_cpu(agf->agf_freeblks)
-		- args->len - args->minleft;
-	if (diff >= 0)
-		return 1;
-	args->len += diff;		/* shrink the allocated space */
-	/* casts to (int) catch length underflows */
-	if ((int)args->len >= (int)args->minlen)
-		return 1;
-	args->agbno = NULLAGBLOCK;
-	return 0;
 }
 
 /*
@@ -689,28 +662,12 @@ xfs_alloc_ag_vextent(
 	xfs_alloc_arg_t	*args)	/* argument structure for allocation */
 {
 	int		error=0;
-	xfs_extlen_t	reservation;
-	xfs_extlen_t	oldmax;
 
 	ASSERT(args->minlen > 0);
 	ASSERT(args->maxlen > 0);
 	ASSERT(args->minlen <= args->maxlen);
 	ASSERT(args->mod < args->prod);
 	ASSERT(args->alignment > 0);
-
-	/*
-	 * Clamp maxlen to the amount of free space minus any reservations
-	 * that have been made.
-	 */
-	oldmax = args->maxlen;
-	reservation = xfs_ag_resv_needed(args->pag, args->resv);
-	if (args->maxlen > args->pag->pagf_freeblks - reservation)
-		args->maxlen = args->pag->pagf_freeblks - reservation;
-	if (args->maxlen == 0) {
-		args->agbno = NULLAGBLOCK;
-		args->maxlen = oldmax;
-		return 0;
-	}
 
 	/*
 	 * Branch to correct routine based on the type.
@@ -730,8 +687,6 @@ xfs_alloc_ag_vextent(
 		ASSERT(0);
 		/* NOTREACHED */
 	}
-
-	args->maxlen = oldmax;
 
 	if (error || args->agbno == NULLAGBLOCK)
 		return error;
@@ -841,9 +796,6 @@ xfs_alloc_ag_vextent_exact(
 	args->len = XFS_AGBLOCK_MIN(tend, args->agbno + args->maxlen)
 						- args->agbno;
 	xfs_alloc_fix_len(args);
-	if (!xfs_alloc_fix_minleft(args))
-		goto not_found;
-
 	ASSERT(args->agbno + args->len <= tend);
 
 	/*
@@ -1149,12 +1101,7 @@ restart:
 		XFS_WANT_CORRUPTED_GOTO(args->mp, i == 1, error0);
 		ASSERT(ltbno + ltlen <= be32_to_cpu(XFS_BUF_TO_AGF(args->agbp)->agf_length));
 		args->len = blen;
-		if (!xfs_alloc_fix_minleft(args)) {
-			xfs_btree_del_cursor(cnt_cur, XFS_BTREE_NOERROR);
-			trace_xfs_alloc_near_nominleft(args);
-			return 0;
-		}
-		blen = args->len;
+
 		/*
 		 * We are allocating starting at bnew for blen blocks.
 		 */
@@ -1346,12 +1293,6 @@ restart:
 	 */
 	args->len = XFS_EXTLEN_MIN(ltlena, args->maxlen);
 	xfs_alloc_fix_len(args);
-	if (!xfs_alloc_fix_minleft(args)) {
-		trace_xfs_alloc_near_nominleft(args);
-		xfs_btree_del_cursor(bno_cur_lt, XFS_BTREE_NOERROR);
-		xfs_btree_del_cursor(cnt_cur, XFS_BTREE_NOERROR);
-		return 0;
-	}
 	rlen = args->len;
 	(void)xfs_alloc_compute_diff(args->agbno, rlen, args->alignment,
 				     args->datatype, ltbnoa, ltlena, &ltnew);
@@ -1553,8 +1494,6 @@ restart:
 	}
 	xfs_alloc_fix_len(args);
 
-	if (!xfs_alloc_fix_minleft(args))
-		goto out_nominleft;
 	rlen = args->len;
 	XFS_WANT_CORRUPTED_GOTO(args->mp, rlen <= flen, error0);
 	/*
@@ -1640,6 +1579,10 @@ xfs_alloc_ag_vextent_small(
 
 				bp = xfs_btree_get_bufs(args->mp, args->tp,
 					args->agno, fbno, 0);
+				if (!bp) {
+					error = -EFSCORRUPTED;
+					goto error0;
+				}
 				xfs_trans_binval(args->tp, bp);
 			}
 			args->len = 1;
@@ -2056,7 +1999,7 @@ xfs_alloc_space_available(
 	int			flags)
 {
 	struct xfs_perag	*pag = args->pag;
-	xfs_extlen_t		longest;
+	xfs_extlen_t		alloc_len, longest;
 	xfs_extlen_t		reservation; /* blocks that are still reserved */
 	int			available;
 
@@ -2066,18 +2009,116 @@ xfs_alloc_space_available(
 	reservation = xfs_ag_resv_needed(pag, args->resv);
 
 	/* do we have enough contiguous free space for the allocation? */
+	alloc_len = args->minlen + (args->alignment - 1) + args->minalignslop;
 	longest = xfs_alloc_longest_free_extent(args->mp, pag, min_free,
 			reservation);
-	if ((args->minlen + args->alignment + args->minalignslop - 1) > longest)
+	if (longest < alloc_len)
 		return false;
 
 	/* do we have enough free space remaining for the allocation? */
 	available = (int)(pag->pagf_freeblks + pag->pagf_flcount -
-			  reservation - min_free - args->total);
-	if (available < (int)args->minleft || available <= 0)
+			  reservation - min_free - args->minleft);
+	if (available < (int)max(args->total, alloc_len))
 		return false;
 
+	/*
+	 * Clamp maxlen to the amount of free space available for the actual
+	 * extent allocation.
+	 */
+	if (available < (int)args->maxlen && !(flags & XFS_ALLOC_FLAG_CHECK)) {
+		args->maxlen = available;
+		ASSERT(args->maxlen > 0);
+		ASSERT(args->maxlen >= args->minlen);
+	}
+
 	return true;
+}
+
+/*
+ * Check the agfl fields of the agf for inconsistency or corruption. The purpose
+ * is to detect an agfl header padding mismatch between current and early v5
+ * kernels. This problem manifests as a 1-slot size difference between the
+ * on-disk flcount and the active [first, last] range of a wrapped agfl. This
+ * may also catch variants of agfl count corruption unrelated to padding. Either
+ * way, we'll reset the agfl and warn the user.
+ *
+ * Return true if a reset is required before the agfl can be used, false
+ * otherwise.
+ */
+static bool
+xfs_agfl_needs_reset(
+	struct xfs_mount	*mp,
+	struct xfs_agf		*agf)
+{
+	uint32_t		f = be32_to_cpu(agf->agf_flfirst);
+	uint32_t		l = be32_to_cpu(agf->agf_fllast);
+	uint32_t		c = be32_to_cpu(agf->agf_flcount);
+	int			agfl_size = XFS_AGFL_SIZE(mp);
+	int			active;
+
+	/* no agfl header on v4 supers */
+	if (!xfs_sb_version_hascrc(&mp->m_sb))
+		return false;
+
+	/*
+	 * The agf read verifier catches severe corruption of these fields.
+	 * Repeat some sanity checks to cover a packed -> unpacked mismatch if
+	 * the verifier allows it.
+	 */
+	if (f >= agfl_size || l >= agfl_size)
+		return true;
+	if (c > agfl_size)
+		return true;
+
+	/*
+	 * Check consistency between the on-disk count and the active range. An
+	 * agfl padding mismatch manifests as an inconsistent flcount.
+	 */
+	if (c && l >= f)
+		active = l - f + 1;
+	else if (c)
+		active = agfl_size - f + l + 1;
+	else
+		active = 0;
+
+	return active != c;
+}
+
+/*
+ * Reset the agfl to an empty state. Ignore/drop any existing blocks since the
+ * agfl content cannot be trusted. Warn the user that a repair is required to
+ * recover leaked blocks.
+ *
+ * The purpose of this mechanism is to handle filesystems affected by the agfl
+ * header padding mismatch problem. A reset keeps the filesystem online with a
+ * relatively minor free space accounting inconsistency rather than suffer the
+ * inevitable crash from use of an invalid agfl block.
+ */
+static void
+xfs_agfl_reset(
+	struct xfs_trans	*tp,
+	struct xfs_buf		*agbp,
+	struct xfs_perag	*pag)
+{
+	struct xfs_mount	*mp = tp->t_mountp;
+	struct xfs_agf		*agf = XFS_BUF_TO_AGF(agbp);
+
+	ASSERT(pag->pagf_agflreset);
+	trace_xfs_agfl_reset(mp, agf, 0, _RET_IP_);
+
+	xfs_warn(mp,
+	       "WARNING: Reset corrupted AGFL on AG %u. %d blocks leaked. "
+	       "Please unmount and run xfs_repair.",
+	         pag->pag_agno, pag->pagf_flcount);
+
+	agf->agf_flfirst = 0;
+	agf->agf_fllast = cpu_to_be32(XFS_AGFL_SIZE(mp) - 1);
+	agf->agf_flcount = 0;
+	xfs_alloc_log_agf(tp, agbp, XFS_AGF_FLFIRST | XFS_AGF_FLLAST |
+				    XFS_AGF_FLCOUNT);
+
+	pag->pagf_flcount = 0;
+	pag->pagf_agflreset = false;
 }
 
 /*
@@ -2122,7 +2163,8 @@ xfs_alloc_fix_freelist(
 	}
 
 	need = xfs_alloc_min_freelist(mp, pag);
-	if (!xfs_alloc_space_available(args, need, flags))
+	if (!xfs_alloc_space_available(args, need, flags |
+			XFS_ALLOC_FLAG_CHECK))
 		goto out_agbp_relse;
 
 	/*
@@ -2139,6 +2181,10 @@ xfs_alloc_fix_freelist(
 			goto out_no_agbp;
 		}
 	}
+
+	/* reset a padding mismatched agfl before final free space check */
+	if (pag->pagf_agflreset)
+		xfs_agfl_reset(tp, agbp, pag);
 
 	/* If there isn't enough total space or single-extent, reject it. */
 	need = xfs_alloc_min_freelist(mp, pag);
@@ -2185,6 +2231,10 @@ xfs_alloc_fix_freelist(
 		if (error)
 			goto out_agbp_relse;
 		bp = xfs_btree_get_bufs(mp, tp, args->agno, bno, 0);
+		if (!bp) {
+			error = -EFSCORRUPTED;
+			goto out_agbp_relse;
+		}
 		xfs_trans_binval(tp, bp);
 	}
 
@@ -2292,6 +2342,7 @@ xfs_alloc_get_freelist(
 		agf->agf_flfirst = 0;
 
 	pag = xfs_perag_get(mp, be32_to_cpu(agf->agf_seqno));
+	ASSERT(!pag->pagf_agflreset);
 	be32_add_cpu(&agf->agf_flcount, -1);
 	xfs_trans_agflist_delta(tp, -1);
 	pag->pagf_flcount--;
@@ -2403,6 +2454,7 @@ xfs_alloc_put_freelist(
 		agf->agf_fllast = 0;
 
 	pag = xfs_perag_get(mp, be32_to_cpu(agf->agf_seqno));
+	ASSERT(!pag->pagf_agflreset);
 	be32_add_cpu(&agf->agf_flcount, 1);
 	xfs_trans_agflist_delta(tp, 1);
 	pag->pagf_flcount++;
@@ -2455,12 +2507,26 @@ xfs_agf_verify(
 	      be32_to_cpu(agf->agf_flcount) <= XFS_AGFL_SIZE(mp)))
 		return false;
 
-	if (be32_to_cpu(agf->agf_levels[XFS_BTNUM_BNO]) > XFS_BTREE_MAXLEVELS ||
+	if (be32_to_cpu(agf->agf_length) > mp->m_sb.sb_dblocks)
+		return false;
+
+	if (be32_to_cpu(agf->agf_freeblks) < be32_to_cpu(agf->agf_longest) ||
+	    be32_to_cpu(agf->agf_freeblks) > be32_to_cpu(agf->agf_length))
+		return false;
+
+	if (be32_to_cpu(agf->agf_levels[XFS_BTNUM_BNO]) < 1 ||
+	    be32_to_cpu(agf->agf_levels[XFS_BTNUM_CNT]) < 1 ||
+	    be32_to_cpu(agf->agf_levels[XFS_BTNUM_BNO]) > XFS_BTREE_MAXLEVELS ||
 	    be32_to_cpu(agf->agf_levels[XFS_BTNUM_CNT]) > XFS_BTREE_MAXLEVELS)
 		return false;
 
 	if (xfs_sb_version_hasrmapbt(&mp->m_sb) &&
-	    be32_to_cpu(agf->agf_levels[XFS_BTNUM_RMAP]) > XFS_BTREE_MAXLEVELS)
+	    (be32_to_cpu(agf->agf_levels[XFS_BTNUM_RMAP]) < 1 ||
+	     be32_to_cpu(agf->agf_levels[XFS_BTNUM_RMAP]) > XFS_BTREE_MAXLEVELS))
+		return false;
+
+	if (xfs_sb_version_hasrmapbt(&mp->m_sb) &&
+	    be32_to_cpu(agf->agf_rmap_blocks) > be32_to_cpu(agf->agf_length))
 		return false;
 
 	/*
@@ -2477,7 +2543,13 @@ xfs_agf_verify(
 		return false;
 
 	if (xfs_sb_version_hasreflink(&mp->m_sb) &&
-	    be32_to_cpu(agf->agf_refcount_level) > XFS_BTREE_MAXLEVELS)
+	    be32_to_cpu(agf->agf_refcount_blocks) >
+	    be32_to_cpu(agf->agf_length))
+		return false;
+
+	if (xfs_sb_version_hasreflink(&mp->m_sb) &&
+	    (be32_to_cpu(agf->agf_refcount_level) < 1 ||
+	     be32_to_cpu(agf->agf_refcount_level) > XFS_BTREE_MAXLEVELS))
 		return false;
 
 	return true;;
@@ -2605,6 +2677,7 @@ xfs_alloc_read_agf(
 		pag->pagb_count = 0;
 		pag->pagb_tree = RB_ROOT;
 		pag->pagf_init = 1;
+		pag->pagf_agflreset = xfs_agfl_needs_reset(mp, agf);
 	}
 #ifdef DEBUG
 	else if (!XFS_FORCED_SHUTDOWN(mp)) {
@@ -2634,12 +2707,10 @@ xfs_alloc_vextent(
 	xfs_agblock_t	agsize;	/* allocation group size */
 	int		error;
 	int		flags;	/* XFS_ALLOC_FLAG_... locking flags */
-	xfs_extlen_t	minleft;/* minimum left value, temp copy */
 	xfs_mount_t	*mp;	/* mount structure pointer */
 	xfs_agnumber_t	sagno;	/* starting allocation group number */
 	xfs_alloctype_t	type;	/* input allocation type */
 	int		bump_rotor = 0;
-	int		no_min = 0;
 	xfs_agnumber_t	rotorstep = xfs_rotorstep; /* inode32 agf stepper */
 
 	mp = args->mp;
@@ -2668,7 +2739,6 @@ xfs_alloc_vextent(
 		trace_xfs_alloc_vextent_badargs(args);
 		return 0;
 	}
-	minleft = args->minleft;
 
 	switch (type) {
 	case XFS_ALLOCTYPE_THIS_AG:
@@ -2679,9 +2749,7 @@ xfs_alloc_vextent(
 		 */
 		args->agno = XFS_FSB_TO_AGNO(mp, args->fsbno);
 		args->pag = xfs_perag_get(mp, args->agno);
-		args->minleft = 0;
 		error = xfs_alloc_fix_freelist(args, 0);
-		args->minleft = minleft;
 		if (error) {
 			trace_xfs_alloc_vextent_nofix(args);
 			goto error0;
@@ -2746,9 +2814,7 @@ xfs_alloc_vextent(
 		 */
 		for (;;) {
 			args->pag = xfs_perag_get(mp, args->agno);
-			if (no_min) args->minleft = 0;
 			error = xfs_alloc_fix_freelist(args, flags);
-			args->minleft = minleft;
 			if (error) {
 				trace_xfs_alloc_vextent_nofix(args);
 				goto error0;
@@ -2788,20 +2854,17 @@ xfs_alloc_vextent(
 			 * or switch to non-trylock mode.
 			 */
 			if (args->agno == sagno) {
-				if (no_min == 1) {
+				if (flags == 0) {
 					args->agbno = NULLAGBLOCK;
 					trace_xfs_alloc_vextent_allfailed(args);
 					break;
 				}
-				if (flags == 0) {
-					no_min = 1;
-				} else {
-					flags = 0;
-					if (type == XFS_ALLOCTYPE_START_BNO) {
-						args->agbno = XFS_FSB_TO_AGBNO(mp,
-							args->fsbno);
-						args->type = XFS_ALLOCTYPE_NEAR_BNO;
-					}
+
+				flags = 0;
+				if (type == XFS_ALLOCTYPE_START_BNO) {
+					args->agbno = XFS_FSB_TO_AGBNO(mp,
+						args->fsbno);
+					args->type = XFS_ALLOCTYPE_NEAR_BNO;
 				}
 			}
 			xfs_perag_put(args->pag);

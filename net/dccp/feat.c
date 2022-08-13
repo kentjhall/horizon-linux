@@ -738,7 +738,12 @@ static int __feat_register_sp(struct list_head *fn, u8 feat, u8 is_local,
 	if (dccp_feat_clone_sp_val(&fval, sp_val, sp_len))
 		return -ENOMEM;
 
-	return dccp_feat_push_change(fn, feat, is_local, mandatory, &fval);
+	if (dccp_feat_push_change(fn, feat, is_local, mandatory, &fval)) {
+		kfree(fval.sp.vec);
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
 /**
@@ -1471,9 +1476,12 @@ int dccp_feat_init(struct sock *sk)
 	 * singleton values (which always leads to failure).
 	 * These settings can still (later) be overridden via sockopts.
 	 */
-	if (ccid_get_builtin_ccids(&tx.val, &tx.len) ||
-	    ccid_get_builtin_ccids(&rx.val, &rx.len))
+	if (ccid_get_builtin_ccids(&tx.val, &tx.len))
 		return -ENOBUFS;
+	if (ccid_get_builtin_ccids(&rx.val, &rx.len)) {
+		kfree(tx.val);
+		return -ENOBUFS;
+	}
 
 	if (!dccp_feat_prefer(sysctl_dccp_tx_ccid, tx.val, tx.len) ||
 	    !dccp_feat_prefer(sysctl_dccp_rx_ccid, rx.val, rx.len))

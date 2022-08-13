@@ -130,6 +130,11 @@
 #define MEDIA_BUS_FMT_SGBRG16_1X16		0x301e
 #define MEDIA_BUS_FMT_SGRBG16_1X16		0x301f
 #define MEDIA_BUS_FMT_SRGGB16_1X16		0x3020
+/* Maintain a higher offset untill upstreamed */
+#define MEDIA_BUS_FMT_XBGGR10P_3X10		0x3050
+#define MEDIA_BUS_FMT_XGBRG10P_3X10		0x3051
+#define MEDIA_BUS_FMT_XGRBG10P_3X10		0x3052
+#define MEDIA_BUS_FMT_XRGGB10P_3X10		0x3053
 
 /* JPEG compressed formats - next is	0x4002 */
 #define MEDIA_BUS_FMT_JPEG_1X8			0x4001

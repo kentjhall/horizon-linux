@@ -162,9 +162,10 @@
 			};
 
 			adc0: adc@f8018000 {
+				atmel,adc-vref = <3300>;
+				atmel,adc-channels-used = <0xfe>;
 				pinctrl-0 = <
 					&pinctrl_adc0_adtrg
-					&pinctrl_adc0_ad0
 					&pinctrl_adc0_ad1
 					&pinctrl_adc0_ad2
 					&pinctrl_adc0_ad3
@@ -172,8 +173,6 @@
 					&pinctrl_adc0_ad5
 					&pinctrl_adc0_ad6
 					&pinctrl_adc0_ad7
-					&pinctrl_adc0_ad8
-					&pinctrl_adc0_ad9
 					>;
 				status = "okay";
 			};
@@ -232,6 +231,11 @@
 						atmel,pins =
 							<AT91_PIOE 9 AT91_PERIPH_GPIO AT91_PINCTRL_DEGLITCH>;	/* PE9, conflicts with A9 */
 					};
+					pinctrl_usb_default: usb_default {
+						atmel,pins =
+							<AT91_PIOE 3 AT91_PERIPH_GPIO AT91_PINCTRL_NONE
+							 AT91_PIOE 4 AT91_PERIPH_GPIO AT91_PINCTRL_NONE>;
+					};
 				};
 			};
 		};
@@ -289,6 +293,8 @@
 					   &pioE 3 GPIO_ACTIVE_LOW
 					   &pioE 4 GPIO_ACTIVE_LOW
 					  >;
+			pinctrl-names = "default";
+			pinctrl-0 = <&pinctrl_usb_default>;
 			status = "okay";
 		};
 

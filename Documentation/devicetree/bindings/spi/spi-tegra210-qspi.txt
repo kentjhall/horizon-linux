@@ -1,0 +1,241 @@
+NVIDIA Tegra210 QSPI(Quad Serial Peripheral Interface) controller.
+
+The NVIDIA Tegra210 QSPI controller is used to interface with various
+QSPI flashes/devices using the SPI communication interface.
+
+Required SOC specific properties:
+---------------------------------
+- compatible: Must be one of
+		"nvidia,tegra210-qspi".
+		"nvidia,tegra186-qspi".
+
+- reg: physical base address of the controller and length of memory mapped
+  region.
+
+- interrupts: The interrupt number of QSPI controller to the cpu. The
+  interrupt specifier format depends on the interrupt controller.
+
+- dmas : Two or more DMA channel specifiers following the convention outlined
+  in bindings/dma/dma.txt
+
+- dma-names: Names for the dma channels. There must be at least one channel
+  named "tx" for transmit and named "rx" for receive.
+
+- clocks : Must contain an entry for each entry in clock-names.
+  See ../clocks/clock-bindings.txt for details.
+
+- clock-names : Must include the following entries:
+			qspi: For QSPI controller clock.
+			qspi_out: For QSPI output signal.
+
+- resets : Must contain an entry for each entry in reset-names.
+  See ../reset/reset.txt for details.
+
+- reset-names : Must include the following entries:
+			qspi
+
+Optional SoC specific properties:
+---------------------------------
+- nvidia,clock-always-on: Boolean, Enable clock of spi always for life of
+			  system. Absence of this property will make dynamic
+			  clock gating i.e. enable clock only when transfer
+			  is started and disable clock once transfer is done.
+
+- qspi-autosuspend-delay: delay in milliseconds for runtime suspend after
+			  device is idle. Larger delay would prevent frequent
+			  clk toggles but might consume slightly more power.
+			  When this property is not set, default delay is 3000.
+			  Set this value to less than 500 for power saving and
+			  above 2000 for better perf.
+
+Recommended SoC properties:
+----------------------
+- spi-max-frequency: Definition as per
+		     Documentation/devicetree/bindings/spi/spi-bus.txt
+
+
+
+Required Board Specific Properties:
+----------------------------------
+
+- #address-cells: should be 1.
+- #size-cells: should be 0.
+
+Optional Board Specific Properties:
+-----------------------------------
+- nvidia,clk-parents: Array of clock source to select the QSPI clock source
+  parent. Tegra QSPI has more than one clock source. However, all clock source
+  are not allowed to feed clocks to QSPI due to DVS restrictions. On this case,
+  this property helps to find the best clock source to get the minimum clock
+  error in requested clock frequency and actually set.
+
+QSPI Controller specific data in SPI slave nodes:
+-----------------------------------------------
+The spi slave nodes should provide the following information which is required
+by the spi controller. Below properties should be defined under 'controller-data'
+child node of the spi slave node.
+
+- nvidia,x1-len-limit:		Integer, X1 Length limit.
+- nvidia,x1-bus-speed:		Integer, X1 Bus speed.
+- nvidia,x1-dymmy-cycle:	Integer, X1 dummy cycle.
+- nvidia,x4-bus-speed:		Integer, X4 bus speed.
+- nvidia,x4-dymmy-cycle:	Integer, X4 dummy cycle.
+- nvidia,x4-is-ddr:		Integer, X4 is DDR?
+- nvidia,ctrl-bus-clk-ratio	Integer, clock ratio bewteen ctrl & bus clk
+- nvidia,combined-seq-mode-en:  Boolean, Select combined sequence mode.
+
+deprecated:
+- nvidia,ifddr-div2-sdr:	Integer, If DDR then device by 2.
+
+
+Bus Speed:
+---------
+To maintain compatibility with old device tree, bus speed on interface is
+half of what is provided in device tree if property 'nvidia,ifddr-div2-sdr'
+is defined. Else speed maintained on interface is same as bus speed
+defined in device tree.
+
+QSPI contorller frequency is 2x of speed maintained at interface in DDR mode.
+For SDR mode, this can be set with 'cltrl-bus-clk-ratio'. Default is 2x (same
+as DDR mode) to avoid settings clock for each transaction and improve
+performance.
+
+Aliases:
+-------
+
+- All the QSPI/SPI controller nodes should be represented in the aliases
+  node using the following format 'spi{n}' where n is a unique number for the alias.
+
+Prod Support:
+------------
+The recommended configuration for SoC/platform from HW/characterisation of
+SoC is provided as prod data. The POR value of controller registers may be
+different than this configurations. It is required to configure the
+controller registers with recommended setting before doing any data transfer.
+
+The prod setting from the SoC characterisation is provided under the
+sub-node "prod-settings". The prod data is provided under the sub node
+of "prod-settings" with different name (default and conditional) and
+it is used to configure controller register before starting transfer.
+The names of DT sub nodes for prod data are:
+- prod: Default DT node for prod setting which need to be configure before
+  starting of any transfer.
+
+- prod_c_DDR<freq>: Conditional prod values for DDR mode of QSPI controller
+  which will set with frequenncy "freq" in MHz. Like for:
+	133MHz, the prod node name will be "prod_c_DDR133".
+	100MHz, the prod node name will be "prod_c_DDR100".
+
+- prod_c_SDR<freq>: Conditional prod values for SDR mode of QSPI controller
+  which will set with frequenncy "freq" in MHz. Like for:
+	133MHz, the prod node name will be "prod_c_SDR133".
+	100MHz, the prod node name will be "prod_c_SDR100".
+
+Example:
+- SoC Specific Portion:
+- For Tegra210:
+        spi@70410000 {
+                compatible = "nvidia,tegra210-qspi";
+                reg = <0x0 0x70410000 0x0 0x1000>;
+                interrupts = <0 10 0x04>;
+                clocks = <&tegra_car TEGRA210_CLK_QSPI>,
+                        <&tegra_car TEGRA210_CLK_QSPI_OUT>;
+                clock-names = "qspi","qspi_out";
+		resets = <&tegra_car TEGRA186_RESET_QSPI>;
+		reset-names = "qspi";
+		dmas = <&apbdma 5>, <&apbdma 5>;
+		dma-names = "rx", "tx";
+                #address-cells = <1>; 
+                #size-cells = <0>; 
+              };   
+
+	
+For Tegra186:
+	spi@3270000 {
+		compatible = "nvidia,tegra186-qspi";
+		reg = <0x0 0x3270000 0x0 0x10000>;
+		interrupts = < 0 35 0x04 >;
+		dmas = <&gpcdma 5>, <&gpcdma 5>;
+		dma-names = "rx", "tx";
+		nvidia,clk-parents = "pll_p";
+		clocks = <&tegra_car TEGRA186_CLK_QSPI>,
+			<&tegra_car TEGRA186_CLK_QSPI_OUT>,
+			<&tegra_car TEGRA186_CLK_PLLP_OUT0>,
+			<&tegra_car TEGRA186_CLK_CLK_M>;
+		clock-names = "qspi","qspi_out","pll_p","clk_m";
+		resets = <&tegra_car TEGRA186_RESET_QSPI>;
+		reset-names = "qspi";
+		spi-max-frequency = <136000000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+- Board Specific Portion:
+
+	spi@3270000 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		spi@0 {
+			compatible = "spidev";
+			reg = <1>;
+			spi-max-frequency = <136000000>;
+			controller-data {
+					nvidia,x1-len-limit = <16>;
+					nvidia,x1-bus-speed = <136000000>; /* In Mhz */
+					nvidia,x1-dymmy-cycle = <0>;
+					nvidia,x4-bus-speed = <136000000>;
+					nvidia,x4-dymmy-cycle = <8>;
+					nvidia,ifddr-div2-sdr = <1>;
+					nvidia,x4-is-ddr;
+			};
+		};
+
+		spiflash@1 {
+			compatible = "s25fs512s";
+			reg = <0>;
+			spi-max-frequency = <136000000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "Whole_flash";
+				reg = <0x00000000 0x4000000>;
+			};
+
+			controller-data {
+				nvidia,x1-len-limit = <16>;
+				nvidia,x1-bus-speed = <136000000>; /* In Mhz */
+				nvidia,x1-dymmy-cycle = <8>;
+				nvidia,x4-bus-speed = <136000000>;
+				nvidia,x4-dymmy-cycle = <8>;
+				nvidia,ifddr-div2-sdr = <1>;
+				nvidia,x4-is-ddr;
+			};
+		};
+	};
+
+- Prod setting porting
+	spi@3270000 {
+		prod-settings {
+			#prod-cells = <3>;
+			prod {
+				prod = <0x000000C8 0xFFFFFFFF 0x80b880b8>;
+			};
+
+			prod_c_DDR133 {
+				/* Prod values for DDR mode at 133MHz */
+			};
+
+			prod_c_DDR100 {
+				/* Prod values for DDR mode at 100MHz */
+			};
+
+			prod_c_SDR133 {
+				/* Prod values for SDR mode at 133MHz */
+			};
+
+			prod_c_SDR100 {
+				/* Prod values for SDR mode at 100MHz */
+			};
+		};
+	};

@@ -174,6 +174,20 @@ extern void __iomem *ioremap_cache(phys_addr_t phys_addr, size_t size);
 #define iounmap				__iounmap
 
 /*
+ * PCI configuration space mapping function.
+ *
+ * The PCI specification disallows posted write configuration transactions.
+ * Add an arch specific pci_remap_cfgspace() definition that is implemented
+ * through nGnRnE device memory attribute as recommended by the ARM v8
+ * Architecture reference manual Issue A.k B2.8.2 "Device memory".
+ */
+#define pci_remap_cfgspace(addr, size) __ioremap((addr), (size), __pgprot(PROT_DEVICE_nGnRnE))
+
+extern int pci_ioremap_io(unsigned int offset, phys_addr_t phys_addr);
+extern void pci_iounmap_io(unsigned int offset);
+
+
+/*
  * io{read,write}{16,32,64}be() macros
  */
 #define ioread16be(p)		({ __u16 __v = be16_to_cpu((__force __be16)__raw_readw(p)); __iormb(); __v; })
@@ -185,6 +199,8 @@ extern void __iomem *ioremap_cache(phys_addr_t phys_addr, size_t size);
 #define iowrite64be(v,p)	({ __iowmb(); __raw_writeq((__force __u64)cpu_to_be64(v), p); })
 
 #include <asm-generic/io.h>
+
+#define IOMEM(x)        ((void __force __iomem *)(x))
 
 /*
  * More restrictive address range checking than the default implementation

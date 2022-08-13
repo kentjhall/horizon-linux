@@ -3697,8 +3697,8 @@ int r600_irq_init(struct radeon_device *rdev)
 	}
 
 	/* setup interrupt control */
-	/* set dummy read address to ring address */
-	WREG32(INTERRUPT_CNTL2, rdev->ih.gpu_addr >> 8);
+	/* set dummy read address to dummy page address */
+	WREG32(INTERRUPT_CNTL2, rdev->dummy_page.addr >> 8);
 	interrupt_cntl = RREG32(INTERRUPT_CNTL);
 	/* IH_DUMMY_RD_OVERRIDE=0 - dummy read disabled with msi, enabled without msi
 	 * IH_DUMMY_RD_OVERRIDE=1 - dummy read controlled by IH_DUMMY_RD_EN
@@ -3995,7 +3995,7 @@ static void r600_irq_ack(struct radeon_device *rdev)
 			WREG32(DC_HPD5_INT_CONTROL, tmp);
 		}
 		if (rdev->irq.stat_regs.r600.disp_int_cont2 & DC_HPD6_INTERRUPT) {
-			tmp = RREG32(DC_HPD5_INT_CONTROL);
+			tmp = RREG32(DC_HPD6_INT_CONTROL);
 			tmp |= DC_HPDx_INT_ACK;
 			WREG32(DC_HPD6_INT_CONTROL, tmp);
 		}

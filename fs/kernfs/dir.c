@@ -123,6 +123,11 @@ static int kernfs_path_from_node_locked(struct kernfs_node *kn_to,
 	size_t depth_from, depth_to, len = 0;
 	int i, j;
 
+	if (!buf && buflen > 0) {
+		WARN(1, "writing to NULL pointer ???\n");
+		return -EINVAL;
+	}
+
 	if (!kn_from)
 		kn_from = kernfs_root(kn_to)->kn;
 

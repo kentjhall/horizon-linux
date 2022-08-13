@@ -1118,7 +1118,7 @@ int be_cmd_pmac_add(struct be_adapter *adapter, u8 *mac_addr,
 err:
 	mutex_unlock(&adapter->mcc_lock);
 
-	 if (status == MCC_STATUS_UNAUTHORIZED_REQUEST)
+	 if (base_status(status) == MCC_STATUS_UNAUTHORIZED_REQUEST)
 		status = -EPERM;
 
 	return status;
@@ -4500,7 +4500,7 @@ int be_cmd_get_profile_config(struct be_adapter *adapter,
 				port_res->max_vfs += le16_to_cpu(pcie->num_vfs);
 			}
 		}
-		return status;
+		goto err;
 	}
 
 	pcie = be_get_pcie_desc(resp->func_param, desc_count,

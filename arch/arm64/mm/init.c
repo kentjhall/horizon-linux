@@ -36,6 +36,7 @@
 #include <linux/efi.h>
 #include <linux/swiotlb.h>
 #include <linux/vmalloc.h>
+#include <linux/mm.h>
 
 #include <asm/boot.h>
 #include <asm/fixmap.h>
@@ -147,7 +148,11 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 #ifdef CONFIG_HAVE_ARCH_PFN_VALID
 int pfn_valid(unsigned long pfn)
 {
-	return memblock_is_map_memory(pfn << PAGE_SHIFT);
+	phys_addr_t addr = pfn << PAGE_SHIFT;
+
+	if ((addr >> PAGE_SHIFT) != pfn)
+		return 0;
+	return memblock_is_map_memory(addr);
 }
 EXPORT_SYMBOL(pfn_valid);
 #endif
@@ -209,8 +214,8 @@ void __init arm64_memblock_init(void)
 	 * linear mapping. Take care not to clip the kernel which may be
 	 * high in memory.
 	 */
-	memblock_remove(max_t(u64, memstart_addr + linear_region_size, __pa(_end)),
-			ULLONG_MAX);
+	memblock_remove(max_t(u64, memstart_addr + linear_region_size,
+			__pa_symbol(_end)), ULLONG_MAX);
 	if (memstart_addr + linear_region_size < memblock_end_of_DRAM()) {
 		/* ensure that memstart_addr remains sufficiently aligned */
 		memstart_addr = round_up(memblock_end_of_DRAM() - linear_region_size,
@@ -225,7 +230,7 @@ void __init arm64_memblock_init(void)
 	 */
 	if (memory_limit != (phys_addr_t)ULLONG_MAX) {
 		memblock_mem_limit_remove_map(memory_limit);
-		memblock_add(__pa(_text), (u64)(_end - _text));
+		memblock_add(__pa_symbol(_text), (u64)(_end - _text));
 	}
 
 	if (IS_ENABLED(CONFIG_BLK_DEV_INITRD) && initrd_start) {
@@ -268,7 +273,7 @@ void __init arm64_memblock_init(void)
 		 * memory spans, randomize the linear region as well.
 		 */
 		if (memstart_offset_seed > 0 && range >= ARM64_MEMSTART_ALIGN) {
-			range = range / ARM64_MEMSTART_ALIGN + 1;
+			range /= ARM64_MEMSTART_ALIGN;
 			memstart_addr -= ARM64_MEMSTART_ALIGN *
 					 ((range * memstart_offset_seed) >> 16);
 		}
@@ -278,7 +283,7 @@ void __init arm64_memblock_init(void)
 	 * Register the kernel text, kernel data, initrd, and initial
 	 * pagetables with memblock.
 	 */
-	memblock_reserve(__pa(_text), _end - _text);
+	memblock_reserve(__pa_symbol(_text), _end - _text);
 #ifdef CONFIG_BLK_DEV_INITRD
 	if (initrd_start) {
 		memblock_reserve(initrd_start, initrd_end - initrd_start);
@@ -296,6 +301,7 @@ void __init arm64_memblock_init(void)
 		arm64_dma_phys_limit = max_zone_dma_phys();
 	else
 		arm64_dma_phys_limit = PHYS_MASK + 1;
+	high_memory = __va(memblock_end_of_DRAM() - 1) + 1;
 	dma_contiguous_reserve(arm64_dma_phys_limit);
 
 	memblock_allow_resize();
@@ -322,7 +328,6 @@ void __init bootmem_init(void)
 	sparse_init();
 	zone_sizes_init(min, max);
 
-	high_memory = __va((max << PAGE_SHIFT) - 1) + 1;
 	memblock_dump_all();
 }
 
@@ -401,8 +406,13 @@ static void __init free_unused_memmap(void)
  */
 void __init mem_init(void)
 {
-	if (swiotlb_force || max_pfn > (arm64_dma_phys_limit >> PAGE_SHIFT))
+#ifdef CONFIG_SWIOTLB
+	if (swiotlb_force == SWIOTLB_FORCE ||
+	    max_pfn > (arm64_dma_phys_limit >> PAGE_SHIFT))
 		swiotlb_init(1);
+	else
+		swiotlb_force = SWIOTLB_NO_FORCE;
+#endif
 
 	set_max_mapnr(pfn_to_page(max_pfn) - mem_map);
 
@@ -465,11 +475,13 @@ void __init mem_init(void)
 	BUILD_BUG_ON(TASK_SIZE_32			> TASK_SIZE_64);
 #endif
 
+#ifdef CONFIG_SPARSEMEM_VMEMMAP
 	/*
 	 * Make sure we chose the upper bound of sizeof(struct page)
-	 * correctly.
+	 * correctly when sizing the VMEMMAP array.
 	 */
 	BUILD_BUG_ON(sizeof(struct page) > (1 << STRUCT_PAGE_MAX_SHIFT));
+#endif
 
 	if (PAGE_SIZE >= 16384 && get_num_physpages() <= 128) {
 		extern int sysctl_overcommit_memory;
@@ -483,7 +495,8 @@ void __init mem_init(void)
 
 void free_initmem(void)
 {
-	free_reserved_area(__va(__pa(__init_begin)), __va(__pa(__init_end)),
+	free_reserved_area(lm_alias(__init_begin),
+			   lm_alias(__init_end),
 			   0, "unused kernel");
 	/*
 	 * Unmap the __init region but leave the VM area in place. This
@@ -536,3 +549,116 @@ static int __init register_mem_limit_dumper(void)
 	return 0;
 }
 __initcall(register_mem_limit_dumper);
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+{
+	pg_data_t *pgdat;
+	struct zone *zone;
+	unsigned long start_pfn = start >> PAGE_SHIFT;
+	unsigned long nr_pages = size >> PAGE_SHIFT;
+	unsigned long end_pfn = start_pfn + nr_pages;
+	unsigned long max_sparsemem_pfn = 1UL << (MAX_PHYSMEM_BITS-PAGE_SHIFT);
+	int ret;
+
+	if (end_pfn > max_sparsemem_pfn) {
+		pr_err("end_pfn too big");
+		return -1;
+	}
+	hotplug_paging(start, size);
+
+	/*
+	 * Mark the first page in the range as unusable. This is needed
+	 * because __add_section (within __add_pages) wants pfn_valid
+	 * of it to be false, and in arm64 pfn falid is implemented by
+	 * just checking at the nomap flag for existing blocks.
+	 *
+	 * A small trick here is that __add_section() requires only
+	 * phys_start_pfn (that is the first pfn of a section) to be
+	 * invalid. Regardless of whether it was assumed (by the function
+	 * author) that all pfns within a section are either all valid
+	 * or all invalid, it allows to avoid looping twice (once here,
+	 * second when memblock_clear_nomap() is called) through all
+	 * pfns of the section and modify only one pfn. Thanks to that,
+	 * further, in __add_zone() only this very first pfn is skipped
+	 * and corresponding page is not flagged reserved. Therefore it
+	 * is enough to correct this setup only for it.
+	 *
+	 * When arch_add_memory() returns the walk_memory_range() function
+	 * is called and passed with online_memory_block() callback,
+	 * which execution finally reaches the memory_block_action()
+	 * function, where also only the first pfn of a memory block is
+	 * checked to be reserved. Above, it was first pfn of a section,
+	 * here it is a block but
+	 * (drivers/base/memory.c):
+	 *     sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
+	 * (include/linux/memory.h):
+	 *     #define MIN_MEMORY_BLOCK_SIZE     (1UL << SECTION_SIZE_BITS)
+	 * so we can consider block and section equivalently
+	 */
+	memblock_mark_nomap(start, 1<<PAGE_SHIFT);
+
+	pgdat = NODE_DATA(nid);
+
+	zone = pgdat->node_zones +
+		zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
+	ret = __add_pages(nid, zone, start_pfn, nr_pages);
+
+	/*
+	 * Make the pages usable after they have been added.
+	 * This will make pfn_valid return true
+	 */
+	memblock_clear_nomap(start, 1<<PAGE_SHIFT);
+
+	/*
+	 * This is a hack to avoid having to mix arch specific code
+	 * into arch independent code. SetPageReserved is supposed
+	 * to be called by __add_zone (within __add_section, within
+	 * __add_pages). However, when it is called there, it assumes that
+	 * pfn_valid returns true.  For the way pfn_valid is implemented
+	 * in arm64 (a check on the nomap flag), the only way to make
+	 * this evaluate true inside __add_zone is to clear the nomap
+	 * flags of blocks in architecture independent code.
+	 *
+	 * To avoid this, we set the Reserved flag here after we cleared
+	 * the nomap flag in the line above.
+	 */
+	SetPageReserved(pfn_to_page(start_pfn));
+
+	if (ret)
+		pr_warn("%s: Problem encountered in __add_pages() ret=%d\n",
+			__func__, ret);
+
+	return ret;
+}
+
+#ifdef CONFIG_MEMORY_HOTREMOVE
+static void kernel_physical_mapping_remove(unsigned long start,
+	unsigned long end)
+{
+	start = (unsigned long)__va(start);
+	end = (unsigned long)__va(end);
+
+	remove_pagetable(start, end, true);
+
+}
+
+int arch_remove_memory(u64 start, u64 size)
+{
+	unsigned long start_pfn = start >> PAGE_SHIFT;
+	unsigned long nr_pages = size >> PAGE_SHIFT;
+	struct page *page = pfn_to_page(start_pfn);
+	struct zone *zone;
+	int ret = 0;
+
+	zone = page_zone(page);
+	ret = __remove_pages(zone, start_pfn, nr_pages);
+	WARN_ON_ONCE(ret);
+
+	kernel_physical_mapping_remove(start, start + size);
+
+	return ret;
+}
+
+#endif /* CONFIG_MEMORY_HOTREMOVE */
+#endif /* CONFIG_MEMORY_HOTPLUG */

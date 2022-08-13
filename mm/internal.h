@@ -74,6 +74,12 @@ static inline void set_page_refcounted(struct page *page)
 extern unsigned long highest_memmap_pfn;
 
 /*
+ * Maximum number of reclaim retries without progress before the OOM
+ * killer is consider the only way forward.
+ */
+#define MAX_RECLAIM_RETRIES 16
+
+/*
  * in mm/vmscan.c:
  */
 extern int isolate_lru_page(struct page *page);
@@ -155,6 +161,18 @@ extern void prep_compound_page(struct page *page, unsigned int order);
 extern void post_alloc_hook(struct page *page, unsigned int order,
 					gfp_t gfp_flags);
 extern int user_min_free_kbytes;
+
+#ifdef CONFIG_CMA
+static inline int is_cma_page(struct page *page)
+{
+	unsigned mt = get_pageblock_migratetype(page);
+	if (mt == MIGRATE_ISOLATE || mt == MIGRATE_CMA)
+		return true;
+	return false;
+}
+#else
+#define is_cma_page(page) 0
+#endif
 
 #if defined CONFIG_COMPACTION || defined CONFIG_CMA
 
@@ -436,6 +454,16 @@ static inline void mminit_validate_memmodel_limits(unsigned long *start_pfn,
 #define NODE_RECLAIM_SOME	0
 #define NODE_RECLAIM_SUCCESS	1
 
+#ifdef CONFIG_NUMA
+extern int node_reclaim(struct pglist_data *, gfp_t, unsigned int);
+#else
+static inline int node_reclaim(struct pglist_data *pgdat, gfp_t mask,
+				unsigned int order)
+{
+	return NODE_RECLAIM_NOSCAN;
+}
+#endif
+
 extern int hwpoison_filter(struct page *p);
 
 extern u32 hwpoison_filter_dev_major;
@@ -472,6 +500,7 @@ struct tlbflush_unmap_batch;
 #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
 void try_to_unmap_flush(void);
 void try_to_unmap_flush_dirty(void);
+void flush_tlb_batched_pending(struct mm_struct *mm);
 #else
 static inline void try_to_unmap_flush(void)
 {
@@ -479,7 +508,9 @@ static inline void try_to_unmap_flush(void)
 static inline void try_to_unmap_flush_dirty(void)
 {
 }
-
+static inline void flush_tlb_batched_pending(struct mm_struct *mm)
+{
+}
 #endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
 
 extern const struct trace_print_flags pageflag_names[];

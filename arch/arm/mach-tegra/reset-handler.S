@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2012-2016, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -17,12 +17,12 @@
 #include <linux/init.h>
 #include <linux/linkage.h>
 
+#include <soc/tegra/flowctrl.h>
 #include <soc/tegra/fuse.h>
 
 #include <asm/asm-offsets.h>
 #include <asm/cache.h>
 
-#include "flowctrl.h"
 #include "iomap.h"
 #include "reset.h"
 #include "sleep.h"
@@ -56,16 +56,16 @@ ENTRY(tegra_resume)
 	cmp	r6, #TEGRA20
 	beq	1f				@ Yes
 	/* Clear the flow controller flags for this CPU. */
-	cpu_to_csr_reg r1, r0
+	cpu_to_csr_reg r3, r0
 	mov32	r2, TEGRA_FLOW_CTRL_BASE
-	ldr	r1, [r2, r1]
+	ldr	r1, [r2, r3]
 	/* Clear event & intr flag */
 	orr	r1, r1, \
 		#FLOW_CTRL_CSR_INTR_FLAG | FLOW_CTRL_CSR_EVENT_FLAG
 	movw	r0, #0x3FFD	@ enable, cluster_switch, immed, bitmaps
 				@ & ext flags for CPU power mgnt
 	bic	r1, r1, r0
-	str	r1, [r2]
+	str	r1, [r2, r3]
 1:
 
 	mov32	r9, 0xc09

@@ -331,6 +331,12 @@ extern void ledtrig_disk_activity(void);
 static inline void ledtrig_disk_activity(void) {}
 #endif
 
+#ifdef CONFIG_LEDS_TRIGGER_THROTTLE
+extern void ledtrig_throttle_event(void);
+#else
+static inline void ledtrig_throttle_event(void) {}
+#endif
+
 #ifdef CONFIG_LEDS_TRIGGER_MTD
 extern void ledtrig_mtd_activity(void);
 #else

@@ -289,6 +289,22 @@ static void at91_ddr_standby(void)
 		at91_ramc_write(1, AT91_DDRSDRC_LPR, saved_lpr1);
 }
 
+static void sama5d3_ddr_standby(void)
+{
+	u32 lpr0;
+	u32 saved_lpr0;
+
+	saved_lpr0 = at91_ramc_read(0, AT91_DDRSDRC_LPR);
+	lpr0 = saved_lpr0 & ~AT91_DDRSDRC_LPCB;
+	lpr0 |= AT91_DDRSDRC_LPCB_POWER_DOWN;
+
+	at91_ramc_write(0, AT91_DDRSDRC_LPR, lpr0);
+
+	cpu_do_idle();
+
+	at91_ramc_write(0, AT91_DDRSDRC_LPR, saved_lpr0);
+}
+
 /* We manage both DDRAM/SDRAM controllers, we need more than one value to
  * remember.
  */
@@ -319,11 +335,11 @@ static void at91sam9_sdram_standby(void)
 		at91_ramc_write(1, AT91_SDRAMC_LPR, saved_lpr1);
 }
 
-static const struct of_device_id const ramc_ids[] __initconst = {
+static const struct of_device_id ramc_ids[] __initconst = {
 	{ .compatible = "atmel,at91rm9200-sdramc", .data = at91rm9200_standby },
 	{ .compatible = "atmel,at91sam9260-sdramc", .data = at91sam9_sdram_standby },
 	{ .compatible = "atmel,at91sam9g45-ddramc", .data = at91_ddr_standby },
-	{ .compatible = "atmel,sama5d3-ddramc", .data = at91_ddr_standby },
+	{ .compatible = "atmel,sama5d3-ddramc", .data = sama5d3_ddr_standby },
 	{ /*sentinel*/ }
 };
 
@@ -395,13 +411,13 @@ static void __init at91_pm_sram_init(void)
 	sram_pool = gen_pool_get(&pdev->dev, NULL);
 	if (!sram_pool) {
 		pr_warn("%s: sram pool unavailable!\n", __func__);
-		return;
+		goto out_put_device;
 	}
 
 	sram_base = gen_pool_alloc(sram_pool, at91_pm_suspend_in_sram_sz);
 	if (!sram_base) {
 		pr_warn("%s: unable to alloc sram!\n", __func__);
-		return;
+		goto out_put_device;
 	}
 
 	sram_pbase = gen_pool_virt_to_phys(sram_pool, sram_base);
@@ -409,12 +425,17 @@ static void __init at91_pm_sram_init(void)
 					at91_pm_suspend_in_sram_sz, false);
 	if (!at91_suspend_sram_fn) {
 		pr_warn("SRAM: Could not map\n");
-		return;
+		goto out_put_device;
 	}
 
 	/* Copy the pm suspend handler to SRAM */
 	at91_suspend_sram_fn = fncpy(at91_suspend_sram_fn,
 			&at91_pm_suspend_in_sram, at91_pm_suspend_in_sram_sz);
+	return;
+
+out_put_device:
+	put_device(&pdev->dev);
+	return;
 }
 
 static const struct of_device_id atmel_pmc_ids[] __initconst = {

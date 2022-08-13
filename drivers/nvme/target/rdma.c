@@ -65,6 +65,7 @@ struct nvmet_rdma_rsp {
 
 	struct nvmet_req	req;
 
+	bool			allocated;
 	u8			n_rdma;
 	u32			flags;
 	u32			invalidate_rkey;
@@ -136,6 +137,10 @@ static void nvmet_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc);
 static void nvmet_rdma_read_data_done(struct ib_cq *cq, struct ib_wc *wc);
 static void nvmet_rdma_qp_event(struct ib_event *event, void *priv);
 static void nvmet_rdma_queue_disconnect(struct nvmet_rdma_queue *queue);
+static void nvmet_rdma_free_rsp(struct nvmet_rdma_device *ndev,
+				struct nvmet_rdma_rsp *r);
+static int nvmet_rdma_alloc_rsp(struct nvmet_rdma_device *ndev,
+				struct nvmet_rdma_rsp *r);
 
 static struct nvmet_fabrics_ops nvmet_rdma_ops;
 
@@ -167,10 +172,26 @@ nvmet_rdma_get_rsp(struct nvmet_rdma_queue *queue)
 	unsigned long flags;
 
 	spin_lock_irqsave(&queue->rsps_lock, flags);
-	rsp = list_first_entry(&queue->free_rsps,
+	rsp = list_first_entry_or_null(&queue->free_rsps,
 				struct nvmet_rdma_rsp, free_list);
-	list_del(&rsp->free_list);
+	if (likely(rsp))
+		list_del(&rsp->free_list);
 	spin_unlock_irqrestore(&queue->rsps_lock, flags);
+
+	if (unlikely(!rsp)) {
+		int ret;
+
+		rsp = kzalloc(sizeof(*rsp), GFP_KERNEL);
+		if (unlikely(!rsp))
+			return NULL;
+		ret = nvmet_rdma_alloc_rsp(queue->dev, rsp);
+		if (unlikely(ret)) {
+			kfree(rsp);
+			return NULL;
+		}
+
+		rsp->allocated = true;
+	}
 
 	return rsp;
 }
@@ -179,6 +200,12 @@ static inline void
 nvmet_rdma_put_rsp(struct nvmet_rdma_rsp *rsp)
 {
 	unsigned long flags;
+
+	if (unlikely(rsp->allocated)) {
+		nvmet_rdma_free_rsp(rsp->queue->dev, rsp);
+		kfree(rsp);
+		return;
+	}
 
 	spin_lock_irqsave(&rsp->queue->rsps_lock, flags);
 	list_add_tail(&rsp->free_list, &rsp->queue->free_rsps);
@@ -438,6 +465,10 @@ static int nvmet_rdma_post_recv(struct nvmet_rdma_device *ndev,
 {
 	struct ib_recv_wr *bad_wr;
 
+	ib_dma_sync_single_for_device(ndev->device,
+		cmd->sge[0].addr, cmd->sge[0].length,
+		DMA_FROM_DEVICE);
+
 	if (ndev->srq)
 		return ib_post_srq_recv(ndev->srq, &cmd->wr, &bad_wr);
 	return ib_post_recv(cmd->queue->cm_id->qp, &cmd->wr, &bad_wr);
@@ -506,6 +537,7 @@ static void nvmet_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct nvmet_rdma_rsp *rsp =
 		container_of(wc->wr_cqe, struct nvmet_rdma_rsp, send_cqe);
+	struct nvmet_rdma_queue *queue = cq->cq_context;
 
 	nvmet_rdma_release_rsp(rsp);
 
@@ -513,7 +545,7 @@ static void nvmet_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
 		     wc->status != IB_WC_WR_FLUSH_ERR)) {
 		pr_err("SEND for CQE 0x%p failed with status %s (%d).\n",
 			wc->wr_cqe, ib_wc_status_msg(wc->status), wc->status);
-		nvmet_rdma_error_comp(rsp->queue);
+		nvmet_rdma_error_comp(queue);
 	}
 }
 
@@ -538,6 +570,11 @@ static void nvmet_rdma_queue_response(struct nvmet_req *req)
 		first_wr = &rsp->send_wr;
 
 	nvmet_rdma_post_recv(rsp->queue->dev, rsp->cmd);
+
+	ib_dma_sync_single_for_device(rsp->queue->dev->device,
+		rsp->send_sge.addr, rsp->send_sge.length,
+		DMA_TO_DEVICE);
+
 	if (ib_post_send(cm_id->qp, first_wr, &bad_wr)) {
 		pr_err("sending cmd response failed\n");
 		nvmet_rdma_release_rsp(rsp);
@@ -694,9 +731,12 @@ static void nvmet_rdma_handle_command(struct nvmet_rdma_queue *queue,
 {
 	u16 status;
 
-	cmd->queue = queue;
-	cmd->n_rdma = 0;
-	cmd->req.port = queue->port;
+	ib_dma_sync_single_for_cpu(queue->dev->device,
+		cmd->cmd->sge[0].addr, cmd->cmd->sge[0].length,
+		DMA_FROM_DEVICE);
+	ib_dma_sync_single_for_cpu(queue->dev->device,
+		cmd->send_sge.addr, cmd->send_sge.length,
+		DMA_TO_DEVICE);
 
 	if (!nvmet_req_init(&cmd->req, &queue->nvme_cq,
 			&queue->nvme_sq, &nvmet_rdma_ops))
@@ -743,9 +783,21 @@ static void nvmet_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 
 	cmd->queue = queue;
 	rsp = nvmet_rdma_get_rsp(queue);
+	if (unlikely(!rsp)) {
+		/*
+		 * we get here only under memory pressure,
+		 * silently drop and have the host retry
+		 * as we can't even fail it.
+		 */
+		nvmet_rdma_post_recv(queue->dev, cmd);
+		return;
+	}
+	rsp->queue = queue;
 	rsp->cmd = cmd;
 	rsp->flags = 0;
 	rsp->req.cmd = cmd->nvme_cmd;
+	rsp->req.port = queue->port;
+	rsp->n_rdma = 0;
 
 	if (unlikely(queue->state != NVMET_RDMA_Q_LIVE)) {
 		unsigned long flags;

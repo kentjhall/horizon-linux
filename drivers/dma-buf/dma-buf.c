@@ -46,9 +46,162 @@ struct dma_buf_list {
 
 static struct dma_buf_list db_list;
 
+static struct mutex context_dev_lock;
+
+/**
+ * dma_buf_set_drvdata - Set driver specific data to dmabuf. The data
+ * will remain even if the device is detached from the device. This is useful
+ * if the device requires some buffer specific parameters that should be
+ * available when the buffer is accessed next time.
+ *
+ * The exporter calls the destroy callback:
+ *  - the buffer is freed
+ *  - the device/driver is removed
+ *  - new device private data is set
+ *
+ * @dmabuf	[in]	Buffer object
+ * @device	[in]	Device to which the data is related to.
+ * @priv	[in]	Private data
+ * @destroy	[in]	Function callback to destroy function. Called when the
+ *			data is not needed anymore (device or dmabuf is
+ *			removed)
+ *
+ * The function returns 0 on success. Otherwise the function returns a negative
+ * errorcode
+ */
+int dma_buf_set_drvdata(struct dma_buf * dmabuf, struct device *device,
+			void *priv, void (*destroy)(void *))
+{
+	if (!(dmabuf && dmabuf->ops && dmabuf->ops->set_drvdata))
+		return -ENOSYS;
+
+	return dmabuf->ops->set_drvdata(dmabuf, device, priv, destroy);
+}
+EXPORT_SYMBOL(dma_buf_set_drvdata);
+
+/**
+ * dma_buf_get_drvdata - Get driver specific data to dmabuf.
+ *
+ * @dmabuf	[in]	Buffer object
+ * @device	[in]	Device to which the data is related to.
+ *
+ * The function returns the user data structure on success. Otherwise NULL
+ * is returned.
+ */
+void *dma_buf_get_drvdata(struct dma_buf *dmabuf, struct device *device)
+{
+	if (!(dmabuf && dmabuf->ops && dmabuf->ops->get_drvdata))
+		return ERR_PTR(-ENOSYS);
+
+	return dmabuf->ops->get_drvdata(dmabuf, device);
+}
+EXPORT_SYMBOL(dma_buf_get_drvdata);
+
+/*
+ * once this flag is set, no device
+ * should be able to disable its lazy unmapping feature.
+ * Using this flag avoids unnecessary complex ref counting
+ * and locking that could make the lazy unmapping feature
+ * complex.
+ */
+static bool dmabuf_stop_disabling_lazy_unmapping;
+
+/**
+ * dma_buf_disable_lazy_unmapping - Set device specific data to disable
+ * lazy unmapping for that specific device. Once disabled, lazy unmapping
+ * cannot be enabled again.
+ *
+ * @device	[in]	Device for which the lazy unmapping need to be
+ *			disabled.
+ */
+int dma_buf_disable_lazy_unmapping(struct device *device)
+{
+	if (!IS_ENABLED(CONFIG_DMABUF_DEFERRED_UNMAPPING))
+		return 0;
+
+	if (dmabuf_stop_disabling_lazy_unmapping)
+		return -EINVAL;
+
+	device->no_dmabuf_defer_unmap = 1;
+	return 0;
+}
+EXPORT_SYMBOL(dma_buf_disable_lazy_unmapping);
+
+static bool dmabuf_can_defer_unmap(struct dma_buf *dmabuf,
+		struct device *device)
+{
+	if (!IS_ENABLED(CONFIG_DMABUF_DEFERRED_UNMAPPING))
+		return false;
+
+	if (!(dmabuf->flags & DMABUF_CAN_DEFER_UNMAP))
+		return false;
+
+	return !device->no_dmabuf_defer_unmap;
+}
+
+static void dma_buf_release_attachment(struct dma_buf_attachment *attach)
+{
+	struct dma_buf *dmabuf = attach->dmabuf;
+
+	BUG_ON(atomic_read(&attach->ref) != 1);
+	BUG_ON(atomic_read(&attach->maps));
+
+	if (attach->dev->context_dev)
+		list_del(&attach->dev_node);
+
+	list_del(&attach->node);
+	if (dmabuf_can_defer_unmap(dmabuf, attach->dev)) {
+		/* sg_table is -ENOMEM if map fails before release */
+		if (!IS_ERR_OR_NULL(attach->sg_table))
+			dmabuf->ops->unmap_dma_buf(attach,
+				attach->sg_table, DMA_BIDIRECTIONAL);
+		if (dmabuf->ops->detach)
+			dmabuf->ops->detach(dmabuf, attach);
+		kzfree(attach);
+	}
+}
+
+void dma_buf_release_stash(struct device *dev)
+{
+	struct dma_buf_attachment *attach, *next;
+	struct dma_buf_attachment *attach_inner, *next_inner;
+	struct dma_buf *dmabuf;
+	bool other_context_dev_attached = false;
+
+	if (!dev->context_dev)
+		return;
+
+	mutex_lock(&context_dev_lock);
+
+	list_for_each_entry_safe(attach, next, &dev->attachments, dev_node) {
+		dmabuf = attach->dmabuf;
+
+		mutex_lock(&dmabuf->lock);
+		dma_buf_release_attachment(attach);
+
+		list_for_each_entry_safe(attach_inner, next_inner,
+			&dmabuf->attachments, node) {
+			if (attach_inner->dev->context_dev) {
+				other_context_dev_attached = true;
+				break;
+			}
+		}
+
+		if (!other_context_dev_attached)
+			dmabuf->context_dev = false;
+
+		mutex_unlock(&dmabuf->lock);
+	}
+
+	mutex_unlock(&context_dev_lock);
+}
+EXPORT_SYMBOL(dma_buf_release_stash);
+
 static int dma_buf_release(struct inode *inode, struct file *file)
 {
 	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach, *next;
+	bool context_dev_locked = false;
 
 	if (!is_dma_buf_file(file))
 		return -EINVAL;
@@ -56,6 +209,22 @@ static int dma_buf_release(struct inode *inode, struct file *file)
 	dmabuf = file->private_data;
 
 	BUG_ON(dmabuf->vmapping_counter);
+
+	if (dmabuf->context_dev) {
+		mutex_lock(&context_dev_lock);
+		context_dev_locked = true;
+	}
+
+	mutex_lock(&dmabuf->lock);
+
+	list_for_each_entry_safe(attach, next, &dmabuf->attachments, node) {
+		dma_buf_release_attachment(attach);
+	}
+
+	mutex_unlock(&dmabuf->lock);
+
+	if (context_dev_locked)
+		mutex_unlock(&context_dev_lock);
 
 	/*
 	 * Any fences that a dma-buf poll can wait on should be signaled
@@ -77,7 +246,7 @@ static int dma_buf_release(struct inode *inode, struct file *file)
 		reservation_object_fini(dmabuf->resv);
 
 	module_put(dmabuf->owner);
-	kfree(dmabuf);
+	kzfree(dmabuf);
 	return 0;
 }
 
@@ -260,7 +429,6 @@ static long dma_buf_ioctl(struct file *file,
 	struct dma_buf *dmabuf;
 	struct dma_buf_sync sync;
 	enum dma_data_direction direction;
-	int ret;
 
 	dmabuf = file->private_data;
 
@@ -287,11 +455,12 @@ static long dma_buf_ioctl(struct file *file,
 		}
 
 		if (sync.flags & DMA_BUF_SYNC_END)
-			ret = dma_buf_end_cpu_access(dmabuf, direction);
+			dma_buf_end_cpu_access(dmabuf, 0,
+					dmabuf->size, direction);
 		else
-			ret = dma_buf_begin_cpu_access(dmabuf, direction);
-
-		return ret;
+			dma_buf_begin_cpu_access(dmabuf, 0,
+					dmabuf->size, direction);
+		return 0;
 	default:
 		return -ENOTTY;
 	}
@@ -303,6 +472,9 @@ static const struct file_operations dma_buf_fops = {
 	.llseek		= dma_buf_llseek,
 	.poll		= dma_buf_poll,
 	.unlocked_ioctl	= dma_buf_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= dma_buf_ioctl,
+#endif
 };
 
 /*
@@ -336,6 +508,8 @@ struct dma_buf *dma_buf_export(const struct dma_buf_export_info *exp_info)
 	size_t alloc_size = sizeof(struct dma_buf);
 	int ret;
 
+	dmabuf_stop_disabling_lazy_unmapping = true;
+
 	if (!exp_info->resv)
 		alloc_size += sizeof(struct reservation_object);
 	else
@@ -366,6 +540,7 @@ struct dma_buf *dma_buf_export(const struct dma_buf_export_info *exp_info)
 	dmabuf->ops = exp_info->ops;
 	dmabuf->size = exp_info->size;
 	dmabuf->exp_name = exp_info->exp_name;
+	dmabuf->flags = exp_info->exp_flags;
 	dmabuf->owner = exp_info->owner;
 	init_waitqueue_head(&dmabuf->poll);
 	dmabuf->cb_excl.poll = dmabuf->cb_shared.poll = &dmabuf->poll;
@@ -487,28 +662,82 @@ struct dma_buf_attachment *dma_buf_attach(struct dma_buf *dmabuf,
 	if (WARN_ON(!dmabuf || !dev))
 		return ERR_PTR(-EINVAL);
 
+	if (dev->context_dev)
+		mutex_lock(&context_dev_lock);
+
+	mutex_lock(&dmabuf->lock);
+	if (dmabuf_can_defer_unmap(dmabuf, dev)) {
+		/* Don't allow multiple attachments for a device */
+		list_for_each_entry(attach, &dmabuf->attachments, node) {
+			int ref;
+
+			if (attach->dev != dev)
+				continue;
+
+			/* attach is ready for free. Do not use it. */
+			ref = atomic_inc_not_zero(&attach->ref);
+			BUG_ON(ref < 0);
+			if (ref == 0)
+				continue;
+
+			mutex_unlock(&dmabuf->lock);
+			if (dev->context_dev)
+				mutex_unlock(&context_dev_lock);
+			return attach;
+		}
+	}
+
 	attach = kzalloc(sizeof(struct dma_buf_attachment), GFP_KERNEL);
-	if (attach == NULL)
+	if (attach == NULL) {
+		mutex_unlock(&dmabuf->lock);
+		if (dev->context_dev)
+			mutex_unlock(&context_dev_lock);
 		return ERR_PTR(-ENOMEM);
+	}
 
 	attach->dev = dev;
 	attach->dmabuf = dmabuf;
-
-	mutex_lock(&dmabuf->lock);
+	/*
+	 * 2 because it is possible that a dmabuf has matching
+	 * number of attach/detach in many intermediate states
+	 * till the buffer is freed. This extra ref count will
+	 * prevent multiple mappings for a given device in such
+	 * scenarios. For devices which do not use defer unmap
+	 * it needs to be 1 as we want to free those as soon as
+	 * possible.
+	 */
+	if (dmabuf_can_defer_unmap(dmabuf, dev))
+		atomic_set(&attach->ref, 2);
+	else
+		atomic_set(&attach->ref, 1);
+	atomic_set(&attach->maps, 0);
 
 	if (dmabuf->ops->attach) {
 		ret = dmabuf->ops->attach(dmabuf, dev, attach);
 		if (ret)
 			goto err_attach;
 	}
-	list_add(&attach->node, &dmabuf->attachments);
+
+	if (dev->context_dev) {
+		dmabuf->context_dev = true;
+		list_add(&attach->dev_node, &dev->attachments);
+		list_add(&attach->node, &dmabuf->attachments);
+	} else {
+		list_add(&attach->node, &dmabuf->attachments);
+	}
 
 	mutex_unlock(&dmabuf->lock);
+
+	if (dev->context_dev)
+		mutex_unlock(&context_dev_lock);
+
 	return attach;
 
 err_attach:
 	kfree(attach);
 	mutex_unlock(&dmabuf->lock);
+	if (dev->context_dev)
+		mutex_unlock(&context_dev_lock);
 	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_GPL(dma_buf_attach);
@@ -522,8 +751,24 @@ EXPORT_SYMBOL_GPL(dma_buf_attach);
  */
 void dma_buf_detach(struct dma_buf *dmabuf, struct dma_buf_attachment *attach)
 {
+	bool is_locked = false;
+
 	if (WARN_ON(!dmabuf || !attach))
 		return;
+
+	if (atomic_dec_return(&attach->ref) > 0)
+		return;
+
+	if (WARN_ON(atomic_read(&attach->maps)))
+		return;
+
+	if (dmabuf_can_defer_unmap(dmabuf, attach->dev))
+		return;
+
+	if (dmabuf->context_dev) {
+		mutex_lock(&context_dev_lock);
+		is_locked = true;
+	}
 
 	mutex_lock(&dmabuf->lock);
 	list_del(&attach->node);
@@ -531,7 +776,11 @@ void dma_buf_detach(struct dma_buf *dmabuf, struct dma_buf_attachment *attach)
 		dmabuf->ops->detach(dmabuf, attach);
 
 	mutex_unlock(&dmabuf->lock);
-	kfree(attach);
+
+	if (is_locked)
+		mutex_unlock(&context_dev_lock);
+
+	kzfree(attach);
 }
 EXPORT_SYMBOL_GPL(dma_buf_detach);
 
@@ -548,17 +797,38 @@ EXPORT_SYMBOL_GPL(dma_buf_detach);
 struct sg_table *dma_buf_map_attachment(struct dma_buf_attachment *attach,
 					enum dma_data_direction direction)
 {
-	struct sg_table *sg_table = ERR_PTR(-EINVAL);
+	struct sg_table *sg_table;
 
 	might_sleep();
 
 	if (WARN_ON(!attach || !attach->dmabuf))
 		return ERR_PTR(-EINVAL);
 
+	mutex_lock(&attach->dmabuf->lock);
+	if (!atomic_inc_not_zero(&attach->ref)) {
+		mutex_unlock(&attach->dmabuf->lock);
+		return ERR_PTR(-EINVAL);
+	}
+
+	sg_table = attach->sg_table;
+	if (dmabuf_can_defer_unmap(attach->dmabuf, attach->dev) && sg_table) {
+		if (!(attach->dmabuf->flags & DMABUF_SKIP_CACHE_SYNC))
+			dma_sync_sg_for_device(attach->dev, sg_table->sgl,
+					sg_table->nents, direction);
+		goto finish;
+	}
+
 	sg_table = attach->dmabuf->ops->map_dma_buf(attach, direction);
 	if (!sg_table)
 		sg_table = ERR_PTR(-ENOMEM);
 
+	attach->sg_table = sg_table;
+finish:
+	if (!IS_ERR(sg_table))
+		atomic_inc(&attach->maps);
+	else
+		atomic_dec(&attach->ref);
+	mutex_unlock(&attach->dmabuf->lock);
 	return sg_table;
 }
 EXPORT_SYMBOL_GPL(dma_buf_map_attachment);
@@ -578,11 +848,29 @@ void dma_buf_unmap_attachment(struct dma_buf_attachment *attach,
 {
 	might_sleep();
 
-	if (WARN_ON(!attach || !attach->dmabuf || !sg_table))
+	if (WARN(!attach, "attach is NULL"))
 		return;
+
+	if (WARN(!attach->dmabuf, "attach->dmabuf is NULL"))
+		return;
+
+	if (WARN(!sg_table, "sg_table is NULL"))
+		return;
+
+	mutex_lock(&attach->dmabuf->lock);
+	if (dmabuf_can_defer_unmap(attach->dmabuf, attach->dev)) {
+		if (!(attach->dmabuf->flags & DMABUF_SKIP_CACHE_SYNC))
+			dma_sync_sg_for_cpu(attach->dev, sg_table->sgl,
+					sg_table->nents, direction);
+		goto finish;
+	}
 
 	attach->dmabuf->ops->unmap_dma_buf(attach, sg_table,
 						direction);
+finish:
+	atomic_dec(&attach->maps);
+	atomic_dec(&attach->ref);
+	mutex_unlock(&attach->dmabuf->lock);
 }
 EXPORT_SYMBOL_GPL(dma_buf_unmap_attachment);
 
@@ -609,11 +897,13 @@ static int __dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
  * preparations. Coherency is only guaranteed in the specified range for the
  * specified access direction.
  * @dmabuf:	[in]	buffer to prepare cpu access for.
+ * @start:	[in]	start of range for cpu access.
+ * @len:	[in]	length of range for cpu access.
  * @direction:	[in]	length of range for cpu access.
  *
  * Can return negative error values, returns 0 on success.
  */
-int dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
+int dma_buf_begin_cpu_access(struct dma_buf *dmabuf, size_t start, size_t len,
 			     enum dma_data_direction direction)
 {
 	int ret = 0;
@@ -622,7 +912,8 @@ int dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
 		return -EINVAL;
 
 	if (dmabuf->ops->begin_cpu_access)
-		ret = dmabuf->ops->begin_cpu_access(dmabuf, direction);
+		ret = dmabuf->ops->begin_cpu_access(dmabuf, start,
+							len, direction);
 
 	/* Ensure that all fences are waited upon - but we first allow
 	 * the native handler the chance to do so more efficiently if it
@@ -641,21 +932,19 @@ EXPORT_SYMBOL_GPL(dma_buf_begin_cpu_access);
  * actions. Coherency is only guaranteed in the specified range for the
  * specified access direction.
  * @dmabuf:	[in]	buffer to complete cpu access for.
+ * @start:	[in]	start of range for cpu access.
+ * @len:	[in]	length of range for cpu access.
  * @direction:	[in]	length of range for cpu access.
  *
  * Can return negative error values, returns 0 on success.
  */
-int dma_buf_end_cpu_access(struct dma_buf *dmabuf,
-			   enum dma_data_direction direction)
+void dma_buf_end_cpu_access(struct dma_buf *dmabuf, size_t start, size_t len,
+			    enum dma_data_direction direction)
 {
-	int ret = 0;
-
 	WARN_ON(!dmabuf);
 
 	if (dmabuf->ops->end_cpu_access)
-		ret = dmabuf->ops->end_cpu_access(dmabuf, direction);
-
-	return ret;
+		dmabuf->ops->end_cpu_access(dmabuf, start, len, direction);
 }
 EXPORT_SYMBOL_GPL(dma_buf_end_cpu_access);
 
@@ -965,6 +1254,9 @@ static int __init dma_buf_init(void)
 {
 	mutex_init(&db_list.lock);
 	INIT_LIST_HEAD(&db_list.head);
+
+	mutex_init(&context_dev_lock);
+
 	dma_buf_init_debugfs();
 	return 0;
 }

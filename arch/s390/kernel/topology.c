@@ -37,7 +37,6 @@ static void set_topology_timer(void);
 static void topology_work_fn(struct work_struct *work);
 static struct sysinfo_15_1_x *tl_info;
 
-static bool topology_enabled = true;
 static DECLARE_WORK(topology_work, topology_work_fn);
 
 /*
@@ -56,7 +55,7 @@ static cpumask_t cpu_group_map(struct mask_info *info, unsigned int cpu)
 	cpumask_t mask;
 
 	cpumask_copy(&mask, cpumask_of(cpu));
-	if (!topology_enabled || !MACHINE_HAS_TOPOLOGY)
+	if (!MACHINE_HAS_TOPOLOGY)
 		return mask;
 	for (; info; info = info->next) {
 		if (cpumask_test_cpu(cpu, &info->mask))
@@ -71,7 +70,7 @@ static cpumask_t cpu_thread_map(unsigned int cpu)
 	int i;
 
 	cpumask_copy(&mask, cpumask_of(cpu));
-	if (!topology_enabled || !MACHINE_HAS_TOPOLOGY)
+	if (!MACHINE_HAS_TOPOLOGY)
 		return mask;
 	cpu -= cpu % (smp_cpu_mtid + 1);
 	for (i = 0; i <= smp_cpu_mtid; i++)
@@ -257,7 +256,8 @@ int arch_update_cpu_topology(void)
 		topology_update_polarization_simple();
 	for_each_online_cpu(cpu) {
 		dev = get_cpu_device(cpu);
-		kobject_uevent(&dev->kobj, KOBJ_CHANGE);
+		if (dev)
+			kobject_uevent(&dev->kobj, KOBJ_CHANGE);
 	}
 	return rc;
 }
@@ -413,12 +413,6 @@ static const struct cpumask *cpu_drawer_mask(int cpu)
 	return &per_cpu(cpu_topology, cpu).drawer_mask;
 }
 
-static int __init early_parse_topology(char *p)
-{
-	return kstrtobool(p, &topology_enabled);
-}
-early_param("topology", early_parse_topology);
-
 static struct sched_domain_topology_level s390_topology[] = {
 	{ cpu_thread_mask, cpu_smt_flags, SD_INIT_NAME(SMT) },
 	{ cpu_coregroup_mask, cpu_core_flags, SD_INIT_NAME(MC) },
@@ -448,6 +442,7 @@ static int __init s390_topology_init(void)
 	struct sysinfo_15_1_x *info;
 	int i;
 
+	set_sched_topology(s390_topology);
 	if (!MACHINE_HAS_TOPOLOGY)
 		return 0;
 	tl_info = (struct sysinfo_15_1_x *)__get_free_page(GFP_KERNEL);
@@ -460,7 +455,6 @@ static int __init s390_topology_init(void)
 	alloc_masks(info, &socket_info, 1);
 	alloc_masks(info, &book_info, 2);
 	alloc_masks(info, &drawer_info, 3);
-	set_sched_topology(s390_topology);
 	return 0;
 }
 early_initcall(s390_topology_init);

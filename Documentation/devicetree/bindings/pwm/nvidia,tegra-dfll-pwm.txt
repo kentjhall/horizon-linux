@@ -1,0 +1,48 @@
+Tegra SoC DFLL PWM controller
+
+Required properties:
+- compatible: For Tegra210, must contain "nvidia,tegra210-dfll-pwm".
+- reg: physical base address and length of the controller's registers
+- #pwm-cells: should be 2. See pwm.txt in this directory for a description of
+  the cells format.
+- clock-names: Must include the "ref" entry.
+- clocks: Must contain one entry, for the DFLL closed loop reference clock.
+  See ../clocks/clock-bindings.txt for details.
+- pwm-regulator: phandle to PWM regulator for using this PWM controller.
+- pinctrl-names: Must contain two entries to enable and disable PWM signals
+  output pinmux states.
+- pinctrl-0: pinmux state to enable PWM signals output
+- pinctrl-1: pinmux state to disable PWM signals output
+
+Example:
+
+	pinmux: pinmux@700008d4 {
+		dvfs_pwm_active_state: dvfs_pwm_active {
+			dvfs_pwm_pbb1 {
+				nvidia,pins = "dvfs_pwm_pbb1";
+				nvidia,tristate = <TEGRA_PIN_DISABLE>;
+			};
+		};
+
+		dvfs_pwm_inactive_state: dvfs_pwm_inactive {
+			dvfs_pwm_pbb1 {
+				nvidia,pins = "dvfs_pwm_pbb1";
+				nvidia,tristate = <TEGRA_PIN_ENABLE>;
+			};
+		};
+	};
+
+	pwm_dfll: pwm@70110000 {
+		compatible = "nvidia,tegra210-dfll-pwm";
+		reg = <0x0 0x70110000 0x0 0x400>;
+		clocks = <&tegra_car TEGRA210_CLK_DFLL_REF>;
+		clock-names = "ref";
+		#pwm-cells = <2>;
+		pwm-regulator = <&cpu_ovr_reg>;
+
+		pinctrl-names = "dvfs_pwm_enable", "dvfs_pwm_disable";
+		pinctrl-0 = <&dvfs_pwm_active_state>;
+		pinctrl-1 = <&dvfs_pwm_inactive_state>;
+
+		status = "okay";
+	};

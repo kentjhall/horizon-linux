@@ -35,6 +35,7 @@
 #include <linux/interrupt.h>
 #include <linux/genalloc.h>
 #include <linux/of_device.h>
+#include <linux/vmalloc.h>
 
 static inline size_t chunk_size(const struct gen_pool_chunk *chunk)
 {
@@ -82,14 +83,14 @@ static int clear_bits_ll(unsigned long *addr, unsigned long mask_to_clear)
  * users set the same bit, one user will return remain bits, otherwise
  * return 0.
  */
-static int bitmap_set_ll(unsigned long *map, int start, int nr)
+static int bitmap_set_ll(unsigned long *map, unsigned long start, unsigned long nr)
 {
 	unsigned long *p = map + BIT_WORD(start);
-	const int size = start + nr;
+	const unsigned long size = start + nr;
 	int bits_to_set = BITS_PER_LONG - (start % BITS_PER_LONG);
 	unsigned long mask_to_set = BITMAP_FIRST_WORD_MASK(start);
 
-	while (nr - bits_to_set >= 0) {
+	while (nr >= bits_to_set) {
 		if (set_bits_ll(p, mask_to_set))
 			return nr;
 		nr -= bits_to_set;
@@ -117,14 +118,15 @@ static int bitmap_set_ll(unsigned long *map, int start, int nr)
  * users clear the same bit, one user will return remain bits,
  * otherwise return 0.
  */
-static int bitmap_clear_ll(unsigned long *map, int start, int nr)
+static unsigned long
+bitmap_clear_ll(unsigned long *map, unsigned long start, unsigned long nr)
 {
 	unsigned long *p = map + BIT_WORD(start);
-	const int size = start + nr;
+	const unsigned long size = start + nr;
 	int bits_to_clear = BITS_PER_LONG - (start % BITS_PER_LONG);
 	unsigned long mask_to_clear = BITMAP_FIRST_WORD_MASK(start);
 
-	while (nr - bits_to_clear >= 0) {
+	while (nr >= bits_to_clear) {
 		if (clear_bits_ll(p, mask_to_clear))
 			return nr;
 		nr -= bits_to_clear;
@@ -183,18 +185,18 @@ int gen_pool_add_virt(struct gen_pool *pool, unsigned long virt, phys_addr_t phy
 		 size_t size, int nid)
 {
 	struct gen_pool_chunk *chunk;
-	int nbits = size >> pool->min_alloc_order;
-	int nbytes = sizeof(struct gen_pool_chunk) +
+	unsigned long nbits = size >> pool->min_alloc_order;
+	unsigned long nbytes = sizeof(struct gen_pool_chunk) +
 				BITS_TO_LONGS(nbits) * sizeof(long);
 
-	chunk = kzalloc_node(nbytes, GFP_KERNEL, nid);
+	chunk = vzalloc_node(nbytes, nid);
 	if (unlikely(chunk == NULL))
 		return -ENOMEM;
 
 	chunk->phys_addr = phys;
 	chunk->start_addr = virt;
 	chunk->end_addr = virt + size - 1;
-	atomic_set(&chunk->avail, size);
+	atomic_long_set(&chunk->avail, size);
 
 	spin_lock(&pool->lock);
 	list_add_rcu(&chunk->next_chunk, &pool->chunks);
@@ -241,7 +243,7 @@ void gen_pool_destroy(struct gen_pool *pool)
 	struct list_head *_chunk, *_next_chunk;
 	struct gen_pool_chunk *chunk;
 	int order = pool->min_alloc_order;
-	int bit, end_bit;
+	unsigned long bit, end_bit;
 
 	list_for_each_safe(_chunk, _next_chunk, &pool->chunks) {
 		chunk = list_entry(_chunk, struct gen_pool_chunk, next_chunk);
@@ -251,7 +253,7 @@ void gen_pool_destroy(struct gen_pool *pool)
 		bit = find_next_bit(chunk->bits, end_bit, 0);
 		BUG_ON(bit < end_bit);
 
-		kfree(chunk);
+		vfree(chunk);
 	}
 	kfree_const(pool->name);
 	kfree(pool);
@@ -292,7 +294,7 @@ unsigned long gen_pool_alloc_algo(struct gen_pool *pool, size_t size,
 	struct gen_pool_chunk *chunk;
 	unsigned long addr = 0;
 	int order = pool->min_alloc_order;
-	int nbits, start_bit, end_bit, remain;
+	unsigned long nbits, start_bit, end_bit, remain;
 
 #ifndef CONFIG_ARCH_HAVE_NMI_SAFE_CMPXCHG
 	BUG_ON(in_nmi());
@@ -304,14 +306,14 @@ unsigned long gen_pool_alloc_algo(struct gen_pool *pool, size_t size,
 	nbits = (size + (1UL << order) - 1) >> order;
 	rcu_read_lock();
 	list_for_each_entry_rcu(chunk, &pool->chunks, next_chunk) {
-		if (size > atomic_read(&chunk->avail))
+		if (size > atomic_long_read(&chunk->avail))
 			continue;
 
 		start_bit = 0;
 		end_bit = chunk_size(chunk) >> order;
 retry:
 		start_bit = algo(chunk->bits, end_bit, start_bit,
-				 nbits, data, pool);
+				 nbits, data, pool, chunk->start_addr);
 		if (start_bit >= end_bit)
 			continue;
 		remain = bitmap_set_ll(chunk->bits, start_bit, nbits);
@@ -324,7 +326,7 @@ retry:
 
 		addr = chunk->start_addr + ((unsigned long)start_bit << order);
 		size = nbits << order;
-		atomic_sub(size, &chunk->avail);
+		atomic_long_sub(size, &chunk->avail);
 		break;
 	}
 	rcu_read_unlock();
@@ -375,7 +377,7 @@ void gen_pool_free(struct gen_pool *pool, unsigned long addr, size_t size)
 {
 	struct gen_pool_chunk *chunk;
 	int order = pool->min_alloc_order;
-	int start_bit, nbits, remain;
+	unsigned long start_bit, nbits, remain;
 
 #ifndef CONFIG_ARCH_HAVE_NMI_SAFE_CMPXCHG
 	BUG_ON(in_nmi());
@@ -390,7 +392,7 @@ void gen_pool_free(struct gen_pool *pool, unsigned long addr, size_t size)
 			remain = bitmap_clear_ll(chunk->bits, start_bit, nbits);
 			BUG_ON(remain);
 			size = nbits << order;
-			atomic_add(size, &chunk->avail);
+			atomic_long_add(size, &chunk->avail);
 			rcu_read_unlock();
 			return;
 		}
@@ -464,7 +466,7 @@ size_t gen_pool_avail(struct gen_pool *pool)
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(chunk, &pool->chunks, next_chunk)
-		avail += atomic_read(&chunk->avail);
+		avail += atomic_long_read(&chunk->avail);
 	rcu_read_unlock();
 	return avail;
 }
@@ -525,7 +527,7 @@ EXPORT_SYMBOL(gen_pool_set_algo);
  */
 unsigned long gen_pool_first_fit(unsigned long *map, unsigned long size,
 		unsigned long start, unsigned int nr, void *data,
-		struct gen_pool *pool)
+		struct gen_pool *pool, unsigned long start_addr)
 {
 	return bitmap_find_next_zero_area(map, size, start, nr, 0);
 }
@@ -543,16 +545,19 @@ EXPORT_SYMBOL(gen_pool_first_fit);
  */
 unsigned long gen_pool_first_fit_align(unsigned long *map, unsigned long size,
 		unsigned long start, unsigned int nr, void *data,
-		struct gen_pool *pool)
+		struct gen_pool *pool, unsigned long start_addr)
 {
 	struct genpool_data_align *alignment;
-	unsigned long align_mask;
+	unsigned long align_mask, align_off;
 	int order;
 
 	alignment = data;
 	order = pool->min_alloc_order;
 	align_mask = ((alignment->align + (1UL << order) - 1) >> order) - 1;
-	return bitmap_find_next_zero_area(map, size, start, nr, align_mask);
+	align_off = (start_addr & (alignment->align - 1)) >> order;
+
+	return bitmap_find_next_zero_area_off(map, size, start, nr,
+					      align_mask, align_off);
 }
 EXPORT_SYMBOL(gen_pool_first_fit_align);
 
@@ -567,7 +572,7 @@ EXPORT_SYMBOL(gen_pool_first_fit_align);
  */
 unsigned long gen_pool_fixed_alloc(unsigned long *map, unsigned long size,
 		unsigned long start, unsigned int nr, void *data,
-		struct gen_pool *pool)
+		struct gen_pool *pool, unsigned long start_addr)
 {
 	struct genpool_data_fixed *fixed_data;
 	int order;
@@ -601,7 +606,8 @@ EXPORT_SYMBOL(gen_pool_fixed_alloc);
  */
 unsigned long gen_pool_first_fit_order_align(unsigned long *map,
 		unsigned long size, unsigned long start,
-		unsigned int nr, void *data, struct gen_pool *pool)
+		unsigned int nr, void *data, struct gen_pool *pool,
+		unsigned long start_addr)
 {
 	unsigned long align_mask = roundup_pow_of_two(nr) - 1;
 
@@ -624,7 +630,7 @@ EXPORT_SYMBOL(gen_pool_first_fit_order_align);
  */
 unsigned long gen_pool_best_fit(unsigned long *map, unsigned long size,
 		unsigned long start, unsigned int nr, void *data,
-		struct gen_pool *pool)
+		struct gen_pool *pool, unsigned long start_addr)
 {
 	unsigned long start_bit = size;
 	unsigned long len = size + 1;
@@ -633,7 +639,7 @@ unsigned long gen_pool_best_fit(unsigned long *map, unsigned long size,
 	index = bitmap_find_next_zero_area(map, size, start, nr, 0);
 
 	while (index < size) {
-		int next_bit = find_next_bit(map, size, index + nr);
+		unsigned long next_bit = find_next_bit(map, size, index + nr);
 		if ((next_bit - index) < len) {
 			len = next_bit - index;
 			start_bit = index;

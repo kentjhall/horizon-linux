@@ -207,6 +207,20 @@ config FB_MODE_HELPERS
 	  your driver does not take advantage of this feature, choosing Y will
 	  just increase the kernel size by about 5K.
 
+config FB_MODE_PIXCLOCK_HZ
+	bool "Enable storing fb videomode pixel clock in Hz"
+	depends on FB && TEGRA_DC
+	default n
+	---help---
+	  This config helps in storing the pixclock of each mode in hz.
+	  Currently, framebuffer stores pixel clock of videomodes in
+	  pico seconds. This necessitates conversion to Hz during modeset.
+	  Such conversion reduces the precision of pixel clock, and the
+	  final pixel clock value might not match the original pixel clock
+	  from the mode advertized by sink. By storing pixclock in hz,
+	  conversion to/from picoseconds to hz can be avoided, and the exact
+	  pixel clock value is retained.
+
 config FB_TILEBLITTING
        bool "Enable Tile Blitting Support"
        depends on FB

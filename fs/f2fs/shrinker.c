@@ -21,14 +21,16 @@ static unsigned int shrinker_run_no;
 
 static unsigned long __count_nat_entries(struct f2fs_sb_info *sbi)
 {
-	return NM_I(sbi)->nat_cnt - NM_I(sbi)->dirty_nat_cnt;
+	long count = NM_I(sbi)->nat_cnt - NM_I(sbi)->dirty_nat_cnt;
+
+	return count > 0 ? count : 0;
 }
 
 static unsigned long __count_free_nids(struct f2fs_sb_info *sbi)
 {
-	if (NM_I(sbi)->fcnt > MAX_FREE_NIDS)
-		return NM_I(sbi)->fcnt - MAX_FREE_NIDS;
-	return 0;
+	long count = NM_I(sbi)->nid_cnt[FREE_NID] - MAX_FREE_NIDS;
+
+	return count > 0 ? count : 0;
 }
 
 static unsigned long __count_extent_cache(struct f2fs_sb_info *sbi)
@@ -136,6 +138,6 @@ void f2fs_leave_shrinker(struct f2fs_sb_info *sbi)
 	f2fs_shrink_extent_tree(sbi, __count_extent_cache(sbi));
 
 	spin_lock(&f2fs_list_lock);
-	list_del(&sbi->s_list);
+	list_del_init(&sbi->s_list);
 	spin_unlock(&f2fs_list_lock);
 }

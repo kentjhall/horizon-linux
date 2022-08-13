@@ -45,9 +45,11 @@ static struct menu *current_menu, *current_entry;
 
 %token <id>T_MAINMENU
 %token <id>T_MENU
+%token <id>T_APPEND_MENU
 %token <id>T_ENDMENU
 %token <id>T_SOURCE
 %token <id>T_CHOICE
+%token <id>T_APPEND_CHOICE
 %token <id>T_ENDCHOICE
 %token <id>T_COMMENT
 %token <id>T_CONFIG
@@ -89,7 +91,7 @@ static struct menu *current_menu, *current_entry;
 %type <expr> if_expr
 %type <id> end
 %type <id> option_name
-%type <menu> if_entry menu_entry choice_entry
+%type <menu> if_entry menu_entry append_menu_entry choice_entry append_choice_entry
 %type <string> symbol_option_arg word_opt
 
 %destructor {
@@ -97,7 +99,7 @@ static struct menu *current_menu, *current_entry;
 		$$->file->name, $$->lineno);
 	if (current_menu == $$)
 		menu_end_menu();
-} if_entry menu_entry choice_entry
+} if_entry menu_entry append_menu_entry choice_entry append_choice_entry
 
 %{
 /* Include zconf.hash.c here so it can see the token constants. */
@@ -107,7 +109,27 @@ static struct menu *current_menu, *current_entry;
 %%
 input: nl start | start;
 
-start: mainmenu_stmt stmt_list | stmt_list;
+start: mainmenu_stmt stmt_list | no_mainmenu_stmt stmt_list;
+
+/* mainmenu entry */
+
+mainmenu_stmt: T_MAINMENU prompt nl
+{
+	menu_add_prompt(P_MENU, $2, NULL);
+};
+
+/* Default main menu, if there's no mainmenu entry */
+
+no_mainmenu_stmt: /* empty */
+{
+	/*
+	 * Hack: Keep the main menu title on the heap so we can safely free it
+	 * later regardless of whether it comes from the 'prompt' in
+	 * mainmenu_stmt or here
+	 */
+	menu_add_prompt(P_MENU, strdup("Linux Kernel Configuration"), NULL);
+};
+
 
 stmt_list:
 	  /* empty */
@@ -258,6 +280,12 @@ choice_entry: choice choice_option_list
 	$$ = menu_add_menu();
 };
 
+append_choice_entry: T_APPEND_CHOICE prompt T_EOL
+{
+	printd(DEBUG_PARSE, "%s:%d:append_choice\n", zconf_curname(), zconf_lineno());
+	$$ = menu_append_choice($2);
+}
+
 choice_end: end
 {
 	if (zconf_endtoken($1, T_CHOICE, T_ENDCHOICE)) {
@@ -266,7 +294,9 @@ choice_end: end
 	}
 };
 
-choice_stmt: choice_entry choice_block choice_end
+choice_stmt:
+	  choice_entry choice_block choice_end
+	| append_choice_entry choice_block choice_end
 ;
 
 choice_option_list:
@@ -344,13 +374,6 @@ if_block:
 	| if_block choice_stmt
 ;
 
-/* mainmenu entry */
-
-mainmenu_stmt: T_MAINMENU prompt nl
-{
-	menu_add_prompt(P_MENU, $2, NULL);
-};
-
 /* menu entry */
 
 menu: T_MENU prompt T_EOL
@@ -365,6 +388,12 @@ menu_entry: menu visibility_list depends_list
 	$$ = menu_add_menu();
 };
 
+append_menu_entry: T_APPEND_MENU prompt T_EOL
+{
+	printd(DEBUG_PARSE, "%s:%d:append_menu\n", zconf_curname(), zconf_lineno());
+	$$ = menu_append_entry($2);
+}
+
 menu_end: end
 {
 	if (zconf_endtoken($1, T_MENU, T_ENDMENU)) {
@@ -373,7 +402,9 @@ menu_end: end
 	}
 };
 
-menu_stmt: menu_entry menu_block menu_end
+menu_stmt:
+	  menu_entry menu_block menu_end
+	| append_menu_entry menu_block menu_end
 ;
 
 menu_block:
@@ -495,6 +526,7 @@ word_opt: /* empty */			{ $$ = NULL; }
 
 void conf_parse(const char *name)
 {
+	const char *tmp;
 	struct symbol *sym;
 	int i;
 
@@ -502,7 +534,6 @@ void conf_parse(const char *name)
 
 	sym_init();
 	_menu_init();
-	rootmenu.prompt = menu_add_prompt(P_MENU, "Linux Kernel Configuration", NULL);
 
 	if (getenv("ZCONF_DEBUG"))
 		zconfdebug = 1;
@@ -512,8 +543,10 @@ void conf_parse(const char *name)
 	if (!modules_sym)
 		modules_sym = sym_find( "n" );
 
+	tmp = rootmenu.prompt->text;
 	rootmenu.prompt->text = _(rootmenu.prompt->text);
 	rootmenu.prompt->text = sym_expand_string_value(rootmenu.prompt->text);
+	free((char*)tmp);
 
 	menu_finalize(&rootmenu);
 	for_all_symbols(i, sym) {
@@ -529,8 +562,10 @@ static const char *zconf_tokenname(int token)
 {
 	switch (token) {
 	case T_MENU:		return "menu";
+	case T_APPEND_MENU:	return "append_menu";
 	case T_ENDMENU:		return "endmenu";
 	case T_CHOICE:		return "choice";
+	case T_APPEND_CHOICE:	return "append_choice";
 	case T_ENDCHOICE:	return "endchoice";
 	case T_IF:		return "if";
 	case T_ENDIF:		return "endif";
@@ -548,7 +583,7 @@ static bool zconf_endtoken(const struct kconf_id *id, int starttoken, int endtok
 		zconfnerrs++;
 		return false;
 	}
-	if (current_menu->file != current_file) {
+	if (strcmp(current_menu->file->logical_name, current_file->logical_name)) {
 		zconf_error("'%s' in different file than '%s'",
 			kconf_id_strings + id->name, zconf_tokenname(starttoken));
 		fprintf(stderr, "%s:%d: location of the '%s'\n",

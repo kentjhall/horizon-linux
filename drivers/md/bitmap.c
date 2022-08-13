@@ -1339,7 +1339,7 @@ __acquires(bitmap->lock)
 	if (bitmap->bp[page].hijacked ||
 	    bitmap->bp[page].map == NULL)
 		csize = ((sector_t)1) << (bitmap->chunkshift +
-					  PAGE_COUNTER_SHIFT - 1);
+					  PAGE_COUNTER_SHIFT);
 	else
 		csize = ((sector_t)1) << bitmap->chunkshift;
 	*blocks = csize - (offset & (csize - 1));
@@ -1699,7 +1699,7 @@ void bitmap_flush(struct mddev *mddev)
 /*
  * free memory that was allocated
  */
-static void bitmap_free(struct bitmap *bitmap)
+static void md_bitmap_free(struct bitmap *bitmap)
 {
 	unsigned long k, pages;
 	struct bitmap_page *bp;
@@ -1749,7 +1749,7 @@ void bitmap_destroy(struct mddev *mddev)
 	if (mddev->thread)
 		mddev->thread->timeout = MAX_SCHEDULE_TIMEOUT;
 
-	bitmap_free(bitmap);
+	md_bitmap_free(bitmap);
 }
 
 /*
@@ -1834,7 +1834,7 @@ struct bitmap *bitmap_create(struct mddev *mddev, int slot)
 
 	return bitmap;
  error:
-	bitmap_free(bitmap);
+	md_bitmap_free(bitmap);
 	return ERR_PTR(err);
 }
 
@@ -1936,7 +1936,7 @@ int bitmap_copy_from_slot(struct mddev *mddev, int slot,
 	*low = lo;
 	*high = hi;
 err:
-	bitmap_free(bitmap);
+	md_bitmap_free(bitmap);
 	return rv;
 }
 EXPORT_SYMBOL_GPL(bitmap_copy_from_slot);
@@ -1991,6 +1991,11 @@ int bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 	int ret = 0;
 	long pages;
 	struct bitmap_page *new_bp;
+
+	if (bitmap->storage.file && !init) {
+		pr_info("md: cannot resize file-based bitmap\n");
+		return -EINVAL;
+	}
 
 	if (chunksize == 0) {
 		/* If there is enough space, leave the chunk size unchanged,
@@ -2079,6 +2084,7 @@ int bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 				for (k = 0; k < page; k++) {
 					kfree(new_bp[k].map);
 				}
+				kfree(new_bp);
 
 				/* restore some fields from old_counts */
 				bitmap->counts.bp = old_counts.bp;
@@ -2127,6 +2133,14 @@ int bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 				old_blocks = new_blocks;
 		}
 		block += old_blocks;
+	}
+
+	if (bitmap->counts.bp != old_counts.bp) {
+		unsigned long k;
+		for (k = 0; k < old_counts.pages; k++)
+			if (!old_counts.bp[k].hijacked)
+				kfree(old_counts.bp[k].map);
+		kfree(old_counts.bp);
 	}
 
 	if (!init) {

@@ -198,7 +198,7 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 	int ret;
 	struct brcmf_if *ifp = netdev_priv(ndev);
 	struct brcmf_pub *drvr = ifp->drvr;
-	struct ethhdr *eh = (struct ethhdr *)(skb->data);
+	struct ethhdr *eh;
 
 	brcmf_dbg(DATA, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
 
@@ -211,22 +211,13 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 		goto done;
 	}
 
-	/* Make sure there's enough room for any header */
-	if (skb_headroom(skb) < drvr->hdrlen) {
-		struct sk_buff *skb2;
-
-		brcmf_dbg(INFO, "%s: insufficient headroom\n",
+	/* Make sure there's enough writable headroom*/
+	ret = skb_cow_head(skb, drvr->hdrlen);
+	if (ret < 0) {
+		brcmf_err("%s: skb_cow_head failed\n",
 			  brcmf_ifname(ifp));
-		drvr->bus_if->tx_realloc++;
-		skb2 = skb_realloc_headroom(skb, drvr->hdrlen);
 		dev_kfree_skb(skb);
-		skb = skb2;
-		if (skb == NULL) {
-			brcmf_err("%s: skb_realloc_headroom failed\n",
-				  brcmf_ifname(ifp));
-			ret = -ENOMEM;
-			goto done;
-		}
+		goto done;
 	}
 
 	/* validate length for ether packet */
@@ -235,6 +226,8 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 		dev_kfree_skb(skb);
 		goto done;
 	}
+
+	eh = (struct ethhdr *)(skb->data);
 
 	if (eh->h_proto == htons(ETH_P_PAE))
 		atomic_inc(&ifp->pend_8021x_cnt);
@@ -346,7 +339,8 @@ void brcmf_rx_frame(struct device *dev, struct sk_buff *skb, bool handle_event)
 	} else {
 		/* Process special event packets */
 		if (handle_event)
-			brcmf_fweh_process_skb(ifp->drvr, skb);
+			brcmf_fweh_process_skb(ifp->drvr, skb,
+					       BCMILCP_SUBTYPE_VENDOR_LONG);
 
 		brcmf_netif_rx(ifp, skb);
 	}
@@ -363,7 +357,7 @@ void brcmf_rx_event(struct device *dev, struct sk_buff *skb)
 	if (brcmf_rx_hdrpull(drvr, skb, &ifp))
 		return;
 
-	brcmf_fweh_process_skb(ifp->drvr, skb);
+	brcmf_fweh_process_skb(ifp->drvr, skb, 0);
 	brcmu_pkt_buf_free_skb(skb);
 }
 
@@ -692,17 +686,17 @@ static void brcmf_del_if(struct brcmf_pub *drvr, s32 bsscfgidx,
 			 bool rtnl_locked)
 {
 	struct brcmf_if *ifp;
+	int ifidx;
 
 	ifp = drvr->iflist[bsscfgidx];
-	drvr->iflist[bsscfgidx] = NULL;
 	if (!ifp) {
 		brcmf_err("Null interface, bsscfgidx=%d\n", bsscfgidx);
 		return;
 	}
 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d, ifidx=%d\n", bsscfgidx,
 		  ifp->ifidx);
-	if (drvr->if2bss[ifp->ifidx] == bsscfgidx)
-		drvr->if2bss[ifp->ifidx] = BRCMF_BSSIDX_INVALID;
+	ifidx = ifp->ifidx;
+
 	if (ifp->ndev) {
 		if (bsscfgidx == 0) {
 			if (ifp->ndev->netdev_ops == &brcmf_netdev_ops_pri) {
@@ -730,6 +724,10 @@ static void brcmf_del_if(struct brcmf_pub *drvr, s32 bsscfgidx,
 		brcmf_p2p_ifp_removed(ifp, rtnl_locked);
 		kfree(ifp);
 	}
+
+	drvr->iflist[bsscfgidx] = NULL;
+	if (drvr->if2bss[ifidx] == bsscfgidx)
+		drvr->if2bss[ifidx] = BRCMF_BSSIDX_INVALID;
 }
 
 void brcmf_remove_interface(struct brcmf_if *ifp, bool rtnl_locked)

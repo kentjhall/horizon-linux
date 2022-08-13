@@ -22,12 +22,15 @@
 #include <linux/kvm.h>
 #include <linux/kvm_host.h>
 
+#include <kvm/arm_psci.h>
+
 #include <asm/esr.h>
 #include <asm/kvm_asm.h>
 #include <asm/kvm_coproc.h>
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_mmu.h>
-#include <asm/kvm_psci.h>
+#include <asm/debug-monitors.h>
+#include <asm/traps.h>
 
 #define CREATE_TRACE_POINTS
 #include "trace.h"
@@ -42,9 +45,9 @@ static int handle_hvc(struct kvm_vcpu *vcpu, struct kvm_run *run)
 			    kvm_vcpu_hvc_get_imm(vcpu));
 	vcpu->stat.hvc_exit_stat++;
 
-	ret = kvm_psci_call(vcpu);
+	ret = kvm_hvc_call_handler(vcpu);
 	if (ret < 0) {
-		kvm_inject_undefined(vcpu);
+		vcpu_set_reg(vcpu, 0, ~0UL);
 		return 1;
 	}
 
@@ -53,7 +56,16 @@ static int handle_hvc(struct kvm_vcpu *vcpu, struct kvm_run *run)
 
 static int handle_smc(struct kvm_vcpu *vcpu, struct kvm_run *run)
 {
-	kvm_inject_undefined(vcpu);
+	/*
+	 * "If an SMC instruction executed at Non-secure EL1 is
+	 * trapped to EL2 because HCR_EL2.TSC is 1, the exception is a
+	 * Trap exception, not a Secure Monitor Call exception [...]"
+	 *
+	 * We need to advance the PC after the trap, as it would
+	 * otherwise return to the same address...
+	 */
+	vcpu_set_reg(vcpu, 0, ~0UL);
+	kvm_skip_instr(vcpu, kvm_vcpu_trap_il_is32bit(vcpu));
 	return 1;
 }
 
@@ -125,7 +137,19 @@ static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu, struct kvm_run *run)
 	return ret;
 }
 
+static int kvm_handle_unknown_ec(struct kvm_vcpu *vcpu, struct kvm_run *run)
+{
+	u32 hsr = kvm_vcpu_get_hsr(vcpu);
+
+	kvm_pr_unimpl("Unknown exception class: hsr: %#08x -- %s\n",
+		      hsr, esr_get_class_string(hsr));
+
+	kvm_inject_undefined(vcpu);
+	return 1;
+}
+
 static exit_handle_fn arm_exit_handlers[] = {
+	[0 ... ESR_ELx_EC_MAX]	= kvm_handle_unknown_ec,
 	[ESR_ELx_EC_WFx]	= kvm_handle_wfx,
 	[ESR_ELx_EC_CP15_32]	= kvm_handle_cp15_32,
 	[ESR_ELx_EC_CP15_64]	= kvm_handle_cp15_64,
@@ -150,13 +174,6 @@ static exit_handle_fn kvm_get_exit_handler(struct kvm_vcpu *vcpu)
 {
 	u32 hsr = kvm_vcpu_get_hsr(vcpu);
 	u8 hsr_ec = ESR_ELx_EC(hsr);
-
-	if (hsr_ec >= ARRAY_SIZE(arm_exit_handlers) ||
-	    !arm_exit_handlers[hsr_ec]) {
-		kvm_err("Unknown exception class: hsr: %#08x -- %s\n",
-			hsr, esr_get_class_string(hsr));
-		BUG();
-	}
 
 	return arm_exit_handlers[hsr_ec];
 }

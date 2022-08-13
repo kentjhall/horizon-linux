@@ -943,16 +943,22 @@ u32 ieee802_11_parse_elems_crc(const u8 *start, size_t len, bool action,
 				elem_parse_failed = true;
 			break;
 		case WLAN_EID_VHT_OPERATION:
-			if (elen >= sizeof(struct ieee80211_vht_operation))
+			if (elen >= sizeof(struct ieee80211_vht_operation)) {
 				elems->vht_operation = (void *)pos;
-			else
-				elem_parse_failed = true;
+				if (calc_crc)
+					crc = crc32_be(crc, pos - 2, elen + 2);
+				break;
+			}
+			elem_parse_failed = true;
 			break;
 		case WLAN_EID_OPMODE_NOTIF:
-			if (elen > 0)
+			if (elen > 0) {
 				elems->opmode_notif = pos;
-			else
-				elem_parse_failed = true;
+				if (calc_crc)
+					crc = crc32_be(crc, pos - 2, elen + 2);
+				break;
+			}
+			elem_parse_failed = true;
 			break;
 		case WLAN_EID_MESH_ID:
 			elems->mesh_id = pos;
@@ -1590,13 +1596,13 @@ u32 ieee80211_sta_get_rates(struct ieee80211_sub_if_data *sdata,
 	size_t num_rates;
 	u32 supp_rates, rate_flags;
 	int i, j, shift;
+
 	sband = sdata->local->hw.wiphy->bands[band];
+	if (WARN_ON(!sband))
+		return 1;
 
 	rate_flags = ieee80211_chandef_rate_flags(&sdata->vif.bss_conf.chandef);
 	shift = ieee80211_vif_get_shift(&sdata->vif);
-
-	if (WARN_ON(!sband))
-		return 1;
 
 	num_rates = sband->n_bitrates;
 	supp_rates = 0;
@@ -2061,7 +2067,8 @@ int ieee80211_reconfig(struct ieee80211_local *local)
 		if (!sta->uploaded)
 			continue;
 
-		if (sta->sdata->vif.type != NL80211_IFTYPE_AP)
+		if (sta->sdata->vif.type != NL80211_IFTYPE_AP &&
+		    sta->sdata->vif.type != NL80211_IFTYPE_AP_VLAN)
 			continue;
 
 		for (state = IEEE80211_STA_NOTEXIST;

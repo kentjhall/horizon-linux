@@ -263,6 +263,11 @@ static void tipc_node_write_lock(struct tipc_node *n)
 	write_lock_bh(&n->lock);
 }
 
+static void tipc_node_write_unlock_fast(struct tipc_node *n)
+{
+	write_unlock_bh(&n->lock);
+}
+
 static void tipc_node_write_unlock(struct tipc_node *n)
 {
 	struct net *net = n->net;
@@ -417,7 +422,7 @@ void tipc_node_subscribe(struct net *net, struct list_head *subscr, u32 addr)
 	}
 	tipc_node_write_lock(n);
 	list_add_tail(subscr, &n->publ_list);
-	tipc_node_write_unlock(n);
+	tipc_node_write_unlock_fast(n);
 	tipc_node_put(n);
 }
 
@@ -435,7 +440,7 @@ void tipc_node_unsubscribe(struct net *net, struct list_head *subscr, u32 addr)
 	}
 	tipc_node_write_lock(n);
 	list_del_init(subscr);
-	tipc_node_write_unlock(n);
+	tipc_node_write_unlock_fast(n);
 	tipc_node_put(n);
 }
 
@@ -683,10 +688,10 @@ static void __tipc_node_link_down(struct tipc_node *n, int *bearer_id,
 static void tipc_node_link_down(struct tipc_node *n, int bearer_id, bool delete)
 {
 	struct tipc_link_entry *le = &n->links[bearer_id];
+	struct tipc_media_addr *maddr = NULL;
 	struct tipc_link *l = le->link;
-	struct tipc_media_addr *maddr;
-	struct sk_buff_head xmitq;
 	int old_bearer_id = bearer_id;
+	struct sk_buff_head xmitq;
 
 	if (!l)
 		return;
@@ -708,7 +713,8 @@ static void tipc_node_link_down(struct tipc_node *n, int bearer_id, bool delete)
 	tipc_node_write_unlock(n);
 	if (delete)
 		tipc_mon_remove_peer(n->net, n->addr, old_bearer_id);
-	tipc_bearer_xmit(n->net, bearer_id, &xmitq, maddr);
+	if (!skb_queue_empty(&xmitq))
+		tipc_bearer_xmit(n->net, bearer_id, &xmitq, maddr);
 	tipc_sk_rcv(n->net, &le->inputq);
 }
 
@@ -1843,36 +1849,38 @@ int tipc_nl_node_get_link(struct sk_buff *skb, struct genl_info *info)
 
 	if (strcmp(name, tipc_bclink_name) == 0) {
 		err = tipc_nl_add_bc_link(net, &msg);
-		if (err) {
-			nlmsg_free(msg.skb);
-			return err;
-		}
+		if (err)
+			goto err_free;
 	} else {
 		int bearer_id;
 		struct tipc_node *node;
 		struct tipc_link *link;
 
 		node = tipc_node_find_by_name(net, name, &bearer_id);
-		if (!node)
-			return -EINVAL;
+		if (!node) {
+			err = -EINVAL;
+			goto err_free;
+		}
 
 		tipc_node_read_lock(node);
 		link = node->links[bearer_id].link;
 		if (!link) {
 			tipc_node_read_unlock(node);
-			nlmsg_free(msg.skb);
-			return -EINVAL;
+			err = -EINVAL;
+			goto err_free;
 		}
 
 		err = __tipc_nl_add_link(net, &msg, link, 0);
 		tipc_node_read_unlock(node);
-		if (err) {
-			nlmsg_free(msg.skb);
-			return err;
-		}
+		if (err)
+			goto err_free;
 	}
 
 	return genlmsg_reply(msg.skb, info);
+
+err_free:
+	nlmsg_free(msg.skb);
+	return err;
 }
 
 int tipc_nl_node_reset_link_stats(struct sk_buff *skb, struct genl_info *info)
@@ -2087,6 +2095,8 @@ int tipc_nl_node_get_monitor(struct sk_buff *skb, struct genl_info *info)
 	int err;
 
 	msg.skb = nlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	if (!msg.skb)
+		return -ENOMEM;
 	msg.portid = info->snd_portid;
 	msg.seq = info->snd_seq;
 

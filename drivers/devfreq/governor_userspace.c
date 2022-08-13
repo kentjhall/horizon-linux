@@ -75,9 +75,9 @@ static ssize_t show_freq(struct device *dev, struct device_attribute *attr,
 	data = devfreq->data;
 
 	if (data->valid)
-		err = sprintf(buf, "%lu\n", data->user_frequency);
+		err = snprintf(buf, PAGE_SIZE, "%lu\n", data->user_frequency);
 	else
-		err = sprintf(buf, "undefined\n");
+		err = snprintf(buf, PAGE_SIZE, "undefined\n");
 	mutex_unlock(&devfreq->lock);
 	return err;
 }
@@ -112,7 +112,13 @@ out:
 
 static void userspace_exit(struct devfreq *devfreq)
 {
-	sysfs_remove_group(&devfreq->dev.kobj, &dev_attr_group);
+	/*
+	 * Remove the sysfs entry, unless this is being called after
+	 * device_del(), which should have done this already via kobject_del().
+	 */
+	if (devfreq->dev.kobj.sd)
+		sysfs_remove_group(&devfreq->dev.kobj, &dev_attr_group);
+
 	kfree(devfreq->data);
 	devfreq->data = NULL;
 }

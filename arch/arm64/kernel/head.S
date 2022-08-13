@@ -326,14 +326,14 @@ __create_page_tables:
 	 * dirty cache lines being evicted.
 	 */
 	adrp	x0, idmap_pg_dir
-	adrp	x1, swapper_pg_dir + SWAPPER_DIR_SIZE
+	adrp	x1, swapper_pg_dir + SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE
 	bl	__inval_cache_range
 
 	/*
 	 * Clear the idmap and swapper page tables.
 	 */
 	adrp	x0, idmap_pg_dir
-	adrp	x6, swapper_pg_dir + SWAPPER_DIR_SIZE
+	adrp	x6, swapper_pg_dir + SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE
 1:	stp	xzr, xzr, [x0], #16
 	stp	xzr, xzr, [x0], #16
 	stp	xzr, xzr, [x0], #16
@@ -412,7 +412,7 @@ __create_page_tables:
 	 * tables again to remove any speculatively loaded cache lines.
 	 */
 	adrp	x0, idmap_pg_dir
-	adrp	x1, swapper_pg_dir + SWAPPER_DIR_SIZE
+	adrp	x1, swapper_pg_dir + SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE
 	dmb	sy
 	bl	__inval_cache_range
 
@@ -428,7 +428,8 @@ ENDPROC(__create_page_tables)
 __primary_switched:
 	adrp	x4, init_thread_union
 	add	sp, x4, #THREAD_SIZE
-	msr	sp_el0, x4			// Save thread_info
+	adr_l	x5, init_task
+	msr	sp_el0, x5			// Save thread_info
 
 	adr_l	x8, vectors			// load VBAR_EL1 with virtual
 	msr	vbar_el1, x8			// vector table address
@@ -451,6 +452,9 @@ __primary_switched:
 	bl	__pi_memset
 	dsb	ishst				// Make zero page visible to PTW
 
+#ifdef CONFIG_SERROR_HANDLER
+	msr	daifclr, #4
+#endif
 #ifdef CONFIG_KASAN
 	bl	kasan_early_init
 #endif
@@ -473,7 +477,7 @@ ENDPROC(__primary_switched)
  * end early head section, begin head code that is also used for
  * hotplug and needs to have the same protections as the text region
  */
-	.section ".idmap.text","ax"
+	.section ".idmap.text","awx"
 
 ENTRY(kimage_vaddr)
 	.quad		_text - TEXT_OFFSET
@@ -486,6 +490,7 @@ ENTRY(kimage_vaddr)
  * booted in EL1 or EL2 respectively.
  */
 ENTRY(el2_setup)
+	msr	SPsel, #1			// We want to use SP_EL{1,2}
 	mrs	x0, CurrentEL
 	cmp	x0, #CurrentEL_EL2
 	b.ne	1f
@@ -516,10 +521,9 @@ CPU_LE(	bic	x0, x0, #(3 << 24)	)	// Clear the EE and E0E bits for EL1
 #endif
 
 	/* Hyp configuration. */
-	mov	x0, #HCR_RW			// 64-bit EL1
+	mov_q	x0, HCR_HOST_NVHE_FLAGS
 	cbz	x2, set_hcr
-	orr	x0, x0, #HCR_TGE		// Enable Host Extensions
-	orr	x0, x0, #HCR_E2H
+	mov_q	x0, HCR_HOST_VHE_FLAGS
 set_hcr:
 	msr	hcr_el2, x0
 	isb
@@ -534,8 +538,7 @@ set_hcr:
 	/* GICv3 system register access */
 	mrs	x0, id_aa64pfr0_el1
 	ubfx	x0, x0, #24, #4
-	cmp	x0, #1
-	b.ne	3f
+	cbz	x0, 3f
 
 	mrs_s	x0, ICC_SRE_EL2
 	orr	x0, x0, #ICC_SRE_EL2_SRE	// Set ICC_SRE_EL2.SRE==1
@@ -651,7 +654,7 @@ ENTRY(__boot_cpu_mode)
  * with MMU turned off.
  */
 ENTRY(__early_cpu_boot_status)
-	.long 	0
+	.quad 	0
 
 	.popsection
 
@@ -687,6 +690,7 @@ secondary_startup:
 	/*
 	 * Common entry point for secondary CPUs.
 	 */
+	bl	__cpu_secondary_check52bitva
 	bl	__cpu_setup			// initialise processor
 	bl	__enable_mmu
 	ldr	x8, =__secondary_switched
@@ -699,10 +703,10 @@ __secondary_switched:
 	isb
 
 	adr_l	x0, secondary_data
-	ldr	x0, [x0, #CPU_BOOT_STACK]	// get secondary_data.stack
-	mov	sp, x0
-	and	x0, x0, #~(THREAD_SIZE - 1)
-	msr	sp_el0, x0			// save thread_info
+	ldr	x1, [x0, #CPU_BOOT_STACK]	// get secondary_data.stack
+	mov	sp, x1
+	ldr	x2, [x0, #CPU_BOOT_TASK]
+	msr	sp_el0, x2
 	mov	x29, #0
 	b	secondary_start_kernel
 ENDPROC(__secondary_switched)
@@ -759,6 +763,31 @@ ENTRY(__enable_mmu)
 	isb
 	ret
 ENDPROC(__enable_mmu)
+
+ENTRY(__cpu_secondary_check52bitva)
+#ifdef CONFIG_ARM64_52BIT_VA
+	ldr_l	x0, vabits_user
+	cmp	x0, #52
+	b.ne	2f
+
+	mrs_s	x0, SYS_ID_AA64MMFR2_EL1
+	and	x0, x0, #(0xf << ID_AA64MMFR2_LVA_SHIFT)
+	cbnz	x0, 2f
+
+	adr_l	x0, va52mismatch
+	mov	w1, #1
+	strb	w1, [x0]
+	dmb	sy
+	dc	ivac, x0	// Invalidate potentially stale cache line
+
+	update_early_cpu_boot_status CPU_STUCK_IN_KERNEL, x0, x1
+1:	wfe
+	wfi
+	b	1b
+
+#endif
+2:	ret
+ENDPROC(__cpu_secondary_check52bitva)
 
 __no_granule_support:
 	/* Indicate that this CPU can't boot and is stuck in the kernel */

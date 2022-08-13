@@ -57,6 +57,8 @@ contain the following properties.
 		3-wire mode.
 - spi-lsb-first   - (optional) Empty property indicating device requires
 		LSB first mode.
+- spi-lsbyte-first - (optional) Empty property indicating device requires
+                      Least Significant Byte first mode.
 - spi-tx-bus-width - (optional) The bus width (number of data wires) that is
                       used for MOSI. Defaults to 1 if not present.
 - spi-rx-bus-width - (optional) The bus width (number of data wires) that is

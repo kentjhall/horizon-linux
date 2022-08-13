@@ -354,7 +354,7 @@ struct tty_driver *tty_find_polling_driver(char *name, int *line)
 	mutex_lock(&tty_mutex);
 	/* Search through the tty devices to look for a match */
 	list_for_each_entry(p, &tty_drivers, tty_drivers) {
-		if (strncmp(name, p->name, len) != 0)
+		if (!len || strncmp(name, p->name, len) != 0)
 			continue;
 		stp = str;
 		if (*stp == ',')
@@ -520,6 +520,8 @@ void proc_clear_tty(struct task_struct *p)
 	tty_kref_put(tty);
 }
 
+extern void tty_sysctl_init(void);
+
 /**
  * proc_set_tty -  set the controlling terminal
  *
@@ -542,8 +544,8 @@ static void __proc_set_tty(struct tty_struct *tty)
 	put_pid(tty->session);
 	put_pid(tty->pgrp);
 	tty->pgrp = get_pid(task_pgrp(current));
-	spin_unlock_irqrestore(&tty->ctrl_lock, flags);
 	tty->session = get_pid(task_session(current));
+	spin_unlock_irqrestore(&tty->ctrl_lock, flags);
 	if (current->signal->tty) {
 		tty_debug(tty, "current tty %s not NULL!!\n",
 			  current->signal->tty->name);
@@ -709,6 +711,14 @@ static void __tty_hangup(struct tty_struct *tty, int exit_session)
 		return;
 	}
 
+	/*
+	 * Some console devices aren't actually hung up for technical and
+	 * historical reasons, which can lead to indefinite interruptible
+	 * sleep in n_tty_read().  The following explicitly tells
+	 * n_tty_read() to abort readers.
+	 */
+	set_bit(TTY_HUPPING, &tty->flags);
+
 	/* inuse_filps is protected by the single tty lock,
 	   this really needs to change if we want to flush the
 	   workqueue with the lock held */
@@ -763,6 +773,7 @@ static void __tty_hangup(struct tty_struct *tty, int exit_session)
 	 * from the ldisc side, which is now guaranteed.
 	 */
 	set_bit(TTY_HUPPED, &tty->flags);
+	clear_bit(TTY_HUPPING, &tty->flags);
 	tty_unlock(tty);
 
 	if (f)
@@ -924,21 +935,24 @@ void disassociate_ctty(int on_exit)
 	spin_lock_irq(&current->sighand->siglock);
 	put_pid(current->signal->tty_old_pgrp);
 	current->signal->tty_old_pgrp = NULL;
-
 	tty = tty_kref_get(current->signal->tty);
+	spin_unlock_irq(&current->sighand->siglock);
+
 	if (tty) {
 		unsigned long flags;
+
+		tty_lock(tty);
 		spin_lock_irqsave(&tty->ctrl_lock, flags);
 		put_pid(tty->session);
 		put_pid(tty->pgrp);
 		tty->session = NULL;
 		tty->pgrp = NULL;
 		spin_unlock_irqrestore(&tty->ctrl_lock, flags);
+		tty_unlock(tty);
 		tty_kref_put(tty);
 	} else
 		tty_debug_hangup(tty, "no current tty\n");
 
-	spin_unlock_irq(&current->sighand->siglock);
 	/* Now clear signal->tty under the lock */
 	read_lock(&tasklist_lock);
 	session_clear_tty(task_session(current));
@@ -1466,6 +1480,8 @@ static void tty_driver_remove_tty(struct tty_driver *driver, struct tty_struct *
 static int tty_reopen(struct tty_struct *tty)
 {
 	struct tty_driver *driver = tty->driver;
+	struct tty_ldisc *ld;
+	int retval = 0;
 
 	if (driver->type == TTY_DRIVER_TYPE_PTY &&
 	    driver->subtype == PTY_TYPE_MASTER)
@@ -1477,12 +1493,23 @@ static int tty_reopen(struct tty_struct *tty)
 	if (test_bit(TTY_EXCLUSIVE, &tty->flags) && !capable(CAP_SYS_ADMIN))
 		return -EBUSY;
 
-	tty->count++;
+	ld = tty_ldisc_ref_wait(tty);
+	if (ld) {
+		tty_ldisc_deref(ld);
+	} else {
+		retval = tty_ldisc_lock(tty, 5 * HZ);
+		if (retval)
+			return retval;
 
-	if (!tty->ldisc)
-		return tty_ldisc_reinit(tty, tty->termios.c_line);
+		if (!tty->ldisc)
+			retval = tty_ldisc_reinit(tty, tty->termios.c_line);
+		tty_ldisc_unlock(tty);
+	}
 
-	return 0;
+	if (retval == 0)
+		tty->count++;
+
+	return retval;
 }
 
 /**
@@ -1543,6 +1570,9 @@ struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx)
 			"%s: %s driver does not set tty->port. This will crash the kernel later. Fix the driver!\n",
 			__func__, tty->driver->name);
 
+	retval = tty_ldisc_lock(tty, 5 * HZ);
+	if (retval)
+		goto err_release_lock;
 	tty->port->itty = tty;
 
 	/*
@@ -1553,6 +1583,7 @@ struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx)
 	retval = tty_ldisc_setup(tty, tty->link);
 	if (retval)
 		goto err_release_tty;
+	tty_ldisc_unlock(tty);
 	/* Return the tty locked so that it cannot vanish under the caller */
 	return tty;
 
@@ -1565,9 +1596,11 @@ err_module_put:
 
 	/* call the tty release_tty routine to clean out this slot */
 err_release_tty:
-	tty_unlock(tty);
+	tty_ldisc_unlock(tty);
 	tty_info_ratelimited(tty, "ldisc open failed (%d), clearing slot %d\n",
 			     retval, idx);
+err_release_lock:
+	tty_unlock(tty);
 	release_tty(tty, idx);
 	return ERR_PTR(retval);
 }
@@ -1696,6 +1729,8 @@ static void release_tty(struct tty_struct *tty, int idx)
 	if (tty->link)
 		tty->link->port->itty = NULL;
 	tty_buffer_cancel_work(tty->port);
+	if (tty->link)
+		tty_buffer_cancel_work(tty->link->port);
 
 	tty_kref_put(tty->link);
 	tty_kref_put(tty);
@@ -2294,7 +2329,8 @@ static int tiocsti(struct tty_struct *tty, char __user *p)
 	ld = tty_ldisc_ref_wait(tty);
 	if (!ld)
 		return -EIO;
-	ld->ops->receive_buf(tty, &ch, &mbz, 1);
+	if (ld->ops->receive_buf)
+		ld->ops->receive_buf(tty, &ch, &mbz, 1);
 	tty_ldisc_deref(ld);
 	return 0;
 }
@@ -2595,14 +2631,19 @@ static int tiocspgrp(struct tty_struct *tty, struct tty_struct *real_tty, pid_t 
 		return -ENOTTY;
 	if (retval)
 		return retval;
-	if (!current->signal->tty ||
-	    (current->signal->tty != real_tty) ||
-	    (real_tty->session != task_session(current)))
-		return -ENOTTY;
+
 	if (get_user(pgrp_nr, p))
 		return -EFAULT;
 	if (pgrp_nr < 0)
 		return -EINVAL;
+
+	spin_lock_irq(&real_tty->ctrl_lock);
+	if (!current->signal->tty ||
+	    (current->signal->tty != real_tty) ||
+	    (real_tty->session != task_session(current))) {
+		retval = -ENOTTY;
+		goto out_unlock_ctrl;
+	}
 	rcu_read_lock();
 	pgrp = find_vpid(pgrp_nr);
 	retval = -ESRCH;
@@ -2612,12 +2653,12 @@ static int tiocspgrp(struct tty_struct *tty, struct tty_struct *real_tty, pid_t 
 	if (session_of_pgrp(pgrp) != task_session(current))
 		goto out_unlock;
 	retval = 0;
-	spin_lock_irq(&tty->ctrl_lock);
 	put_pid(real_tty->pgrp);
 	real_tty->pgrp = get_pid(pgrp);
-	spin_unlock_irq(&tty->ctrl_lock);
 out_unlock:
 	rcu_read_unlock();
+out_unlock_ctrl:
+	spin_unlock_irq(&real_tty->ctrl_lock);
 	return retval;
 }
 
@@ -2629,21 +2670,31 @@ out_unlock:
  *
  *	Obtain the session id of the tty. If there is no session
  *	return an error.
- *
- *	Locking: none. Reference to current->signal->tty is safe.
  */
 
 static int tiocgsid(struct tty_struct *tty, struct tty_struct *real_tty, pid_t __user *p)
 {
+	unsigned long flags;
+	pid_t sid;
+
 	/*
 	 * (tty == real_tty) is a cheap way of
 	 * testing if the tty is NOT a master pty.
 	*/
 	if (tty == real_tty && current->signal->tty != real_tty)
 		return -ENOTTY;
+
+	spin_lock_irqsave(&real_tty->ctrl_lock, flags);
 	if (!real_tty->session)
-		return -ENOTTY;
-	return put_user(pid_vnr(real_tty->session), p);
+		goto err;
+	sid = pid_vnr(real_tty->session);
+	spin_unlock_irqrestore(&real_tty->ctrl_lock, flags);
+
+	return put_user(sid, p);
+
+err:
+	spin_unlock_irqrestore(&real_tty->ctrl_lock, flags);
+	return -ENOTTY;
 }
 
 /**
@@ -3061,10 +3112,14 @@ void __do_SAK(struct tty_struct *tty)
 	struct task_struct *g, *p;
 	struct pid *session;
 	int		i;
+	unsigned long flags;
 
 	if (!tty)
 		return;
-	session = tty->session;
+
+	spin_lock_irqsave(&tty->ctrl_lock, flags);
+	session = get_pid(tty->session);
+	spin_unlock_irqrestore(&tty->ctrl_lock, flags);
 
 	tty_ldisc_flush(tty);
 
@@ -3096,6 +3151,7 @@ void __do_SAK(struct tty_struct *tty)
 		task_unlock(p);
 	} while_each_thread(g, p);
 	read_unlock(&tasklist_lock);
+	put_pid(session);
 #endif
 }
 
@@ -3153,7 +3209,10 @@ struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx)
 
 	kref_init(&tty->kref);
 	tty->magic = TTY_MAGIC;
-	tty_ldisc_init(tty);
+	if (tty_ldisc_init(tty)) {
+		kfree(tty);
+		return NULL;
+	}
 	tty->session = NULL;
 	tty->pgrp = NULL;
 	mutex_init(&tty->legacy_mutex);
@@ -3671,6 +3730,7 @@ void console_sysfs_notify(void)
  */
 int __init tty_init(void)
 {
+	tty_sysctl_init();
 	cdev_init(&tty_cdev, &tty_fops);
 	if (cdev_add(&tty_cdev, MKDEV(TTYAUX_MAJOR, 0), 1) ||
 	    register_chrdev_region(MKDEV(TTYAUX_MAJOR, 0), 1, "/dev/tty") < 0)

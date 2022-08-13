@@ -230,7 +230,7 @@ u32 __pci_msix_desc_mask_irq(struct msi_desc *desc, u32 flag)
 		return 0;
 
 	mask_bits &= ~PCI_MSIX_ENTRY_CTRL_MASKBIT;
-	if (flag)
+	if (flag & PCI_MSIX_ENTRY_CTRL_MASKBIT)
 		mask_bits |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
 	writel(mask_bits, pci_msix_desc_addr(desc) + PCI_MSIX_ENTRY_VECTOR_CTRL);
 
@@ -730,7 +730,7 @@ static int msix_setup_entries(struct pci_dev *dev, void __iomem *base,
 	ret = 0;
 out:
 	kfree(masks);
-	return 0;
+	return ret;
 }
 
 static void msix_program_entries(struct pci_dev *dev,
@@ -981,7 +981,6 @@ static int __pci_enable_msix(struct pci_dev *dev, struct msix_entry *entries,
 			}
 		}
 	}
-	WARN_ON(!!dev->msix_enabled);
 
 	/* Check whether driver already requested for MSI irq */
 	if (dev->msi_enabled) {
@@ -1068,8 +1067,6 @@ static int __pci_enable_msi_range(struct pci_dev *dev, int minvec, int maxvec,
 	if (!pci_msi_supported(dev, minvec))
 		return -EINVAL;
 
-	WARN_ON(!!dev->msi_enabled);
-
 	/* Check whether driver already requested MSI-X irqs */
 	if (dev->msix_enabled) {
 		dev_info(&dev->dev,
@@ -1079,6 +1076,9 @@ static int __pci_enable_msi_range(struct pci_dev *dev, int minvec, int maxvec,
 
 	if (maxvec < minvec)
 		return -ERANGE;
+
+	if (WARN_ON_ONCE(dev->msi_enabled))
+		return -EINVAL;
 
 	nvec = pci_msi_vec_count(dev);
 	if (nvec < 0)
@@ -1137,6 +1137,9 @@ static int __pci_enable_msix_range(struct pci_dev *dev,
 
 	if (maxvec < minvec)
 		return -ERANGE;
+
+	if (WARN_ON_ONCE(dev->msix_enabled))
+		return -EINVAL;
 
 	for (;;) {
 		if (affinity) {
@@ -1294,7 +1297,8 @@ const struct cpumask *pci_irq_get_affinity(struct pci_dev *dev, int nr)
 	} else if (dev->msi_enabled) {
 		struct msi_desc *entry = first_pci_msi_entry(dev);
 
-		if (WARN_ON_ONCE(!entry || nr >= entry->nvec_used))
+		if (WARN_ON_ONCE(!entry || !entry->affinity ||
+				 nr >= entry->nvec_used))
 			return NULL;
 
 		return &entry->affinity[nr];

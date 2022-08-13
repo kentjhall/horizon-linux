@@ -32,6 +32,13 @@
 
 static unsigned long __chunk_size = EFI_READ_CHUNK_SIZE;
 
+static int __section(.data) __nokaslr;
+
+int __pure nokaslr(void)
+{
+	return __nokaslr;
+}
+
 /*
  * Allow the platform to override the allocation granularity: this allows
  * systems that have the capability to run with a larger page size to deal
@@ -351,9 +358,13 @@ void efi_free(efi_system_table_t *sys_table_arg, unsigned long size,
  * environments, first in the early boot environment of the EFI boot
  * stub, and subsequently during the kernel boot.
  */
-efi_status_t efi_parse_options(char *cmdline)
+efi_status_t efi_parse_options(char const *cmdline)
 {
 	char *str;
+
+	str = strstr(cmdline, "nokaslr");
+	if (str == cmdline || (str && str > cmdline && *(str - 1) == ' '))
+		__nokaslr = 1;
 
 	/*
 	 * If no EFI parameters were specified on the cmdline we've got
@@ -528,7 +539,8 @@ efi_status_t handle_cmdline_files(efi_system_table_t *sys_table_arg,
 			size = files[j].size;
 			while (size) {
 				unsigned long chunksize;
-				if (size > __chunk_size)
+
+				if (IS_ENABLED(CONFIG_X86) && size > __chunk_size)
 					chunksize = __chunk_size;
 				else
 					chunksize = size;

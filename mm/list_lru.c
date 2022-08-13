@@ -42,11 +42,7 @@ static void list_lru_unregister(struct list_lru *lru)
 #if defined(CONFIG_MEMCG) && !defined(CONFIG_SLOB)
 static inline bool list_lru_memcg_aware(struct list_lru *lru)
 {
-	/*
-	 * This needs node 0 to be always present, even
-	 * in the systems supporting sparse numa ids.
-	 */
-	return !!lru->node[0].memcg_lrus;
+	return lru->memcg_aware;
 }
 
 static inline struct list_lru_one *
@@ -117,6 +113,7 @@ bool list_lru_add(struct list_lru *lru, struct list_head *item)
 		l = list_lru_from_kmem(nlru, item);
 		list_add_tail(item, &l->list);
 		l->nr_items++;
+		nlru->nr_items++;
 		spin_unlock(&nlru->lock);
 		return true;
 	}
@@ -136,6 +133,7 @@ bool list_lru_del(struct list_lru *lru, struct list_head *item)
 		l = list_lru_from_kmem(nlru, item);
 		list_del_init(item);
 		l->nr_items--;
+		nlru->nr_items--;
 		spin_unlock(&nlru->lock);
 		return true;
 	}
@@ -183,15 +181,10 @@ EXPORT_SYMBOL_GPL(list_lru_count_one);
 
 unsigned long list_lru_count_node(struct list_lru *lru, int nid)
 {
-	long count = 0;
-	int memcg_idx;
+	struct list_lru_node *nlru;
 
-	count += __list_lru_count_one(lru, nid, -1);
-	if (list_lru_memcg_aware(lru)) {
-		for_each_memcg_cache_index(memcg_idx)
-			count += __list_lru_count_one(lru, nid, memcg_idx);
-	}
-	return count;
+	nlru = &lru->node[nid];
+	return nlru->nr_items;
 }
 EXPORT_SYMBOL_GPL(list_lru_count_node);
 
@@ -226,6 +219,7 @@ restart:
 			assert_spin_locked(&nlru->lock);
 		case LRU_REMOVED:
 			isolated++;
+			nlru->nr_items--;
 			/*
 			 * If the lru lock has been dropped, our list
 			 * traversal is now invalid and so we have to
@@ -319,7 +313,7 @@ static int __memcg_init_list_lru_node(struct list_lru_memcg *memcg_lrus,
 	}
 	return 0;
 fail:
-	__memcg_destroy_list_lru_node(memcg_lrus, begin, i - 1);
+	__memcg_destroy_list_lru_node(memcg_lrus, begin, i);
 	return -ENOMEM;
 }
 
@@ -390,6 +384,8 @@ static void memcg_cancel_update_list_lru_node(struct list_lru_node *nlru,
 static int memcg_init_list_lru(struct list_lru *lru, bool memcg_aware)
 {
 	int i;
+
+	lru->memcg_aware = memcg_aware;
 
 	if (!memcg_aware)
 		return 0;

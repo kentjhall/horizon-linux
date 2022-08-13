@@ -1,0 +1,44 @@
+
+# Copyright (c) 2012-2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms and conditions of the GNU General Public License,
+# version 2, as published by the Free Software Foundation.
+#
+# This program is distributed in the hope it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+comment "NVIDIA Tegra options"
+
+config TEGRA_WAKEUP_MONITOR
+	bool "Enable tegra wakeup monitor"
+	depends on PM_SLEEP && ANDROID_INTF_ALARM_DEV
+	help
+	  This option enables support for the monitor of tegra wakeups, it will
+	  send out wakeup source and uevents which indicate suspend_prepare and
+	  post_suspend.
+
+config TEGRA_POWERGATE
+	bool "Tegra powergate support"
+	default y
+	help
+	  Enable Tegra powergate support.
+
+config NV_TEGRA_IVC
+	bool "Tegra IVC protocol support (Downstream version)"
+	default n
+	help
+	  Enable the Tegra IVC library, which implements a lockless, shared-
+	  memory queue.
+
+config TEGRA_HV_XHCI_DEBUG
+	bool "Enable Tegra Hypervisor XHCI Server Debug"
+	depends on TEGRA_HV_MANAGER
+	default n
+	help
+	  Enable Tegra XHCI Server debugging when runs in virtualization.

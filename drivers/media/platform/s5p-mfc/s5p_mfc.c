@@ -206,6 +206,7 @@ static void s5p_mfc_watchdog_worker(struct work_struct *work)
 		}
 		s5p_mfc_clock_on();
 		ret = s5p_mfc_init_hw(dev);
+		s5p_mfc_clock_off();
 		if (ret)
 			mfc_err("Failed to reinit FW\n");
 	}
@@ -248,24 +249,24 @@ static void s5p_mfc_handle_frame_all_extracted(struct s5p_mfc_ctx *ctx)
 static void s5p_mfc_handle_frame_copy_time(struct s5p_mfc_ctx *ctx)
 {
 	struct s5p_mfc_dev *dev = ctx->dev;
-	struct s5p_mfc_buf  *dst_buf, *src_buf;
-	size_t dec_y_addr;
+	struct s5p_mfc_buf *dst_buf, *src_buf;
+	u32 dec_y_addr;
 	unsigned int frame_type;
 
 	/* Make sure we actually have a new frame before continuing. */
 	frame_type = s5p_mfc_hw_call(dev->mfc_ops, get_dec_frame_type, dev);
 	if (frame_type == S5P_FIMV_DECODE_FRAME_SKIPPED)
 		return;
-	dec_y_addr = s5p_mfc_hw_call(dev->mfc_ops, get_dec_y_adr, dev);
+	dec_y_addr = (u32)s5p_mfc_hw_call(dev->mfc_ops, get_dec_y_adr, dev);
 
 	/* Copy timestamp / timecode from decoded src to dst and set
 	   appropriate flags. */
 	src_buf = list_entry(ctx->src_queue.next, struct s5p_mfc_buf, list);
 	list_for_each_entry(dst_buf, &ctx->dst_queue, list) {
-		if (vb2_dma_contig_plane_dma_addr(&dst_buf->b->vb2_buf, 0)
-				== dec_y_addr) {
-			dst_buf->b->timecode =
-						src_buf->b->timecode;
+		u32 addr = (u32)vb2_dma_contig_plane_dma_addr(&dst_buf->b->vb2_buf, 0);
+
+		if (addr == dec_y_addr) {
+			dst_buf->b->timecode = src_buf->b->timecode;
 			dst_buf->b->vb2_buf.timestamp =
 						src_buf->b->vb2_buf.timestamp;
 			dst_buf->b->flags &=
@@ -301,10 +302,10 @@ static void s5p_mfc_handle_frame_new(struct s5p_mfc_ctx *ctx, unsigned int err)
 {
 	struct s5p_mfc_dev *dev = ctx->dev;
 	struct s5p_mfc_buf  *dst_buf;
-	size_t dspl_y_addr;
+	u32 dspl_y_addr;
 	unsigned int frame_type;
 
-	dspl_y_addr = s5p_mfc_hw_call(dev->mfc_ops, get_dspl_y_adr, dev);
+	dspl_y_addr = (u32)s5p_mfc_hw_call(dev->mfc_ops, get_dspl_y_adr, dev);
 	if (IS_MFCV6_PLUS(dev))
 		frame_type = s5p_mfc_hw_call(dev->mfc_ops,
 			get_disp_frame_type, ctx);
@@ -323,9 +324,10 @@ static void s5p_mfc_handle_frame_new(struct s5p_mfc_ctx *ctx, unsigned int err)
 	/* The MFC returns address of the buffer, now we have to
 	 * check which videobuf does it correspond to */
 	list_for_each_entry(dst_buf, &ctx->dst_queue, list) {
+		u32 addr = (u32)vb2_dma_contig_plane_dma_addr(&dst_buf->b->vb2_buf, 0);
+
 		/* Check if this is the buffer we're looking for */
-		if (vb2_dma_contig_plane_dma_addr(&dst_buf->b->vb2_buf, 0)
-				== dspl_y_addr) {
+		if (addr == dspl_y_addr) {
 			list_del(&dst_buf->list);
 			ctx->dst_queue_cnt--;
 			dst_buf->b->sequence = ctx->sequence;
@@ -663,9 +665,9 @@ static irqreturn_t s5p_mfc_irq(int irq, void *priv)
 				break;
 			}
 			s5p_mfc_hw_call(dev->mfc_ops, clear_int_flags, dev);
-			wake_up_ctx(ctx, reason, err);
 			WARN_ON(test_and_clear_bit(0, &dev->hw_lock) == 0);
 			s5p_mfc_clock_off();
+			wake_up_ctx(ctx, reason, err);
 			s5p_mfc_hw_call(dev->mfc_ops, try_run, dev);
 		} else {
 			s5p_mfc_handle_frame(ctx, reason, err);
@@ -679,15 +681,11 @@ static irqreturn_t s5p_mfc_irq(int irq, void *priv)
 	case S5P_MFC_R2H_CMD_OPEN_INSTANCE_RET:
 		ctx->inst_no = s5p_mfc_hw_call(dev->mfc_ops, get_inst_no, dev);
 		ctx->state = MFCINST_GOT_INST;
-		clear_work_bit(ctx);
-		wake_up(&ctx->queue);
 		goto irq_cleanup_hw;
 
 	case S5P_MFC_R2H_CMD_CLOSE_INSTANCE_RET:
-		clear_work_bit(ctx);
 		ctx->inst_no = MFC_NO_INSTANCE_SET;
 		ctx->state = MFCINST_FREE;
-		wake_up(&ctx->queue);
 		goto irq_cleanup_hw;
 
 	case S5P_MFC_R2H_CMD_SYS_INIT_RET:
@@ -697,9 +695,9 @@ static irqreturn_t s5p_mfc_irq(int irq, void *priv)
 		if (ctx)
 			clear_work_bit(ctx);
 		s5p_mfc_hw_call(dev->mfc_ops, clear_int_flags, dev);
-		wake_up_dev(dev, reason, err);
 		clear_bit(0, &dev->hw_lock);
 		clear_bit(0, &dev->enter_suspend);
+		wake_up_dev(dev, reason, err);
 		break;
 
 	case S5P_MFC_R2H_CMD_INIT_BUFFERS_RET:
@@ -714,9 +712,7 @@ static irqreturn_t s5p_mfc_irq(int irq, void *priv)
 		break;
 
 	case S5P_MFC_R2H_CMD_DPB_FLUSH_RET:
-		clear_work_bit(ctx);
 		ctx->state = MFCINST_RUNNING;
-		wake_up(&ctx->queue);
 		goto irq_cleanup_hw;
 
 	default:
@@ -735,6 +731,8 @@ irq_cleanup_hw:
 		mfc_err("Failed to unlock hw\n");
 
 	s5p_mfc_clock_off();
+	clear_work_bit(ctx);
+	wake_up(&ctx->queue);
 
 	s5p_mfc_hw_call(dev->mfc_ops, try_run, dev);
 	spin_unlock(&dev->irqlock);
@@ -926,10 +924,11 @@ static int s5p_mfc_release(struct file *file)
 	mfc_debug_enter();
 	if (dev)
 		mutex_lock(&dev->mfc_mutex);
-	s5p_mfc_clock_on();
 	vb2_queue_release(&ctx->vq_src);
 	vb2_queue_release(&ctx->vq_dst);
 	if (dev) {
+		s5p_mfc_clock_on();
+
 		/* Mark context as idle */
 		clear_work_bit_irqsave(ctx);
 		/*
@@ -951,9 +950,9 @@ static int s5p_mfc_release(struct file *file)
 			if (s5p_mfc_power_off() < 0)
 				mfc_err("Power off failed\n");
 		}
+		mfc_debug(2, "Shutting down clock\n");
+		s5p_mfc_clock_off();
 	}
-	mfc_debug(2, "Shutting down clock\n");
-	s5p_mfc_clock_off();
 	if (dev)
 		dev->ctx[ctx->num] = NULL;
 	s5p_mfc_dec_ctrls_delete(ctx);
@@ -1082,6 +1081,7 @@ static struct device *s5p_mfc_alloc_memdev(struct device *dev,
 							 idx);
 		if (ret == 0)
 			return child;
+		device_del(child);
 	}
 
 	put_device(child);

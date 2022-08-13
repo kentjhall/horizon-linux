@@ -17,6 +17,7 @@
 #define __DMA_IOMMU_H
 
 #ifdef __KERNEL__
+#include <linux/types.h>
 #include <asm/errno.h>
 
 #ifdef CONFIG_IOMMU_DMA
@@ -24,6 +25,8 @@
 #include <linux/msi.h>
 
 int iommu_dma_init(void);
+int iommu_dma_init_domain(struct iommu_domain *domain, dma_addr_t base,
+		u64 size, struct device *dev);
 
 /* Domain management interface for IOMMU drivers */
 int iommu_get_dma_cookie(struct iommu_domain *domain);
@@ -42,14 +45,20 @@ int dma_direction_to_prot(enum dma_data_direction dir, bool coherent);
  */
 struct page **iommu_dma_alloc(struct device *dev, size_t size, gfp_t gfp,
 		unsigned long attrs, int prot, dma_addr_t *handle,
-		void (*flush_page)(struct device *, const void *, phys_addr_t));
+		void (*flush_sg)(struct device *, struct sg_table *));
 void iommu_dma_free(struct device *dev, struct page **pages, size_t size,
-		dma_addr_t *handle);
+		dma_addr_t *handle, unsigned long attrs);
+
+dma_addr_t iommu_dma_alloc_iova(struct device *dev, size_t size,
+		dma_addr_t dma_limit);
+void iommu_dma_free_iova(struct device *dev, dma_addr_t iova, size_t size);
 
 int iommu_dma_mmap(struct page **pages, size_t size, struct vm_area_struct *vma);
 
 dma_addr_t iommu_dma_map_page(struct device *dev, struct page *page,
 		unsigned long offset, size_t size, int prot);
+dma_addr_t iommu_dma_map_at(struct device *dev, dma_addr_t dma_handle,
+			    phys_addr_t phys, size_t size, int prot);
 int iommu_dma_map_sg(struct device *dev, struct scatterlist *sg,
 		int nents, int prot);
 

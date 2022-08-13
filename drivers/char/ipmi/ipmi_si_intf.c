@@ -241,6 +241,9 @@ struct smi_info {
 	/* The timer for this si. */
 	struct timer_list   si_timer;
 
+	/* This flag is set, if the timer can be set */
+	bool		    timer_can_start;
+
 	/* This flag is set, if the timer is running (timer_pending() isn't enough) */
 	bool		    timer_running;
 
@@ -279,6 +282,9 @@ struct smi_info {
 	 * bit, even if they support interrupts.
 	 */
 	bool irq_enable_broken;
+
+	/* Is the driver in maintenance mode? */
+	bool in_maintenance_mode;
 
 	/*
 	 * Did we get an attention that we did not handle?
@@ -416,6 +422,8 @@ out:
 
 static void smi_mod_timer(struct smi_info *smi_info, unsigned long new_val)
 {
+	if (!smi_info->timer_can_start)
+		return;
 	smi_info->last_timeout_jiffies = jiffies;
 	mod_timer(&smi_info->si_timer, new_val);
 	smi_info->timer_running = true;
@@ -435,21 +443,18 @@ static void start_new_msg(struct smi_info *smi_info, unsigned char *msg,
 	smi_info->handlers->start_transaction(smi_info->si_sm, msg, size);
 }
 
-static void start_check_enables(struct smi_info *smi_info, bool start_timer)
+static void start_check_enables(struct smi_info *smi_info)
 {
 	unsigned char msg[2];
 
 	msg[0] = (IPMI_NETFN_APP_REQUEST << 2);
 	msg[1] = IPMI_GET_BMC_GLOBAL_ENABLES_CMD;
 
-	if (start_timer)
-		start_new_msg(smi_info, msg, 2);
-	else
-		smi_info->handlers->start_transaction(smi_info->si_sm, msg, 2);
+	start_new_msg(smi_info, msg, 2);
 	smi_info->si_state = SI_CHECKING_ENABLES;
 }
 
-static void start_clear_flags(struct smi_info *smi_info, bool start_timer)
+static void start_clear_flags(struct smi_info *smi_info)
 {
 	unsigned char msg[3];
 
@@ -458,10 +463,7 @@ static void start_clear_flags(struct smi_info *smi_info, bool start_timer)
 	msg[1] = IPMI_CLEAR_MSG_FLAGS_CMD;
 	msg[2] = WDT_PRE_TIMEOUT_INT;
 
-	if (start_timer)
-		start_new_msg(smi_info, msg, 3);
-	else
-		smi_info->handlers->start_transaction(smi_info->si_sm, msg, 3);
+	start_new_msg(smi_info, msg, 3);
 	smi_info->si_state = SI_CLEARING_FLAGS;
 }
 
@@ -496,11 +498,11 @@ static void start_getting_events(struct smi_info *smi_info)
  * Note that we cannot just use disable_irq(), since the interrupt may
  * be shared.
  */
-static inline bool disable_si_irq(struct smi_info *smi_info, bool start_timer)
+static inline bool disable_si_irq(struct smi_info *smi_info)
 {
 	if ((smi_info->irq) && (!smi_info->interrupt_disabled)) {
 		smi_info->interrupt_disabled = true;
-		start_check_enables(smi_info, start_timer);
+		start_check_enables(smi_info);
 		return true;
 	}
 	return false;
@@ -510,7 +512,7 @@ static inline bool enable_si_irq(struct smi_info *smi_info)
 {
 	if ((smi_info->irq) && (smi_info->interrupt_disabled)) {
 		smi_info->interrupt_disabled = false;
-		start_check_enables(smi_info, true);
+		start_check_enables(smi_info);
 		return true;
 	}
 	return false;
@@ -528,7 +530,7 @@ static struct ipmi_smi_msg *alloc_msg_handle_irq(struct smi_info *smi_info)
 
 	msg = ipmi_alloc_smi_msg();
 	if (!msg) {
-		if (!disable_si_irq(smi_info, true))
+		if (!disable_si_irq(smi_info))
 			smi_info->si_state = SI_NORMAL;
 	} else if (enable_si_irq(smi_info)) {
 		ipmi_free_smi_msg(msg);
@@ -544,7 +546,7 @@ retry:
 		/* Watchdog pre-timeout */
 		smi_inc_stat(smi_info, watchdog_pretimeouts);
 
-		start_clear_flags(smi_info, true);
+		start_clear_flags(smi_info);
 		smi_info->msg_flags &= ~WDT_PRE_TIMEOUT_INT;
 		if (smi_info->intf)
 			ipmi_smi_watchdog_pretimeout(smi_info->intf);
@@ -927,7 +929,7 @@ restart:
 		 * disable and messages disabled.
 		 */
 		if (smi_info->supports_event_msg_buff || smi_info->irq) {
-			start_check_enables(smi_info, true);
+			start_check_enables(smi_info);
 		} else {
 			smi_info->curr_msg = alloc_msg_handle_irq(smi_info);
 			if (!smi_info->curr_msg)
@@ -1094,11 +1096,20 @@ static int ipmi_thread(void *data)
 		spin_unlock_irqrestore(&(smi_info->si_lock), flags);
 		busy_wait = ipmi_thread_busy_wait(smi_result, smi_info,
 						  &busy_until);
-		if (smi_result == SI_SM_CALL_WITHOUT_DELAY)
+		if (smi_result == SI_SM_CALL_WITHOUT_DELAY) {
 			; /* do nothing */
-		else if (smi_result == SI_SM_CALL_WITH_DELAY && busy_wait)
-			schedule();
-		else if (smi_result == SI_SM_IDLE) {
+		} else if (smi_result == SI_SM_CALL_WITH_DELAY && busy_wait) {
+			/*
+			 * In maintenance mode we run as fast as
+			 * possible to allow firmware updates to
+			 * complete as fast as possible, but normally
+			 * don't bang on the scheduler.
+			 */
+			if (smi_info->in_maintenance_mode)
+				schedule();
+			else
+				usleep_range(100, 200);
+		} else if (smi_result == SI_SM_IDLE) {
 			if (atomic_read(&smi_info->need_watch)) {
 				schedule_timeout_interruptible(100);
 			} else {
@@ -1106,8 +1117,9 @@ static int ipmi_thread(void *data)
 				__set_current_state(TASK_INTERRUPTIBLE);
 				schedule();
 			}
-		} else
+		} else {
 			schedule_timeout_interruptible(1);
+		}
 	}
 	return 0;
 }
@@ -1234,6 +1246,7 @@ static int smi_start_processing(void       *send_info,
 
 	/* Set up the timer that drives the interface. */
 	setup_timer(&new_smi->si_timer, smi_timeout, (long)new_smi);
+	new_smi->timer_can_start = true;
 	smi_mod_timer(new_smi, jiffies + SI_TIMEOUT_JIFFIES);
 
 	/* Try to claim any interrupts. */
@@ -1285,6 +1298,7 @@ static void set_maintenance_mode(void *send_info, bool enable)
 
 	if (!enable)
 		atomic_set(&smi_info->req_events, 0);
+	smi_info->in_maintenance_mode = enable;
 }
 
 static const struct ipmi_smi_handlers handlers = {
@@ -1344,7 +1358,7 @@ static unsigned int num_slave_addrs;
 #define IPMI_MEM_ADDR_SPACE 1
 static const char * const addr_space_to_str[] = { "i/o", "mem" };
 
-static int hotmod_handler(const char *val, struct kernel_param *kp);
+static int hotmod_handler(const char *val, const struct kernel_param *kp);
 
 module_param_call(hotmod, hotmod_handler, NULL, NULL, 0200);
 MODULE_PARM_DESC(hotmod, "Add and remove interfaces.  See"
@@ -1814,7 +1828,7 @@ static struct smi_info *smi_info_alloc(void)
 	return info;
 }
 
-static int hotmod_handler(const char *val, struct kernel_param *kp)
+static int hotmod_handler(const char *val, const struct kernel_param *kp)
 {
 	char *str = kstrdup(val, GFP_KERNEL);
 	int  rv;
@@ -3448,10 +3462,12 @@ static void check_for_broken_irqs(struct smi_info *smi_info)
 	check_set_rcv_irq(smi_info);
 }
 
-static inline void wait_for_timer_and_thread(struct smi_info *smi_info)
+static inline void stop_timer_and_thread(struct smi_info *smi_info)
 {
 	if (smi_info->thread != NULL)
 		kthread_stop(smi_info->thread);
+
+	smi_info->timer_can_start = false;
 	if (smi_info->timer_running)
 		del_timer_sync(&smi_info->si_timer);
 }
@@ -3593,7 +3609,7 @@ static int try_smi_init(struct smi_info *new_smi)
 	 * Start clearing the flags before we enable interrupts or the
 	 * timer to avoid racing with the timer.
 	 */
-	start_clear_flags(new_smi, false);
+	start_clear_flags(new_smi);
 
 	/*
 	 * IRQ is defined to be set when non-zero.  req_events will
@@ -3671,7 +3687,7 @@ static int try_smi_init(struct smi_info *new_smi)
 	return 0;
 
 out_err_stop_timer:
-	wait_for_timer_and_thread(new_smi);
+	stop_timer_and_thread(new_smi);
 
 out_err:
 	new_smi->interrupt_disabled = true;
@@ -3865,7 +3881,7 @@ static void cleanup_one_si(struct smi_info *to_clean)
 	 */
 	if (to_clean->irq_cleanup)
 		to_clean->irq_cleanup(to_clean);
-	wait_for_timer_and_thread(to_clean);
+	stop_timer_and_thread(to_clean);
 
 	/*
 	 * Timeouts are stopped, now make sure the interrupts are off
@@ -3876,7 +3892,7 @@ static void cleanup_one_si(struct smi_info *to_clean)
 		poll(to_clean);
 		schedule_timeout_uninterruptible(1);
 	}
-	disable_si_irq(to_clean, false);
+	disable_si_irq(to_clean);
 	while (to_clean->curr_msg || (to_clean->si_state != SI_NORMAL)) {
 		poll(to_clean);
 		schedule_timeout_uninterruptible(1);

@@ -1,0 +1,11 @@
+NVDUMPER to capture copy of RAM following a crash
+and helps analyze the failure
+
+Required Properties:
+ - compatible : Should be "nvidia,tegra210-nvdumper";
+
+nvdumper {
+        compatible = "nvidia,tegra210-nvdumper";
+	status = "okay";
+};
+

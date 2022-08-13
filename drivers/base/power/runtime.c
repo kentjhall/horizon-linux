@@ -515,7 +515,7 @@ static int rpm_suspend(struct device *dev, int rpmflags)
 
 	callback = RPM_GET_CALLBACK(dev, runtime_suspend);
 
-	dev_pm_enable_wake_irq(dev);
+	dev_pm_enable_wake_irq_check(dev, true);
 	retval = rpm_callback(callback, dev);
 	if (retval)
 		goto fail;
@@ -554,7 +554,7 @@ static int rpm_suspend(struct device *dev, int rpmflags)
 	return retval;
 
  fail:
-	dev_pm_disable_wake_irq(dev);
+	dev_pm_disable_wake_irq_check(dev);
 	__update_runtime_status(dev, RPM_ACTIVE);
 	dev->power.deferred_resume = false;
 	wake_up_all(&dev->power.wait_queue);
@@ -737,12 +737,12 @@ static int rpm_resume(struct device *dev, int rpmflags)
 
 	callback = RPM_GET_CALLBACK(dev, runtime_resume);
 
-	dev_pm_disable_wake_irq(dev);
+	dev_pm_disable_wake_irq_check(dev);
 	retval = rpm_callback(callback, dev);
 	if (retval) {
 		__update_runtime_status(dev, RPM_SUSPENDED);
 		pm_runtime_cancel_pending(dev);
-		dev_pm_enable_wake_irq(dev);
+		dev_pm_enable_wake_irq_check(dev, false);
 	} else {
  no_callback:
 		__update_runtime_status(dev, RPM_ACTIVE);
@@ -889,12 +889,12 @@ int __pm_runtime_idle(struct device *dev, int rpmflags)
 	unsigned long flags;
 	int retval;
 
-	might_sleep_if(!(rpmflags & RPM_ASYNC) && !dev->power.irq_safe);
-
 	if (rpmflags & RPM_GET_PUT) {
 		if (!atomic_dec_and_test(&dev->power.usage_count))
 			return 0;
 	}
+
+	might_sleep_if(!(rpmflags & RPM_ASYNC) && !dev->power.irq_safe);
 
 	spin_lock_irqsave(&dev->power.lock, flags);
 	retval = rpm_idle(dev, rpmflags);
@@ -921,12 +921,12 @@ int __pm_runtime_suspend(struct device *dev, int rpmflags)
 	unsigned long flags;
 	int retval;
 
-	might_sleep_if(!(rpmflags & RPM_ASYNC) && !dev->power.irq_safe);
-
 	if (rpmflags & RPM_GET_PUT) {
 		if (!atomic_dec_and_test(&dev->power.usage_count))
 			return 0;
 	}
+
+	might_sleep_if(!(rpmflags & RPM_ASYNC) && !dev->power.irq_safe);
 
 	spin_lock_irqsave(&dev->power.lock, flags);
 	retval = rpm_suspend(dev, rpmflags);
@@ -952,7 +952,8 @@ int __pm_runtime_resume(struct device *dev, int rpmflags)
 	unsigned long flags;
 	int retval;
 
-	might_sleep_if(!(rpmflags & RPM_ASYNC) && !dev->power.irq_safe);
+	might_sleep_if(!(rpmflags & RPM_ASYNC) && !dev->power.irq_safe &&
+			dev->power.runtime_status != RPM_ACTIVE);
 
 	if (rpmflags & RPM_GET_PUT)
 		atomic_inc(&dev->power.usage_count);
@@ -1478,6 +1479,16 @@ int pm_runtime_force_suspend(struct device *dev)
 	if (ret)
 		goto err;
 
+	/*
+	 * Increase the runtime PM usage count for the device's parent, in case
+	 * when we find the device being used when system suspend was invoked.
+	 * This informs pm_runtime_force_resume() to resume the parent
+	 * immediately, which is needed to be able to resume its children,
+	 * when not deferring the resume to be managed via runtime PM.
+	 */
+	if (dev->parent && atomic_read(&dev->power.usage_count) > 1)
+		pm_runtime_get_noresume(dev->parent);
+
 	pm_runtime_set_suspended(dev);
 	return 0;
 err:
@@ -1487,16 +1498,20 @@ err:
 EXPORT_SYMBOL_GPL(pm_runtime_force_suspend);
 
 /**
- * pm_runtime_force_resume - Force a device into resume state.
+ * pm_runtime_force_resume - Force a device into resume state if needed.
  * @dev: Device to resume.
  *
  * Prior invoking this function we expect the user to have brought the device
  * into low power state by a call to pm_runtime_force_suspend(). Here we reverse
- * those actions and brings the device into full power. We update the runtime PM
- * status and re-enables runtime PM.
+ * those actions and brings the device into full power, if it is expected to be
+ * used on system resume. To distinguish that, we check whether the runtime PM
+ * usage count is greater than 1 (the PM core increases the usage count in the
+ * system PM prepare phase), as that indicates a real user (such as a subsystem,
+ * driver, userspace, etc.) is using it. If that is the case, the device is
+ * expected to be used on system resume as well, so then we resume it. In the
+ * other case, we defer the resume to be managed via runtime PM.
  *
- * Typically this function may be invoked from a system resume callback to make
- * sure the device is put into full power state.
+ * Typically this function may be invoked from a system resume callback.
  */
 int pm_runtime_force_resume(struct device *dev)
 {
@@ -1512,6 +1527,17 @@ int pm_runtime_force_resume(struct device *dev)
 
 	if (!pm_runtime_status_suspended(dev))
 		goto out;
+
+	/*
+	 * Decrease the parent's runtime PM usage count, if we increased it
+	 * during system suspend in pm_runtime_force_suspend().
+	*/
+	if (atomic_read(&dev->power.usage_count) > 1) {
+		if (dev->parent)
+			pm_runtime_put_noidle(dev->parent);
+	} else {
+		goto out;
+	}
 
 	ret = pm_runtime_set_active(dev);
 	if (ret)

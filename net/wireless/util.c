@@ -454,6 +454,8 @@ int ieee80211_data_to_8023_exthdr(struct sk_buff *skb, struct ethhdr *ehdr,
 	if (iftype == NL80211_IFTYPE_MESH_POINT)
 		skb_copy_bits(skb, hdrlen, &mesh_flags, 1);
 
+	mesh_flags &= MESH_FLAGS_AE;
+
 	switch (hdr->frame_control &
 		cpu_to_le16(IEEE80211_FCTL_TODS | IEEE80211_FCTL_FROMDS)) {
 	case cpu_to_le16(IEEE80211_FCTL_TODS):
@@ -469,9 +471,9 @@ int ieee80211_data_to_8023_exthdr(struct sk_buff *skb, struct ethhdr *ehdr,
 			     iftype != NL80211_IFTYPE_STATION))
 			return -1;
 		if (iftype == NL80211_IFTYPE_MESH_POINT) {
-			if (mesh_flags & MESH_FLAGS_AE_A4)
+			if (mesh_flags == MESH_FLAGS_AE_A4)
 				return -1;
-			if (mesh_flags & MESH_FLAGS_AE_A5_A6) {
+			if (mesh_flags == MESH_FLAGS_AE_A5_A6) {
 				skb_copy_bits(skb, hdrlen +
 					offsetof(struct ieee80211s_hdr, eaddr1),
 					tmp.h_dest, 2 * ETH_ALEN);
@@ -487,9 +489,9 @@ int ieee80211_data_to_8023_exthdr(struct sk_buff *skb, struct ethhdr *ehdr,
 		     ether_addr_equal(tmp.h_source, addr)))
 			return -1;
 		if (iftype == NL80211_IFTYPE_MESH_POINT) {
-			if (mesh_flags & MESH_FLAGS_AE_A5_A6)
+			if (mesh_flags == MESH_FLAGS_AE_A5_A6)
 				return -1;
-			if (mesh_flags & MESH_FLAGS_AE_A4)
+			if (mesh_flags == MESH_FLAGS_AE_A4)
 				skb_copy_bits(skb, hdrlen +
 					offsetof(struct ieee80211s_hdr, eaddr1),
 					tmp.h_source, ETH_ALEN);
@@ -651,7 +653,7 @@ __frame_add_frag(struct sk_buff *skb, struct page *page,
 	struct skb_shared_info *sh = skb_shinfo(skb);
 	int page_offset;
 
-	page_ref_inc(page);
+	get_page(page);
 	page_offset = ptr - page_address(page);
 	skb_add_rx_frag(skb, sh->nr_frags, page, page_offset, len, size);
 }
@@ -661,7 +663,7 @@ __ieee80211_amsdu_copy_frag(struct sk_buff *skb, struct sk_buff *frame,
 			    int offset, int len)
 {
 	struct skb_shared_info *sh = skb_shinfo(skb);
-	const skb_frag_t *frag = &sh->frags[-1];
+	const skb_frag_t *frag = &sh->frags[0];
 	struct page *frag_page;
 	void *frag_ptr;
 	int frag_len, frag_size;
@@ -674,10 +676,10 @@ __ieee80211_amsdu_copy_frag(struct sk_buff *skb, struct sk_buff *frame,
 
 	while (offset >= frag_size) {
 		offset -= frag_size;
-		frag++;
 		frag_page = skb_frag_page(frag);
 		frag_ptr = skb_frag_address(frag);
 		frag_size = skb_frag_size(frag);
+		frag++;
 	}
 
 	frag_ptr += offset;
@@ -689,12 +691,12 @@ __ieee80211_amsdu_copy_frag(struct sk_buff *skb, struct sk_buff *frame,
 	len -= cur_len;
 
 	while (len > 0) {
-		frag++;
 		frag_len = skb_frag_size(frag);
 		cur_len = min(len, frag_len);
 		__frame_add_frag(frame, skb_frag_page(frag),
 				 skb_frag_address(frag), cur_len, frag_len);
 		len -= cur_len;
+		frag++;
 	}
 }
 
@@ -1049,6 +1051,7 @@ int cfg80211_change_iface(struct cfg80211_registered_device *rdev,
 		}
 
 		cfg80211_process_rdev_events(rdev);
+		cfg80211_mlme_purge_registrations(dev->ieee80211_ptr);
 	}
 
 	err = rdev_change_virtual_intf(rdev, dev, ntype, flags, params);
@@ -1430,7 +1433,7 @@ bool ieee80211_chandef_to_operating_class(struct cfg80211_chan_def *chandef,
 					  u8 *op_class)
 {
 	u8 vht_opclass;
-	u16 freq = chandef->center_freq1;
+	u32 freq = chandef->center_freq1;
 
 	if (freq >= 2412 && freq <= 2472) {
 		if (chandef->width > NL80211_CHAN_WIDTH_40)
@@ -1791,3 +1794,48 @@ EXPORT_SYMBOL(rfc1042_header);
 const unsigned char bridge_tunnel_header[] __aligned(2) =
 	{ 0xaa, 0xaa, 0x03, 0x00, 0x00, 0xf8 };
 EXPORT_SYMBOL(bridge_tunnel_header);
+
+/* Layer 2 Update frame (802.2 Type 1 LLC XID Update response) */
+struct iapp_layer2_update {
+	u8 da[ETH_ALEN];	/* broadcast */
+	u8 sa[ETH_ALEN];	/* STA addr */
+	__be16 len;		/* 6 */
+	u8 dsap;		/* 0 */
+	u8 ssap;		/* 0 */
+	u8 control;
+	u8 xid_info[3];
+} __packed;
+
+void cfg80211_send_layer2_update(struct net_device *dev, const u8 *addr)
+{
+	struct iapp_layer2_update *msg;
+	struct sk_buff *skb;
+
+	/* Send Level 2 Update Frame to update forwarding tables in layer 2
+	 * bridge devices */
+
+	skb = dev_alloc_skb(sizeof(*msg));
+	if (!skb)
+		return;
+	msg = (struct iapp_layer2_update *)skb_put(skb, sizeof(*msg));
+
+	/* 802.2 Type 1 Logical Link Control (LLC) Exchange Identifier (XID)
+	 * Update response frame; IEEE Std 802.2-1998, 5.4.1.2.1 */
+
+	eth_broadcast_addr(msg->da);
+	ether_addr_copy(msg->sa, addr);
+	msg->len = htons(6);
+	msg->dsap = 0;
+	msg->ssap = 0x01;	/* NULL LSAP, CR Bit: Response */
+	msg->control = 0xaf;	/* XID response lsb.1111F101.
+				 * F=0 (no poll command; unsolicited frame) */
+	msg->xid_info[0] = 0x81;	/* XID format identifier */
+	msg->xid_info[1] = 1;	/* LLC types/classes: Type 1 LLC */
+	msg->xid_info[2] = 0;	/* XID sender's receive window size (RW) */
+
+	skb->dev = dev;
+	skb->protocol = eth_type_trans(skb, dev);
+	memset(skb->cb, 0, sizeof(skb->cb));
+	netif_rx_ni(skb);
+}
+EXPORT_SYMBOL(cfg80211_send_layer2_update);

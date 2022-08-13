@@ -164,7 +164,8 @@ static inline void drv_bss_info_changed(struct ieee80211_local *local,
 	if (WARN_ON_ONCE(sdata->vif.type == NL80211_IFTYPE_P2P_DEVICE ||
 			 sdata->vif.type == NL80211_IFTYPE_NAN ||
 			 (sdata->vif.type == NL80211_IFTYPE_MONITOR &&
-			  !sdata->vif.mu_mimo_owner)))
+			  !sdata->vif.mu_mimo_owner &&
+			  !(changed & BSS_CHANGED_TXPOWER))))
 		return;
 
 	if (!check_sdata_in_driver(sdata))
@@ -1161,6 +1162,9 @@ static inline void drv_wake_tx_queue(struct ieee80211_local *local,
 				     struct txq_info *txq)
 {
 	struct ieee80211_sub_if_data *sdata = vif_to_sdata(txq->txq.vif);
+
+	if (local->in_reconfig)
+		return;
 
 	if (!check_sdata_in_driver(sdata))
 		return;

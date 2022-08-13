@@ -1829,6 +1829,12 @@ config SENSORS_XGENE
 	  If you say yes here you get support for the temperature
 	  and power sensors for APM X-Gene SoC.
 
+config GPIO_TACHOMETER
+	tristate "GPIO tachometer"
+	depends on GPIOLIB
+	help
+	  Enables a driver to use gpio IRQ to measure motor speed.
+
 if ACPI
 
 comment "ACPI drivers"

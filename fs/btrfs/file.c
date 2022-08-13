@@ -1555,6 +1555,7 @@ static noinline ssize_t __btrfs_buffered_write(struct file *file,
 			break;
 		}
 
+		only_release_metadata = false;
 		sector_offset = pos & (root->sectorsize - 1);
 		reserve_bytes = round_up(write_bytes + sector_offset,
 				root->sectorsize);
@@ -1704,7 +1705,6 @@ again:
 			set_extent_bit(&BTRFS_I(inode)->io_tree, lockstart,
 				       lockend, EXTENT_NORESERVE, NULL,
 				       NULL, GFP_NOFS);
-			only_release_metadata = false;
 		}
 
 		btrfs_drop_pages(pages, num_pages);
@@ -1912,10 +1912,19 @@ int btrfs_release_file(struct inode *inode, struct file *filp)
 static int start_ordered_ops(struct inode *inode, loff_t start, loff_t end)
 {
 	int ret;
+	struct blk_plug plug;
 
+	/*
+	 * This is only called in fsync, which would do synchronous writes, so
+	 * a plug can merge adjacent IOs as much as possible.  Esp. in case of
+	 * multiple disks using raid profile, a large IO can be split to
+	 * several segments of stripe length (currently 64K).
+	 */
+	blk_start_plug(&plug);
 	atomic_inc(&BTRFS_I(inode)->sync_writers);
 	ret = btrfs_fdatawrite_range(inode, start, end);
 	atomic_dec(&BTRFS_I(inode)->sync_writers);
+	blk_finish_plug(&plug);
 
 	return ret;
 }
@@ -1941,6 +1950,18 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 	int ret = 0;
 	bool full_sync = 0;
 	u64 len;
+
+	/*
+	 * If the inode needs a full sync, make sure we use a full range to
+	 * avoid log tree corruption, due to hole detection racing with ordered
+	 * extent completion for adjacent ranges, and assertion failures during
+	 * hole detection.
+	 */
+	if (test_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+		     &BTRFS_I(inode)->runtime_flags)) {
+		start = 0;
+		end = LLONG_MAX;
+	}
 
 	/*
 	 * The range length can be represented by u64, we have to do the typecasts
@@ -2625,6 +2646,11 @@ out_only_mutex:
 		 * for detecting, at fsync time, if the inode isn't yet in the
 		 * log tree or it's there but not up to date.
 		 */
+		struct timespec now = current_time(inode);
+
+		inode_inc_iversion(inode);
+		inode->i_mtime = now;
+		inode->i_ctime = now;
 		trans = btrfs_start_transaction(root, 1);
 		if (IS_ERR(trans)) {
 			err = PTR_ERR(trans);
@@ -2817,8 +2843,10 @@ static long btrfs_fallocate(struct file *file, int mode,
 			}
 			ret = btrfs_qgroup_reserve_data(inode, cur_offset,
 					last_byte - cur_offset);
-			if (ret < 0)
+			if (ret < 0) {
+				free_extent_map(em);
 				break;
+			}
 		} else {
 			/*
 			 * Do not need to reserve unwritten extent for this
@@ -2842,7 +2870,7 @@ static long btrfs_fallocate(struct file *file, int mode,
 		if (!ret)
 			ret = btrfs_prealloc_file_range(inode, mode,
 					range->start,
-					range->len, 1 << inode->i_blkbits,
+					range->len, i_blocksize(inode),
 					offset + len, &alloc_hint);
 		else
 			btrfs_free_reserved_data_space(inode, range->start,

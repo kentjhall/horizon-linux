@@ -144,14 +144,14 @@ unsigned long __must_check __copy_to_user(void __user *to, const void *from,
 		"	jg	2b\n"				\
 		".popsection\n"					\
 		EX_TABLE(0b,3b) EX_TABLE(1b,3b)			\
-		: "=d" (__rc), "=Q" (*(to))			\
+		: "=d" (__rc), "+Q" (*(to))			\
 		: "d" (size), "Q" (*(from)),			\
 		  "d" (__reg0), "K" (-EFAULT)			\
 		: "cc");					\
 	__rc;							\
 })
 
-static inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
+static __always_inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
 {
 	unsigned long spec = 0x810000UL;
 	int rc;
@@ -181,7 +181,7 @@ static inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
 	return rc;
 }
 
-static inline int __get_user_fn(void *x, const void __user *ptr, unsigned long size)
+static __always_inline int __get_user_fn(void *x, const void __user *ptr, unsigned long size)
 {
 	unsigned long spec = 0x81UL;
 	int rc;

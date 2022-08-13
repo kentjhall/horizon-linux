@@ -297,14 +297,15 @@ struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u32 ctxt,
 		 * The resulting value will be rounded down to the closest
 		 * multiple of dd->rcv_entries.group_size.
 		 */
-		rcd->egrbufs.buffers = kcalloc(rcd->egrbufs.count,
-					       sizeof(*rcd->egrbufs.buffers),
-					       GFP_KERNEL);
+		rcd->egrbufs.buffers = kzalloc_node(
+			rcd->egrbufs.count * sizeof(*rcd->egrbufs.buffers),
+			GFP_KERNEL, numa);
 		if (!rcd->egrbufs.buffers)
 			goto bail;
-		rcd->egrbufs.rcvtids = kcalloc(rcd->egrbufs.count,
-					       sizeof(*rcd->egrbufs.rcvtids),
-					       GFP_KERNEL);
+		rcd->egrbufs.rcvtids = kzalloc_node(
+				rcd->egrbufs.count *
+				sizeof(*rcd->egrbufs.rcvtids),
+				GFP_KERNEL, numa);
 		if (!rcd->egrbufs.rcvtids)
 			goto bail;
 		rcd->egrbufs.size = eager_buffer_size;
@@ -322,8 +323,8 @@ struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u32 ctxt,
 		rcd->egrbufs.rcvtid_size = HFI1_MAX_EAGER_BUFFER_SIZE;
 
 		if (ctxt < dd->first_user_ctxt) { /* N/A for PSM contexts */
-			rcd->opstats = kzalloc(sizeof(*rcd->opstats),
-				GFP_KERNEL);
+			rcd->opstats = kzalloc_node(sizeof(*rcd->opstats),
+						    GFP_KERNEL, numa);
 			if (!rcd->opstats)
 				goto bail;
 		}
@@ -856,6 +857,10 @@ static void shutdown_device(struct hfi1_devdata *dd)
 	unsigned pidx;
 	int i;
 
+	if (dd->flags & HFI1_SHUTDOWN)
+		return;
+	dd->flags |= HFI1_SHUTDOWN;
+
 	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
 		ppd = dd->pport + pidx;
 
@@ -1048,6 +1053,8 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
 		return ERR_PTR(-ENOMEM);
 	dd->num_pports = nports;
 	dd->pport = (struct hfi1_pportdata *)(dd + 1);
+	dd->pcidev = pdev;
+	pci_set_drvdata(pdev, dd);
 
 	INIT_LIST_HEAD(&dd->list);
 	idr_preload(GFP_KERNEL);
@@ -1077,11 +1084,11 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
 	spin_lock_init(&dd->uctxt_lock);
 	spin_lock_init(&dd->hfi1_diag_trans_lock);
 	spin_lock_init(&dd->sc_init_lock);
-	spin_lock_init(&dd->dc8051_lock);
 	spin_lock_init(&dd->dc8051_memlock);
 	seqlock_init(&dd->sc2vl_lock);
 	spin_lock_init(&dd->sde_map_lock);
 	spin_lock_init(&dd->pio_map_lock);
+	mutex_init(&dd->dc8051_lock);
 	init_waitqueue_head(&dd->event_queue);
 
 	dd->int_counter = alloc_percpu(u64);
@@ -1165,6 +1172,7 @@ void hfi1_disable_after_error(struct hfi1_devdata *dd)
 
 static void remove_one(struct pci_dev *);
 static int init_one(struct pci_dev *, const struct pci_device_id *);
+static void shutdown_one(struct pci_dev *);
 
 #define DRIVER_LOAD_MSG "Intel " DRIVER_NAME " loaded: "
 #define PFX DRIVER_NAME ": "
@@ -1181,6 +1189,7 @@ static struct pci_driver hfi1_pci_driver = {
 	.name = DRIVER_NAME,
 	.probe = init_one,
 	.remove = remove_one,
+	.shutdown = shutdown_one,
 	.id_table = hfi1_pci_tbl,
 	.err_handler = &hfi1_pci_err_handler,
 };
@@ -1587,6 +1596,13 @@ static void remove_one(struct pci_dev *pdev)
 	postinit_cleanup(dd);
 }
 
+static void shutdown_one(struct pci_dev *pdev)
+{
+	struct hfi1_devdata *dd = pci_get_drvdata(pdev);
+
+	shutdown_device(dd);
+}
+
 /**
  * hfi1_create_rcvhdrq - create a receive header queue
  * @dd: the hfi1_ib device
@@ -1602,7 +1618,6 @@ int hfi1_create_rcvhdrq(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
 	u64 reg;
 
 	if (!rcd->rcvhdrq) {
-		dma_addr_t dma_hdrqtail;
 		gfp_t gfp_flags;
 
 		/*
@@ -1625,13 +1640,13 @@ int hfi1_create_rcvhdrq(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
 			goto bail;
 		}
 
-		if (HFI1_CAP_KGET_MASK(rcd->flags, DMA_RTAIL)) {
+		if (HFI1_CAP_KGET_MASK(rcd->flags, DMA_RTAIL) ||
+		    HFI1_CAP_UGET_MASK(rcd->flags, DMA_RTAIL)) {
 			rcd->rcvhdrtail_kvaddr = dma_zalloc_coherent(
-				&dd->pcidev->dev, PAGE_SIZE, &dma_hdrqtail,
-				gfp_flags);
+				&dd->pcidev->dev, PAGE_SIZE,
+				&rcd->rcvhdrqtailaddr_dma, gfp_flags);
 			if (!rcd->rcvhdrtail_kvaddr)
 				goto bail_free;
-			rcd->rcvhdrqtailaddr_dma = dma_hdrqtail;
 		}
 
 		rcd->rcvhdrq_size = amt;
@@ -1757,6 +1772,7 @@ int hfi1_setup_eagerbufs(struct hfi1_ctxtdata *rcd)
 			    !HFI1_CAP_KGET_MASK(rcd->flags, MULTI_PKT_EGR)) {
 				dd_dev_err(dd, "ctxt%u: Failed to allocate eager buffers\n",
 					   rcd->ctxt);
+				ret = -ENOMEM;
 				goto bail_rcvegrbuf_phys;
 			}
 

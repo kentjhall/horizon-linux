@@ -209,3 +209,9 @@ config CIFS_FSCACHE
 	    to be cached locally on disk through the general filesystem cache
 	    manager. If unsure, say N.
 
+config CIFS_SYSFS
+	bool "sysfs file system support"
+	depends on CIFS && SYSFS
+	help
+	  Say Y to export kernel object attributes, controls, and deliver
+          events to userspace

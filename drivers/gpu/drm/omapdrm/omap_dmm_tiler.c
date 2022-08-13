@@ -273,6 +273,17 @@ static int dmm_txn_commit(struct dmm_txn *txn, bool wait)
 	}
 
 	txn->last_pat->next_pa = 0;
+	/* ensure that the written descriptors are visible to DMM */
+	wmb();
+
+	/*
+	 * NOTE: the wmb() above should be enough, but there seems to be a bug
+	 * in OMAP's memory barrier implementation, which in some rare cases may
+	 * cause the writes not to be observable after wmb().
+	 */
+
+	/* read back to ensure the data is in RAM */
+	readl(&txn->last_pat->next_pa);
 
 	/* write to PAT_DESCR to clear out any pending transaction */
 	dmm_write(dmm, 0x0, reg[PAT_DESCR][engine->id]);
@@ -298,7 +309,12 @@ static int dmm_txn_commit(struct dmm_txn *txn, bool wait)
 				msecs_to_jiffies(100))) {
 			dev_err(dmm->dev, "timed out waiting for done\n");
 			ret = -ETIMEDOUT;
+			goto cleanup;
 		}
+
+		/* Check the engine status before continue */
+		ret = wait_status(engine, DMM_PATSTATUS_READY |
+				  DMM_PATSTATUS_VALID | DMM_PATSTATUS_DONE);
 	}
 
 cleanup:
@@ -638,7 +654,8 @@ static int omap_dmm_probe(struct platform_device *dev)
 		match = of_match_node(dmm_of_match, dev->dev.of_node);
 		if (!match) {
 			dev_err(&dev->dev, "failed to find matching device node\n");
-			return -ENODEV;
+			ret = -ENODEV;
+			goto fail;
 		}
 
 		omap_dmm->plat_data = match->data;
@@ -730,6 +747,7 @@ static int omap_dmm_probe(struct platform_device *dev)
 					   &omap_dmm->refill_pa, GFP_KERNEL);
 	if (!omap_dmm->refill_va) {
 		dev_err(&dev->dev, "could not allocate refill memory\n");
+		ret = -ENOMEM;
 		goto fail;
 	}
 

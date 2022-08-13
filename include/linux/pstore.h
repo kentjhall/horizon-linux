@@ -79,6 +79,19 @@ struct pstore_info {
 	void		*data;
 };
 
+enum rtrace_event_type {
+	RTRACE_READ = 0,
+	RTRACE_WRITE = 1,
+};
+
+#ifndef CONFIG_PSTORE_RTRACE
+static inline void
+pstore_rtrace_call(enum rtrace_event_type log_type, void *data)
+{ }
+static inline void pstore_rtrace_set_bypass(int bypass)
+{ }
+#endif
+
 #define PSTORE_FLAGS_DMESG	(1 << 0)
 #define PSTORE_FLAGS_FRAGILE	PSTORE_FLAGS_DMESG
 #define PSTORE_FLAGS_CONSOLE	(1 << 1)

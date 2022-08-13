@@ -25,6 +25,8 @@
 #endif
 #define CREATE_TRACE_POINTS
 
+#include <linux/buffer_head.h>
+#include <linux/delay.h>
 #include <linux/memblock.h>
 #include <linux/err.h>
 #include <linux/mm.h>
@@ -36,6 +38,11 @@
 #include <linux/highmem.h>
 #include <linux/io.h>
 #include <trace/events/cma.h>
+#include <linux/dma-mapping.h>
+#include <linux/dma-contiguous.h>
+
+#include <asm/tlbflush.h>
+#include <asm/cacheflush.h>
 
 #include "cma.h"
 
@@ -54,7 +61,7 @@ unsigned long cma_get_size(const struct cma *cma)
 }
 
 static unsigned long cma_bitmap_aligned_mask(const struct cma *cma,
-					     int align_order)
+					     unsigned int align_order)
 {
 	if (align_order <= cma->order_per_bit)
 		return 0;
@@ -62,17 +69,14 @@ static unsigned long cma_bitmap_aligned_mask(const struct cma *cma,
 }
 
 /*
- * Find a PFN aligned to the specified order and return an offset represented in
- * order_per_bits.
+ * Find the offset of the base PFN from the specified align_order.
+ * The value returned is represented in order_per_bits.
  */
 static unsigned long cma_bitmap_aligned_offset(const struct cma *cma,
-					       int align_order)
+					       unsigned int align_order)
 {
-	if (align_order <= cma->order_per_bit)
-		return 0;
-
-	return (ALIGN(cma->base_pfn, (1UL << align_order))
-		- cma->base_pfn) >> cma->order_per_bit;
+	return (cma->base_pfn & ((1UL << align_order) - 1))
+		>> cma->order_per_bit;
 }
 
 static unsigned long cma_bitmap_pages_to_bits(const struct cma *cma,
@@ -103,8 +107,10 @@ static int __init cma_activate_area(struct cma *cma)
 
 	cma->bitmap = kzalloc(bitmap_size, GFP_KERNEL);
 
-	if (!cma->bitmap)
+	if (!cma->bitmap) {
+		cma->count = 0;
 		return -ENOMEM;
+	}
 
 	WARN_ON_ONCE(!pfn_valid(pfn));
 	zone = page_zone(pfn_to_page(pfn));
@@ -269,6 +275,12 @@ int __init cma_declare_contiguous(phys_addr_t base,
 	 */
 	alignment = max(alignment,  (phys_addr_t)PAGE_SIZE <<
 			  max_t(unsigned long, MAX_ORDER - 1, pageblock_order));
+	if (fixed && base & (alignment - 1)) {
+		ret = -EINVAL;
+		pr_err("Region at %pa must be aligned to %pa bytes\n",
+			&base, &alignment);
+		goto err;
+	}
 	base = ALIGN(base, alignment);
 	size = ALIGN(size, alignment);
 	limit &= ~(alignment - 1);
@@ -298,6 +310,13 @@ int __init cma_declare_contiguous(phys_addr_t base,
 	 */
 	if (limit == 0 || limit > memblock_end)
 		limit = memblock_end;
+
+	if (base + size > limit) {
+		ret = -EINVAL;
+		pr_err("Size (%pa) of region at %pa exceeds limit (%pa)\n",
+			&size, &base, &limit);
+		goto err;
+	}
 
 	/* Reserve memory */
 	if (fixed) {
@@ -342,27 +361,69 @@ int __init cma_declare_contiguous(phys_addr_t base,
 
 	ret = cma_init_reserved_mem(base, size, order_per_bit, res_cma);
 	if (ret)
-		goto err;
+		goto free_mem;
 
 	pr_info("Reserved %ld MiB at %pa\n", (unsigned long)size / SZ_1M,
 		&base);
 	return 0;
 
+free_mem:
+	memblock_free(base, size);
 err:
 	pr_err("Failed to reserve %ld MiB\n", (unsigned long)size / SZ_1M);
 	return ret;
 }
 
-/**
- * cma_alloc() - allocate pages from contiguous area
- * @cma:   Contiguous memory region for which the allocation is performed.
- * @count: Requested number of pages.
- * @align: Requested alignment of pages (in PAGE_SIZE order).
- *
- * This function allocates part of contiguous memory on specific
- * contiguous memory area.
- */
-struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
+static int __dma_update_pte(pte_t *pte, pgtable_t token, unsigned long addr,
+			    void *data)
+{
+	struct page *page = virt_to_page(addr);
+	pgprot_t prot = *(pgprot_t *)data;
+
+	set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
+	return 0;
+}
+
+static void __dma_remap(struct page *page, size_t size, pgprot_t prot)
+{
+	unsigned long start = (unsigned long) page_address(page);
+	unsigned end = start + size;
+	int err;
+
+	err = apply_to_page_range(&init_mm, start,
+		size, __dma_update_pte, &prot);
+	if (err)
+		pr_err("***%s: error=%d, pfn=%lx\n", __func__,
+			err, page_to_pfn(page));
+	dsb(sy);
+	flush_tlb_kernel_range(start, end);
+}
+
+static void __dma_clear_buffer(struct page *page, size_t size)
+{
+	void *ptr;
+	/*
+	 * Ensure that the allocated pages are zeroed, and that any data
+	 * lurking in the kernel direct-mapped region is invalidated.
+	 * The zeroing can be skipped for VPR resize as it is not
+	 * accessible by cpu for either read or write. Since VPR's
+	 * coherent device is the only device that has heap resize notifier
+	 * and that too when resize is enabled, the API
+	 * dma_contiguous_should_replace_page() would return true
+	 * if and only if the cma is VPR and the resize is enabled.
+	 */
+	ptr = page_address(page);
+	if (ptr) {
+		if (!dma_contiguous_should_replace_page(page))
+			memset(ptr, 0, size);
+		__dma_flush_area(ptr, size);
+		/* comment out as not present for arm64 */
+		/* outer_flush_range(__pa(ptr), __pa(ptr) + size);*/
+	}
+}
+
+struct page *cma_alloc_at(struct cma *cma, size_t count,
+				unsigned int align, phys_addr_t at_addr, bool map_non_cached)
 {
 	unsigned long mask, offset;
 	unsigned long pfn = -1;
@@ -370,6 +431,7 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
 	unsigned long bitmap_maxno, bitmap_no, bitmap_count;
 	struct page *page = NULL;
 	int ret;
+	unsigned long start_pfn = __phys_to_pfn(at_addr);
 
 	if (!cma || !cma->count)
 		return NULL;
@@ -388,12 +450,20 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
 	if (bitmap_count > bitmap_maxno)
 		return NULL;
 
+	if (start_pfn && start_pfn < cma->base_pfn)
+		return NULL;
+	start = start_pfn ? start_pfn - cma->base_pfn : start;
+
 	for (;;) {
+		unsigned long timeout = jiffies + msecs_to_jiffies(8000);
+		int retries = 0;
+
 		mutex_lock(&cma->lock);
 		bitmap_no = bitmap_find_next_zero_area_off(cma->bitmap,
 				bitmap_maxno, start, bitmap_count, mask,
 				offset);
-		if (bitmap_no >= bitmap_maxno) {
+		if (bitmap_no >= bitmap_maxno ||
+			(start_pfn && start != bitmap_no)) {
 			mutex_unlock(&cma->lock);
 			break;
 		}
@@ -406,6 +476,7 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
 		mutex_unlock(&cma->lock);
 
 		pfn = cma->base_pfn + (bitmap_no << cma->order_per_bit);
+retry:
 		mutex_lock(&cma_mutex);
 		ret = alloc_contig_range(pfn, pfn + count, MIGRATE_CMA);
 		mutex_unlock(&cma_mutex);
@@ -415,8 +486,21 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
 		}
 
 		cma_clear_bitmap(cma, pfn, count);
-		if (ret != -EBUSY)
+		if (start_pfn && time_before(jiffies, timeout)) {
+			/* Possible migration contention from
+			 * __get_user_pages(). Retry after a bit of sleep.
+			 */
+			if (retries >= 5) {
+				msleep(retries > 10 ? 3 : 1);
+				invalidate_bh_lrus();
+			} else {
+				cond_resched();
+			}
+			retries++;
+			goto retry;
+		} else if (ret != -EBUSY || start_pfn) {
 			break;
+		}
 
 		pr_debug("%s(): memory range at %p is busy, retrying\n",
 			 __func__, pfn_to_page(pfn));
@@ -427,7 +511,29 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
 	trace_cma_alloc(pfn, page, count, align);
 
 	pr_debug("%s(): returned %p\n", __func__, page);
+	if (page) {
+		__dma_remap(page, count << PAGE_SHIFT,
+			pgprot_writecombine(PAGE_KERNEL));
+		__dma_clear_buffer(page, count << PAGE_SHIFT);
+		if(map_non_cached)
+			__dma_remap(page, count << PAGE_SHIFT,
+				pgprot_noncached(PAGE_KERNEL));
+	}
 	return page;
+}
+
+/**
+ * cma_alloc() - allocate pages from contiguous area
+ * @cma:   Contiguous memory region for which the allocation is performed.
+ * @count: Requested number of pages.
+ * @align: Requested alignment of pages (in PAGE_SIZE order).
+ *
+ * This function allocates part of contiguous memory on specific
+ * contiguous memory area.
+ */
+struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
+{
+	return cma_alloc_at(cma, count, align, 0, false);
 }
 
 /**
@@ -456,9 +562,91 @@ bool cma_release(struct cma *cma, const struct page *pages, unsigned int count)
 
 	VM_BUG_ON(pfn + count > cma->base_pfn + cma->count);
 
+	__dma_remap((struct page *)pages, count << PAGE_SHIFT, PAGE_KERNEL_EXEC);
+
 	free_contig_range(pfn, count);
 	cma_clear_bitmap(cma, pfn, count);
 	trace_cma_release(pfn, pages, count);
 
 	return true;
 }
+
+#ifdef CONFIG_DMA_CMA
+int dma_get_contiguous_stats(struct device *dev,
+			struct dma_contiguous_stats *stats)
+{
+	struct cma *cma = NULL;
+
+	if ((!dev) || !stats)
+		return -EINVAL;
+
+	if (dev->cma_area)
+		cma = dev->cma_area;
+
+	if (!cma)
+		return -EINVAL;
+
+	stats->size = (cma->count) << PAGE_SHIFT;
+	stats->base = (cma->base_pfn) << PAGE_SHIFT;
+
+	return 0;
+}
+
+#define MAX_REPLACE_DEV 16
+static struct device *replace_dev_list[MAX_REPLACE_DEV];
+static atomic_t replace_dev_count;
+
+bool dma_contiguous_should_replace_page(struct page *page)
+{
+	int i;
+	ulong pfn;
+	struct cma *cma;
+	struct device *dev;
+	int count = atomic_read(&replace_dev_count);
+
+	if (!page)
+		return false;
+	pfn = page_to_pfn(page);
+
+	for (i = 0; i < count; i++) {
+		dev = replace_dev_list[i];
+		if (!dev)
+			continue;
+		cma = dev->cma_area;
+		if (!cma)
+			continue;
+		if (pfn >= cma->base_pfn &&
+		    pfn < cma->base_pfn + cma->count)
+			return true;
+	}
+
+	return false;
+}
+
+/* Enable replacing pages during get_user_pages.
+ * any ref count on CMA page from get_user_pages
+ * makes the page not migratable and can cause
+ * CMA allocation failure. Enabling replace
+ * would force replacing the CMA pages with non-CMA
+ * pages during get_user_pages
+ */
+int dma_contiguous_enable_replace_pages(struct device *dev)
+{
+	int idx;
+	struct cma *cma;
+
+	if (!dev)
+		return -EINVAL;
+
+	idx = atomic_inc_return(&replace_dev_count);
+	if (idx > MAX_REPLACE_DEV)
+		return -EINVAL;
+	replace_dev_list[idx - 1] = dev;
+	cma = dev->cma_area;
+	if (cma) {
+		pr_info("enabled page replacement for spfn=%lx, epfn=%lx\n",
+			cma->base_pfn, cma->base_pfn + cma->count);
+	}
+	return 0;
+}
+#endif /* CONFIG_DMA_CMA */

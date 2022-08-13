@@ -10,19 +10,32 @@
 #
 # Copyright (C) 1995-2001 by Russell King
 
-LDFLAGS_vmlinux	:=-p --no-undefined -X
+LDFLAGS_vmlinux	:=--no-undefined -X
 CPPFLAGS_vmlinux.lds = -DTEXT_OFFSET=$(TEXT_OFFSET)
 GZFLAGS		:=-9
 
-ifneq ($(CONFIG_RELOCATABLE),)
-LDFLAGS_vmlinux		+= -pie -shared -Bsymbolic
+ifeq ($(CONFIG_RELOCATABLE), y)
+# Pass --no-apply-dynamic-relocs to restore pre-binutils-2.27 behaviour
+# for relative relocs, since this leads to better Image compression
+# with the relocation offsets always being zero.
+LDFLAGS_vmlinux		+= -pie -shared -Bsymbolic \
+			$(call ld-option, --no-apply-dynamic-relocs)
 endif
 
 ifeq ($(CONFIG_ARM64_ERRATUM_843419),y)
   ifeq ($(call ld-option, --fix-cortex-a53-843419),)
 $(warning ld does not support --fix-cortex-a53-843419; kernel may be susceptible to erratum)
   else
+    ifeq ($(call gold-ifversion, -lt, 114000000, y), y)
+$(warning This version of GNU gold may generate incorrect code with --fix-cortex-a53-843419;\
+	see https://sourceware.org/bugzilla/show_bug.cgi?id=21491)
+    endif
 LDFLAGS_vmlinux	+= --fix-cortex-a53-843419
+  endif
+else
+  ifeq ($(ld-name),gold)
+# Pass --no-fix-cortex-a53-843419 to ensure the erratum fix is disabled
+LDFLAGS	+= --no-fix-cortex-a53-843419
   endif
 endif
 
@@ -37,9 +50,17 @@ $(warning LSE atomics not supported by binutils)
   endif
 endif
 
-KBUILD_CFLAGS	+= -mgeneral-regs-only $(lseinstr)
+ifeq ($(cc-name),clang)
+# This is a workaround for https://bugs.llvm.org/show_bug.cgi?id=30792.
+# TODO: revert when this is fixed in LLVM.
+KBUILD_CFLAGS	+= -mno-implicit-float
+else
+KBUILD_CFLAGS	+= -mgeneral-regs-only
+endif
+KBUILD_CFLAGS	+= $(lseinstr)
 KBUILD_CFLAGS	+= -fno-asynchronous-unwind-tables
 KBUILD_CFLAGS	+= $(call cc-option, -mpc-relative-literal-loads)
+KBUILD_CFLAGS	+= -fno-pic
 KBUILD_AFLAGS	+= $(lseinstr)
 
 ifeq ($(CONFIG_CPU_BIG_ENDIAN), y)
@@ -58,6 +79,10 @@ CHECKFLAGS	+= -D__aarch64__
 
 ifeq ($(CONFIG_ARM64_MODULE_CMODEL_LARGE), y)
 KBUILD_CFLAGS_MODULE	+= -mcmodel=large
+ifeq ($(CONFIG_LTO_CLANG), y)
+# Code model is not stored in LLVM IR, so we need to pass it also to LLVMgold
+LDFLAGS		+= -plugin-opt=-code-model=large
+endif
 endif
 
 ifeq ($(CONFIG_ARM64_MODULE_PLTS),y)
@@ -74,6 +99,10 @@ TEXT_OFFSET := $(shell awk "BEGIN {srand(); printf \"0x%06x\n\", \
 		 rand()) * (2 ^ $(CONFIG_ARM64_PAGE_SHIFT))}")
 else
 TEXT_OFFSET := 0x00080000
+endif
+
+ifeq ($(cc-name),clang)
+KBUILD_CFLAGS += $(call cc-disable-warning, asm-operand-widths)
 endif
 
 # KASAN_SHADOW_OFFSET = VA_START + (1 << (VA_BITS - 3)) - (1 << 61)
@@ -94,17 +123,25 @@ libs-y		:= arch/arm64/lib/ $(libs-y)
 core-$(CONFIG_EFI_STUB) += $(objtree)/drivers/firmware/efi/libstub/lib.a
 
 # Default target when executing plain make
+ifeq ($(CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE),y)
+KBUILD_IMAGE	:= $(subst $\",,$(CONFIG_BUILD_ARM64_APPENDED_KERNEL_IMAGE_NAME))
+else
 KBUILD_IMAGE	:= Image.gz
+endif
+
 KBUILD_DTBS	:= dtbs
 
-all:	$(KBUILD_IMAGE) $(KBUILD_DTBS)
+all:	$(KBUILD_IMAGE) $(KBUILD_DTBS) zImage
 
 boot := arch/arm64/boot
 
 Image: vmlinux
 	$(Q)$(MAKE) $(build)=$(boot) $(boot)/$@
 
-Image.%: Image
+zImage: Image
+	$(Q)$(MAKE) $(build)=$(boot) $(boot)/$@
+
+Image.gz: Image
 	$(Q)$(MAKE) $(build)=$(boot) $(boot)/$@
 
 zinstall install:
@@ -113,13 +150,11 @@ zinstall install:
 %.dtb: scripts
 	$(Q)$(MAKE) $(build)=$(boot)/dts $(boot)/dts/$@
 
-PHONY += dtbs dtbs_install
+dtbs: scripts
+	$(Q)$(MAKE) $(build)=$(boot)/dts dtbs
 
-dtbs: prepare scripts
-	$(Q)$(MAKE) $(build)=$(boot)/dts
-
-dtbs_install:
-	$(Q)$(MAKE) $(dtbinst)=$(boot)/dts
+Image-dtb Image.gz-dtb: vmlinux scripts dtbs
+	$(Q)$(MAKE) $(build)=$(boot) $(boot)/$@
 
 PHONY += vdso_install
 vdso_install:
@@ -130,6 +165,7 @@ archclean:
 	$(Q)$(MAKE) $(clean)=$(boot)
 	$(Q)$(MAKE) $(clean)=$(boot)/dts
 
+ifeq ($(KBUILD_EXTMOD),)
 # We need to generate vdso-offsets.h before compiling certain files in kernel/.
 # In order to do that, we should use the archprepare target, but we can't since
 # asm-offsets.h is included in some files used to generate vdso-offsets.h, and
@@ -139,12 +175,12 @@ archclean:
 prepare: vdso_prepare
 vdso_prepare: prepare0
 	$(Q)$(MAKE) $(build)=arch/arm64/kernel/vdso include/generated/vdso-offsets.h
+endif
 
 define archhelp
   echo  '* Image.gz      - Compressed kernel image (arch/$(ARCH)/boot/Image.gz)'
   echo  '  Image         - Uncompressed kernel image (arch/$(ARCH)/boot/Image)'
   echo  '* dtbs          - Build device tree blobs for enabled boards'
-  echo  '  dtbs_install  - Install dtbs to $(INSTALL_DTBS_PATH)'
   echo  '  install       - Install uncompressed kernel'
   echo  '  zinstall      - Install compressed kernel'
   echo  '                  Install using (your) ~/bin/installkernel or'

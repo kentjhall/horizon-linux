@@ -95,6 +95,7 @@ struct amd_gpio {
 	struct gpio_chip        gc;
 	struct resource         *res;
 	struct platform_device  *pdev;
+	u32			*saved_regs;
 };
 
 /*  KERNCZ configuration*/
@@ -249,7 +250,7 @@ static const struct amd_pingroup kerncz_groups[] = {
 	{
 		.name = "uart0",
 		.pins = uart0_pins,
-		.npins = 9,
+		.npins = 5,
 	},
 	{
 		.name = "uart1",

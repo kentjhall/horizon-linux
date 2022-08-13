@@ -3,6 +3,16 @@
  *
  * (C) Jens Axboe <jens.axboe@oracle.com> 2008
  */
+/*
+ * Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * NVIDIA CORPORATION and its licensors retain all intellectual property
+ * and proprietary rights in and to this software, related documentation
+ * and any modifications thereto.  Any use, reproduction, disclosure or
+ * distribution of this software and related documentation without an express
+ * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ */
+
 #include <linux/irq_work.h>
 #include <linux/rcupdate.h>
 #include <linux/rculist.h>
@@ -482,8 +492,13 @@ EXPORT_SYMBOL(smp_call_function);
 
 /* Setup configured maximum number of CPUs to activate */
 unsigned int setup_max_cpus = NR_CPUS;
+static bool setup_max_cpus_set /* = false */;
 EXPORT_SYMBOL(setup_max_cpus);
 
+/* Setup bitmask to activate maximum number of CPUs by default */
+unsigned int setup_max_cpus_mask = ~0;
+static bool setup_max_cpus_mask_set /* = false */;
+EXPORT_SYMBOL(setup_max_cpus_mask);
 
 /*
  * Setup routine for controlling SMP activation
@@ -502,6 +517,7 @@ static int __init nosmp(char *str)
 {
 	setup_max_cpus = 0;
 	arch_disable_smp_support();
+	setup_max_cpus_set = true;
 
 	return 0;
 }
@@ -527,11 +543,22 @@ static int __init maxcpus(char *str)
 	get_option(&str, &setup_max_cpus);
 	if (setup_max_cpus == 0)
 		arch_disable_smp_support();
+	setup_max_cpus_set = true;
 
 	return 0;
 }
 
 early_param("maxcpus", maxcpus);
+
+static int __init maxcpusmask(char *str)
+{
+	get_option(&str, &setup_max_cpus_mask);
+	setup_max_cpus_mask_set = true;
+
+	return 0;
+}
+
+early_param("maxcpusmask", maxcpusmask);
 
 /* Setup number of possible processor ids */
 int nr_cpu_ids __read_mostly = NR_CPUS;
@@ -552,18 +579,45 @@ void __weak smp_announce(void)
 void __init smp_init(void)
 {
 	unsigned int cpu;
+	unsigned int check_cpumask;
 
 	idle_threads_init();
 	cpuhp_threads_init();
 
+	if (setup_max_cpus_set && setup_max_cpus_mask_set)
+		pr_warn("Both maxcpus and maxcpumask are set --"
+			"ignoring maxcpus\n");
+
 	/* FIXME: This should be done in userspace --RR */
 	for_each_present_cpu(cpu) {
+
+		/*
+		 * first, we'll try to use max_cpus_mask,
+		 * if it was set in the command line
+		 */
+		if (setup_max_cpus_mask_set) {
+			/*
+			 * Is the bit for this cpu set in setup_max_cpus_mask?
+			 */
+			check_cpumask = (1 << (cpu));
+			if (setup_max_cpus_mask & check_cpumask) {
+				/* Online the CPU now */
+				if (!cpu_online(cpu)) {
+					pr_info("Bringing up CPU%d...\n", cpu);
+					cpu_up(cpu);
+				}
+			}
+			continue;
+		}
+
 		if (num_online_cpus() >= setup_max_cpus)
 			break;
 		if (!cpu_online(cpu))
 			cpu_up(cpu);
 	}
 
+	/* Final decision about SMT support */
+	cpu_smt_check_topology();
 	/* Any cleanup work */
 	smp_announce();
 	smp_cpus_done(setup_max_cpus);

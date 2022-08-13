@@ -17,7 +17,7 @@
 
 #define NFSDBG_FACILITY		NFSDBG_PNFS_LD
 
-static unsigned int dataserver_timeo = NFS_DEF_TCP_RETRANS;
+static unsigned int dataserver_timeo = NFS_DEF_TCP_TIMEO;
 static unsigned int dataserver_retrans;
 
 void nfs4_ff_layout_put_deviceid(struct nfs4_ff_layout_ds *mirror_ds)
@@ -30,6 +30,7 @@ void nfs4_ff_layout_free_deviceid(struct nfs4_ff_layout_ds *mirror_ds)
 {
 	nfs4_print_deviceid(&mirror_ds->id_node.deviceid);
 	nfs4_pnfs_ds_put(mirror_ds->ds);
+	kfree(mirror_ds->ds_versions);
 	kfree_rcu(mirror_ds, id_node.rcu);
 }
 

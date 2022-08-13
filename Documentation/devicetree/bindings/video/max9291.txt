@@ -1,0 +1,17 @@
+MAX9291 HDMI to GMSL Serializer driver
+
+Required properties:
+- compatible : should be "maxim,max9291".
+- reg : i2c regmap address
+- maxim,enable-gpio : GPIO for enabling MAX9291 chip
+
+Examples:
+        i2c@31c0000 {
+                max9291@40 {
+                        compatible = "maxim,max9291";
+                        reg = <0x40>;
+                        status = "okay";
+                        maxim,enable-gpio = <&tegra_main_gpio TEGRA_MAIN_GPIO(O, 1) 0>;
+                };
+
+}

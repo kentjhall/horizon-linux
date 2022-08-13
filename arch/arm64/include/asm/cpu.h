@@ -59,6 +59,9 @@ struct cpuinfo_arm64 {
 	u32		reg_mvfr0;
 	u32		reg_mvfr1;
 	u32		reg_mvfr2;
+
+	/* Denver firmware revision */
+	u32		reg_aidr;
 };
 
 DECLARE_PER_CPU(struct cpuinfo_arm64, cpu_data);

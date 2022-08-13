@@ -142,16 +142,6 @@ static u64 psched_ns_t2l(const struct psched_ratecfg *r,
 	return len;
 }
 
-/*
- * Return length of individual segments of a gso packet,
- * including all headers (MAC, IP, TCP/UDP)
- */
-static unsigned int skb_gso_mac_seglen(const struct sk_buff *skb)
-{
-	unsigned int hdr_len = skb_transport_header(skb) - skb_mac_header(skb);
-	return hdr_len + skb_gso_transport_seglen(skb);
-}
-
 /* GSO packet is too big, segment it so that tbf can transmit
  * each segment in time
  */
@@ -423,12 +413,13 @@ static int tbf_init(struct Qdisc *sch, struct nlattr *opt)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 
+	qdisc_watchdog_init(&q->watchdog, sch);
+	q->qdisc = &noop_qdisc;
+
 	if (opt == NULL)
 		return -EINVAL;
 
 	q->t_c = ktime_get_ns();
-	qdisc_watchdog_init(&q->watchdog, sch);
-	q->qdisc = &noop_qdisc;
 
 	return tbf_change(sch, opt);
 }

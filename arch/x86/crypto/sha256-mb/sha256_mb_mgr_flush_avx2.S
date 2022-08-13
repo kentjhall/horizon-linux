@@ -155,8 +155,8 @@ LABEL skip_ %I
 .endr
 
 	# Find min length
-	vmovdqa _lens+0*16(state), %xmm0
-	vmovdqa _lens+1*16(state), %xmm1
+	vmovdqu _lens+0*16(state), %xmm0
+	vmovdqu _lens+1*16(state), %xmm1
 
 	vpminud %xmm1, %xmm0, %xmm2		# xmm2 has {D,C,B,A}
 	vpalignr $8, %xmm2, %xmm3, %xmm3	# xmm3 has {x,x,D,C}
@@ -176,8 +176,8 @@ LABEL skip_ %I
 	vpsubd	%xmm2, %xmm0, %xmm0
 	vpsubd	%xmm2, %xmm1, %xmm1
 
-	vmovdqa	%xmm0, _lens+0*16(state)
-	vmovdqa	%xmm1, _lens+1*16(state)
+	vmovdqu	%xmm0, _lens+0*16(state)
+	vmovdqu	%xmm1, _lens+1*16(state)
 
 	# "state" and "args" are the same address, arg1
 	# len is arg2
@@ -234,8 +234,8 @@ ENTRY(sha256_mb_mgr_get_comp_job_avx2)
 	jc	.return_null
 
 	# Find min length
-	vmovdqa	_lens(state), %xmm0
-	vmovdqa	_lens+1*16(state), %xmm1
+	vmovdqu	_lens(state), %xmm0
+	vmovdqu	_lens+1*16(state), %xmm1
 
 	vpminud	%xmm1, %xmm0, %xmm2		# xmm2 has {D,C,B,A}
 	vpalignr $8, %xmm2, %xmm3, %xmm3	# xmm3 has {x,x,D,C}
@@ -265,7 +265,7 @@ ENTRY(sha256_mb_mgr_get_comp_job_avx2)
 	vpinsrd	$1, _args_digest+1*32(state, idx, 4), %xmm0, %xmm0
 	vpinsrd	$2, _args_digest+2*32(state, idx, 4), %xmm0, %xmm0
 	vpinsrd	$3, _args_digest+3*32(state, idx, 4), %xmm0, %xmm0
-	vmovd   _args_digest(state , idx, 4) , %xmm0
+	vmovd	_args_digest+4*32(state, idx, 4), %xmm1
 	vpinsrd	$1, _args_digest+5*32(state, idx, 4), %xmm1, %xmm1
 	vpinsrd	$2, _args_digest+6*32(state, idx, 4), %xmm1, %xmm1
 	vpinsrd	$3, _args_digest+7*32(state, idx, 4), %xmm1, %xmm1

@@ -502,8 +502,7 @@ STATIC void
 xfs_set_inoalignment(xfs_mount_t *mp)
 {
 	if (xfs_sb_version_hasalign(&mp->m_sb) &&
-	    mp->m_sb.sb_inoalignmt >=
-	    XFS_B_TO_FSBT(mp, mp->m_inode_cluster_size))
+		mp->m_sb.sb_inoalignmt >= xfs_icluster_size_fsb(mp))
 		mp->m_inoalign_mask = mp->m_sb.sb_inoalignmt - 1;
 	else
 		mp->m_inoalign_mask = 0;
@@ -926,15 +925,6 @@ xfs_mountfs(
 	}
 
 	/*
-	 * During the second phase of log recovery, we need iget and
-	 * iput to behave like they do for an active filesystem.
-	 * xfs_fs_drop_inode needs to be able to prevent the deletion
-	 * of inodes before we're done replaying log items on those
-	 * inodes.
-	 */
-	mp->m_super->s_flags |= MS_ACTIVE;
-
-	/*
 	 * Finish recovering the file system.  This part needed to be delayed
 	 * until after the root and real-time bitmap inodes were consistently
 	 * read in.
@@ -1009,12 +999,13 @@ xfs_mountfs(
  out_quota:
 	xfs_qm_unmount_quotas(mp);
  out_rtunmount:
-	mp->m_super->s_flags &= ~MS_ACTIVE;
 	xfs_rtunmount_inodes(mp);
  out_rele_rip:
 	IRELE(rip);
 	cancel_delayed_work_sync(&mp->m_reclaim_work);
 	xfs_reclaim_inodes(mp, SYNC_WAIT);
+	/* Clean out dquots that might be in memory after quotacheck. */
+	xfs_qm_unmount(mp);
  out_log_dealloc:
 	mp->m_flags |= XFS_MOUNT_UNMOUNTING;
 	xfs_log_mount_cancel(mp);

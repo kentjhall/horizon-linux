@@ -33,10 +33,13 @@ static u32 crc32c_vpmsum(u32 crc, unsigned char const *p, size_t len)
 	}
 
 	if (len & ~VMX_ALIGN_MASK) {
+		preempt_disable();
 		pagefault_disable();
 		enable_kernel_altivec();
 		crc = __crc32c_vpmsum(crc, p, len & ~VMX_ALIGN_MASK);
+		disable_kernel_altivec();
 		pagefault_enable();
+		preempt_enable();
 	}
 
 	tail = len & VMX_ALIGN_MASK;
@@ -52,7 +55,7 @@ static int crc32c_vpmsum_cra_init(struct crypto_tfm *tfm)
 {
 	u32 *key = crypto_tfm_ctx(tfm);
 
-	*key = 0;
+	*key = ~0;
 
 	return 0;
 }
@@ -138,6 +141,7 @@ static struct shash_alg alg = {
 		.cra_name		= "crc32c",
 		.cra_driver_name	= "crc32c-vpmsum",
 		.cra_priority		= 200,
+		.cra_flags		= CRYPTO_ALG_OPTIONAL_KEY,
 		.cra_blocksize		= CHKSUM_BLOCK_SIZE,
 		.cra_ctxsize		= sizeof(u32),
 		.cra_module		= THIS_MODULE,

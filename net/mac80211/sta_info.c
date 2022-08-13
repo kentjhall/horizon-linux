@@ -3,6 +3,7 @@
  * Copyright 2006-2007	Jiri Benc <jbenc@suse.cz>
  * Copyright 2013-2014  Intel Mobile Communications GmbH
  * Copyright (C) 2015 - 2016 Intel Deutschland GmbH
+ * Copyright (C) 2018-2020 Intel Corporation
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -242,6 +243,24 @@ struct sta_info *sta_info_get_by_idx(struct ieee80211_sub_if_data *sdata,
  */
 void sta_info_free(struct ieee80211_local *local, struct sta_info *sta)
 {
+	/*
+	 * If we had used sta_info_pre_move_state() then we might not
+	 * have gone through the state transitions down again, so do
+	 * it here now (and warn if it's inserted).
+	 *
+	 * This will clear state such as fast TX/RX that may have been
+	 * allocated during state transitions.
+	 */
+	while (sta->sta_state > IEEE80211_STA_NONE) {
+		int ret;
+
+		WARN_ON_ONCE(test_sta_flag(sta, WLAN_STA_INSERTED));
+
+		ret = sta_info_move_state(sta, sta->sta_state - 1);
+		if (WARN_ONCE(ret, "sta_info_move_state() returned %d\n", ret))
+			break;
+	}
+
 	if (sta->rate_ctrl)
 		rate_control_free_sta(sta);
 
@@ -313,7 +332,7 @@ struct sta_info *sta_info_alloc(struct ieee80211_sub_if_data *sdata,
 
 	if (ieee80211_hw_check(hw, USES_RSS)) {
 		sta->pcpu_rx_stats =
-			alloc_percpu(struct ieee80211_sta_rx_stats);
+			alloc_percpu_gfp(struct ieee80211_sta_rx_stats, gfp);
 		if (!sta->pcpu_rx_stats)
 			goto free;
 	}
@@ -395,10 +414,15 @@ struct sta_info *sta_info_alloc(struct ieee80211_sub_if_data *sdata,
 	sta->sta.smps_mode = IEEE80211_SMPS_OFF;
 	if (sdata->vif.type == NL80211_IFTYPE_AP ||
 	    sdata->vif.type == NL80211_IFTYPE_AP_VLAN) {
-		struct ieee80211_supported_band *sband =
-			hw->wiphy->bands[ieee80211_get_sdata_band(sdata)];
-		u8 smps = (sband->ht_cap.cap & IEEE80211_HT_CAP_SM_PS) >>
-				IEEE80211_HT_CAP_SM_PS_SHIFT;
+		struct ieee80211_supported_band *sband;
+		u8 smps;
+
+		sband = ieee80211_get_sband(sdata);
+		if (!sband)
+			goto free_txq;
+
+		smps = (sband->ht_cap.cap & IEEE80211_HT_CAP_SM_PS) >>
+			IEEE80211_HT_CAP_SM_PS_SHIFT;
 		/*
 		 * Assume that hostapd advertises our caps in the beacon and
 		 * this is the known_smps_mode for a station that just assciated
@@ -428,6 +452,7 @@ free_txq:
 	if (sta->sta.txq[0])
 		kfree(to_txq_info(sta->sta.txq[0]));
 free:
+	free_percpu(sta->pcpu_rx_stats);
 #ifdef CONFIG_MAC80211_MESH
 	kfree(sta->mesh);
 #endif
@@ -576,7 +601,7 @@ static int sta_info_insert_finish(struct sta_info *sta) __acquires(RCU)
  out_drop_sta:
 	local->num_sta--;
 	synchronize_net();
-	__cleanup_single_sta(sta);
+	cleanup_single_sta(sta);
  out_err:
 	mutex_unlock(&local->sta_mtx);
 	kfree(sinfo);
@@ -595,19 +620,13 @@ int sta_info_insert_rcu(struct sta_info *sta) __acquires(RCU)
 
 	err = sta_info_insert_check(sta);
 	if (err) {
+		sta_info_free(local, sta);
 		mutex_unlock(&local->sta_mtx);
 		rcu_read_lock();
-		goto out_free;
+		return err;
 	}
 
-	err = sta_info_insert_finish(sta);
-	if (err)
-		goto out_free;
-
-	return 0;
- out_free:
-	sta_info_free(local, sta);
-	return err;
+	return sta_info_insert_finish(sta);
 }
 
 int sta_info_insert(struct sta_info *sta)
@@ -688,7 +707,7 @@ static void __sta_info_recalc_tim(struct sta_info *sta, bool ignore_pending)
 	}
 
 	/* No need to do anything if the driver does all */
-	if (ieee80211_hw_check(&local->hw, AP_LINK_PS))
+	if (ieee80211_hw_check(&local->hw, AP_LINK_PS) && !local->ops->set_tim)
 		return;
 
 	if (sta->dead)
@@ -938,6 +957,11 @@ static void __sta_info_destroy_part2(struct sta_info *sta)
 
 	might_sleep();
 	lockdep_assert_held(&local->sta_mtx);
+
+	if (sta->sta_state == IEEE80211_STA_AUTHORIZED) {
+		ret = sta_info_move_state(sta, IEEE80211_STA_ASSOC);
+		WARN_ON_ONCE(ret);
+	}
 
 	/* now keys can no longer be reached */
 	ieee80211_free_sta_keys(local, sta);
@@ -1890,6 +1914,10 @@ int sta_info_move_state(struct sta_info *sta,
 			ieee80211_check_fast_xmit(sta);
 			ieee80211_check_fast_rx(sta);
 		}
+		if (sta->sdata->vif.type == NL80211_IFTYPE_AP_VLAN ||
+		    sta->sdata->vif.type == NL80211_IFTYPE_AP)
+			cfg80211_send_layer2_update(sta->sdata->dev,
+						    sta->sta.addr);
 		break;
 	default:
 		break;
@@ -2148,7 +2176,7 @@ void sta_set_sinfo(struct sta_info *sta, struct station_info *sinfo)
 			struct ieee80211_sta_rx_stats *cpurxs;
 
 			cpurxs = per_cpu_ptr(sta->pcpu_rx_stats, cpu);
-			sinfo->rx_packets += cpurxs->dropped;
+			sinfo->rx_dropped_misc += cpurxs->dropped;
 		}
 	}
 
@@ -2299,7 +2327,8 @@ unsigned long ieee80211_sta_last_active(struct sta_info *sta)
 {
 	struct ieee80211_sta_rx_stats *stats = sta_get_last_rx_stats(sta);
 
-	if (time_after(stats->last_rx, sta->status_stats.last_ack))
+	if (!sta->status_stats.last_ack ||
+	    time_after(stats->last_rx, sta->status_stats.last_ack))
 		return stats->last_rx;
 	return sta->status_stats.last_ack;
 }

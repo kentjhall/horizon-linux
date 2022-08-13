@@ -71,9 +71,12 @@ static void request_key_auth_describe(const struct key *key,
 {
 	struct request_key_auth *rka = key->payload.data[0];
 
+	if (!rka)
+		return;
+
 	seq_puts(m, "key:");
 	seq_puts(m, key->description);
-	if (key_is_instantiated(key))
+	if (key_is_positive(key))
 		seq_printf(m, " pid:%d ci:%zu", rka->pid, rka->callout_len);
 }
 
@@ -87,6 +90,9 @@ static long request_key_auth_read(const struct key *key,
 	struct request_key_auth *rka = key->payload.data[0];
 	size_t datalen;
 	long ret;
+
+	if (!rka)
+		return -EKEYREVOKED;
 
 	datalen = rka->callout_len;
 	ret = datalen;
@@ -254,7 +260,7 @@ struct key *key_get_instantiation_authkey(key_serial_t target_id)
 	struct key *authkey;
 	key_ref_t authkey_ref;
 
-	sprintf(description, "%x", target_id);
+	ctx.index_key.desc_len = sprintf(description, "%x", target_id);
 
 	authkey_ref = search_process_keyrings(&ctx);
 

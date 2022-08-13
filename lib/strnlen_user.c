@@ -27,7 +27,7 @@
 static inline long do_strnlen_user(const char __user *src, unsigned long count, unsigned long max)
 {
 	const struct word_at_a_time constants = WORD_AT_A_TIME_CONSTANTS;
-	long align, res = 0;
+	unsigned long align, res = 0;
 	unsigned long c;
 
 	/*
@@ -41,7 +41,7 @@ static inline long do_strnlen_user(const char __user *src, unsigned long count, 
 	 * Do everything aligned. But that means that we
 	 * need to also expand the maximum..
 	 */
-	align = (sizeof(long) - 1) & (unsigned long)src;
+	align = (sizeof(unsigned long) - 1) & (unsigned long)src;
 	src -= align;
 	max += align;
 
@@ -113,10 +113,11 @@ long strnlen_user(const char __user *str, long count)
 		unsigned long max = max_addr - src_addr;
 		long retval;
 
-		user_access_begin();
-		retval = do_strnlen_user(str, count, max);
-		user_access_end();
-		return retval;
+		if (user_access_begin(str, max)) {
+			retval = do_strnlen_user(str, count, max);
+			user_access_end();
+			return retval;
+		}
 	}
 	return 0;
 }
@@ -147,10 +148,11 @@ long strlen_user(const char __user *str)
 		unsigned long max = max_addr - src_addr;
 		long retval;
 
-		user_access_begin();
-		retval = do_strnlen_user(str, ~0ul, max);
-		user_access_end();
-		return retval;
+		if (user_access_begin(str, max)) {
+			retval = do_strnlen_user(str, ~0ul, max);
+			user_access_end();
+			return retval;
+		}
 	}
 	return 0;
 }

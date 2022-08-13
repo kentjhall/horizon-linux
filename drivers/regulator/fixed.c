@@ -211,13 +211,43 @@ static int __init regulator_fixed_voltage_init(void)
 {
 	return platform_driver_register(&regulator_fixed_voltage_driver);
 }
-subsys_initcall(regulator_fixed_voltage_init);
+arch_initcall(regulator_fixed_voltage_init);
 
 static void __exit regulator_fixed_voltage_exit(void)
 {
 	platform_driver_unregister(&regulator_fixed_voltage_driver);
 }
 module_exit(regulator_fixed_voltage_exit);
+
+
+#if defined(CONFIG_OF)
+static const struct of_device_id fixed_sync_of_match[] = {
+	{ .compatible = "regulator-fixed-sync", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, fixed_sync_of_match);
+#endif
+
+static struct platform_driver regulator_fixed_sync_voltage_driver = {
+	.probe		= reg_fixed_voltage_probe,
+	.driver		= {
+		.name		= "reg-fixed-sync-voltage",
+		.owner		= THIS_MODULE,
+		.of_match_table = of_match_ptr(fixed_sync_of_match),
+	},
+};
+
+static int __init regulator_fixed_sync_voltage_init(void)
+{
+	return platform_driver_register(&regulator_fixed_sync_voltage_driver);
+}
+subsys_initcall_sync(regulator_fixed_sync_voltage_init);
+
+static void __exit regulator_fixed_sync_voltage_exit(void)
+{
+	platform_driver_unregister(&regulator_fixed_sync_voltage_driver);
+}
+module_exit(regulator_fixed_sync_voltage_exit);
 
 MODULE_AUTHOR("Mark Brown <broonie@opensource.wolfsonmicro.com>");
 MODULE_DESCRIPTION("Fixed voltage regulator");

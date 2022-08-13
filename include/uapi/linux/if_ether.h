@@ -29,6 +29,7 @@
  */
 
 #define ETH_ALEN	6		/* Octets in one ethernet addr	 */
+#define ETH_TLEN	2		/* Octets in ethernet type field */
 #define ETH_HLEN	14		/* Total octets in header.	 */
 #define ETH_ZLEN	60		/* Min. octets in frame sans FCS */
 #define ETH_DATA_LEN	1500		/* Max. octets in payload	 */
@@ -138,11 +139,18 @@
  *	This is an Ethernet frame header.
  */
 
+/* allow libcs like musl to deactivate this, glibc does not implement this. */
+#ifndef __UAPI_DEF_ETHHDR
+#define __UAPI_DEF_ETHHDR		1
+#endif
+
+#if __UAPI_DEF_ETHHDR
 struct ethhdr {
 	unsigned char	h_dest[ETH_ALEN];	/* destination eth addr	*/
 	unsigned char	h_source[ETH_ALEN];	/* source ether addr	*/
 	__be16		h_proto;		/* packet type ID field	*/
 } __attribute__((packed));
+#endif
 
 
 #endif /* _UAPI_LINUX_IF_ETHER_H */

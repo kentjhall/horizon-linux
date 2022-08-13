@@ -223,8 +223,20 @@ EXPORT_SYMBOL(dibusb_i2c_algo);
 
 int dibusb_read_eeprom_byte(struct dvb_usb_device *d, u8 offs, u8 *val)
 {
-	u8 wbuf[1] = { offs };
-	return dibusb_i2c_msg(d, 0x50, wbuf, 1, val, 1);
+	u8 *buf;
+	int rc;
+
+	buf = kmalloc(2, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	buf[0] = offs;
+
+	rc = dibusb_i2c_msg(d, 0x50, &buf[0], 1, &buf[1], 1);
+	*val = buf[1];
+	kfree(buf);
+
+	return rc;
 }
 EXPORT_SYMBOL(dibusb_read_eeprom_byte);
 
@@ -382,9 +394,9 @@ int dibusb_rc_query(struct dvb_usb_device *d, u32 *event, int *state)
 	if (buf[0] != 0)
 		deb_info("key: %*ph\n", 5, buf);
 
+ret:
 	kfree(buf);
 
-ret:
 	return ret;
 }
 EXPORT_SYMBOL(dibusb_rc_query);

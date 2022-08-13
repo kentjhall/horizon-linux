@@ -64,7 +64,7 @@ struct tty_buffer {
 	int read;
 	int flags;
 	/* Data points here */
-	unsigned long data[0];
+	unsigned long data[];
 };
 
 /* Values for .flags field of tty_buffer */
@@ -90,6 +90,7 @@ struct tty_bufhead {
 	atomic_t	   mem_used;    /* In-use buffers excluding free list */
 	int		   mem_limit;
 	struct tty_buffer *tail;	/* Active buffer */
+	atomic_t	  current_data_count;
 };
 /*
  * When a break, frame error, or parity error happens, these codes are
@@ -241,6 +242,7 @@ struct tty_port {
 						   based drain is needed else
 						   set to size of fifo */
 	struct kref		kref;		/* Ref counter */
+	struct task_struct	*tty_kthread;	/* RT thread to flush data */
 };
 
 /* tty_port::iflags bits -- use atomic bit ops */
@@ -293,6 +295,10 @@ struct tty_struct {
 	struct termiox *termiox;	/* May be NULL for unsupported */
 	char name[64];
 	struct pid *pgrp;		/* Protected by ctrl lock */
+	/*
+	 * Writes protected by both ctrl lock and legacy mutex, readers must use
+	 * at least one of them.
+	 */
 	struct pid *session;
 	unsigned long flags;
 	int count;
@@ -355,6 +361,8 @@ struct tty_file_private {
 #define TTY_PTY_LOCK 		16	/* pty private */
 #define TTY_NO_WRITE_SPLIT 	17	/* Preserve write boundaries to driver */
 #define TTY_HUPPED 		18	/* Post driver->hangup() */
+#define TTY_HUPPING		19	/* Hangup in progress */
+#define TTY_LDISC_CHANGING	20	/* Change pending - non-block IO */
 #define TTY_LDISC_HALTED	22	/* Line discipline is halted */
 
 /* Values for tty->flow_change */
@@ -370,6 +378,12 @@ static inline void tty_set_flow_change(struct tty_struct *tty, int val)
 {
 	tty->flow_change = val;
 	smp_mb();
+}
+
+static inline bool tty_io_nonblock(struct tty_struct *tty, struct file *file)
+{
+	return file->f_flags & O_NONBLOCK ||
+		test_bit(TTY_LDISC_CHANGING, &tty->flags);
 }
 
 static inline bool tty_io_error(struct tty_struct *tty)
@@ -394,6 +408,8 @@ extern struct tty_struct *get_current_tty(void);
 /* tty_io.c */
 extern int __init tty_init(void);
 extern const char *tty_name(const struct tty_struct *tty);
+extern int tty_ldisc_lock(struct tty_struct *tty, unsigned long timeout);
+extern void tty_ldisc_unlock(struct tty_struct *tty);
 #else
 static inline void console_init(void)
 { }
@@ -654,7 +670,7 @@ extern int tty_unregister_ldisc(int disc);
 extern int tty_set_ldisc(struct tty_struct *tty, int disc);
 extern int tty_ldisc_setup(struct tty_struct *tty, struct tty_struct *o_tty);
 extern void tty_ldisc_release(struct tty_struct *tty);
-extern void tty_ldisc_init(struct tty_struct *tty);
+extern int __must_check tty_ldisc_init(struct tty_struct *tty);
 extern void tty_ldisc_deinit(struct tty_struct *tty);
 extern int tty_ldisc_receive_buf(struct tty_ldisc *ld, unsigned char *p,
 				 char *f, int count);
@@ -735,3 +751,6 @@ static inline void proc_tty_unregister_driver(struct tty_driver *d) {}
 		tty_msg(pr_info_ratelimited, tty, f, ##__VA_ARGS__)
 
 #endif
+
+extern int tty_buffer_start_rt_thread(struct tty_port *port, int id);
+extern void tty_buffer_stop_rt_thread(struct tty_port *port);

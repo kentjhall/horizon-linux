@@ -143,6 +143,16 @@ static inline int gpio_direction_output(unsigned gpio, int value)
 	return -ENOSYS;
 }
 
+static inline int gpio_timestamp_control(unsigned gpio, int enable)
+{
+	return -ENOSYS;
+}
+
+static inline int gpio_timestamp_read(unsigned gpio, u64 *ts)
+{
+	return -ENOSYS;
+}
+
 static inline int gpio_set_debounce(unsigned gpio, unsigned debounce)
 {
 	return -ENOSYS;
@@ -227,30 +237,6 @@ static inline int irq_to_gpio(unsigned irq)
 	/* irq can never have been returned from gpio_to_irq() */
 	WARN_ON(1);
 	return -EINVAL;
-}
-
-static inline int
-gpiochip_add_pin_range(struct gpio_chip *chip, const char *pinctl_name,
-		       unsigned int gpio_offset, unsigned int pin_offset,
-		       unsigned int npins)
-{
-	WARN_ON(1);
-	return -EINVAL;
-}
-
-static inline int
-gpiochip_add_pingroup_range(struct gpio_chip *chip,
-			struct pinctrl_dev *pctldev,
-			unsigned int gpio_offset, const char *pin_group)
-{
-	WARN_ON(1);
-	return -EINVAL;
-}
-
-static inline void
-gpiochip_remove_pin_ranges(struct gpio_chip *chip)
-{
-	WARN_ON(1);
 }
 
 static inline int devm_gpio_request(struct device *dev, unsigned gpio,

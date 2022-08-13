@@ -317,12 +317,12 @@ int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
 
 	if (v != MBOX_OWNER_DRV) {
 		ret = (v == MBOX_OWNER_FW) ? -EBUSY : -ETIMEDOUT;
-		t4_record_mbox(adap, cmd, MBOX_LEN, access, ret);
+		t4_record_mbox(adap, cmd, size, access, ret);
 		return ret;
 	}
 
 	/* Copy in the new mailbox command and send it on its way ... */
-	t4_record_mbox(adap, cmd, MBOX_LEN, access, 0);
+	t4_record_mbox(adap, cmd, size, access, 0);
 	for (i = 0; i < size; i += 8)
 		t4_write_reg64(adap, data_reg + i, be64_to_cpu(*p++));
 
@@ -371,7 +371,7 @@ int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
 	}
 
 	ret = (pcie_fw & PCIE_FW_ERR_F) ? -ENXIO : -ETIMEDOUT;
-	t4_record_mbox(adap, cmd, MBOX_LEN, access, ret);
+	t4_record_mbox(adap, cmd, size, access, ret);
 	dev_err(adap->pdev_dev, "command %#x in mailbox %d timed out\n",
 		*(const u8 *)cmd, mbox);
 	t4_report_fw_error(adap);
@@ -2596,7 +2596,6 @@ void t4_get_regs(struct adapter *adap, void *buf, size_t buf_size)
 }
 
 #define EEPROM_STAT_ADDR   0x7bfc
-#define VPD_SIZE           0x800
 #define VPD_BASE           0x400
 #define VPD_BASE_OLD       0
 #define VPD_LEN            1024
@@ -2633,15 +2632,6 @@ int t4_get_raw_vpd_params(struct adapter *adapter, struct vpd_params *p)
 	vpd = vmalloc(VPD_LEN);
 	if (!vpd)
 		return -ENOMEM;
-
-	/* We have two VPD data structures stored in the adapter VPD area.
-	 * By default, Linux calculates the size of the VPD area by traversing
-	 * the first VPD area at offset 0x0, so we need to tell the OS what
-	 * our real VPD size is.
-	 */
-	ret = pci_set_vpd_size(adapter->pdev, VPD_SIZE);
-	if (ret < 0)
-		goto out;
 
 	/* Card information normally starts at VPD_BASE but early cards had
 	 * it at 0.
@@ -3162,7 +3152,7 @@ int t4_prep_fw(struct adapter *adap, struct fw_info *fw_info,
 	drv_fw = &fw_info->fw_hdr;
 
 	/* Read the header of the firmware on the card */
-	ret = -t4_read_flash(adap, FLASH_FW_START,
+	ret = t4_read_flash(adap, FLASH_FW_START,
 			    sizeof(*card_fw) / sizeof(uint32_t),
 			    (uint32_t *)card_fw, 1);
 	if (ret == 0) {
@@ -3191,8 +3181,8 @@ int t4_prep_fw(struct adapter *adap, struct fw_info *fw_info,
 		   should_install_fs_fw(adap, card_fw_usable,
 					be32_to_cpu(fs_fw->fw_ver),
 					be32_to_cpu(card_fw->fw_ver))) {
-		ret = -t4_fw_upgrade(adap, adap->mbox, fw_data,
-				     fw_size, 0);
+		ret = t4_fw_upgrade(adap, adap->mbox, fw_data,
+				    fw_size, 0);
 		if (ret != 0) {
 			dev_err(adap->pdev_dev,
 				"failed to install firmware: %d\n", ret);
@@ -3223,7 +3213,7 @@ int t4_prep_fw(struct adapter *adap, struct fw_info *fw_info,
 			FW_HDR_FW_VER_MICRO_G(c), FW_HDR_FW_VER_BUILD_G(c),
 			FW_HDR_FW_VER_MAJOR_G(k), FW_HDR_FW_VER_MINOR_G(k),
 			FW_HDR_FW_VER_MICRO_G(k), FW_HDR_FW_VER_BUILD_G(k));
-		ret = EINVAL;
+		ret = -EINVAL;
 		goto bye;
 	}
 
@@ -3410,7 +3400,7 @@ int t4_phy_fw_ver(struct adapter *adap, int *phy_fw_ver)
 		 FW_PARAMS_PARAM_Z_V(FW_PARAMS_PARAM_DEV_PHYFW_VERSION));
 	ret = t4_query_params(adap, adap->mbox, adap->pf, 0, 1,
 			      &param, &val);
-	if (ret < 0)
+	if (ret)
 		return ret;
 	*phy_fw_ver = val;
 	return 0;
@@ -3551,7 +3541,7 @@ int t4_fwcache(struct adapter *adap, enum fw_params_param_dev_fwcache op)
 	c.param[0].mnem =
 		cpu_to_be32(FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DEV) |
 			    FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DEV_FWCACHE));
-	c.param[0].val = (__force __be32)op;
+	c.param[0].val = cpu_to_be32(op);
 
 	return t4_wr_mbox(adap, adap->mbox, &c, sizeof(c), NULL);
 }
@@ -6195,13 +6185,18 @@ int t4_fw_upgrade(struct adapter *adap, unsigned int mbox,
 	if (!t4_fw_matches_chip(adap, fw_hdr))
 		return -EINVAL;
 
+	/* Disable FW_OK flag so that mbox commands with FW_OK flag set
+	 * wont be sent when we are flashing FW.
+	 */
+	adap->flags &= ~FW_OK;
+
 	ret = t4_fw_halt(adap, mbox, force);
 	if (ret < 0 && !force)
-		return ret;
+		goto out;
 
 	ret = t4_load_fw(adap, fw_data, size);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	/*
 	 * Older versions of the firmware don't understand the new
@@ -6212,7 +6207,17 @@ int t4_fw_upgrade(struct adapter *adap, unsigned int mbox,
 	 * its header flags to see if it advertises the capability.
 	 */
 	reset = ((be32_to_cpu(fw_hdr->flags) & FW_HDR_FLAGS_RESET_HALT) == 0);
-	return t4_fw_restart(adap, mbox, reset);
+	ret = t4_fw_restart(adap, mbox, reset);
+
+	/* Grab potentially new Firmware Device Log parameters so we can see
+	 * how healthy the new Firmware is.  It's okay to contact the new
+	 * Firmware for these parameters even though, as far as it's
+	 * concerned, we've never said "HELLO" to it ...
+	 */
+	(void)t4_init_devlog_params(adap);
+out:
+	adap->flags |= FW_OK;
+	return ret;
 }
 
 /**
@@ -8083,7 +8088,16 @@ int t4_cim_read_la(struct adapter *adap, u32 *la_buf, unsigned int *wrptr)
 		ret = t4_cim_read(adap, UP_UP_DBG_LA_DATA_A, 1, &la_buf[i]);
 		if (ret)
 			break;
-		idx = (idx + 1) & UPDBGLARDPTR_M;
+
+		/* Bits 0-3 of UpDbgLaRdPtr can be between 0000 to 1001 to
+		 * identify the 32-bit portion of the full 312-bit data
+		 */
+		if (is_t6(adap->params.chip) && (idx & 0xf) >= 9)
+			idx = (idx & 0xff0) + 0x10;
+		else
+			idx++;
+		/* address can't exceed 0xfff */
+		idx &= UPDBGLARDPTR_M;
 	}
 restart:
 	if (cfg & UPDBGLAEN_F) {

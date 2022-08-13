@@ -4,6 +4,7 @@
  * Copyright (C) 2005 Phil Chang <pchang23@sbcglobal.net>
  * Copyright (C) 2006 James Painter <jamie.painter@iname.com>
  * Copyright (c) 2002-2003 TiVo Inc.
+ * Copyright (c) 2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -237,7 +238,7 @@ static void asix_phy_reset(struct usbnet *dev, unsigned int reset_bits)
 static int ax88172_bind(struct usbnet *dev, struct usb_interface *intf)
 {
 	int ret = 0;
-	u8 buf[ETH_ALEN];
+	u8 buf[ETH_ALEN] = {0};
 	int i;
 	unsigned long gpio_bits = dev->driver_info->data;
 
@@ -284,6 +285,12 @@ static int ax88172_bind(struct usbnet *dev, struct usb_interface *intf)
 	asix_mdio_write(dev->net, dev->mii.phy_id, MII_ADVERTISE,
 		ADVERTISE_ALL | ADVERTISE_CSMA | ADVERTISE_PAUSE_CAP);
 	mii_nway_restart(&dev->mii);
+
+	dev->driver_priv = kzalloc(
+		sizeof(*(struct asix_common_private *)dev->driver_priv),
+		GFP_KERNEL);
+	if (!dev->driver_priv)
+		return -ENOMEM;
 
 	return 0;
 
@@ -624,7 +631,7 @@ static int asix_suspend(struct usb_interface *intf, pm_message_t message)
 	struct usbnet *dev = usb_get_intfdata(intf);
 	struct asix_common_private *priv = dev->driver_priv;
 
-	if (priv->suspend)
+	if (priv && priv->suspend)
 		priv->suspend(dev);
 
 	return usbnet_suspend(intf, message);
@@ -639,11 +646,16 @@ static void ax88772_restore_phy(struct usbnet *dev)
 		asix_mdio_write_nopm(dev->net, dev->mii.phy_id, MII_ADVERTISE,
 				     priv->presvd_phy_advertise);
 
+		if (priv->presvd_phy_bmcr & BMCR_ANENABLE)
+			priv->presvd_phy_bmcr |= BMCR_ANRESTART;
+
 		/* Restore BMCR */
+		if (priv->presvd_phy_bmcr & BMCR_ANENABLE)
+			priv->presvd_phy_bmcr |= BMCR_ANRESTART;
+
 		asix_mdio_write_nopm(dev->net, dev->mii.phy_id, MII_BMCR,
 				     priv->presvd_phy_bmcr);
 
-		mii_nway_restart(&dev->mii);
 		priv->presvd_phy_advertise = 0;
 		priv->presvd_phy_bmcr = 0;
 	}
@@ -676,7 +688,7 @@ static int asix_resume(struct usb_interface *intf)
 	struct usbnet *dev = usb_get_intfdata(intf);
 	struct asix_common_private *priv = dev->driver_priv;
 
-	if (priv->resume)
+	if (priv && priv->resume)
 		priv->resume(dev);
 
 	return usbnet_resume(intf);
@@ -685,7 +697,7 @@ static int asix_resume(struct usb_interface *intf)
 static int ax88772_bind(struct usbnet *dev, struct usb_interface *intf)
 {
 	int ret, i;
-	u8 buf[ETH_ALEN], chipcode = 0;
+	u8 buf[ETH_ALEN] = {0}, chipcode = 0;
 	u32 phyid;
 	struct asix_common_private *priv;
 
@@ -727,8 +739,13 @@ static int ax88772_bind(struct usbnet *dev, struct usb_interface *intf)
 	asix_read_cmd(dev, AX_CMD_STATMNGSTS_REG, 0, 0, 1, &chipcode, 0);
 	chipcode &= AX_CHIPCODE_MASK;
 
-	(chipcode == AX_AX88772_CHIPCODE) ? ax88772_hw_reset(dev, 0) :
-					    ax88772a_hw_reset(dev, 0);
+	ret = (chipcode == AX_AX88772_CHIPCODE) ? ax88772_hw_reset(dev, 0) :
+						  ax88772a_hw_reset(dev, 0);
+
+	if (ret < 0) {
+		netdev_dbg(dev->net, "Failed to reset AX88772: %d\n", ret);
+		return ret;
+	}
 
 	/* Read PHYID register *AFTER* the PHY was reset properly */
 	phyid = asix_get_phyid(dev);
@@ -1057,7 +1074,7 @@ static const struct net_device_ops ax88178_netdev_ops = {
 static int ax88178_bind(struct usbnet *dev, struct usb_interface *intf)
 {
 	int ret;
-	u8 buf[ETH_ALEN];
+	u8 buf[ETH_ALEN] = {0};
 
 	usbnet_get_endpoints(dev,intf);
 
@@ -1369,6 +1386,7 @@ static struct usb_driver asix_driver = {
 	.probe =	usbnet_probe,
 	.suspend =	asix_suspend,
 	.resume =	asix_resume,
+	.reset_resume =	asix_resume,
 	.disconnect =	usbnet_disconnect,
 	.supports_autosuspend = 1,
 	.disable_hub_initiated_lpm = 1,

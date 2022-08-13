@@ -1269,7 +1269,7 @@ static void set_td_timer(struct r8a66597 *r8a66597, struct r8a66597_td *td)
 			time = 30;
 			break;
 		default:
-			time = 300;
+			time = 50;
 			break;
 		}
 
@@ -1785,6 +1785,7 @@ static void r8a66597_td_timer(unsigned long _r8a66597)
 		pipe = td->pipe;
 		pipe_stop(r8a66597, pipe);
 
+		/* Select a different address or endpoint */
 		new_td = td;
 		do {
 			list_move_tail(&new_td->queue,
@@ -1794,7 +1795,8 @@ static void r8a66597_td_timer(unsigned long _r8a66597)
 				new_td = td;
 				break;
 			}
-		} while (td != new_td && td->address == new_td->address);
+		} while (td != new_td && td->address == new_td->address &&
+			td->pipe->info.epnum == new_td->pipe->info.epnum);
 
 		start_transfer(r8a66597, new_td);
 
@@ -1988,6 +1990,8 @@ static int r8a66597_urb_dequeue(struct usb_hcd *hcd, struct urb *urb,
 
 static void r8a66597_endpoint_disable(struct usb_hcd *hcd,
 				      struct usb_host_endpoint *hep)
+__acquires(r8a66597->lock)
+__releases(r8a66597->lock)
 {
 	struct r8a66597 *r8a66597 = hcd_to_r8a66597(hcd);
 	struct r8a66597_pipe *pipe = (struct r8a66597_pipe *)hep->hcpriv;
@@ -2000,13 +2004,14 @@ static void r8a66597_endpoint_disable(struct usb_hcd *hcd,
 		return;
 	pipenum = pipe->info.pipenum;
 
+	spin_lock_irqsave(&r8a66597->lock, flags);
 	if (pipenum == 0) {
 		kfree(hep->hcpriv);
 		hep->hcpriv = NULL;
+		spin_unlock_irqrestore(&r8a66597->lock, flags);
 		return;
 	}
 
-	spin_lock_irqsave(&r8a66597->lock, flags);
 	pipe_stop(r8a66597, pipe);
 	pipe_irq_disable(r8a66597, pipenum);
 	disable_irq_empty(r8a66597, pipenum);

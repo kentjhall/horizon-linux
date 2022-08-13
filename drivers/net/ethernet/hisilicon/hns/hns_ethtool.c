@@ -243,7 +243,9 @@ static int hns_nic_set_link_ksettings(struct net_device *net_dev,
 	}
 
 	if (h->dev->ops->adjust_link) {
+		netif_carrier_off(net_dev);
 		h->dev->ops->adjust_link(h, (int)speed, cmd->base.duplex);
+		netif_carrier_on(net_dev);
 		return 0;
 	}
 
@@ -365,6 +367,7 @@ static int __lb_setup(struct net_device *ndev,
 static int __lb_up(struct net_device *ndev,
 		   enum hnae_loop loop_mode)
 {
+#define NIC_LB_TEST_WAIT_PHY_LINK_TIME 300
 	struct hns_nic_priv *priv = netdev_priv(ndev);
 	struct hnae_handle *h = priv->ae_handle;
 	int speed, duplex;
@@ -390,6 +393,9 @@ static int __lb_up(struct net_device *ndev,
 	duplex = 1;
 
 	h->dev->ops->adjust_link(h, speed, duplex);
+
+	/* wait adjust link done and phy ready */
+	msleep(NIC_LB_TEST_WAIT_PHY_LINK_TIME);
 
 	return 0;
 }
@@ -441,6 +447,10 @@ static void __lb_other_process(struct hns_nic_ring_data *ring_data,
 	/* for mutl buffer*/
 	new_skb = skb_copy(skb, GFP_ATOMIC);
 	dev_kfree_skb_any(skb);
+	if (!new_skb) {
+		netdev_err(ndev, "skb alloc failed\n");
+		return;
+	}
 	skb = new_skb;
 
 	check_ok = 0;
@@ -1017,8 +1027,10 @@ int hns_get_sset_count(struct net_device *netdev, int stringset)
 			cnt--;
 
 		return cnt;
-	} else {
+	} else if (stringset == ETH_SS_STATS) {
 		return (HNS_NET_STATS_CNT + ops->get_sset_count(h, stringset));
+	} else {
+		return -EOPNOTSUPP;
 	}
 }
 
@@ -1252,12 +1264,10 @@ hns_set_rss(struct net_device *netdev, const u32 *indir, const u8 *key,
 
 	ops = priv->ae_handle->dev->ops;
 
-	/* currently hfunc can only be Toeplitz hash */
-	if (key ||
-	    (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP))
+	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP) {
+		netdev_err(netdev, "Invalid hfunc!\n");
 		return -EOPNOTSUPP;
-	if (!indir)
-		return 0;
+	}
 
 	return ops->set_rss(priv->ae_handle, indir, key, hfunc);
 }

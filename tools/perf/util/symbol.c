@@ -58,6 +58,7 @@ static enum dso_binary_type binary_type_symtab[] = {
 	DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE,
 	DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE_COMP,
 	DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO,
+	DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO,
 	DSO_BINARY_TYPE__NOT_FOUND,
 };
 
@@ -202,7 +203,7 @@ void symbols__fixup_end(struct rb_root *symbols)
 
 	/* Last entry */
 	if (curr->end == curr->start)
-		curr->end = roundup(curr->start, 4096);
+		curr->end = roundup(curr->start, 4096) + 4096;
 }
 
 void __map_groups__fixup_end(struct map_groups *mg, enum map_type type)
@@ -217,7 +218,8 @@ void __map_groups__fixup_end(struct map_groups *mg, enum map_type type)
 		goto out_unlock;
 
 	for (next = map__next(curr); next; next = map__next(curr)) {
-		curr->end = next->start;
+		if (!curr->end)
+			curr->end = next->start;
 		curr = next;
 	}
 
@@ -225,7 +227,8 @@ void __map_groups__fixup_end(struct map_groups *mg, enum map_type type)
 	 * We still haven't the actual symbols, so guess the
 	 * last map final address.
 	 */
-	curr->end = ~0ULL;
+	if (!curr->end)
+		curr->end = ~0ULL;
 
 out_unlock:
 	pthread_rwlock_unlock(&maps->lock);
@@ -512,7 +515,7 @@ void dso__sort_by_name(struct dso *dso, enum map_type type)
 
 int modules__parse(const char *filename, void *arg,
 		   int (*process_module)(void *arg, const char *name,
-					 u64 start))
+					 u64 start, u64 size))
 {
 	char *line = NULL;
 	size_t n;
@@ -525,8 +528,8 @@ int modules__parse(const char *filename, void *arg,
 
 	while (1) {
 		char name[PATH_MAX];
-		u64 start;
-		char *sep;
+		u64 start, size;
+		char *sep, *endptr;
 		ssize_t line_len;
 
 		line_len = getline(&line, &n, file);
@@ -558,7 +561,11 @@ int modules__parse(const char *filename, void *arg,
 
 		scnprintf(name, sizeof(name), "[%s]", line);
 
-		err = process_module(arg, name, start);
+		size = strtoul(sep + 1, &endptr, 0);
+		if (*endptr != ' ' && *endptr != '\t')
+			continue;
+
+		err = process_module(arg, name, start, size);
 		if (err)
 			break;
 	}
@@ -905,7 +912,8 @@ static struct module_info *find_module(const char *name,
 	return NULL;
 }
 
-static int __read_proc_modules(void *arg, const char *name, u64 start)
+static int __read_proc_modules(void *arg, const char *name, u64 start,
+			       u64 size __maybe_unused)
 {
 	struct rb_root *modules = arg;
 	struct module_info *mi;
@@ -1354,6 +1362,7 @@ static bool dso__is_compatible_symtab_type(struct dso *dso, bool kmod,
 	case DSO_BINARY_TYPE__SYSTEM_PATH_DSO:
 	case DSO_BINARY_TYPE__FEDORA_DEBUGINFO:
 	case DSO_BINARY_TYPE__UBUNTU_DEBUGINFO:
+	case DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO:
 	case DSO_BINARY_TYPE__BUILDID_DEBUGINFO:
 	case DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO:
 		return !kmod && dso->kernel == DSO_TYPE_USER;
@@ -1459,7 +1468,8 @@ int dso__load(struct dso *dso, struct map *map)
 	 * Read the build id if possible. This is required for
 	 * DSO_BINARY_TYPE__BUILDID_DEBUGINFO to work
 	 */
-	if (is_regular_file(dso->long_name) &&
+	if (!dso->has_build_id &&
+	    is_regular_file(dso->long_name) &&
 	    filename__read_build_id(dso->long_name, build_id, BUILD_ID_SIZE) > 0)
 		dso__set_build_id(dso, build_id);
 

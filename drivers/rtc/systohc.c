@@ -2,6 +2,7 @@
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 as published by
  * the Free Software Foundation.
+ * Copyright (C) 2016 NVIDIA CORPORATION. All rights reserved.
  *
  */
 #include <linux/rtc.h>
@@ -39,6 +40,15 @@ int rtc_set_ntp_time(struct timespec64 now)
 		    (rtc->ops->set_time ||
 		     rtc->ops->set_mmss64 ||
 		     rtc->ops->set_mmss))
+			err = rtc_set_time(rtc, &tm);
+		rtc_class_close(rtc);
+	}
+	rtc = rtc_class_open(CONFIG_RTC_BACKUP_HCTOSYS_DEVICE);
+	if (rtc) {
+		/* rtc_hctosys exclusively uses UTC, so we call set_time here,
+		 * not set_mmss.
+		 */
+		if (rtc->ops && (rtc->ops->set_time || rtc->ops->set_mmss))
 			err = rtc_set_time(rtc, &tm);
 		rtc_class_close(rtc);
 	}

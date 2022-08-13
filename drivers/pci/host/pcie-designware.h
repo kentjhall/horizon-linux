@@ -46,11 +46,13 @@ struct pcie_port {
 	u32			lanes;
 	u32			num_viewport;
 	struct pcie_host_ops	*ops;
+	struct pci_bus		*bus;
 	int			msi_irq;
 	struct irq_domain	*irq_domain;
 	unsigned long		msi_data;
 	u8			iatu_unroll_enabled;
 	DECLARE_BITMAP(msi_irq_in_use, MAX_MSI_IRQS);
+	raw_spinlock_t		lock;
 };
 
 struct pcie_host_ops {
@@ -64,12 +66,15 @@ struct pcie_host_ops {
 			unsigned int devfn, int where, int size, u32 val);
 	int (*link_up)(struct pcie_port *pp);
 	void (*host_init)(struct pcie_port *pp);
+	void (*host_deinit)(struct pcie_port *pp);
 	void (*msi_set_irq)(struct pcie_port *pp, int irq);
 	void (*msi_clear_irq)(struct pcie_port *pp, int irq);
 	phys_addr_t (*get_msi_addr)(struct pcie_port *pp);
 	u32 (*get_msi_data)(struct pcie_port *pp, int pos);
 	void (*scan_bus)(struct pcie_port *pp);
 	int (*msi_host_init)(struct pcie_port *pp, struct msi_controller *chip);
+	int (*msi_host_deinit)(struct pcie_port *pp,
+			       struct msi_controller *chip);
 };
 
 u32 dw_pcie_readl_rc(struct pcie_port *pp, u32 reg);
@@ -82,5 +87,6 @@ int dw_pcie_wait_for_link(struct pcie_port *pp);
 int dw_pcie_link_up(struct pcie_port *pp);
 void dw_pcie_setup_rc(struct pcie_port *pp);
 int dw_pcie_host_init(struct pcie_port *pp);
+void dw_pcie_host_deinit(struct pcie_port *pp);
 
 #endif /* _PCIE_DESIGNWARE_H */

@@ -174,6 +174,7 @@ void dwc3_gadget_giveback(struct dwc3_ep *dep, struct dwc3_request *req,
 		int status)
 {
 	struct dwc3			*dwc = dep->dwc;
+	unsigned int			unmap_after_complete = false;
 
 	req->started = false;
 	list_del(&req->list);
@@ -182,17 +183,29 @@ void dwc3_gadget_giveback(struct dwc3_ep *dep, struct dwc3_request *req,
 	if (req->request.status == -EINPROGRESS)
 		req->request.status = status;
 
-	if (dwc->ep0_bounced && dep->number == 0)
+	/*
+	 * NOTICE we don't want to unmap before calling ->complete() if we're
+	 * dealing with a bounced ep0 request. If we unmap it here, we would end
+	 * up overwritting the contents of req->buf and this could confuse the
+	 * gadget driver.
+	 */
+	if (dwc->ep0_bounced && dep->number <= 1) {
 		dwc->ep0_bounced = false;
-	else
-		usb_gadget_unmap_request(&dwc->gadget, &req->request,
-				req->direction);
+		unmap_after_complete = true;
+	} else {
+		usb_gadget_unmap_request(&dwc->gadget,
+				&req->request, req->direction);
+	}
 
 	trace_dwc3_gadget_giveback(req);
 
 	spin_unlock(&dwc->lock);
 	usb_gadget_giveback_request(&dep->endpoint, &req->request);
 	spin_lock(&dwc->lock);
+
+	if (unmap_after_complete)
+		usb_gadget_unmap_request(&dwc->gadget,
+				&req->request, req->direction);
 
 	if (dep->number > 1)
 		pm_runtime_put(dwc->dev);
@@ -234,7 +247,7 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned cmd,
 		struct dwc3_gadget_ep_cmd_params *params)
 {
 	struct dwc3		*dwc = dep->dwc;
-	u32			timeout = 500;
+	u32			timeout = 1000;
 	u32			reg;
 
 	int			cmd_status = 0;
@@ -771,6 +784,9 @@ static void dwc3_prepare_one_trb(struct dwc3_ep *dep,
 		unsigned length, unsigned chain, unsigned node)
 {
 	struct dwc3_trb		*trb;
+	struct dwc3		*dwc = dep->dwc;
+	struct usb_gadget	*gadget = &dwc->gadget;
+	enum usb_device_speed	speed = gadget->speed;
 
 	dwc3_trace(trace_dwc3_gadget, "%s: req %p dma %08llx length %d%s",
 			dep->name, req, (unsigned long long) dma,
@@ -798,10 +814,49 @@ static void dwc3_prepare_one_trb(struct dwc3_ep *dep,
 		break;
 
 	case USB_ENDPOINT_XFER_ISOC:
-		if (!node)
+		if (!node) {
 			trb->ctrl = DWC3_TRBCTL_ISOCHRONOUS_FIRST;
-		else
+
+			/*
+			 * USB Specification 2.0 Section 5.9.2 states that: "If
+			 * there is only a single transaction in the microframe,
+			 * only a DATA0 data packet PID is used.  If there are
+			 * two transactions per microframe, DATA1 is used for
+			 * the first transaction data packet and DATA0 is used
+			 * for the second transaction data packet.  If there are
+			 * three transactions per microframe, DATA2 is used for
+			 * the first transaction data packet, DATA1 is used for
+			 * the second, and DATA0 is used for the third."
+			 *
+			 * IOW, we should satisfy the following cases:
+			 *
+			 * 1) length <= maxpacket
+			 *	- DATA0
+			 *
+			 * 2) maxpacket < length <= (2 * maxpacket)
+			 *	- DATA1, DATA0
+			 *
+			 * 3) (2 * maxpacket) < length <= (3 * maxpacket)
+			 *	- DATA2, DATA1, DATA0
+			 */
+			if (speed == USB_SPEED_HIGH) {
+				struct usb_ep *ep = &dep->endpoint;
+				unsigned int mult = ep->mult - 1;
+				unsigned int maxp;
+
+				maxp = usb_endpoint_maxp(ep->desc) & 0x07ff;
+
+				if (length <= (2 * maxp))
+					mult--;
+
+				if (length <= maxp)
+					mult--;
+
+				trb->size |= DWC3_TRB_SIZE_PCM1(mult);
+			}
+		} else {
 			trb->ctrl = DWC3_TRBCTL_ISOCHRONOUS;
+		}
 
 		/* always enable Interrupt on Missed ISOC */
 		trb->ctrl |= DWC3_TRB_CTRL_ISP_IMI;
@@ -1047,9 +1102,9 @@ static int __dwc3_gadget_ep_queue(struct dwc3_ep *dep, struct dwc3_request *req)
 		return -ESHUTDOWN;
 	}
 
-	if (WARN(req->dep != dep, "request %p belongs to '%s'\n",
+	if (WARN(req->dep != dep, "request %pK belongs to '%s'\n",
 				&req->request, req->dep->name)) {
-		dwc3_trace(trace_dwc3_gadget, "request %p belongs to '%s'",
+		dwc3_trace(trace_dwc3_gadget, "request %pK belongs to '%s'",
 				&req->request, req->dep->name);
 		return -EINVAL;
 	}
@@ -1190,7 +1245,7 @@ static int dwc3_gadget_ep_dequeue(struct usb_ep *ep,
 			dwc3_stop_active_transfer(dwc, dep->number, true);
 			goto out1;
 		}
-		dev_err(dwc->dev, "request %p was not queued to %s\n",
+		dev_err(dwc->dev, "request %pK was not queued to %s\n",
 				request, ep->name);
 		ret = -EINVAL;
 		goto out0;
@@ -1597,7 +1652,7 @@ static int __dwc3_gadget_start(struct dwc3 *dwc)
 			reg |= DWC3_DCFG_LOWSPEED;
 			break;
 		case USB_SPEED_FULL:
-			reg |= DWC3_DCFG_FULLSPEED1;
+			reg |= DWC3_DCFG_FULLSPEED;
 			break;
 		case USB_SPEED_HIGH:
 			reg |= DWC3_DCFG_HIGHSPEED;
@@ -1650,6 +1705,7 @@ static int __dwc3_gadget_start(struct dwc3 *dwc)
 
 	/* begin to receive SETUP packets */
 	dwc->ep0state = EP0_SETUP_PHASE;
+	dwc->link_state = DWC3_LINK_STATE_SS_DIS;
 	dwc3_ep0_out_start(dwc);
 
 	dwc3_gadget_enable_irq(dwc);
@@ -2456,8 +2512,7 @@ static void dwc3_gadget_conndone_interrupt(struct dwc3 *dwc)
 		dwc->gadget.ep0->maxpacket = 64;
 		dwc->gadget.speed = USB_SPEED_HIGH;
 		break;
-	case DWC3_DSTS_FULLSPEED2:
-	case DWC3_DSTS_FULLSPEED1:
+	case DWC3_DSTS_FULLSPEED:
 		dwc3_gadget_ep0_desc.wMaxPacketSize = cpu_to_le16(64);
 		dwc->gadget.ep0->maxpacket = 64;
 		dwc->gadget.speed = USB_SPEED_FULL;
@@ -2468,6 +2523,8 @@ static void dwc3_gadget_conndone_interrupt(struct dwc3 *dwc)
 		dwc->gadget.speed = USB_SPEED_LOW;
 		break;
 	}
+
+	dwc->eps[1]->endpoint.maxpacket = dwc->gadget.ep0->maxpacket;
 
 	/* Enable USB2 LPM Capability */
 
@@ -2830,6 +2887,15 @@ static irqreturn_t dwc3_check_event_buf(struct dwc3_event_buffer *evt)
 		return IRQ_HANDLED;
 	}
 
+	/*
+	 * With PCIe legacy interrupt, test shows that top-half irq handler can
+	 * be called again after HW interrupt deassertion. Check if bottom-half
+	 * irq event handler completes before caching new event to prevent
+	 * losing events.
+	 */
+	if (evt->flags & DWC3_EVENT_PENDING)
+		return IRQ_HANDLED;
+
 	count = dwc3_readl(dwc->regs, DWC3_GEVNTCOUNT(0));
 	count &= DWC3_GEVNTCOUNT_MASK;
 	if (!count)
@@ -2930,7 +2996,6 @@ int dwc3_gadget_init(struct dwc3 *dwc)
 	dwc->gadget.speed		= USB_SPEED_UNKNOWN;
 	dwc->gadget.sg_supported	= true;
 	dwc->gadget.name		= "dwc3-gadget";
-	dwc->gadget.is_otg		= dwc->dr_mode == USB_DR_MODE_OTG;
 
 	/*
 	 * FIXME We might be setting max_speed to <SUPER, however versions
@@ -3024,17 +3089,14 @@ void dwc3_gadget_exit(struct dwc3 *dwc)
 
 int dwc3_gadget_suspend(struct dwc3 *dwc)
 {
-	int ret;
-
 	if (!dwc->gadget_driver)
 		return 0;
 
-	ret = dwc3_gadget_run_stop(dwc, false, false);
-	if (ret < 0)
-		return ret;
-
+	dwc3_gadget_run_stop(dwc, false, false);
 	dwc3_disconnect_gadget(dwc);
 	__dwc3_gadget_stop(dwc);
+
+	synchronize_irq(dwc->irq_gadget);
 
 	return 0;
 }

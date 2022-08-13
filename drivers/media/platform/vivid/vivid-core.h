@@ -28,6 +28,7 @@
 #include <media/v4l2-dev.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-tpg.h>
+#include <media/sensor_common.h>
 #include "vivid-rds-gen.h"
 #include "vivid-vbi-gen.h"
 
@@ -60,6 +61,9 @@
 /* The minimum image width/height */
 #define MIN_WIDTH  16
 #define MIN_HEIGHT 16
+/* Metadata height max/default */
+#define MAX_METADATA_HEIGHT 16
+#define DEF_METADATA_HEIGHT 1
 /* The data_offset of plane 0 for the multiplanar formats */
 #define PLANE0_DATA_OFFSET 128
 
@@ -82,7 +86,9 @@ struct vivid_fmt {
 	u32	fourcc;          /* v4l2 format id */
 	bool	is_yuv;
 	bool	can_do_overlay;
+	bool	is_metadata[TPG_MAX_PLANES];
 	u8	vdownsampling[TPG_MAX_PLANES];
+	u8	packedpixels;
 	u32	alpha_mask;
 	u8	planes;
 	u8	buffers;
@@ -170,6 +176,7 @@ struct vivid_dev {
 	struct v4l2_ctrl_handler	ctrl_hdl_sdr_cap;
 	spinlock_t			slock;
 	struct mutex			mutex;
+	struct mutex			mutex_framerate;
 
 	/* capabilities */
 	u32				vid_cap_caps;
@@ -230,6 +237,12 @@ struct vivid_dev {
 	struct v4l2_ctrl		*colorspace;
 	struct v4l2_ctrl		*rgb_range_cap;
 	struct v4l2_ctrl		*real_rgb_range_cap;
+	struct v4l2_ctrl		*framelength;
+	struct v4l2_ctrl		*ctrl_signalprops;
+	struct v4l2_ctrl		*ctrl_imageprops;
+	struct v4l2_ctrl		*ctrl_controlprops;
+	struct v4l2_ctrl		*ctrl_dvtimings;
+	struct v4l2_ctrl		*ctrl_sensormodes;
 	struct {
 		/* std_signal_mode/standard cluster */
 		struct v4l2_ctrl	*ctrl_std_signal_mode;
@@ -350,6 +363,7 @@ struct vivid_dev {
 	u32				xfer_func_out;
 	u32				service_set_out;
 	unsigned			bytesperline_out[TPG_MAX_PLANES];
+	unsigned			height_out[TPG_MAX_PLANES];
 	unsigned			tv_field_out;
 	unsigned			tv_audio_output;
 	bool				vbi_out_have_wss;
@@ -378,7 +392,7 @@ struct vivid_dev {
 	unsigned			ms_vid_cap;
 	bool				must_blank[VIDEO_MAX_FRAME];
 
-	const struct vivid_fmt		*fmt_cap;
+	struct vivid_fmt		*fmt_cap;
 	struct v4l2_fract		timeperframe_vid_cap;
 	enum v4l2_field			field_cap;
 	struct v4l2_rect		src_rect;
@@ -394,9 +408,11 @@ struct vivid_dev {
 	/* thread for generating video capture stream */
 	struct task_struct		*kthread_vid_cap;
 	unsigned long			jiffies_vid_cap;
+	unsigned long			next_jiffies_vid_cap;
 	u32				cap_seq_offset;
 	u32				cap_seq_count;
 	bool				cap_seq_resync;
+	bool				cap_thread_active;
 	u32				vid_cap_seq_start;
 	u32				vid_cap_seq_count;
 	bool				vid_cap_streaming;
@@ -404,9 +420,14 @@ struct vivid_dev {
 	u32				vbi_cap_seq_count;
 	bool				vbi_cap_streaming;
 	bool				stream_sliced_vbi_cap;
+	u32				embedded_data_height;
+	u32				fmt_out_metadata_height;
+
+	/* added for NV sensor emulation */
+	struct sensor_properties	sensor_props;
 
 	/* video output */
-	const struct vivid_fmt		*fmt_out;
+	struct vivid_fmt		*fmt_out;
 	struct v4l2_fract		timeperframe_vid_out;
 	enum v4l2_field			field_out;
 	struct v4l2_rect		sink_rect;
@@ -448,9 +469,11 @@ struct vivid_dev {
 	/* thread for generating video output stream */
 	struct task_struct		*kthread_vid_out;
 	unsigned long			jiffies_vid_out;
+	unsigned long			next_jiffies_vid_out;
 	u32				out_seq_offset;
 	u32				out_seq_count;
 	bool				out_seq_resync;
+	bool				out_thread_active;
 	u32				vid_out_seq_start;
 	u32				vid_out_seq_count;
 	bool				vid_out_streaming;

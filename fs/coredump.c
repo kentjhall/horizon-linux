@@ -744,7 +744,7 @@ void do_coredump(const siginfo_t *siginfo)
 			goto close_fail;
 		if (!(cprm.file->f_mode & FMODE_CAN_WRITE))
 			goto close_fail;
-		if (do_truncate(cprm.file->f_path.dentry, 0, 0, cprm.file))
+		if (do_truncate2(cprm.file->f_path.mnt, cprm.file->f_path.dentry, 0, 0, cprm.file))
 			goto close_fail;
 	}
 
@@ -761,6 +761,8 @@ void do_coredump(const siginfo_t *siginfo)
 	}
 	if (ispipe && core_pipe_limit)
 		wait_for_dump_helpers(cprm.file);
+	if (cprm.file->f_op->fsync != NULL)
+		cprm.file->f_op->fsync(cprm.file, 0, LLONG_MAX, 0);
 close_fail:
 	if (cprm.file)
 		filp_close(cprm.file, NULL);
@@ -833,3 +835,21 @@ int dump_align(struct coredump_params *cprm, int align)
 	return mod ? dump_skip(cprm, align - mod) : 1;
 }
 EXPORT_SYMBOL(dump_align);
+
+/*
+ * Ensures that file size is big enough to contain the current file
+ * postion. This prevents gdb from complaining about a truncated file
+ * if the last "write" to the file was dump_skip.
+ */
+void dump_truncate(struct coredump_params *cprm)
+{
+	struct file *file = cprm->file;
+	loff_t offset;
+
+	if (file->f_op->llseek && file->f_op->llseek != no_llseek) {
+		offset = file->f_op->llseek(file, 0, SEEK_CUR);
+		if (i_size_read(file->f_mapping->host) < offset)
+			do_truncate(file->f_path.dentry, offset, 0, file);
+	}
+}
+EXPORT_SYMBOL(dump_truncate);

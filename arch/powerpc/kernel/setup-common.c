@@ -228,14 +228,6 @@ static int show_cpuinfo(struct seq_file *m, void *v)
 	unsigned short maj;
 	unsigned short min;
 
-	/* We only show online cpus: disable preempt (overzealous, I
-	 * knew) to prevent cpu going down. */
-	preempt_disable();
-	if (!cpu_online(cpu_id)) {
-		preempt_enable();
-		return 0;
-	}
-
 #ifdef CONFIG_SMP
 	pvr = per_cpu(cpu_pvr, cpu_id);
 #else
@@ -340,9 +332,6 @@ static int show_cpuinfo(struct seq_file *m, void *v)
 #ifdef CONFIG_SMP
 	seq_printf(m, "\n");
 #endif
-
-	preempt_enable();
-
 	/* If this is the last cpu, print the summary */
 	if (cpumask_next(cpu_id, cpu_online_mask) >= nr_cpu_ids)
 		show_cpuinfo_summary(m);
@@ -915,7 +904,7 @@ void __init setup_arch(char **cmdline_p)
 	init_mm.context.pte_frag = NULL;
 #endif
 #ifdef CONFIG_SPAPR_TCE_IOMMU
-	mm_iommu_init(&init_mm.context);
+	mm_iommu_init(&init_mm);
 #endif
 	irqstack_early_init();
 	exc_lvl_early_init();
@@ -928,6 +917,9 @@ void __init setup_arch(char **cmdline_p)
 #endif
 	if (ppc_md.setup_arch)
 		ppc_md.setup_arch();
+
+	setup_barrier_nospec();
+	setup_spectre_v2();
 
 	paging_init();
 

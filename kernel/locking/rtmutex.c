@@ -236,8 +236,7 @@ rt_mutex_waiter_less(struct rt_mutex_waiter *left,
 	 * then right waiter has a dl_prio() too.
 	 */
 	if (dl_prio(left->prio))
-		return dl_time_before(left->task->dl.deadline,
-				      right->task->dl.deadline);
+		return dl_time_before(left->deadline, right->deadline);
 
 	return 0;
 }
@@ -704,7 +703,26 @@ static int rt_mutex_adjust_prio_chain(struct task_struct *task,
 
 	/* [7] Requeue the waiter in the lock waiter tree. */
 	rt_mutex_dequeue(lock, waiter);
+
+	/*
+	 * Update the waiter prio fields now that we're dequeued.
+	 *
+	 * These values can have changed through either:
+	 *
+	 *   sys_sched_set_scheduler() / sys_sched_setattr()
+	 *
+	 * or
+	 *
+	 *   DL CBS enforcement advancing the effective deadline.
+	 *
+	 * Even though pi_waiters also uses these fields, and that tree is only
+	 * updated in [11], we can do this here, since we hold [L], which
+	 * serializes all pi_waiters access and rb_erase() does not care about
+	 * the values of the node being removed.
+	 */
 	waiter->prio = task->prio;
+	waiter->deadline = task->dl.deadline;
+
 	rt_mutex_enqueue(lock, waiter);
 
 	/* [8] Release the task */
@@ -831,6 +849,8 @@ static int rt_mutex_adjust_prio_chain(struct task_struct *task,
 static int try_to_take_rt_mutex(struct rt_mutex *lock, struct task_struct *task,
 				struct rt_mutex_waiter *waiter)
 {
+	lockdep_assert_held(&lock->wait_lock);
+
 	/*
 	 * Before testing whether we can acquire @lock, we set the
 	 * RT_MUTEX_HAS_WAITERS bit in @lock->owner. This forces all
@@ -958,6 +978,8 @@ static int task_blocks_on_rt_mutex(struct rt_mutex *lock,
 	struct rt_mutex *next_lock;
 	int chain_walk = 0, res;
 
+	lockdep_assert_held(&lock->wait_lock);
+
 	/*
 	 * Early deadlock detection. We really don't want the task to
 	 * enqueue on itself just to untangle the mess later. It's not
@@ -975,6 +997,7 @@ static int task_blocks_on_rt_mutex(struct rt_mutex *lock,
 	waiter->task = task;
 	waiter->lock = lock;
 	waiter->prio = task->prio;
+	waiter->deadline = task->dl.deadline;
 
 	/* Get the top priority waiter on the lock */
 	if (rt_mutex_has_waiters(lock))
@@ -1079,6 +1102,8 @@ static void remove_waiter(struct rt_mutex *lock,
 	bool is_top_waiter = (waiter == rt_mutex_top_waiter(lock));
 	struct task_struct *owner = rt_mutex_owner(lock);
 	struct rt_mutex *next_lock;
+
+	lockdep_assert_held(&lock->wait_lock);
 
 	raw_spin_lock(&current->pi_lock);
 	rt_mutex_dequeue(lock, waiter);
@@ -1721,21 +1746,23 @@ struct task_struct *rt_mutex_next_owner(struct rt_mutex *lock)
 }
 
 /**
- * rt_mutex_finish_proxy_lock() - Complete lock acquisition
+ * rt_mutex_wait_proxy_lock() - Wait for lock acquisition
  * @lock:		the rt_mutex we were woken on
  * @to:			the timeout, null if none. hrtimer should already have
  *			been started.
  * @waiter:		the pre-initialized rt_mutex_waiter
  *
- * Complete the lock acquisition started our behalf by another thread.
+ * Wait for the the lock acquisition started on our behalf by
+ * rt_mutex_start_proxy_lock(). Upon failure, the caller must call
+ * rt_mutex_cleanup_proxy_lock().
  *
  * Returns:
  *  0 - success
  * <0 - error, one of -EINTR, -ETIMEDOUT
  *
- * Special API call for PI-futex requeue support
+ * Special API call for PI-futex support
  */
-int rt_mutex_finish_proxy_lock(struct rt_mutex *lock,
+int rt_mutex_wait_proxy_lock(struct rt_mutex *lock,
 			       struct hrtimer_sleeper *to,
 			       struct rt_mutex_waiter *waiter)
 {
@@ -1748,9 +1775,6 @@ int rt_mutex_finish_proxy_lock(struct rt_mutex *lock,
 	/* sleep on the mutex */
 	ret = __rt_mutex_slowlock(lock, TASK_INTERRUPTIBLE, to, waiter);
 
-	if (unlikely(ret))
-		remove_waiter(lock, waiter);
-
 	/*
 	 * try_to_take_rt_mutex() sets the waiter bit unconditionally. We might
 	 * have to fix that up.
@@ -1760,4 +1784,43 @@ int rt_mutex_finish_proxy_lock(struct rt_mutex *lock,
 	raw_spin_unlock_irq(&lock->wait_lock);
 
 	return ret;
+}
+
+/**
+ * rt_mutex_cleanup_proxy_lock() - Cleanup failed lock acquisition
+ * @lock:		the rt_mutex we were woken on
+ * @waiter:		the pre-initialized rt_mutex_waiter
+ *
+ * Attempt to clean up after a failed rt_mutex_wait_proxy_lock().
+ *
+ * Unless we acquired the lock; we're still enqueued on the wait-list and can
+ * in fact still be granted ownership until we're removed. Therefore we can
+ * find we are in fact the owner and must disregard the
+ * rt_mutex_wait_proxy_lock() failure.
+ *
+ * Returns:
+ *  true  - did the cleanup, we done.
+ *  false - we acquired the lock after rt_mutex_wait_proxy_lock() returned,
+ *          caller should disregards its return value.
+ *
+ * Special API call for PI-futex support
+ */
+bool rt_mutex_cleanup_proxy_lock(struct rt_mutex *lock,
+				 struct rt_mutex_waiter *waiter)
+{
+	bool cleanup = false;
+
+	raw_spin_lock_irq(&lock->wait_lock);
+	/*
+	 * Unless we're the owner; we're still enqueued on the wait_list.
+	 * So check if we became owner, if not, take us off the wait_list.
+	 */
+	if (rt_mutex_owner(lock) != current) {
+		remove_waiter(lock, waiter);
+		fixup_rt_mutex_waiters(lock);
+		cleanup = true;
+	}
+	raw_spin_unlock_irq(&lock->wait_lock);
+
+	return cleanup;
 }

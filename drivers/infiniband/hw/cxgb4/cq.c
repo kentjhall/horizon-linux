@@ -575,10 +575,10 @@ static int poll_cq(struct t4_wq *wq, struct t4_cq *cq, struct t4_cqe *cqe,
 			ret = -EAGAIN;
 			goto skip_cqe;
 		}
-		if (unlikely((CQE_WRID_MSN(hw_cqe) != (wq->rq.msn)))) {
+		if (unlikely(!CQE_STATUS(hw_cqe) &&
+			     CQE_WRID_MSN(hw_cqe) != wq->rq.msn)) {
 			t4_set_wq_in_error(wq);
-			hw_cqe->header |= htonl(CQE_STATUS_V(T4_ERR_MSN));
-			goto proc_cqe;
+			hw_cqe->header |= cpu_to_be32(CQE_STATUS_V(T4_ERR_MSN));
 		}
 		goto proc_cqe;
 	}
@@ -892,6 +892,9 @@ struct ib_cq *c4iw_create_cq(struct ib_device *ibdev,
 		return ERR_PTR(-EINVAL);
 
 	rhp = to_c4iw_dev(ibdev);
+
+	if (entries < 1 || entries > ibdev->attrs.max_cqe)
+		return ERR_PTR(-EINVAL);
 
 	if (vector >= rhp->rdev.lldi.nciq)
 		return ERR_PTR(-EINVAL);

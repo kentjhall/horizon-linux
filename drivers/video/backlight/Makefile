@@ -1,5 +1,7 @@
 # Backlight & LCD drivers
 
+ccflags-y += -I$(srctree.nvidia)/drivers/video/tegra/dc/panel
+
 obj-$(CONFIG_LCD_AMS369FG06)		+= ams369fg06.o
 obj-$(CONFIG_LCD_CLASS_DEVICE)		+= lcd.o
 obj-$(CONFIG_LCD_CORGI)			+= corgi_lcd.o
@@ -42,6 +44,8 @@ obj-$(CONFIG_BACKLIGHT_LM3639)		+= lm3639_bl.o
 obj-$(CONFIG_BACKLIGHT_LOCOMO)		+= locomolcd.o
 obj-$(CONFIG_BACKLIGHT_LP855X)		+= lp855x_bl.o
 obj-$(CONFIG_BACKLIGHT_LP8788)		+= lp8788_bl.o
+obj-$(CONFIG_BACKLIGHT_LP88XX_I2C)	+= lp88xx_core.o lp88xx_i2c.o
+obj-$(CONFIG_BACKLIGHT_LP88XX_SPI)	+= lp88xx_core.o lp88xx_spi.o
 obj-$(CONFIG_BACKLIGHT_LV5207LP)	+= lv5207lp.o
 obj-$(CONFIG_BACKLIGHT_MAX8925)		+= max8925_bl.o
 obj-$(CONFIG_BACKLIGHT_OMAP1)		+= omap1_bl.o

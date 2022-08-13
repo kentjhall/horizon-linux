@@ -20,7 +20,6 @@
 
 #include <linux/bug.h>
 
-#include <asm/atomic.h>
 #include <asm/barrier.h>
 #include <asm/lse.h>
 
@@ -46,7 +45,7 @@ static inline unsigned long __xchg_case_##name(unsigned long x,		\
 	"	swp" #acq_lse #rel #sz "\t%" #w "3, %" #w "0, %2\n"	\
 		__nops(3)						\
 	"	" #nop_lse)						\
-	: "=&r" (ret), "=&r" (tmp), "+Q" (*(u8 *)ptr)			\
+	: "=&r" (ret), "=&r" (tmp), "+Q" (*(unsigned long *)ptr)	\
 	: "r" (x)							\
 	: cl);								\
 									\
@@ -73,7 +72,7 @@ __XCHG_CASE( ,  ,  mb_8, dmb ish, nop,  , a, l, "memory")
 #undef __XCHG_CASE
 
 #define __XCHG_GEN(sfx)							\
-static inline unsigned long __xchg##sfx(unsigned long x,		\
+static __always_inline  unsigned long __xchg##sfx(unsigned long x,	\
 					volatile void *ptr,		\
 					int size)			\
 {									\
@@ -115,7 +114,7 @@ __XCHG_GEN(_mb)
 #define xchg(...)		__xchg_wrapper( _mb, __VA_ARGS__)
 
 #define __CMPXCHG_GEN(sfx)						\
-static inline unsigned long __cmpxchg##sfx(volatile void *ptr,		\
+static __always_inline unsigned long __cmpxchg##sfx(volatile void *ptr,	\
 					   unsigned long old,		\
 					   unsigned long new,		\
 					   int size)			\
@@ -229,7 +228,9 @@ static inline void __cmpwait_case_##name(volatile void *ptr,		\
 	unsigned long tmp;						\
 									\
 	asm volatile(							\
-	"	ldxr" #sz "\t%" #w "[tmp], %[v]\n"		\
+	"	sevl\n"							\
+	"	wfe\n"							\
+	"	ldxr" #sz "\t%" #w "[tmp], %[v]\n"			\
 	"	eor	%" #w "[tmp], %" #w "[tmp], %" #w "[val]\n"	\
 	"	cbnz	%" #w "[tmp], 1f\n"				\
 	"	wfe\n"							\
@@ -246,7 +247,7 @@ __CMPWAIT_CASE( ,  , 8);
 #undef __CMPWAIT_CASE
 
 #define __CMPWAIT_GEN(sfx)						\
-static inline void __cmpwait##sfx(volatile void *ptr,			\
+static __always_inline void __cmpwait##sfx(volatile void *ptr,		\
 				  unsigned long val,			\
 				  int size)				\
 {									\

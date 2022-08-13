@@ -68,7 +68,7 @@ static int lpass_platform_pcmops_open(struct snd_pcm_substream *substream)
 	int ret, dma_ch, dir = substream->stream;
 	struct lpass_pcm_data *data;
 
-	data = devm_kzalloc(soc_runtime->dev, sizeof(*data), GFP_KERNEL);
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 
@@ -78,6 +78,9 @@ static int lpass_platform_pcmops_open(struct snd_pcm_substream *substream)
 	dma_ch = 0;
 	if (v->alloc_dma_channel)
 		dma_ch = v->alloc_dma_channel(drvdata, dir);
+	else
+		dma_ch = 0;
+
 	if (dma_ch < 0)
 		return dma_ch;
 
@@ -137,6 +140,7 @@ static int lpass_platform_pcmops_close(struct snd_pcm_substream *substream)
 	if (v->free_dma_channel)
 		v->free_dma_channel(drvdata, dma_ch);
 
+	kfree(data);
 	return 0;
 }
 

@@ -1,0 +1,141 @@
+SN65DSI85 MIPI DSI to LVDS bridge driver
+
+Required properties:
+- compatible : should be "ti,sn65dsi85".
+- reg : i2c regmap address
+- ti,enable-gpio : GPIO for enabling DS90UH949 chip
+- ti,pll-refclk-cfg : Register value to control DP PLL clock source and frequency
+
+Optional properties:
+- ti,dsi-clk-divider-multiplier : register value to program DSI clock divider/multiplier
+- ti,dsi-cfg1 : DSI channel mode (4 lane / 8 lane)
+- ti,dsi-cha-clk-range : Register value for DSI channel A clock range
+- ti,dsi-chb-clk-range : Register value for DSI channel B clock range
+- ti,lvds-format : LVDS channel format (4 lane / 8 lane)
+- ti,video-cha-line-low : Length in pixels of active horizontal line for channel A(lower byte)
+- ti,video-cha-line-high : Length in pixels of active horizontal line for channel A(upper byte)
+- ti,video-chb-line-low : Length in pixels of active horizontal line for channel B(lower byte)
+- ti,video-chb-line-high : Length in pixels of active horizontal line for channel B(upper byte)
+- ti,video-cha-sync-delay-low : Delay from when Hsync/Vsync is received on DSI to when it is
+                                transmitted to LVDS (lower byte)
+- ti,video-cha-sync-delay-high : Delay from when Hsync/Vsync is received on DSI to when it is
+                                 transmitted to LVDS (upper byte)
+- ti,h-pulse-width-low : Hsync pulse width (lower byte)
+- ti,h-pulse-width-high : Hsync pulse width (upper byte)
+- ti,v-pulse-width-low : Vysnc pulse width (lower byte)
+- ti,v-pulse-width-high : Vysnc pulse width (upper byte)
+- ti,h-back-porch : Horizontal back porch
+- ti,v-back-porch : Vertical back porch
+- ti,h-front-porch : Horizontal front porch
+- ti,v-front-porch : Vertical front porch
+
+Examples:
+        i2c@3160000 {
+                sn65dsi85@2c {
+                        compatible = "ti,sn65dsi85";
+                        reg = <0x2C>;
+                        status = "okay";
+                        ti,enable-gpio = <&tegra_main_gpio TEGRA_MAIN_GPIO(O, 1) 0>;
+
+                        /* target PCLK = PCLK = 148.5 MHZ. Since we are using
+                         * 8 LVDS lanes, targetPCLK = PCLK/2 = 74.25 MHZ
+                         * Set LVDS clk range = 62.5 MHz ≤ LVDS_CLK < 87.5 MHz
+                        */
+			/* Please refer SN65DSI85 datasheet REGISTER address = 0x0A
+			 * LVDS_CLK_RANGE = BIT[3:1] = 010 – 62.5 MHz ≤ LVDS_CLK < 87.5 MHz
+			 * HS_CLK_SRC = BIT[0] = 1 - LVDS pixel clock derived from MIPI D-PHY channel A HS continuous clock
+			 * REGISTER value to be programmed = 0x5
+			*/
+                        ti,pll-refclk-cfg = <0x5>;
+
+                        /* DSI CLOCK = 445 MHZ. Since we are using 8 DSI lanes,
+                         * DSI CLOCK = 445/2 = 223 MHZ
+                         * clock divider = DSI CLOCK/LVDS clock = 223/74.25 = 3
+                        */
+			/* Please refer SN65DSI85 datasheet REGISTER address = 0x0B
+			 * DSI_CLK_DIVIDER = BIT[7:3] = 00010 – Divide by 3
+			 * REFCLK_MULTIPLIER = BIT[1:0] = 00 – LVDS clock = source clock (default)
+			 * REGISTER value to be programmed = 0x10
+			*/
+	                ti,dsi-clk-divider-multiplier = <0x10>;
+
+                        /* 8 lane DSI with left-right pixels */
+                        /* Please refer SN65DSI85 datasheet REGISTER address = 0x10
+			 * BIT[0] = 0 - Single bit errors are tolerated for the start of transaction SoT leader sequence
+			 * BIT[2:1] = 00 - Four lanes are enabled for DSI channel A
+			 * BIT[4:3] = 00 - Four lanes are enabled for DSI channel B
+			 * BIT[6:5] = 00 - Dual-channel DSI receiver
+			 * BIT[7] = 1 - DSI channel A receives LEFT image pixels and channel B receives RIGHT image pixels
+			 * REGISTER value to be programmed = 0x80
+			*/
+			ti,dsi-cfg1 = <0x80>;
+
+                        /* DSI channel A clock range = 223/5 = 44 = 0x2C */
+			/* Please refer SN65DSI85 datasheet REGISTER address = 0x12
+			 * CHA_DSI_CLK_RANGE = BIT[7:0] = 0x2C - This field specifies the DSI Clock frequency range in 5 MHz increments (220 ≤ frequency < 225 MHz)
+			 * REGISTER value to be programmed = 0x2C
+			*/
+			ti,dsi-cha-clk-range = <0x2C>;
+
+                        /* DSI channel B clock range = 223/5 = 44 = 0x2C */
+			/* Please refer SN65DSI85 datasheet REGISTER address = 0x13
+			 * CHB_DSI_CLK_RANGE = BIT[7:0] = 0x2C - This field specifies the DSI Clock frequency range in 5 MHz increments (220 ≤ frequency < 225 MHz)
+			 * REGISTER value to be programmed = 0x2C
+			*/
+                        ti,dsi-chb-clk-range = <0x2C>;
+
+                        /* Dual-link (8 lane) LVDS */
+			/* Please refer SN65DSI85 datasheet REGISTER address = 0x18
+			 * BIT[0] = 1 - LVDS channel B lane B_Y3P/N transmits the 2 least significant bits per color
+			 * BIT[1] = 1 - LVDS channel A lane A_Y3P/N transmits the 2 least significant bits per color
+			 * BIT[2] = 0 - Force 18bpp channel B
+			 * BIT[3] = 0 - Force 18BPP channel A
+			 * BIT[4] = 0 - LVDS Channel A and Channel B outputs enabled
+			 * BIT[5] = 1 - VS is negative polarity driven 0 during corresponding sync
+			 * BIT[6] = 0 - HS is positive polarity driven 1 during corresponding sync
+			 * BIT[7] = 0 - DE is positive polarity driven 1 during active pixel transmission on LVDS
+			 * REGISTER value to be programmed = 0x23
+			*/
+			ti,lvds-format = <0x23>;
+
+                        /* channel A width should be set to width/2 since
+                         * we are using 8 lane DSI
+                         * pulse width = 1920/2 = 0x3C0
+                        */
+                        ti,video-cha-line-low = <0xC0>;
+                        ti,video-cha-line-high = <0x03>;
+
+                        /* channel B width should be set to width/2 since
+                         * we are using 8 lane DSI
+                         * pulse width = 1920/2 = 0x3C0
+                        */
+                        ti,video-chb-line-low = <0xC0>;
+                        ti,video-chb-line-high = <0x03>;
+                        ti,video-cha-sync-delay-low = <0x03>;
+                        ti,video-cha-sync-delay-high = <0x02>;
+
+                        /* pulse width should be set to hysnc-len/2 since
+                         * we are using 8 lane DSI
+                         * pulse width = 44/2 = 22
+                        */
+                        ti,h-pulse-width-low = <0x16>;
+                        ti,h-pulse-width-high = <0x00>;
+
+                        /* pulse width should be set to vsync-len/2 since
+                         * we are using 8 lane DSI
+                         * pulse width = 5/2 = 2
+                        */
+                        ti,v-pulse-width-low = <0x02>;
+                        ti,v-pulse-width-high = <0x00>;
+
+                        /* h-back-porch should be set to h-back-porch/2 since
+                         * we are using 8 lane DSI
+                         * h-back-porch = 148/2 = 74
+                        */
+                        ti,h-back-porch = <0x4A>;
+                        ti,v-back-porch = <0x0>;
+                        ti,h-front-porch = <0x0>;
+                        ti,v-front-porch = <0x0>;
+
+                };
+}

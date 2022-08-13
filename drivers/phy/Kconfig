@@ -456,6 +456,7 @@ config PHY_QCOM_UFS
 config PHY_TUSB1210
 	tristate "TI TUSB1210 ULPI PHY module"
 	depends on USB_ULPI_BUS
+	depends on EXTCON || !EXTCON # if EXTCON=m, this cannot be built-in
 	select GENERIC_PHY
 	help
 	  Support for TI TUSB1210 USB ULPI PHY.
@@ -489,4 +490,12 @@ config PHY_NS2_PCIE
 	help
 	  Enable this to support the Broadcom Northstar2 PCIe PHY.
 	  If unsure, say N.
+
+config PHY_MAX16984_CDP
+	tristate "MAX16984 External CDP support for USB UTMI ports"
+	select GENERIC_PHY
+	help
+	  Enable this to support Tegra external CDP for USB2.0 host port
+	  using Max16984 chip.
+
 endmenu

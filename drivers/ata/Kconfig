@@ -100,7 +100,8 @@ config SATA_AHCI_PLATFORM
 
 config AHCI_BRCM
 	tristate "Broadcom AHCI SATA support"
-	depends on ARCH_BRCMSTB || BMIPS_GENERIC || ARCH_BCM_NSP
+	depends on ARCH_BRCMSTB || BMIPS_GENERIC || ARCH_BCM_NSP || \
+		   ARCH_BCM_63XX
 	help
 	  This option enables support for the AHCI SATA3 controller found on
 	  Broadcom SoC's.
@@ -166,6 +167,14 @@ config AHCI_SUNXI
 	help
 	  This option enables support for the Allwinner sunxi SoC's
 	  onboard AHCI SATA.
+
+	  If unsure, say N.
+
+config AHCI_TEGRA_DOWNSTREAM
+	tristate "TEGRA AHCI SATA support"
+	select ARCH_TEGRA_HAS_SATA
+	help
+	  This option enables support for TEGRA AHCI Serial ATA.
 
 	  If unsure, say N.
 
@@ -289,6 +298,7 @@ config SATA_SX4
 
 config ATA_BMDMA
 	bool "ATA BMDMA support"
+	depends on HAS_DMA
 	default y
 	help
 	  This option adds support for SFF ATA controllers with BMDMA
@@ -344,6 +354,7 @@ config SATA_DWC_VDEBUG
 
 config SATA_HIGHBANK
 	tristate "Calxeda Highbank SATA support"
+	depends on HAS_DMA
 	depends on ARCH_HIGHBANK || COMPILE_TEST
 	help
 	  This option enables support for the Calxeda Highbank SoC's
@@ -353,6 +364,7 @@ config SATA_HIGHBANK
 
 config SATA_MV
 	tristate "Marvell SATA support"
+	depends on HAS_DMA
 	depends on PCI || ARCH_DOVE || ARCH_MV78XX0 || \
 		   ARCH_MVEBU || ARCH_ORION5X || COMPILE_TEST
 	select GENERIC_PHY

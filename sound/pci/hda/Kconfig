@@ -21,21 +21,6 @@ config SND_HDA_INTEL
 	  To compile this driver as a module, choose M here: the module
 	  will be called snd-hda-intel.
 
-config SND_HDA_TEGRA
-	tristate "NVIDIA Tegra HD Audio"
-	depends on ARCH_TEGRA
-	select SND_HDA
-	help
-	  Say Y here to support the HDA controller present in NVIDIA
-	  Tegra SoCs
-
-	  This options enables support for the HD Audio controller
-	  present in some NVIDIA Tegra SoCs, used to communicate audio
-	  to the HDMI output.
-
-	  To compile this driver as a module, choose M here: the module
-	  will be called snd-hda-tegra.
-
 if SND_HDA
 
 config SND_HDA_HWDEP
@@ -88,7 +73,6 @@ config SND_HDA_PATCH_LOADER
 config SND_HDA_CODEC_REALTEK
 	tristate "Build Realtek HD-audio codec support"
 	select SND_HDA_GENERIC
-	select INPUT
 	help
 	  Say Y or M here to include Realtek HD-audio codec support in
 	  snd-hda-intel driver, such as ALC880.

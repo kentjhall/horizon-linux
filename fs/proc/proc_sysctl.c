@@ -190,6 +190,7 @@ static void init_header(struct ctl_table_header *head,
 	head->set = set;
 	head->parent = NULL;
 	head->node = node;
+	INIT_HLIST_HEAD(&head->inodes);
 	if (node) {
 		struct ctl_table *entry;
 		for (entry = table; entry->procname; entry++, node++)
@@ -259,6 +260,44 @@ static void unuse_table(struct ctl_table_header *p)
 			complete(p->unregistering);
 }
 
+static void proc_sys_prune_dcache(struct ctl_table_header *head)
+{
+	struct inode *inode;
+	struct proc_inode *ei;
+	struct hlist_node *node;
+	struct super_block *sb;
+
+	rcu_read_lock();
+	for (;;) {
+		node = hlist_first_rcu(&head->inodes);
+		if (!node)
+			break;
+		ei = hlist_entry(node, struct proc_inode, sysctl_inodes);
+		spin_lock(&sysctl_lock);
+		hlist_del_init_rcu(&ei->sysctl_inodes);
+		spin_unlock(&sysctl_lock);
+
+		inode = &ei->vfs_inode;
+		sb = inode->i_sb;
+		if (!atomic_inc_not_zero(&sb->s_active))
+			continue;
+		inode = igrab(inode);
+		rcu_read_unlock();
+		if (unlikely(!inode)) {
+			deactivate_super(sb);
+			rcu_read_lock();
+			continue;
+		}
+
+		d_prune_aliases(inode);
+		iput(inode);
+		deactivate_super(sb);
+
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+}
+
 /* called under sysctl_lock, will reacquire if has to wait */
 static void start_unregistering(struct ctl_table_header *p)
 {
@@ -272,31 +311,22 @@ static void start_unregistering(struct ctl_table_header *p)
 		p->unregistering = &wait;
 		spin_unlock(&sysctl_lock);
 		wait_for_completion(&wait);
-		spin_lock(&sysctl_lock);
 	} else {
 		/* anything non-NULL; we'll never dereference it */
 		p->unregistering = ERR_PTR(-EINVAL);
+		spin_unlock(&sysctl_lock);
 	}
+	/*
+	 * Prune dentries for unregistered sysctls: namespaced sysctls
+	 * can have duplicate names and contaminate dcache very badly.
+	 */
+	proc_sys_prune_dcache(p);
 	/*
 	 * do not remove from the list until nobody holds it; walking the
 	 * list in do_sysctl() relies on that.
 	 */
+	spin_lock(&sysctl_lock);
 	erase_header(p);
-}
-
-static void sysctl_head_get(struct ctl_table_header *head)
-{
-	spin_lock(&sysctl_lock);
-	head->count++;
-	spin_unlock(&sysctl_lock);
-}
-
-void sysctl_head_put(struct ctl_table_header *head)
-{
-	spin_lock(&sysctl_lock);
-	if (!--head->count)
-		kfree_rcu(head, rcu);
-	spin_unlock(&sysctl_lock);
 }
 
 static struct ctl_table_header *sysctl_head_grab(struct ctl_table_header *head)
@@ -436,14 +466,23 @@ static struct inode *proc_sys_make_inode(struct super_block *sb,
 
 	inode = new_inode(sb);
 	if (!inode)
-		goto out;
+		return ERR_PTR(-ENOMEM);
 
 	inode->i_ino = get_next_ino();
 
-	sysctl_head_get(head);
 	ei = PROC_I(inode);
+
+	spin_lock(&sysctl_lock);
+	if (unlikely(head->unregistering)) {
+		spin_unlock(&sysctl_lock);
+		iput(inode);
+		return ERR_PTR(-ENOENT);
+	}
 	ei->sysctl = head;
 	ei->sysctl_entry = table;
+	hlist_add_head_rcu(&ei->sysctl_inodes, &head->inodes);
+	head->count++;
+	spin_unlock(&sysctl_lock);
 
 	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
 	inode->i_mode = table->mode;
@@ -461,9 +500,21 @@ static struct inode *proc_sys_make_inode(struct super_block *sb,
 
 	if (root->set_ownership)
 		root->set_ownership(head, table, &inode->i_uid, &inode->i_gid);
+	else {
+		inode->i_uid = GLOBAL_ROOT_UID;
+		inode->i_gid = GLOBAL_ROOT_GID;
+	}
 
-out:
 	return inode;
+}
+
+void proc_sys_evict_inode(struct inode *inode, struct ctl_table_header *head)
+{
+	spin_lock(&sysctl_lock);
+	hlist_del_init_rcu(&PROC_I(inode)->sysctl_inodes);
+	if (!--head->count)
+		kfree_rcu(head, rcu);
+	spin_unlock(&sysctl_lock);
 }
 
 static struct ctl_table_header *grab_header(struct inode *inode)
@@ -502,10 +553,11 @@ static struct dentry *proc_sys_lookup(struct inode *dir, struct dentry *dentry,
 			goto out;
 	}
 
-	err = ERR_PTR(-ENOMEM);
 	inode = proc_sys_make_inode(dir->i_sb, h ? h : head, p);
-	if (!inode)
+	if (IS_ERR(inode)) {
+		err = ERR_CAST(inode);
 		goto out;
+	}
 
 	err = NULL;
 	d_set_d_op(dentry, &proc_sys_dentry_operations);
@@ -638,7 +690,7 @@ static bool proc_sys_fill_cache(struct file *file,
 			return false;
 		if (d_in_lookup(child)) {
 			inode = proc_sys_make_inode(dir->d_sb, head, table);
-			if (!inode) {
+			if (IS_ERR(inode)) {
 				d_lookup_done(child);
 				dput(child);
 				return false;
@@ -660,7 +712,10 @@ static bool proc_sys_link_fill_cache(struct file *file,
 				    struct ctl_table *table)
 {
 	bool ret = true;
+
 	head = sysctl_head_grab(head);
+	if (IS_ERR(head))
+		return false;
 
 	if (S_ISLNK(table->mode)) {
 		/* It is not an error if we can not follow the link ignore it */
@@ -709,7 +764,7 @@ static int proc_sys_readdir(struct file *file, struct dir_context *ctx)
 	ctl_dir = container_of(head, struct ctl_dir, header);
 
 	if (!dir_emit_dots(file, ctx))
-		return 0;
+		goto out;
 
 	pos = 2;
 
@@ -719,6 +774,7 @@ static int proc_sys_readdir(struct file *file, struct dir_context *ctx)
 			break;
 		}
 	}
+out:
 	sysctl_head_finish(head);
 	return 0;
 }
@@ -1552,8 +1608,11 @@ static void drop_sysctl_table(struct ctl_table_header *header)
 	if (--header->nreg)
 		return;
 
-	put_links(header);
-	start_unregistering(header);
+	if (parent) {
+		put_links(header);
+		start_unregistering(header);
+	}
+
 	if (!--header->count)
 		kfree_rcu(header, rcu);
 

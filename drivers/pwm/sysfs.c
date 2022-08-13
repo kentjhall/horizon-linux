@@ -223,11 +223,119 @@ static ssize_t capture_show(struct device *child,
 	return sprintf(buf, "%u %u\n", result.period, result.duty_cycle);
 }
 
+static ssize_t ramp_time_show(struct device *child,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	const struct pwm_device *pwm = child_to_pwm_device(child);
+	struct pwm_state state;
+
+	pwm_get_state(pwm, &state);
+
+	return sprintf(buf, "%u\n", state.ramp_time);
+}
+
+static ssize_t ramp_time_store(struct device *child,
+			       struct device_attribute *attr,
+			       const char *buf, size_t size)
+{
+	struct pwm_export *export = child_to_pwm_export(child);
+	struct pwm_device *pwm = export->pwm;
+	struct pwm_state state;
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	mutex_lock(&export->lock);
+	pwm_get_state(pwm, &state);
+	state.ramp_time = val;
+	ret = pwm_apply_state(pwm, &state);
+	mutex_unlock(&export->lock);
+
+	return ret ? : size;
+}
+
+static ssize_t double_period_show(struct device *child,
+				  struct device_attribute *attr,
+				  char *buf)
+{
+	const struct pwm_device *pwm = child_to_pwm_device(child);
+	struct pwm_state state;
+
+	pwm_get_state(pwm, &state);
+
+	return sprintf(buf, "%u\n", state.double_period);
+}
+
+static ssize_t double_period_store(struct device *child,
+				   struct device_attribute *attr,
+				   const char *buf, size_t size)
+{
+	struct pwm_export *export = child_to_pwm_export(child);
+	struct pwm_device *pwm = export->pwm;
+	struct pwm_state state;
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	mutex_lock(&export->lock);
+	pwm_get_state(pwm, &state);
+	state.double_period = val;
+	ret = pwm_apply_state(pwm, &state);
+	mutex_unlock(&export->lock);
+
+	return ret ? : size;
+}
+
+static ssize_t capture_window_length_show(struct device *child,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	const struct pwm_device *pwm = child_to_pwm_device(child);
+	struct pwm_state state;
+
+	pwm_get_state(pwm, &state);
+
+	return sprintf(buf, "%u\n", state.capture_win_len);
+}
+
+static ssize_t capture_window_length_store(struct device *child,
+					   struct device_attribute *attr,
+					   const char *buf, size_t size)
+{
+	struct pwm_export *export = child_to_pwm_export(child);
+	struct pwm_device *pwm = export->pwm;
+	struct pwm_state state;
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	mutex_lock(&export->lock);
+	pwm_get_state(pwm, &state);
+	state.capture_win_len = val;
+	ret = pwm_apply_state(pwm, &state);
+	mutex_unlock(&export->lock);
+
+	return ret ? : size;
+}
+
 static DEVICE_ATTR_RW(period);
 static DEVICE_ATTR_RW(duty_cycle);
 static DEVICE_ATTR_RW(enable);
 static DEVICE_ATTR_RW(polarity);
 static DEVICE_ATTR_RO(capture);
+static DEVICE_ATTR_RW(ramp_time);
+static DEVICE_ATTR_RW(double_period);
+static DEVICE_ATTR_RW(capture_window_length);
 
 static struct attribute *pwm_attrs[] = {
 	&dev_attr_period.attr,
@@ -235,6 +343,9 @@ static struct attribute *pwm_attrs[] = {
 	&dev_attr_enable.attr,
 	&dev_attr_polarity.attr,
 	&dev_attr_capture.attr,
+	&dev_attr_ramp_time.attr,
+	&dev_attr_double_period.attr,
+	&dev_attr_capture_window_length.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(pwm);
@@ -249,6 +360,7 @@ static void pwm_export_release(struct device *child)
 static int pwm_export_child(struct device *parent, struct pwm_device *pwm)
 {
 	struct pwm_export *export;
+	char *pwm_prop[2];
 	int ret;
 
 	if (test_and_set_bit(PWMF_EXPORTED, &pwm->flags))
@@ -275,6 +387,10 @@ static int pwm_export_child(struct device *parent, struct pwm_device *pwm)
 		kfree(export);
 		return ret;
 	}
+	pwm_prop[0] = kasprintf(GFP_KERNEL, "EXPORT=pwm%u", pwm->hwpwm);
+	pwm_prop[1] = NULL;
+	kobject_uevent_env(&parent->kobj, KOBJ_CHANGE, pwm_prop);
+	kfree(pwm_prop[0]);
 
 	return 0;
 }
@@ -287,6 +403,7 @@ static int pwm_unexport_match(struct device *child, void *data)
 static int pwm_unexport_child(struct device *parent, struct pwm_device *pwm)
 {
 	struct device *child;
+	char *pwm_prop[2];
 
 	if (!test_and_clear_bit(PWMF_EXPORTED, &pwm->flags))
 		return -ENODEV;
@@ -294,6 +411,11 @@ static int pwm_unexport_child(struct device *parent, struct pwm_device *pwm)
 	child = device_find_child(parent, pwm, pwm_unexport_match);
 	if (!child)
 		return -ENODEV;
+
+	pwm_prop[0] = kasprintf(GFP_KERNEL, "UNEXPORT=pwm%u", pwm->hwpwm);
+	pwm_prop[1] = NULL;
+	kobject_uevent_env(&parent->kobj, KOBJ_CHANGE, pwm_prop);
+	kfree(pwm_prop[0]);
 
 	/* for device_find_child() */
 	put_device(child);
@@ -399,19 +521,6 @@ void pwmchip_sysfs_export(struct pwm_chip *chip)
 void pwmchip_sysfs_unexport(struct pwm_chip *chip)
 {
 	struct device *parent;
-
-	parent = class_find_device(&pwm_class, NULL, chip,
-				   pwmchip_sysfs_match);
-	if (parent) {
-		/* for class_find_device() */
-		put_device(parent);
-		device_unregister(parent);
-	}
-}
-
-void pwmchip_sysfs_unexport_children(struct pwm_chip *chip)
-{
-	struct device *parent;
 	unsigned int i;
 
 	parent = class_find_device(&pwm_class, NULL, chip,
@@ -427,6 +536,7 @@ void pwmchip_sysfs_unexport_children(struct pwm_chip *chip)
 	}
 
 	put_device(parent);
+	device_unregister(parent);
 }
 
 static int __init pwm_sysfs_init(void)

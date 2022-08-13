@@ -91,6 +91,7 @@ static void mlx5e_update_sw_rep_counters(struct mlx5e_priv *priv)
 
 			s->tx_packets		+= sq_stats->packets;
 			s->tx_bytes		+= sq_stats->bytes;
+			s->tx_queue_dropped	+= sq_stats->dropped;
 		}
 	}
 }
@@ -138,7 +139,7 @@ int mlx5e_attr_get(struct net_device *dev, struct switchdev_attr *attr)
 	struct mlx5_eswitch_rep *rep = priv->ppriv;
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 
-	if (esw->mode == SRIOV_NONE)
+	if (esw->mode != SRIOV_OFFLOADS)
 		return -EOPNOTSUPP;
 
 	switch (attr->id) {

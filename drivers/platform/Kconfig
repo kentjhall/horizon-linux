@@ -8,3 +8,7 @@ endif
 source "drivers/platform/goldfish/Kconfig"
 
 source "drivers/platform/chrome/Kconfig"
+
+if ARCH_TEGRA
+source "drivers/platform/tegra/Kconfig"
+endif

@@ -1982,7 +1982,7 @@ static void init_cgroup_root(struct cgroup_root *root,
 	if (opts->release_agent)
 		strcpy(root->release_agent_path, opts->release_agent);
 	if (opts->name)
-		strcpy(root->name, opts->name);
+		strlcpy(root->name, opts->name, sizeof(root->name));
 	if (opts->cpuset_clone_children)
 		set_bit(CGRP_CPUSET_CLONE_CHILDREN, &root->cgrp.flags);
 }
@@ -2856,7 +2856,8 @@ static int cgroup_procs_write_permission(struct task_struct *task,
 	 */
 	if (!uid_eq(cred->euid, GLOBAL_ROOT_UID) &&
 	    !uid_eq(cred->euid, tcred->uid) &&
-	    !uid_eq(cred->euid, tcred->suid))
+	    !uid_eq(cred->euid, tcred->suid) &&
+	    !ns_capable(tcred->user_ns, CAP_SYS_NICE))
 		ret = -EACCES;
 
 	if (!ret && cgroup_on_dfl(dst_cgrp)) {
@@ -2920,11 +2921,12 @@ static ssize_t __cgroup_procs_write(struct kernfs_open_file *of, char *buf,
 		tsk = tsk->group_leader;
 
 	/*
-	 * Workqueue threads may acquire PF_NO_SETAFFINITY and become
-	 * trapped in a cpuset, or RT worker may be born in a cgroup
-	 * with no rt_runtime allocated.  Just say no.
+	 * kthreads may acquire PF_NO_SETAFFINITY during initialization.
+	 * If userland migrates such a kthread to a non-root cgroup, it can
+	 * become trapped in a cpuset, or RT kthread may be born in a
+	 * cgroup with no rt_runtime allocated.  Just say no.
 	 */
-	if (tsk == kthreadd_task || (tsk->flags & PF_NO_SETAFFINITY)) {
+	if (tsk->no_cgroup_migration || (tsk->flags & PF_NO_SETAFFINITY)) {
 		ret = -EINVAL;
 		goto out_unlock_rcu;
 	}
@@ -3486,11 +3488,11 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 	cgrp->subtree_control &= ~disable;
 
 	ret = cgroup_apply_control(cgrp);
-
 	cgroup_finalize_control(cgrp, ret);
+	if (ret)
+		goto out_unlock;
 
 	kernfs_activate(cgrp->kn);
-	ret = 0;
 out_unlock:
 	cgroup_kn_unlock(of->kn);
 	return ret ?: nbytes;
@@ -4385,7 +4387,11 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from)
 	 */
 	do {
 		css_task_iter_start(&from->self, &it);
-		task = css_task_iter_next(&it);
+
+		do {
+			task = css_task_iter_next(&it);
+		} while (task && (task->flags & PF_EXITING));
+
 		if (task)
 			get_task_struct(task);
 		css_task_iter_end(&it);
@@ -5074,6 +5080,8 @@ static void css_release_work_fn(struct work_struct *work)
 		if (cgrp->kn)
 			RCU_INIT_POINTER(*(void __rcu __force **)&cgrp->kn->priv,
 					 NULL);
+
+		cgroup_bpf_put(cgrp);
 	}
 
 	mutex_unlock(&cgroup_mutex);
@@ -5219,6 +5227,11 @@ err_free_css:
 	return ERR_PTR(err);
 }
 
+/*
+ * The returned cgroup is fully initialized including its control mask, but
+ * it isn't associated with its kernfs_node and doesn't have the control
+ * mask applied.
+ */
 static struct cgroup *cgroup_create(struct cgroup *parent)
 {
 	struct cgroup_root *root = parent->root;
@@ -5281,12 +5294,10 @@ static struct cgroup *cgroup_create(struct cgroup *parent)
 	if (!cgroup_on_dfl(cgrp))
 		cgrp->subtree_control = cgroup_control(cgrp);
 
-	cgroup_propagate_control(cgrp);
+	if (parent)
+		cgroup_bpf_inherit(cgrp, parent);
 
-	/* @cgrp doesn't have dir yet so the following will only create csses */
-	ret = cgroup_apply_control_enable(cgrp);
-	if (ret)
-		goto out_destroy;
+	cgroup_propagate_control(cgrp);
 
 	return cgrp;
 
@@ -5294,9 +5305,6 @@ out_cancel_ref:
 	percpu_ref_exit(&cgrp->self.refcnt);
 out_free_cgrp:
 	kfree(cgrp);
-	return ERR_PTR(ret);
-out_destroy:
-	cgroup_destroy_locked(cgrp);
 	return ERR_PTR(ret);
 }
 
@@ -5408,6 +5416,11 @@ static void css_killed_ref_fn(struct percpu_ref *ref)
 static void kill_css(struct cgroup_subsys_state *css)
 {
 	lockdep_assert_held(&cgroup_mutex);
+
+	if (css->flags & CSS_DYING)
+		return;
+
+	css->flags |= CSS_DYING;
 
 	/*
 	 * This must happen before css is disassociated with its cgroup.
@@ -5715,6 +5728,10 @@ int __init cgroup_init(void)
 
 		if (ss->bind)
 			ss->bind(init_css_set.subsys[ssid]);
+
+		mutex_lock(&cgroup_mutex);
+		css_populate_dir(init_css_set.subsys[ssid]);
+		mutex_unlock(&cgroup_mutex);
 	}
 
 	/* init_css_set.subsys[] has been updated, re-hash */
@@ -6315,14 +6332,18 @@ void cgroup_sk_alloc_disable(void)
 
 void cgroup_sk_alloc(struct sock_cgroup_data *skcd)
 {
-	if (cgroup_sk_alloc_disabled)
-		return;
-
-	/* Socket clone path */
-	if (skcd->val) {
-		cgroup_get(sock_cgroup_ptr(skcd));
+	if (cgroup_sk_alloc_disabled) {
+		skcd->no_refcnt = 1;
 		return;
 	}
+
+	/* Don't associate the sock with unrelated interrupted task's cgroup. */
+	if (in_interrupt())
+		return;
+
+	/* Don't associate the sock with unrelated interrupted task's cgroup. */
+	if (in_interrupt())
+		return;
 
 	rcu_read_lock();
 
@@ -6340,8 +6361,26 @@ void cgroup_sk_alloc(struct sock_cgroup_data *skcd)
 	rcu_read_unlock();
 }
 
+void cgroup_sk_clone(struct sock_cgroup_data *skcd)
+{
+	/* Socket clone path */
+	if (skcd->val) {
+		if (skcd->no_refcnt)
+			return;
+		/*
+		 * We might be cloning a socket which is left in an empty
+		 * cgroup and the cgroup might have already been rmdir'd.
+		 * Don't use cgroup_get_live().
+		 */
+		cgroup_get(sock_cgroup_ptr(skcd));
+	}
+}
+
 void cgroup_sk_free(struct sock_cgroup_data *skcd)
 {
+	if (skcd->no_refcnt)
+		return;
+
 	cgroup_put(sock_cgroup_ptr(skcd));
 }
 
@@ -6495,6 +6534,20 @@ static __init int cgroup_namespaces_init(void)
 }
 subsys_initcall(cgroup_namespaces_init);
 
+#ifdef CONFIG_CGROUP_BPF
+int cgroup_bpf_update(struct cgroup *cgrp, struct bpf_prog *prog,
+		      enum bpf_attach_type type, bool overridable)
+{
+	struct cgroup *parent = cgroup_parent(cgrp);
+	int ret;
+
+	mutex_lock(&cgroup_mutex);
+	ret = __cgroup_bpf_update(cgrp, parent, prog, type, overridable);
+	mutex_unlock(&cgroup_mutex);
+	return ret;
+}
+#endif /* CONFIG_CGROUP_BPF */
+
 #ifdef CONFIG_CGROUP_DEBUG
 static struct cgroup_subsys_state *
 debug_css_alloc(struct cgroup_subsys_state *parent_css)
@@ -6573,7 +6626,7 @@ static int cgroup_css_links_read(struct seq_file *seq, void *v)
 		struct task_struct *task;
 		int count = 0;
 
-		seq_printf(seq, "css_set %p\n", cset);
+		seq_printf(seq, "css_set %pK\n", cset);
 
 		list_for_each_entry(task, &cset->tasks, cg_list) {
 			if (count++ > MAX_TASKS_SHOWN_PER_CSS)

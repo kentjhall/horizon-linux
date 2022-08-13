@@ -71,8 +71,18 @@ MODULE_FIRMWARE("b43/ucode11.fw");
 MODULE_FIRMWARE("b43/ucode13.fw");
 MODULE_FIRMWARE("b43/ucode14.fw");
 MODULE_FIRMWARE("b43/ucode15.fw");
+MODULE_FIRMWARE("b43/ucode16_lp.fw");
 MODULE_FIRMWARE("b43/ucode16_mimo.fw");
+MODULE_FIRMWARE("b43/ucode24_lcn.fw");
+MODULE_FIRMWARE("b43/ucode25_lcn.fw");
+MODULE_FIRMWARE("b43/ucode25_mimo.fw");
+MODULE_FIRMWARE("b43/ucode26_mimo.fw");
+MODULE_FIRMWARE("b43/ucode29_mimo.fw");
+MODULE_FIRMWARE("b43/ucode33_lcn40.fw");
+MODULE_FIRMWARE("b43/ucode30_mimo.fw");
 MODULE_FIRMWARE("b43/ucode5.fw");
+MODULE_FIRMWARE("b43/ucode40.fw");
+MODULE_FIRMWARE("b43/ucode42.fw");
 MODULE_FIRMWARE("b43/ucode9.fw");
 
 static int modparam_bad_frames_preempt;
@@ -5586,7 +5596,7 @@ static struct b43_wl *b43_wireless_init(struct b43_bus_dev *dev)
 	/* fill hw info */
 	ieee80211_hw_set(hw, RX_INCLUDES_FCS);
 	ieee80211_hw_set(hw, SIGNAL_DBM);
-
+	ieee80211_hw_set(hw, MFP_CAPABLE);
 	hw->wiphy->interface_modes =
 		BIT(NL80211_IFTYPE_AP) |
 		BIT(NL80211_IFTYPE_MESH_POINT) |

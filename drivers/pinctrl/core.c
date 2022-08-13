@@ -688,6 +688,62 @@ int pinctrl_gpio_direction_output(unsigned gpio)
 }
 EXPORT_SYMBOL_GPL(pinctrl_gpio_direction_output);
 
+/**
+ * pinctrl_gpio_save_config() - Save GPIO configuration of pins.
+ * @gpio: the GPIO pin number from the GPIO subsystem number space
+ *
+ */
+int pinctrl_gpio_save_config(unsigned gpio)
+{
+	struct pinctrl_dev *pctldev;
+	struct pinctrl_gpio_range *range;
+	int ret;
+	int pin;
+
+	ret = pinctrl_get_device_gpio_range(gpio, &pctldev, &range);
+	if (ret)
+		return ret;
+
+	mutex_lock(&pctldev->mutex);
+
+	/* Convert to the pin controllers number space */
+	pin = gpio_to_pin(range, gpio);
+	ret = pinmux_gpio_save_config(pctldev, range, pin);
+
+	mutex_unlock(&pctldev->mutex);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pinctrl_gpio_save_config);
+
+/**
+ * pinctrl_gpio_restore_config() - Restore GPIO configuration of pins.
+ * @gpio: the GPIO pin number from the GPIO subsystem number space
+ *
+ */
+int pinctrl_gpio_restore_config(unsigned gpio)
+{
+	struct pinctrl_dev *pctldev;
+	struct pinctrl_gpio_range *range;
+	int ret;
+	int pin;
+
+	ret = pinctrl_get_device_gpio_range(gpio, &pctldev, &range);
+	if (ret)
+		return ret;
+
+	mutex_lock(&pctldev->mutex);
+
+	/* Convert to the pin controllers number space */
+	pin = gpio_to_pin(range, gpio);
+	ret = pinmux_gpio_restore_config(pctldev, range, pin);
+
+	mutex_unlock(&pctldev->mutex);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pinctrl_gpio_restore_config);
+
 static struct pinctrl_state *find_state(struct pinctrl *p,
 					const char *name)
 {
@@ -857,6 +913,11 @@ static struct pinctrl *create_pinctrl(struct device *dev)
 			mutex_unlock(&pinctrl_maps_mutex);
 			return ERR_PTR(ret);
 		}
+		if (ret < 0) {
+			dev_err(dev, "Failed to add %s setting: %d\n",
+				map->name, ret);
+			break;
+		}
 	}
 	mutex_unlock(&pinctrl_maps_mutex);
 
@@ -992,18 +1053,15 @@ struct pinctrl_state *pinctrl_lookup_state(struct pinctrl *p,
 EXPORT_SYMBOL_GPL(pinctrl_lookup_state);
 
 /**
- * pinctrl_select_state() - select/activate/program a pinctrl state to HW
+ * pinctrl_commit_state() - select/activate/program a pinctrl state to HW
  * @p: the pinctrl handle for the device that requests configuration
  * @state: the state handle to select/activate/program
  */
-int pinctrl_select_state(struct pinctrl *p, struct pinctrl_state *state)
+static int pinctrl_commit_state(struct pinctrl *p, struct pinctrl_state *state)
 {
 	struct pinctrl_setting *setting, *setting2;
 	struct pinctrl_state *old_state = p->state;
 	int ret;
-
-	if (p->state == state)
-		return 0;
 
 	if (p->state) {
 		/*
@@ -1064,9 +1122,22 @@ unapply_new_state:
 
 	/* There's no infinite recursive loop here because p->state is NULL */
 	if (old_state)
-		pinctrl_select_state(p, old_state);
+		ret = pinctrl_select_state(p, old_state);
 
 	return ret;
+}
+
+/**
+ * pinctrl_select_state() - select/activate/program a pinctrl state to HW
+ * @p: the pinctrl handle for the device that requests configuration
+ * @state: the state handle to select/activate/program
+ */
+int pinctrl_select_state(struct pinctrl *p, struct pinctrl_state *state)
+{
+	if (p->state == state)
+		return 0;
+
+	return pinctrl_commit_state(p, state);
 }
 EXPORT_SYMBOL_GPL(pinctrl_select_state);
 
@@ -1236,7 +1307,7 @@ void pinctrl_unregister_map(struct pinctrl_map const *map)
 int pinctrl_force_sleep(struct pinctrl_dev *pctldev)
 {
 	if (!IS_ERR(pctldev->p) && !IS_ERR(pctldev->hog_sleep))
-		return pinctrl_select_state(pctldev->p, pctldev->hog_sleep);
+		return pinctrl_commit_state(pctldev->p, pctldev->hog_sleep);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(pinctrl_force_sleep);
@@ -1248,7 +1319,7 @@ EXPORT_SYMBOL_GPL(pinctrl_force_sleep);
 int pinctrl_force_default(struct pinctrl_dev *pctldev)
 {
 	if (!IS_ERR(pctldev->p) && !IS_ERR(pctldev->hog_default))
-		return pinctrl_select_state(pctldev->p, pctldev->hog_default);
+		return pinctrl_commit_state(pctldev->p, pctldev->hog_default);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(pinctrl_force_default);
@@ -1812,10 +1883,13 @@ struct pinctrl_dev *pinctrl_register(struct pinctrl_desc *pctldesc,
 		if (IS_ERR(pctldev->hog_default)) {
 			dev_dbg(dev, "failed to lookup the default state\n");
 		} else {
-			if (pinctrl_select_state(pctldev->p,
-						pctldev->hog_default))
+			ret = pinctrl_select_state(pctldev->p,
+						   pctldev->hog_default);
+			if (ret < 0) {
 				dev_err(dev,
 					"failed to select default state\n");
+				goto remove_dev;
+			}
 		}
 
 		pctldev->hog_sleep =
@@ -1823,11 +1897,22 @@ struct pinctrl_dev *pinctrl_register(struct pinctrl_desc *pctldesc,
 						    PINCTRL_STATE_SLEEP);
 		if (IS_ERR(pctldev->hog_sleep))
 			dev_dbg(dev, "failed to lookup the sleep state\n");
+	} else {
+		ret = PTR_ERR(pctldev->p);
+		dev_err(dev, "Failed to get pinctrl device: %d\n", ret);
+		goto remove_dev;
 	}
 
 	pinctrl_init_device_debugfs(pctldev);
 
 	return pctldev;
+
+remove_dev:
+	mutex_lock(&pinctrldev_list_mutex);
+	list_del(&pctldev->node);
+	pinctrl_free_pindescs(pctldev, pctldev->desc->pins,
+			      pctldev->desc->npins);
+	mutex_unlock(&pinctrldev_list_mutex);
 
 out_err:
 	mutex_destroy(&pctldev->mutex);

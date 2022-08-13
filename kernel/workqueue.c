@@ -48,6 +48,7 @@
 #include <linux/nodemask.h>
 #include <linux/moduleparam.h>
 #include <linux/uaccess.h>
+#include <linux/nmi.h>
 
 #include "workqueue_internal.h"
 
@@ -68,6 +69,7 @@ enum {
 	 * attach_mutex to avoid changing binding state while
 	 * worker_attach_to_pool() is in progress.
 	 */
+	POOL_MANAGER_ACTIVE	= 1 << 0,	/* being managed */
 	POOL_DISASSOCIATED	= 1 << 2,	/* cpu can't serve workers */
 
 	/* worker flags */
@@ -165,7 +167,6 @@ struct worker_pool {
 						/* L: hash of busy workers */
 
 	/* see manage_workers() for details on the two manager mutexes */
-	struct mutex		manager_arb;	/* manager arbitration */
 	struct worker		*manager;	/* L: purely informational */
 	struct mutex		attach_mutex;	/* attach/detach exclusion */
 	struct list_head	workers;	/* A: attached workers */
@@ -297,6 +298,7 @@ static struct workqueue_attrs *wq_update_unbound_numa_attrs_buf;
 
 static DEFINE_MUTEX(wq_pool_mutex);	/* protects pools and workqueues list */
 static DEFINE_SPINLOCK(wq_mayday_lock);	/* protects wq->maydays list */
+static DECLARE_WAIT_QUEUE_HEAD(wq_manager_wait); /* wait for manager to go away */
 
 static LIST_HEAD(workqueues);		/* PR: list of all workqueues */
 static bool workqueue_freezing;		/* PL: have wqs started freezing? */
@@ -799,7 +801,7 @@ static bool need_to_create_worker(struct worker_pool *pool)
 /* Do we have too many workers and should some go away? */
 static bool too_many_workers(struct worker_pool *pool)
 {
-	bool managing = mutex_is_locked(&pool->manager_arb);
+	bool managing = pool->flags & POOL_MANAGER_ACTIVE;
 	int nr_idle = pool->nr_idle + managing; /* manager is considered idle */
 	int nr_busy = pool->nr_workers - nr_idle;
 
@@ -1382,14 +1384,16 @@ static void __queue_work(int cpu, struct workqueue_struct *wq,
 	    WARN_ON_ONCE(!is_chained_work(wq)))
 		return;
 retry:
-	if (req_cpu == WORK_CPU_UNBOUND)
-		cpu = wq_select_unbound_cpu(raw_smp_processor_id());
-
 	/* pwq which will be used unless @work is executing elsewhere */
-	if (!(wq->flags & WQ_UNBOUND))
-		pwq = per_cpu_ptr(wq->cpu_pwqs, cpu);
-	else
+	if (wq->flags & WQ_UNBOUND) {
+		if (req_cpu == WORK_CPU_UNBOUND)
+			cpu = wq_select_unbound_cpu(raw_smp_processor_id());
 		pwq = unbound_pwq_by_node(wq, cpu_to_node(cpu));
+	} else {
+		if (req_cpu == WORK_CPU_UNBOUND)
+			cpu = raw_smp_processor_id();
+		pwq = per_cpu_ptr(wq->cpu_pwqs, cpu);
+	}
 
 	/*
 	 * If @work was previously on a different pool, it might still be
@@ -1505,6 +1509,7 @@ static void __queue_delayed_work(int cpu, struct workqueue_struct *wq,
 	struct timer_list *timer = &dwork->timer;
 	struct work_struct *work = &dwork->work;
 
+	WARN_ON_ONCE(!wq);
 	WARN_ON_ONCE(timer->function != delayed_work_timer_fn ||
 		     timer->data != (unsigned long)dwork);
 	WARN_ON_ONCE(timer_pending(timer));
@@ -1979,24 +1984,17 @@ static bool manage_workers(struct worker *worker)
 {
 	struct worker_pool *pool = worker->pool;
 
-	/*
-	 * Anyone who successfully grabs manager_arb wins the arbitration
-	 * and becomes the manager.  mutex_trylock() on pool->manager_arb
-	 * failure while holding pool->lock reliably indicates that someone
-	 * else is managing the pool and the worker which failed trylock
-	 * can proceed to executing work items.  This means that anyone
-	 * grabbing manager_arb is responsible for actually performing
-	 * manager duties.  If manager_arb is grabbed and released without
-	 * actual management, the pool may stall indefinitely.
-	 */
-	if (!mutex_trylock(&pool->manager_arb))
+	if (pool->flags & POOL_MANAGER_ACTIVE)
 		return false;
+
+	pool->flags |= POOL_MANAGER_ACTIVE;
 	pool->manager = worker;
 
 	maybe_create_worker(pool);
 
 	pool->manager = NULL;
-	mutex_unlock(&pool->manager_arb);
+	pool->flags &= ~POOL_MANAGER_ACTIVE;
+	wake_up(&wq_manager_wait);
 	return true;
 }
 
@@ -2348,8 +2346,14 @@ repeat:
 			 */
 			if (need_to_create_worker(pool)) {
 				spin_lock(&wq_mayday_lock);
-				get_pwq(pwq);
-				list_move_tail(&pwq->mayday_node, &wq->maydays);
+				/*
+				 * Queue iff we aren't racing destruction
+				 * and somebody else hasn't queued it already.
+				 */
+				if (wq->rescuer && list_empty(&pwq->mayday_node)) {
+					get_pwq(pwq);
+					list_add_tail(&pwq->mayday_node, &wq->maydays);
+				}
 				spin_unlock(&wq_mayday_lock);
 			}
 		}
@@ -3203,7 +3207,6 @@ static int init_worker_pool(struct worker_pool *pool)
 	setup_timer(&pool->mayday_timer, pool_mayday_timeout,
 		    (unsigned long)pool);
 
-	mutex_init(&pool->manager_arb);
 	mutex_init(&pool->attach_mutex);
 	INIT_LIST_HEAD(&pool->workers);
 
@@ -3273,13 +3276,15 @@ static void put_unbound_pool(struct worker_pool *pool)
 	hash_del(&pool->hash_node);
 
 	/*
-	 * Become the manager and destroy all workers.  Grabbing
-	 * manager_arb prevents @pool's workers from blocking on
-	 * attach_mutex.
+	 * Become the manager and destroy all workers.  This prevents
+	 * @pool's workers from blocking on attach_mutex.  We're the last
+	 * manager and @pool gets freed with the flag set.
 	 */
-	mutex_lock(&pool->manager_arb);
-
 	spin_lock_irq(&pool->lock);
+	wait_event_lock_irq(wq_manager_wait,
+			    !(pool->flags & POOL_MANAGER_ACTIVE), pool->lock);
+	pool->flags |= POOL_MANAGER_ACTIVE;
+
 	while ((worker = first_idle_worker(pool)))
 		destroy_worker(worker);
 	WARN_ON(pool->nr_workers || pool->nr_idle);
@@ -3292,8 +3297,6 @@ static void put_unbound_pool(struct worker_pool *pool)
 
 	if (pool->detach_completion)
 		wait_for_completion(pool->detach_completion);
-
-	mutex_unlock(&pool->manager_arb);
 
 	/* shut down the timers */
 	del_timer_sync(&pool->idle_timer);
@@ -3445,17 +3448,24 @@ static void pwq_adjust_max_active(struct pool_workqueue *pwq)
 	 * is updated and visible.
 	 */
 	if (!freezable || !workqueue_freezing) {
+		bool kick = false;
+
 		pwq->max_active = wq->saved_max_active;
 
 		while (!list_empty(&pwq->delayed_works) &&
-		       pwq->nr_active < pwq->max_active)
+		       pwq->nr_active < pwq->max_active) {
 			pwq_activate_first_delayed(pwq);
+			kick = true;
+		}
 
 		/*
 		 * Need to kick a worker after thawed or an unbound wq's
-		 * max_active is bumped.  It's a slow path.  Do it always.
+		 * max_active is bumped. In realtime scenarios, always kicking a
+		 * worker will cause interference on the isolated cpu cores, so
+		 * let's kick iff work items were activated.
 		 */
-		wake_up_worker(pwq->pool);
+		if (kick)
+			wake_up_worker(pwq->pool);
 	} else {
 		pwq->max_active = 0;
 	}
@@ -3730,8 +3740,12 @@ static int apply_workqueue_attrs_locked(struct workqueue_struct *wq,
 		return -EINVAL;
 
 	/* creating multiple pwqs breaks ordering guarantee */
-	if (WARN_ON((wq->flags & __WQ_ORDERED) && !list_empty(&wq->pwqs)))
-		return -EINVAL;
+	if (!list_empty(&wq->pwqs)) {
+		if (WARN_ON(wq->flags & __WQ_ORDERED_EXPLICIT))
+			return -EINVAL;
+
+		wq->flags &= ~__WQ_ORDERED;
+	}
 
 	ctx = apply_wqattrs_prepare(wq, attrs);
 	if (!ctx)
@@ -3915,6 +3929,16 @@ struct workqueue_struct *__alloc_workqueue_key(const char *fmt,
 	struct workqueue_struct *wq;
 	struct pool_workqueue *pwq;
 
+	/*
+	 * Unbound && max_active == 1 used to imply ordered, which is no
+	 * longer the case on NUMA machines due to per-node pools.  While
+	 * alloc_ordered_workqueue() is the right way to create an ordered
+	 * workqueue, keep the previous behavior to avoid subtle breakages
+	 * on NUMA.
+	 */
+	if ((flags & WQ_UNBOUND) && max_active == 1)
+		flags |= __WQ_ORDERED;
+
 	/* see the comment above the definition of WQ_POWER_EFFICIENT */
 	if ((flags & WQ_POWER_EFFICIENT) && wq_power_efficient)
 		flags |= WQ_UNBOUND;
@@ -4022,8 +4046,28 @@ void destroy_workqueue(struct workqueue_struct *wq)
 	struct pool_workqueue *pwq;
 	int node;
 
+	/*
+	 * Remove it from sysfs first so that sanity check failure doesn't
+	 * lead to sysfs name conflicts.
+	 */
+	workqueue_sysfs_unregister(wq);
+
 	/* drain it before proceeding with destruction */
 	drain_workqueue(wq);
+
+	/* kill rescuer, if sanity checks fail, leave it w/o rescuer */
+	if (wq->rescuer) {
+		struct worker *rescuer = wq->rescuer;
+
+		/* this prevents new queueing */
+		spin_lock_irq(&wq_mayday_lock);
+		wq->rescuer = NULL;
+		spin_unlock_irq(&wq_mayday_lock);
+
+		/* rescuer will empty maydays list before exiting */
+		kthread_stop(rescuer->task);
+		kfree(rescuer);
+	}
 
 	/* sanity checks */
 	mutex_lock(&wq->mutex);
@@ -4053,11 +4097,6 @@ void destroy_workqueue(struct workqueue_struct *wq)
 	mutex_lock(&wq_pool_mutex);
 	list_del_rcu(&wq->list);
 	mutex_unlock(&wq_pool_mutex);
-
-	workqueue_sysfs_unregister(wq);
-
-	if (wq->rescuer)
-		kthread_stop(wq->rescuer->task);
 
 	if (!(wq->flags & WQ_UNBOUND)) {
 		/*
@@ -4103,13 +4142,14 @@ void workqueue_set_max_active(struct workqueue_struct *wq, int max_active)
 	struct pool_workqueue *pwq;
 
 	/* disallow meddling with max_active for ordered workqueues */
-	if (WARN_ON(wq->flags & __WQ_ORDERED))
+	if (WARN_ON(wq->flags & __WQ_ORDERED_EXPLICIT))
 		return;
 
 	max_active = wq_clamp_max_active(max_active, wq->flags, wq->name);
 
 	mutex_lock(&wq->mutex);
 
+	wq->flags &= ~__WQ_ORDERED;
 	wq->saved_max_active = max_active;
 
 	for_each_pwq(pwq, wq)
@@ -4118,6 +4158,22 @@ void workqueue_set_max_active(struct workqueue_struct *wq, int max_active)
 	mutex_unlock(&wq->mutex);
 }
 EXPORT_SYMBOL_GPL(workqueue_set_max_active);
+
+/**
+ * current_work - retrieve %current task's work struct
+ *
+ * Determine if %current task is a workqueue worker and what it's working on.
+ * Useful to find out the context that the %current task is running in.
+ *
+ * Return: work struct if %current task is a workqueue worker, %NULL otherwise.
+ */
+struct work_struct *current_work(void)
+{
+	struct worker *worker = current_wq_worker();
+
+	return worker ? worker->current_work : NULL;
+}
+EXPORT_SYMBOL(current_work);
 
 /**
  * current_is_workqueue_rescuer - is %current workqueue rescuer?
@@ -4318,7 +4374,8 @@ static void show_pwq(struct pool_workqueue *pwq)
 	pr_info("  pwq %d:", pool->id);
 	pr_cont_pool_info(pool);
 
-	pr_cont(" active=%d/%d%s\n", pwq->nr_active, pwq->max_active,
+	pr_cont(" active=%d/%d refcnt=%d%s\n",
+		pwq->nr_active, pwq->max_active, pwq->refcnt,
 		!list_empty(&pwq->mayday_node) ? " MAYDAY" : "");
 
 	hash_for_each(pool->busy_hash, bkt, worker, hentry) {
@@ -4415,6 +4472,12 @@ void show_workqueue_state(void)
 			if (pwq->nr_active || !list_empty(&pwq->delayed_works))
 				show_pwq(pwq);
 			spin_unlock_irqrestore(&pwq->pool->lock, flags);
+			/*
+			 * We could be printing a lot from atomic context, e.g.
+			 * sysrq-t -> show_workqueue_state(). Avoid triggering
+			 * hard lockup.
+			 */
+			touch_nmi_watchdog();
 		}
 	}
 
@@ -4442,6 +4505,12 @@ void show_workqueue_state(void)
 		pr_cont("\n");
 	next_pool:
 		spin_unlock_irqrestore(&pool->lock, flags);
+		/*
+		 * We could be printing a lot from atomic context, e.g.
+		 * sysrq-t -> show_workqueue_state(). Avoid triggering
+		 * hard lockup.
+		 */
+		touch_nmi_watchdog();
 	}
 
 	rcu_read_unlock_sched();
@@ -5214,7 +5283,7 @@ int workqueue_sysfs_register(struct workqueue_struct *wq)
 	 * attributes breaks ordering guarantee.  Disallow exposing ordered
 	 * workqueues.
 	 */
-	if (WARN_ON(wq->flags & __WQ_ORDERED))
+	if (WARN_ON(wq->flags & __WQ_ORDERED_EXPLICIT))
 		return -EINVAL;
 
 	wq->wq_dev = wq_dev = kzalloc(sizeof(*wq_dev), GFP_KERNEL);
@@ -5234,7 +5303,7 @@ int workqueue_sysfs_register(struct workqueue_struct *wq)
 
 	ret = device_register(&wq_dev->dev);
 	if (ret) {
-		kfree(wq_dev);
+		put_device(&wq_dev->dev);
 		wq->wq_dev = NULL;
 		return ret;
 	}

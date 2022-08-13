@@ -272,15 +272,18 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
 			sq->stats.tso_bytes += skb->len - ihs;
 		}
 
+		sq->stats.packets += skb_shinfo(skb)->gso_segs;
 		num_bytes = skb->len + (skb_shinfo(skb)->gso_segs - 1) * ihs;
 	} else {
 		bf = sq->bf_budget &&
 		     !skb->xmit_more &&
 		     !skb_shinfo(skb)->nr_frags;
 		ihs = mlx5e_get_inline_hdr_size(sq, skb, bf);
+		sq->stats.packets++;
 		num_bytes = max_t(unsigned int, skb->len, ETH_ZLEN);
 	}
 
+	sq->stats.bytes += num_bytes;
 	wi->num_bytes = num_bytes;
 
 	if (skb_vlan_tag_present(skb)) {
@@ -377,8 +380,6 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
 	if (bf)
 		sq->bf_budget--;
 
-	sq->stats.packets++;
-	sq->stats.bytes += num_bytes;
 	return NETDEV_TX_OK;
 
 dma_unmap_wqe_err:
@@ -498,8 +499,9 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 static void mlx5e_free_txq_sq_descs(struct mlx5e_sq *sq)
 {
 	struct mlx5e_tx_wqe_info *wi;
+	u32 nbytes = 0;
+	u16 ci, npkts = 0;
 	struct sk_buff *skb;
-	u16 ci;
 	int i;
 
 	while (sq->cc != sq->pc) {
@@ -520,8 +522,11 @@ static void mlx5e_free_txq_sq_descs(struct mlx5e_sq *sq)
 		}
 
 		dev_kfree_skb_any(skb);
+		npkts++;
+		nbytes += wi->num_bytes;
 		sq->cc += wi->num_wqebbs;
 	}
+	netdev_tx_completed_queue(sq->txq, npkts, nbytes);
 }
 
 static void mlx5e_free_xdp_sq_descs(struct mlx5e_sq *sq)

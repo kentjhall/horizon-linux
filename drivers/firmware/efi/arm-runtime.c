@@ -65,6 +65,7 @@ static bool __init efi_virtmap_init(void)
 	bool systab_found;
 
 	efi_mm.pgd = pgd_alloc(&efi_mm);
+	mm_init_cpumask(&efi_mm);
 	init_new_context(NULL, &efi_mm);
 
 	systab_found = false;
@@ -121,6 +122,8 @@ static int __init arm_enable_runtime_services(void)
 		pr_info("EFI services will not be available.\n");
 		return 0;
 	}
+
+	efi_memmap_unmap();
 
 	if (efi_runtime_disabled()) {
 		pr_info("EFI runtime services will be disabled.\n");

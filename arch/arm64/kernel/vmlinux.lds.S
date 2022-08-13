@@ -23,6 +23,13 @@ ENTRY(_text)
 
 jiffies = jiffies_64;
 
+
+#define HYPERVISOR_EXTABLE					\
+	. = ALIGN(SZ_8);					\
+	VMLINUX_SYMBOL(__start___kvm_ex_table) = .;		\
+	*(__kvm_ex_table)					\
+	VMLINUX_SYMBOL(__stop___kvm_ex_table) = .;
+
 #define HYPERVISOR_TEXT					\
 	/*						\
 	 * Align to 4 KB so that			\
@@ -38,6 +45,7 @@ jiffies = jiffies_64;
 	VMLINUX_SYMBOL(__hyp_idmap_text_end) = .;	\
 	VMLINUX_SYMBOL(__hyp_text_start) = .;		\
 	*(.hyp.text)					\
+	HYPERVISOR_EXTABLE				\
 	VMLINUX_SYMBOL(__hyp_text_end) = .;
 
 #define IDMAP_TEXT					\
@@ -54,6 +62,17 @@ jiffies = jiffies_64;
 	VMLINUX_SYMBOL(__hibernate_exit_text_end) = .;
 #else
 #define HIBERNATE_TEXT
+#endif
+
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+#define TRAMP_TEXT					\
+	. = ALIGN(PAGE_SIZE);				\
+	VMLINUX_SYMBOL(__entry_tramp_text_start) = .;	\
+	KEEP(*(.entry.tramp.text))			\
+	. = ALIGN(PAGE_SIZE);				\
+	VMLINUX_SYMBOL(__entry_tramp_text_end) = .;
+#else
+#define TRAMP_TEXT
 #endif
 
 /*
@@ -128,6 +147,7 @@ SECTIONS
 			HYPERVISOR_TEXT
 			IDMAP_TEXT
 			HIBERNATE_TEXT
+			TRAMP_TEXT
 			*(.fixup)
 			*(.gnu.warning)
 		. = ALIGN(16);
@@ -167,11 +187,11 @@ SECTIONS
 	. = ALIGN(4);
 	.altinstructions : {
 		__alt_instructions = .;
-		*(.altinstructions)
+		KEEP(*(.altinstructions))
 		__alt_instructions_end = .;
 	}
 	.altinstr_replacement : {
-		*(.altinstr_replacement)
+		KEEP(*(.altinstr_replacement))
 	}
 	.rela : ALIGN(8) {
 		*(.rela .rela*)
@@ -216,6 +236,16 @@ SECTIONS
 	swapper_pg_dir = .;
 	. += SWAPPER_DIR_SIZE;
 
+#ifdef CONFIG_ARM64_SW_TTBR0_PAN
+	reserved_ttbr0 = .;
+	. += RESERVED_TTBR0_SIZE;
+#endif
+
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+	tramp_pg_dir = .;
+	. += PAGE_SIZE;
+#endif
+
 	_end = .;
 
 	STABS_DEBUG
@@ -235,7 +265,10 @@ ASSERT(__idmap_text_end - (__idmap_text_start & ~(SZ_4K - 1)) <= SZ_4K,
 ASSERT(__hibernate_exit_text_end - (__hibernate_exit_text_start & ~(SZ_4K - 1))
 	<= SZ_4K, "Hibernate exit text too big or misaligned")
 #endif
-
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+ASSERT((__entry_tramp_text_end - __entry_tramp_text_start) == PAGE_SIZE,
+	"Entry trampoline text too big")
+#endif
 /*
  * If padding is applied before .head.text, virt<->phys conversions will fail.
  */

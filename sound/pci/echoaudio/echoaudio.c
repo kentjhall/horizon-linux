@@ -1272,11 +1272,11 @@ static int snd_echo_mixer_info(struct snd_kcontrol *kcontrol,
 
 	chip = snd_kcontrol_chip(kcontrol);
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
 	uinfo->value.integer.min = ECHOGAIN_MINOUT;
 	uinfo->value.integer.max = ECHOGAIN_MAXOUT;
 	uinfo->dimen.d[0] = num_busses_out(chip);
 	uinfo->dimen.d[1] = num_busses_in(chip);
-	uinfo->count = uinfo->dimen.d[0] * uinfo->dimen.d[1];
 	return 0;
 }
 
@@ -1344,11 +1344,11 @@ static int snd_echo_vmixer_info(struct snd_kcontrol *kcontrol,
 
 	chip = snd_kcontrol_chip(kcontrol);
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
 	uinfo->value.integer.min = ECHOGAIN_MINOUT;
 	uinfo->value.integer.max = ECHOGAIN_MAXOUT;
 	uinfo->dimen.d[0] = num_busses_out(chip);
 	uinfo->dimen.d[1] = num_pipes_out(chip);
-	uinfo->count = uinfo->dimen.d[0] * uinfo->dimen.d[1];
 	return 0;
 }
 
@@ -1728,6 +1728,7 @@ static int snd_echo_vumeters_info(struct snd_kcontrol *kcontrol,
 				  struct snd_ctl_elem_info *uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 96;
 	uinfo->value.integer.min = ECHOGAIN_MINOUT;
 	uinfo->value.integer.max = 0;
 #ifdef ECHOCARD_HAS_VMIXER
@@ -1737,7 +1738,6 @@ static int snd_echo_vumeters_info(struct snd_kcontrol *kcontrol,
 #endif
 	uinfo->dimen.d[1] = 16;	/* 16 channels */
 	uinfo->dimen.d[2] = 2;	/* 0=level, 1=peak */
-	uinfo->count = uinfo->dimen.d[0] * uinfo->dimen.d[1] * uinfo->dimen.d[2];
 	return 0;
 }
 
@@ -1953,6 +1953,11 @@ static int snd_echo_create(struct snd_card *card,
 	}
 	chip->dsp_registers = (volatile u32 __iomem *)
 		ioremap_nocache(chip->dsp_registers_phys, sz);
+	if (!chip->dsp_registers) {
+		dev_err(chip->card->dev, "ioremap failed\n");
+		snd_echo_free(chip);
+		return -ENOMEM;
+	}
 
 	if (request_irq(pci->irq, snd_echo_interrupt, IRQF_SHARED,
 			KBUILD_MODNAME, chip)) {
@@ -2210,7 +2215,6 @@ static int snd_echo_resume(struct device *dev)
 	if (err < 0) {
 		kfree(commpage_bak);
 		dev_err(dev, "resume init_hw err=%d\n", err);
-		snd_echo_free(chip);
 		return err;
 	}
 
@@ -2237,7 +2241,6 @@ static int snd_echo_resume(struct device *dev)
 	if (request_irq(pci->irq, snd_echo_interrupt, IRQF_SHARED,
 			KBUILD_MODNAME, chip)) {
 		dev_err(chip->card->dev, "cannot grab irq\n");
-		snd_echo_free(chip);
 		return -EBUSY;
 	}
 	chip->irq = pci->irq;

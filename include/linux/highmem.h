@@ -169,7 +169,8 @@ __alloc_zeroed_user_highpage(gfp_t movableflags,
 #endif
 
 /**
- * alloc_zeroed_user_highpage_movable - Allocate a zeroed HIGHMEM page for a VMA that the caller knows can move
+ * alloc_zeroed_user_highpage_movable - Allocate a zeroed HIGHMEM page for
+ *					a VMA that the caller knows can move
  * @vma: The VMA the page is to be allocated for
  * @vaddr: The virtual address the page will be inserted into
  *
@@ -178,9 +179,16 @@ __alloc_zeroed_user_highpage(gfp_t movableflags,
  */
 static inline struct page *
 alloc_zeroed_user_highpage_movable(struct vm_area_struct *vma,
-					unsigned long vaddr)
+				   unsigned long vaddr)
 {
 	return __alloc_zeroed_user_highpage(__GFP_MOVABLE, vma, vaddr);
+}
+
+static inline struct page *
+alloc_zeroed_user_highpage(gfp_t gfp, struct vm_area_struct *vma,
+			   unsigned long vaddr)
+{
+	return __alloc_zeroed_user_highpage(gfp, vma, vaddr);
 }
 
 static inline void clear_highpage(struct page *page)

@@ -75,7 +75,7 @@
 #define DESC_AEAD_BASE			(4 * CAAM_CMD_SZ)
 #define DESC_AEAD_ENC_LEN		(DESC_AEAD_BASE + 11 * CAAM_CMD_SZ)
 #define DESC_AEAD_DEC_LEN		(DESC_AEAD_BASE + 15 * CAAM_CMD_SZ)
-#define DESC_AEAD_GIVENC_LEN		(DESC_AEAD_ENC_LEN + 9 * CAAM_CMD_SZ)
+#define DESC_AEAD_GIVENC_LEN		(DESC_AEAD_ENC_LEN + 10 * CAAM_CMD_SZ)
 
 /* Note: Nonce is counted in enckeylen */
 #define DESC_AEAD_CTR_RFC3686_LEN	(4 * CAAM_CMD_SZ)
@@ -474,6 +474,7 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
 	u32 geniv, moveiv;
 	u32 ctx1_iv_off = 0;
 	u32 *desc;
+	u32 *wait_cmd;
 	const bool ctr_mode = ((ctx->class1_alg_type & OP_ALG_AAI_MASK) ==
 			       OP_ALG_AAI_CTR_MOD128);
 	const bool is_rfc3686 = alg->caam.rfc3686;
@@ -736,7 +737,17 @@ copy_iv:
 
 	/* Will read cryptlen */
 	append_math_add(desc, VARSEQINLEN, SEQINLEN, REG0, CAAM_CMD_SZ);
-	aead_append_src_dst(desc, FIFOLD_TYPE_MSG1OUT2);
+
+	/*
+	 * Wait for IV transfer (ofifo -> class2) to finish before starting
+	 * ciphertext transfer (ofifo -> external memory).
+	 */
+	wait_cmd = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL | JUMP_COND_NIFP);
+	set_jump_tgt_here(desc, wait_cmd);
+
+	append_seq_fifo_load(desc, 0, FIFOLD_CLASS_BOTH | KEY_VLF |
+			     FIFOLD_TYPE_MSG1OUT2 | FIFOLD_TYPE_LASTBOTH);
+	append_seq_fifo_store(desc, 0, FIFOST_TYPE_MESSAGE_DATA | KEY_VLF);
 
 	/* Write ICV */
 	append_seq_store(desc, ctx->authsize, LDST_CLASS_2_CCB |
@@ -2012,10 +2023,11 @@ static void ablkcipher_encrypt_done(struct device *jrdev, u32 *desc, u32 err,
 {
 	struct ablkcipher_request *req = context;
 	struct ablkcipher_edesc *edesc;
-#ifdef DEBUG
 	struct crypto_ablkcipher *ablkcipher = crypto_ablkcipher_reqtfm(req);
+	struct caam_ctx *ctx = crypto_ablkcipher_ctx(ablkcipher);
 	int ivsize = crypto_ablkcipher_ivsize(ablkcipher);
 
+#ifdef DEBUG
 	dev_err(jrdev, "%s %d: err 0x%x\n", __func__, __LINE__, err);
 #endif
 
@@ -2035,6 +2047,15 @@ static void ablkcipher_encrypt_done(struct device *jrdev, u32 *desc, u32 err,
 #endif
 
 	ablkcipher_unmap(jrdev, edesc, req);
+
+	/*
+	 * The crypto API expects us to set the IV (req->info) to the last
+	 * ciphertext block when running in CBC mode.
+	 */
+	if ((ctx->class1_alg_type & OP_ALG_AAI_MASK) == OP_ALG_AAI_CBC)
+		scatterwalk_map_and_copy(req->info, req->dst, req->nbytes -
+					 ivsize, ivsize, 0);
+
 	kfree(edesc);
 
 	ablkcipher_request_complete(req, err);
@@ -2045,10 +2066,11 @@ static void ablkcipher_decrypt_done(struct device *jrdev, u32 *desc, u32 err,
 {
 	struct ablkcipher_request *req = context;
 	struct ablkcipher_edesc *edesc;
-#ifdef DEBUG
 	struct crypto_ablkcipher *ablkcipher = crypto_ablkcipher_reqtfm(req);
+	struct caam_ctx *ctx = crypto_ablkcipher_ctx(ablkcipher);
 	int ivsize = crypto_ablkcipher_ivsize(ablkcipher);
 
+#ifdef DEBUG
 	dev_err(jrdev, "%s %d: err 0x%x\n", __func__, __LINE__, err);
 #endif
 
@@ -2067,6 +2089,15 @@ static void ablkcipher_decrypt_done(struct device *jrdev, u32 *desc, u32 err,
 #endif
 
 	ablkcipher_unmap(jrdev, edesc, req);
+
+	/*
+	 * The crypto API expects us to set the IV (req->info) to the last
+	 * ciphertext block when running in CBC mode.
+	 */
+	if ((ctx->class1_alg_type & OP_ALG_AAI_MASK) == OP_ALG_AAI_CBC)
+		scatterwalk_map_and_copy(req->info, req->src, req->nbytes -
+					 ivsize, ivsize, 0);
+
 	kfree(edesc);
 
 	ablkcipher_request_complete(req, err);
@@ -2113,6 +2144,7 @@ static void init_aead_job(struct aead_request *req,
 	if (unlikely(req->src != req->dst)) {
 		if (!edesc->dst_nents) {
 			dst_dma = sg_dma_address(req->dst);
+			out_options = 0;
 		} else {
 			dst_dma = edesc->sec4_sg_dma +
 				  sec4_sg_index *
@@ -2599,8 +2631,7 @@ static struct ablkcipher_edesc *ablkcipher_edesc_alloc(struct ablkcipher_request
 	struct crypto_ablkcipher *ablkcipher = crypto_ablkcipher_reqtfm(req);
 	struct caam_ctx *ctx = crypto_ablkcipher_ctx(ablkcipher);
 	struct device *jrdev = ctx->jrdev;
-	gfp_t flags = (req->base.flags & (CRYPTO_TFM_REQ_MAY_BACKLOG |
-					  CRYPTO_TFM_REQ_MAY_SLEEP)) ?
+	gfp_t flags = (req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) ?
 		       GFP_KERNEL : GFP_ATOMIC;
 	int src_nents, dst_nents = 0, sec4_sg_bytes;
 	struct ablkcipher_edesc *edesc;

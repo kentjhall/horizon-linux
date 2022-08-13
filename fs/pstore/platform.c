@@ -584,8 +584,8 @@ static void pstore_console_write(struct console *con, const char *s, unsigned c)
 		} else {
 			spin_lock_irqsave(&psinfo->buf_lock, flags);
 		}
-		memcpy(psinfo->buf, s, c);
-		psinfo->write(PSTORE_TYPE_CONSOLE, 0, &id, 0, 0, 0, c, psinfo);
+		psinfo->write_buf(PSTORE_TYPE_CONSOLE, 0, &id, 0,
+				  s, 0, c, psinfo);
 		spin_unlock_irqrestore(&psinfo->buf_lock, flags);
 		s += c;
 		c = e - s;
@@ -704,6 +704,7 @@ int pstore_register(struct pstore_info *psi)
 	if (psi->flags & PSTORE_FLAGS_PMSG)
 		pstore_register_pmsg();
 
+	/* Start watching for new records, if desired. */
 	if (pstore_update_ms >= 0) {
 		pstore_timer.expires = jiffies +
 			msecs_to_jiffies(pstore_update_ms);
@@ -726,6 +727,11 @@ EXPORT_SYMBOL_GPL(pstore_register);
 
 void pstore_unregister(struct pstore_info *psi)
 {
+	/* Stop timer and make sure all work has finished. */
+	pstore_update_ms = -1;
+	del_timer_sync(&pstore_timer);
+	flush_work(&pstore_work);
+
 	if (psi->flags & PSTORE_FLAGS_PMSG)
 		pstore_unregister_pmsg();
 	if (psi->flags & PSTORE_FLAGS_FTRACE)
@@ -825,7 +831,9 @@ static void pstore_timefunc(unsigned long dummy)
 		schedule_work(&pstore_work);
 	}
 
-	mod_timer(&pstore_timer, jiffies + msecs_to_jiffies(pstore_update_ms));
+	if (pstore_update_ms >= 0)
+		mod_timer(&pstore_timer,
+			  jiffies + msecs_to_jiffies(pstore_update_ms));
 }
 
 module_param(backend, charp, 0444);

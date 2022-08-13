@@ -18,6 +18,14 @@ extern unsigned int sysctl_sched_latency;
 extern unsigned int sysctl_sched_min_granularity;
 extern unsigned int sysctl_sched_wakeup_granularity;
 extern unsigned int sysctl_sched_child_runs_first;
+extern unsigned int sysctl_sched_sync_hint_enable;
+extern unsigned int sysctl_sched_cstate_aware;
+#ifdef CONFIG_SCHED_WALT
+extern unsigned int sysctl_sched_use_walt_cpu_util;
+extern unsigned int sysctl_sched_use_walt_task_util;
+extern unsigned int sysctl_sched_walt_init_task_load_pct;
+extern unsigned int sysctl_sched_walt_cpu_high_irqload;
+#endif
 
 enum sched_tunable_scaling {
 	SCHED_TUNABLESCALING_NONE,
@@ -33,9 +41,9 @@ extern unsigned int sysctl_numa_balancing_scan_period_max;
 extern unsigned int sysctl_numa_balancing_scan_size;
 
 #ifdef CONFIG_SCHED_DEBUG
-extern unsigned int sysctl_sched_migration_cost;
-extern unsigned int sysctl_sched_nr_migrate;
-extern unsigned int sysctl_sched_time_avg;
+extern __read_mostly unsigned int sysctl_sched_migration_cost;
+extern __read_mostly unsigned int sysctl_sched_nr_migrate;
+extern __read_mostly unsigned int sysctl_sched_time_avg;
 extern unsigned int sysctl_sched_shares_window;
 
 int sched_proc_update_handler(struct ctl_table *table, int write,
@@ -56,10 +64,27 @@ extern int sysctl_sched_rt_runtime;
 extern unsigned int sysctl_sched_cfs_bandwidth_slice;
 #endif
 
+#ifdef CONFIG_SCHED_TUNE
+extern unsigned int sysctl_sched_cfs_boost;
+int sysctl_sched_cfs_boost_handler(struct ctl_table *table, int write,
+				   void __user *buffer, size_t *length,
+				   loff_t *ppos);
+static inline unsigned int get_sysctl_sched_cfs_boost(void)
+{
+	return sysctl_sched_cfs_boost;
+}
+#else
+static inline unsigned int get_sysctl_sched_cfs_boost(void)
+{
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_SCHED_AUTOGROUP
 extern unsigned int sysctl_sched_autogroup_enabled;
 #endif
 
+extern int sysctl_sched_rr_timeslice;
 extern int sched_rr_timeslice;
 
 extern int sched_rr_handler(struct ctl_table *table, int write,

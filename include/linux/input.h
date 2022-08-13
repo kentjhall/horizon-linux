@@ -122,6 +122,7 @@ struct input_dev {
 	const char *name;
 	const char *phys;
 	const char *uniq;
+	bool enabled;
 	struct input_id id;
 
 	unsigned long propbit[BITS_TO_LONGS(INPUT_PROP_CNT)];
@@ -168,6 +169,8 @@ struct input_dev {
 	void (*close)(struct input_dev *dev);
 	int (*flush)(struct input_dev *dev, struct file *file);
 	int (*event)(struct input_dev *dev, unsigned int type, unsigned int code, int value);
+	int (*enable)(struct input_dev *dev);
+	int (*disable)(struct input_dev *dev);
 
 	struct input_handle __rcu *grab;
 
@@ -529,6 +532,7 @@ int input_ff_event(struct input_dev *dev, unsigned int type, unsigned int code, 
 
 int input_ff_upload(struct input_dev *dev, struct ff_effect *effect, struct file *file);
 int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file);
+int input_ff_flush(struct input_dev *dev, struct file *file);
 
 int input_ff_create_memless(struct input_dev *dev, void *data,
 		int (*play_effect)(struct input_dev *, void *, struct ff_effect *));

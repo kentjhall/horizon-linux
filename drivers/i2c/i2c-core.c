@@ -1230,6 +1230,55 @@ static void i2c_dev_set_name(struct i2c_adapter *adap,
 		     i2c_encode_flags_to_addr(client));
 }
 
+int i2c_set_adapter_bus_clk_rate(struct i2c_adapter *adap, int bus_rate)
+{
+	int ret;
+
+	if (adap->is_bus_clk_rate_supported) {
+		ret = adap->is_bus_clk_rate_supported(adap, bus_rate);
+		if (!ret) {
+			dev_err(&adap->dev, "clk rate %d not supported\n",
+				bus_rate);
+			return -EPERM;
+		}
+	}
+	i2c_lock_adapter(adap);
+	adap->bus_clk_rate = bus_rate;
+	i2c_unlock_adapter(adap);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(i2c_set_adapter_bus_clk_rate);
+
+int i2c_get_adapter_bus_clk_rate(struct i2c_adapter *adap)
+{
+	int bus_clk_rate;
+
+	i2c_lock_adapter(adap);
+	bus_clk_rate = adap->bus_clk_rate;
+	i2c_unlock_adapter(adap);
+
+	return bus_clk_rate;
+}
+EXPORT_SYMBOL_GPL(i2c_get_adapter_bus_clk_rate);
+
+void i2c_shutdown_adapter(struct i2c_adapter *adapter)
+{
+	i2c_lock_adapter(adapter);
+	adapter->cancel_xfer_on_shutdown = true;
+	i2c_unlock_adapter(adapter);
+}
+EXPORT_SYMBOL_GPL(i2c_shutdown_adapter);
+
+void i2c_shutdown_clear_adapter(struct i2c_adapter *adapter)
+{
+	i2c_lock_adapter(adapter);
+	adapter->cancel_xfer_on_shutdown = false;
+	adapter->atomic_xfer_only = true;
+	i2c_unlock_adapter(adapter);
+}
+EXPORT_SYMBOL_GPL(i2c_shutdown_clear_adapter);
+
 /**
  * i2c_new_device - instantiate an i2c device
  * @adap: the adapter managing the device
@@ -1565,10 +1614,37 @@ i2c_sysfs_delete_device(struct device *dev, struct device_attribute *attr,
 static DEVICE_ATTR_IGNORE_LOCKDEP(delete_device, S_IWUSR, NULL,
 				   i2c_sysfs_delete_device);
 
+static ssize_t show_bus_clk_rate(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct i2c_adapter *adap = to_i2c_adapter(dev);
+
+	return sprintf(buf, "%ld\n", adap->bus_clk_rate);
+}
+
+static ssize_t set_bus_clk_rate(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct i2c_adapter *adap = to_i2c_adapter(dev);
+	char *p = (char *)buf;
+	int bus_clk_rate;
+	bool ret;
+
+	bus_clk_rate = memparse(p, &p);
+	ret = i2c_set_adapter_bus_clk_rate(adap, bus_clk_rate);
+	if (!ret)
+		dev_info(dev, "Setting clock rate %d on next transfer\n",
+				bus_clk_rate);
+	return count;
+}
+static DEVICE_ATTR(bus_clk_rate, S_IRUGO | S_IWUSR, show_bus_clk_rate,
+		   set_bus_clk_rate);
+
 static struct attribute *i2c_adapter_attrs[] = {
 	&dev_attr_name.attr,
 	&dev_attr_new_device.attr,
 	&dev_attr_delete_device.attr,
+	&dev_attr_bus_clk_rate.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(i2c_adapter);
@@ -1657,7 +1733,7 @@ static struct i2c_client *of_i2c_register_device(struct i2c_adapter *adap,
 
 	if (i2c_check_addr_validity(addr, info.flags)) {
 		dev_err(&adap->dev, "of_i2c: invalid addr=%x on %s\n",
-			info.addr, node->full_name);
+			addr, node->full_name);
 		return ERR_PTR(-EINVAL);
 	}
 
@@ -1694,6 +1770,8 @@ static void of_i2c_register_devices(struct i2c_adapter *adap)
 		bus = of_node_get(adap->dev.of_node);
 
 	for_each_available_child_of_node(bus, node) {
+		if (!strcmp(node->name, "prod-settings"))
+			continue;
 		if (of_node_test_and_set_flag(node, OF_POPULATED))
 			continue;
 
@@ -1858,8 +1936,8 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 
 	/* create pre-declared device nodes */
 	of_i2c_register_devices(adap);
-	i2c_acpi_register_devices(adap);
 	i2c_acpi_install_space_handler(adap);
+	i2c_acpi_register_devices(adap);
 
 	if (adap->nr < __i2c_first_dynamic_bus_num)
 		i2c_scan_static_board_info(adap);
@@ -2575,7 +2653,10 @@ int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 			i2c_lock_bus(adap, I2C_LOCK_SEGMENT);
 		}
 
-		ret = __i2c_transfer(adap, msgs, num);
+		if (!adap->cancel_xfer_on_shutdown)
+			ret = __i2c_transfer(adap, msgs, num);
+		else
+			ret = -EPERM;
 		i2c_unlock_bus(adap, I2C_LOCK_SEGMENT);
 
 		return ret;
@@ -3250,16 +3331,16 @@ static s32 i2c_smbus_xfer_emulated(struct i2c_adapter *adapter, u16 addr,
 				   the underlying bus driver */
 		break;
 	case I2C_SMBUS_I2C_BLOCK_DATA:
+		if (data->block[0] > I2C_SMBUS_BLOCK_MAX) {
+			dev_err(&adapter->dev, "Invalid block %s size %d\n",
+				read_write == I2C_SMBUS_READ ? "read" : "write",
+				data->block[0]);
+			return -EINVAL;
+		}
 		if (read_write == I2C_SMBUS_READ) {
 			msg[1].len = data->block[0];
 		} else {
 			msg[0].len = data->block[0] + 1;
-			if (msg[0].len > I2C_SMBUS_BLOCK_MAX + 1) {
-				dev_err(&adapter->dev,
-					"Invalid block write size %d\n",
-					data->block[0]);
-				return -EINVAL;
-			}
 			for (i = 1; i <= data->block[0]; i++)
 				msgbuf0[i] = data->block[i];
 		}

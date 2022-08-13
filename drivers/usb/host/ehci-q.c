@@ -40,6 +40,10 @@
 
 /*-------------------------------------------------------------------------*/
 
+/* PID Codes that are used here, from EHCI specification, Table 3-16. */
+#define PID_CODE_IN    1
+#define PID_CODE_SETUP 2
+
 /* fill a qtd, returning how much of the buffer we were able to queue up */
 
 static int
@@ -73,7 +77,7 @@ qtd_fill(struct ehci_hcd *ehci, struct ehci_qtd *qtd, dma_addr_t buf,
 		}
 
 		/* short packets may only terminate transfers */
-		if (count != len)
+		if (count != len && maxpacket)
 			count -= (count % maxpacket);
 	}
 	qtd->hw_token = cpu_to_hc32(ehci, (count << 16) | token);
@@ -203,7 +207,7 @@ static int qtd_copy_status (
 	int	status = -EINPROGRESS;
 
 	/* count IN/OUT bytes, not SETUP (even short packets) */
-	if (likely (QTD_PID (token) != 2))
+	if (likely(QTD_PID(token) != PID_CODE_SETUP))
 		urb->actual_length += length - QTD_LENGTH (token);
 
 	/* don't modify error codes */
@@ -219,6 +223,13 @@ static int qtd_copy_status (
 		if (token & QTD_STS_BABBLE) {
 			/* FIXME "must" disable babbling device's port too */
 			status = -EOVERFLOW;
+		/*
+		 * When MMF is active and PID Code is IN, queue is halted.
+		 * EHCI Specification, Table 4-13.
+		 */
+		} else if ((token & QTD_STS_MMF) &&
+					(QTD_PID(token) == PID_CODE_IN)) {
+			status = -EPROTO;
 		/* CERR nonzero + halt --> stall */
 		} else if (QTD_CERR(token)) {
 			status = -EPIPE;
@@ -717,9 +728,11 @@ qh_urb_transaction (
 			one_more = 1;
 			token ^= 0x0100;	/* "in" <--> "out"  */
 			token |= QTD_TOGGLE;	/* force DATA1 */
-		} else if (usb_pipeout(urb->pipe)
-				&& (urb->transfer_flags & URB_ZERO_PACKET)
-				&& !(urb->transfer_buffer_length % maxpacket)) {
+		} else if (maxpacket && usb_pipeout(urb->pipe)
+				&& (urb->transfer_flags &
+				URB_ZERO_PACKET) &&
+				!(urb->transfer_buffer_length %
+				maxpacket)) {
 			one_more = 1;
 		}
 		if (one_more) {

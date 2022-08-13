@@ -22,6 +22,7 @@ struct route_info {
 #include <net/flow.h>
 #include <net/ip6_fib.h>
 #include <net/sock.h>
+#include <net/lwtunnel.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/route.h>
@@ -84,6 +85,7 @@ struct dst_entry *ip6_route_lookup(struct net *net, struct flowi6 *fl6,
 struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table,
 			       int ifindex, struct flowi6 *fl6, int flags);
 
+void ip6_route_init_special_entries(void);
 int ip6_route_init(void);
 void ip6_route_cleanup(void);
 
@@ -140,9 +142,10 @@ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
 		  const struct in6_addr *gwaddr);
 
 void ip6_update_pmtu(struct sk_buff *skb, struct net *net, __be32 mtu, int oif,
-		     u32 mark);
+		     u32 mark, kuid_t uid);
 void ip6_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, __be32 mtu);
-void ip6_redirect(struct sk_buff *skb, struct net *net, int oif, u32 mark);
+void ip6_redirect(struct sk_buff *skb, struct net *net, int oif, u32 mark,
+		  kuid_t uid);
 void ip6_redirect_no_header(struct sk_buff *skb, struct net *net, int oif,
 			    u32 mark);
 void ip6_sk_redirect(struct sk_buff *skb, struct sock *sk);
@@ -193,6 +196,7 @@ static inline bool ipv6_anycast_destination(const struct dst_entry *dst,
 
 	return rt->rt6i_flags & RTF_ANYCAST ||
 		(rt->rt6i_dst.plen != 128 &&
+		 !(rt->rt6i_flags & (RTF_GATEWAY | RTF_NONEXTHOP)) &&
 		 ipv6_addr_equal(&rt->rt6i_dst.addr, daddr));
 }
 
@@ -231,4 +235,11 @@ static inline struct in6_addr *rt6_nexthop(struct rt6_info *rt,
 		return daddr;
 }
 
+static inline bool rt6_duplicate_nexthop(struct rt6_info *a, struct rt6_info *b)
+{
+	return a->dst.dev == b->dst.dev &&
+	       a->rt6i_idev == b->rt6i_idev &&
+	       ipv6_addr_equal(&a->rt6i_gateway, &b->rt6i_gateway) &&
+	       !lwtunnel_cmp_encap(a->dst.lwtstate, b->dst.lwtstate);
+}
 #endif

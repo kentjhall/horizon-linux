@@ -218,6 +218,7 @@ static const struct of_device_id img_ascii_lcd_matches[] = {
 	{ .compatible = "img,boston-lcd", .data = &boston_config },
 	{ .compatible = "mti,malta-lcd", .data = &malta_config },
 	{ .compatible = "mti,sead3-lcd", .data = &sead3_config },
+	{ /* sentinel */ }
 };
 
 /**
@@ -441,3 +442,7 @@ static struct platform_driver img_ascii_lcd_driver = {
 	.remove	= img_ascii_lcd_remove,
 };
 module_platform_driver(img_ascii_lcd_driver);
+
+MODULE_DESCRIPTION("Imagination Technologies ASCII LCD Display");
+MODULE_AUTHOR("Paul Burton <paul.burton@mips.com>");
+MODULE_LICENSE("GPL");

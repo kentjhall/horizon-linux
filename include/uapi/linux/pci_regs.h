@@ -106,7 +106,7 @@
 #define PCI_SUBSYSTEM_ID	0x2e
 #define PCI_ROM_ADDRESS		0x30	/* Bits 31..11 are address, 10..1 reserved */
 #define  PCI_ROM_ADDRESS_ENABLE	0x01
-#define PCI_ROM_ADDRESS_MASK	(~0x7ffUL)
+#define PCI_ROM_ADDRESS_MASK	(~0x7ffU)
 
 #define PCI_CAPABILITY_LIST	0x34	/* Offset of first capability list entry */
 
@@ -674,6 +674,7 @@
 #define PCI_EXT_CAP_ID_PMUX	0x1A	/* Protocol Multiplexing */
 #define PCI_EXT_CAP_ID_PASID	0x1B	/* Process Address Space ID */
 #define PCI_EXT_CAP_ID_DPC	0x1D	/* Downstream Port Containment */
+#define PCI_EXT_CAP_ID_L1SS	0x1E	/* L1 Substates */
 #define PCI_EXT_CAP_ID_PTM	0x1F	/* Precision Time Measurement */
 #define PCI_EXT_CAP_ID_MAX	PCI_EXT_CAP_ID_PTM
 
@@ -950,6 +951,60 @@
 #define PCI_TPH_CAP_ST_MASK	0x07FF0000	/* st table mask */
 #define PCI_TPH_CAP_ST_SHIFT	16	/* st table shift */
 #define PCI_TPH_BASE_SIZEOF	12	/* size with no st table */
+
+/* L1SS capability */
+#define PCI_L1SS_CAP		0x04	/* L1SS Capability Register */
+#define  PCI_L1SS_CAP_L1PM_MASK	0x0F	/* L1 PM Substate Supported */
+#define  PCI_L1SS_CAP_PM_L12S	0x01	/* PCI-PM L1.2 Supported */
+#define  PCI_L1SS_CAP_PM_L11S	0x02	/* PCI-PM L1.1 Supported */
+#define  PCI_L1SS_CAP_ASPM_L12S	0x04	/* ASPM L1.2 Supported */
+#define  PCI_L1SS_CAP_ASPM_L11S	0x08	/* ASPM L1.1 Supported */
+#define  PCI_L1SS_CAP_L1PMS		0x10	/* L1 PM Substate Supported */
+#define  PCI_L1SS_CAP_CM_RTM_MASK	0xFF00	/* Common mode restore time */
+#define  PCI_L1SS_CAP_CM_RTM_SHIFT	8	/* Common mode restore mask */
+#define  PCI_L1SS_CAP_PWRN_SCL_MASK	0x30000	/* T_POWER_ON scale mask */
+#define  PCI_L1SS_CAP_PWRN_SCL_SHIFT	16	/* T_POWER_ON scale shift */
+#define  PCI_L1SS_CAP_PWRN_VAL_MASK	0xF80000	/* T_POWER_ON val mask */
+#define  PCI_L1SS_CAP_PWRN_VAL_SHIFT	19	/* T_POWER_ON val shift */
+#define  PCI_L1SS_CAP_PWRN_VS_MASK	0xFF0000	/* T_POWER_ON val mask */
+#define PCI_L1SS_CTRL1		0x08	/* L1SS control 1 register */
+#define  PCI_L1SS_CTRL1_PM_L12S	0x01	/* PCI-PM L1.2 Enable */
+#define  PCI_L1SS_CTRL1_PM_L11S	0x02	/* PCI-PM L1.1 Enable */
+#define  PCI_L1SS_CTRL1_ASPM_L12S	0x04	/* ASPM L1.2 Enable */
+#define  PCI_L1SS_CTRL1_ASPM_L11S	0x08	/* ASPM L1.1 Enable */
+#define  PCI_L1SS_CTRL1_ASPM_L11SC	0x0C	/* ASPM L1SS Enable */
+#define  PCI_L1SS_CTRL1_CMRT_MASK	0xFF00	/* CM restore time mask */
+#define  PCI_L1SS_CTRL1_CMRT_SHIFT	8	/* CM restore time shift */
+#define  PCI_L1SS_CTRL1_L12TH_VAL_MASK	0x3FF0000	/* L1.2 threshold val mask */
+#define  PCI_L1SS_CTRL1_L12TH_VAL_SHIFT	16	/* L1.2 threshold val shift */
+#define  PCI_L1SS_CTRL1_L12TH_SCALE_MASK	0xE0000000	/* L1.2 threshold scale mask */
+#define  PCI_L1SS_CTRL1_L12TH_SCALE_SHIFT	29	/* L1.2 threshold scale shift */
+#define PCI_L1SS_CTRL2		0x0C	/* L1SS control 2 register */
+#define PCI_L1SS_CTRL2_PWRN_SCL_MASK	0x03	/* L1SS ctrl 2 reg scale mask */
+#define PCI_L1SS_CTRL2_PWRN_VAL_MASK	0xF8	/* L1SS ctrl 2 reg val mask */
+#define PCI_L1SS_CTRL2_PWRN_VAL_SHIFT	3	/* L1SS ctrl 2 reg val shift */
+
+/* Note: Some of these backports from k4.14 overlap existing k4.9 values... */
+/* ASPM L1 PM Substates */
+#define PCI_L1SS_CAP		0x04	/* Capabilities Register */
+#define  PCI_L1SS_CAP_PCIPM_L1_2	0x00000001  /* PCI-PM L1.2 Supported */
+#define  PCI_L1SS_CAP_PCIPM_L1_1	0x00000002  /* PCI-PM L1.1 Supported */
+#define  PCI_L1SS_CAP_ASPM_L1_2		0x00000004  /* ASPM L1.2 Supported */
+#define  PCI_L1SS_CAP_ASPM_L1_1		0x00000008  /* ASPM L1.1 Supported */
+#define  PCI_L1SS_CAP_L1_PM_SS		0x00000010  /* L1 PM Substates Supported */
+#define  PCI_L1SS_CAP_CM_RESTORE_TIME	0x0000ff00  /* Port Common_Mode_Restore_Time */
+#define  PCI_L1SS_CAP_P_PWR_ON_SCALE	0x00030000  /* Port T_POWER_ON scale */
+#define  PCI_L1SS_CAP_P_PWR_ON_VALUE	0x00f80000  /* Port T_POWER_ON value */
+#define PCI_L1SS_CTL1		0x08	/* Control 1 Register */
+#define  PCI_L1SS_CTL1_PCIPM_L1_2	0x00000001  /* PCI-PM L1.2 Enable */
+#define  PCI_L1SS_CTL1_PCIPM_L1_1	0x00000002  /* PCI-PM L1.1 Enable */
+#define  PCI_L1SS_CTL1_ASPM_L1_2	0x00000004  /* ASPM L1.2 Enable */
+#define  PCI_L1SS_CTL1_ASPM_L1_1	0x00000008  /* ASPM L1.1 Enable */
+#define  PCI_L1SS_CTL1_L1SS_MASK	0x0000000f
+#define  PCI_L1SS_CTL1_CM_RESTORE_TIME	0x0000ff00  /* Common_Mode_Restore_Time */
+#define  PCI_L1SS_CTL1_LTR_L12_TH_VALUE	0x03ff0000  /* LTR_L1.2_THRESHOLD_Value */
+#define  PCI_L1SS_CTL1_LTR_L12_TH_SCALE	0xe0000000  /* LTR_L1.2_THRESHOLD_Scale */
+#define PCI_L1SS_CTL2		0x0c	/* Control 2 Register */
 
 /* Downstream Port Containment */
 #define PCI_EXP_DPC_CAP			4	/* DPC Capability */

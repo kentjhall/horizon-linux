@@ -105,6 +105,13 @@ static void bxt_init_clock_gating(struct drm_device *dev)
 	if (IS_BXT_REVID(dev_priv, BXT_REVID_B0, REVID_FOREVER))
 		I915_WRITE(GEN9_CLKGATE_DIS_0, I915_READ(GEN9_CLKGATE_DIS_0) |
 			   PWM1_GATING_DIS | PWM2_GATING_DIS);
+	/*
+	 * Lower the display internal timeout.
+	 * This is needed to avoid any hard hangs when DSI port PLL
+	 * is off and a MMIO access is attempted by any privilege
+	 * application, using batch buffers or any other means.
+	 */
+	I915_WRITE(RM_TIMEOUT, MMIO_TIMEOUT_US(950));
 }
 
 static void i915_pineview_get_mem_freq(struct drm_device *dev)
@@ -2879,6 +2886,21 @@ skl_wm_plane_id(const struct intel_plane *plane)
 	}
 }
 
+/*
+ * FIXME: We still don't have the proper code detect if we need to apply the WA,
+ * so assume we'll always need it in order to avoid underruns.
+ */
+static bool skl_needs_memory_bw_wa(struct intel_atomic_state *state)
+{
+	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+
+	if (IS_SKYLAKE(dev_priv) || IS_BROXTON(dev_priv) ||
+	    IS_KABYLAKE(dev_priv))
+		return true;
+
+	return false;
+}
+
 static bool
 intel_has_sagv(struct drm_i915_private *dev_priv)
 {
@@ -2940,24 +2962,10 @@ intel_enable_sagv(struct drm_i915_private *dev_priv)
 	return 0;
 }
 
-static int
-intel_do_sagv_disable(struct drm_i915_private *dev_priv)
-{
-	int ret;
-	uint32_t temp = GEN9_SAGV_DISABLE;
-
-	ret = sandybridge_pcode_read(dev_priv, GEN9_PCODE_SAGV_CONTROL,
-				     &temp);
-	if (ret)
-		return ret;
-	else
-		return temp & GEN9_SAGV_IS_DISABLED;
-}
-
 int
 intel_disable_sagv(struct drm_i915_private *dev_priv)
 {
-	int ret, result;
+	int ret;
 
 	if (!intel_has_sagv(dev_priv))
 		return 0;
@@ -2969,25 +2977,23 @@ intel_disable_sagv(struct drm_i915_private *dev_priv)
 	mutex_lock(&dev_priv->rps.hw_lock);
 
 	/* bspec says to keep retrying for at least 1 ms */
-	ret = wait_for(result = intel_do_sagv_disable(dev_priv), 1);
+	ret = skl_pcode_request(dev_priv, GEN9_PCODE_SAGV_CONTROL,
+				GEN9_SAGV_DISABLE,
+				GEN9_SAGV_IS_DISABLED, GEN9_SAGV_IS_DISABLED,
+				1);
 	mutex_unlock(&dev_priv->rps.hw_lock);
-
-	if (ret == -ETIMEDOUT) {
-		DRM_ERROR("Request to disable SAGV timed out\n");
-		return -ETIMEDOUT;
-	}
 
 	/*
 	 * Some skl systems, pre-release machines in particular,
 	 * don't actually have an SAGV.
 	 */
-	if (IS_SKYLAKE(dev_priv) && result == -ENXIO) {
+	if (IS_SKYLAKE(dev_priv) && ret == -ENXIO) {
 		DRM_DEBUG_DRIVER("No SAGV found on system, ignoring\n");
 		dev_priv->sagv_status = I915_SAGV_NOT_CONTROLLED;
 		return 0;
-	} else if (result < 0) {
-		DRM_ERROR("Failed to disable the SAGV\n");
-		return result;
+	} else if (ret < 0) {
+		DRM_ERROR("Failed to disable the SAGV (%d)\n", ret);
+		return ret;
 	}
 
 	dev_priv->sagv_status = I915_SAGV_DISABLED;
@@ -2999,9 +3005,10 @@ bool intel_can_enable_sagv(struct drm_atomic_state *state)
 	struct drm_device *dev = state->dev;
 	struct drm_i915_private *dev_priv = to_i915(dev);
 	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
-	struct drm_crtc *crtc;
+	struct intel_crtc *crtc;
+	struct intel_plane *plane;
 	enum pipe pipe;
-	int level, plane;
+	int level, id, latency;
 
 	if (!intel_has_sagv(dev_priv))
 		return false;
@@ -3019,27 +3026,36 @@ bool intel_can_enable_sagv(struct drm_atomic_state *state)
 
 	/* Since we're now guaranteed to only have one active CRTC... */
 	pipe = ffs(intel_state->active_crtcs) - 1;
-	crtc = dev_priv->pipe_to_crtc_mapping[pipe];
+	crtc = to_intel_crtc(dev_priv->pipe_to_crtc_mapping[pipe]);
 
-	if (crtc->state->mode.flags & DRM_MODE_FLAG_INTERLACE)
+	if (crtc->base.state->mode.flags & DRM_MODE_FLAG_INTERLACE)
 		return false;
 
-	for_each_plane(dev_priv, pipe, plane) {
+	for_each_intel_plane_on_crtc(dev, crtc, plane) {
+		id = skl_wm_plane_id(plane);
+
 		/* Skip this plane if it's not enabled */
-		if (intel_state->wm_results.plane[pipe][plane][0] == 0)
+		if (intel_state->wm_results.plane[pipe][id][0] == 0)
 			continue;
 
 		/* Find the highest enabled wm level for this plane */
 		for (level = ilk_wm_max_level(dev);
-		     intel_state->wm_results.plane[pipe][plane][level] == 0; --level)
+		     intel_state->wm_results.plane[pipe][id][level] == 0; --level)
 		     { }
+
+		latency = dev_priv->wm.skl_latency[level];
+
+		if (skl_needs_memory_bw_wa(intel_state) &&
+		    plane->base.state->fb->modifier[0] ==
+		    I915_FORMAT_MOD_X_TILED)
+			latency += 15;
 
 		/*
 		 * If any of the planes on this pipe don't enable wm levels
 		 * that incur memory latencies higher then 30µs we can't enable
 		 * the SAGV
 		 */
-		if (dev_priv->wm.skl_latency[level] < SKL_SAGV_BLOCK_TIME)
+		if (latency < SKL_SAGV_BLOCK_TIME)
 			return false;
 	}
 
@@ -3549,11 +3565,17 @@ static int skl_compute_plane_wm(const struct drm_i915_private *dev_priv,
 	uint32_t width = 0, height = 0;
 	uint32_t plane_pixel_rate;
 	uint32_t y_tile_minimum, y_min_scanlines;
+	struct intel_atomic_state *state =
+		to_intel_atomic_state(cstate->base.state);
+	bool apply_memory_bw_wa = skl_needs_memory_bw_wa(state);
 
 	if (latency == 0 || !cstate->base.active || !intel_pstate->base.visible) {
 		*enabled = false;
 		return 0;
 	}
+
+	if (apply_memory_bw_wa && fb->modifier[0] == I915_FORMAT_MOD_X_TILED)
+		latency += 15;
 
 	width = drm_rect_width(&intel_pstate->base.src) >> 16;
 	height = drm_rect_height(&intel_pstate->base.src) >> 16;
@@ -3585,6 +3607,9 @@ static int skl_compute_plane_wm(const struct drm_i915_private *dev_priv,
 	} else {
 		y_min_scanlines = 4;
 	}
+
+	if (apply_memory_bw_wa)
+		y_min_scanlines *= 2;
 
 	plane_bytes_per_line = width * cpp;
 	if (fb->modifier[0] == I915_FORMAT_MOD_Y_TILED ||
@@ -4096,9 +4121,17 @@ skl_compute_wm(struct drm_atomic_state *state)
 	struct drm_crtc_state *cstate;
 	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
 	struct skl_wm_values *results = &intel_state->wm_results;
+	struct drm_device *dev = state->dev;
 	struct skl_pipe_wm *pipe_wm;
 	bool changed = false;
 	int ret, i;
+
+	/*
+	 * When we distrust bios wm we always need to recompute to set the
+	 * expected DDB allocations for each CRTC.
+	 */
+	if (to_i915(dev)->wm.distrust_bios_wm)
+		changed = true;
 
 	/*
 	 * If this transaction isn't actually touching any CRTC's, don't
@@ -4110,6 +4143,7 @@ skl_compute_wm(struct drm_atomic_state *state)
 	 */
 	for_each_crtc_in_state(state, crtc, cstate, i)
 		changed = true;
+
 	if (!changed)
 		return 0;
 
@@ -4885,6 +4919,12 @@ static void gen6_set_rps_thresholds(struct drm_i915_private *dev_priv, u8 val)
 		break;
 	}
 
+	/* When byt can survive without system hang with dynamic
+	 * sw freq adjustments, this restriction can be lifted.
+	 */
+	if (IS_VALLEYVIEW(dev_priv))
+		goto skip_hw_write;
+
 	I915_WRITE(GEN6_RP_UP_EI,
 		   GT_INTERVAL_FROM_US(dev_priv, ei_up));
 	I915_WRITE(GEN6_RP_UP_THRESHOLD,
@@ -4905,6 +4945,7 @@ static void gen6_set_rps_thresholds(struct drm_i915_private *dev_priv, u8 val)
 		   GEN6_RP_UP_BUSY_AVG |
 		   GEN6_RP_DOWN_IDLE_AVG);
 
+skip_hw_write:
 	dev_priv->rps.power = new_power;
 	dev_priv->rps.up_threshold = threshold_up;
 	dev_priv->rps.down_threshold = threshold_down;
@@ -4915,8 +4956,9 @@ static u32 gen6_rps_pm_mask(struct drm_i915_private *dev_priv, u8 val)
 {
 	u32 mask = 0;
 
+	/* We use UP_EI_EXPIRED interupts for both up/down in manual mode */
 	if (val > dev_priv->rps.min_freq_softlimit)
-		mask |= GEN6_PM_RP_DOWN_EI_EXPIRED | GEN6_PM_RP_DOWN_THRESHOLD | GEN6_PM_RP_DOWN_TIMEOUT;
+		mask |= GEN6_PM_RP_UP_EI_EXPIRED | GEN6_PM_RP_DOWN_THRESHOLD | GEN6_PM_RP_DOWN_TIMEOUT;
 	if (val < dev_priv->rps.max_freq_softlimit)
 		mask |= GEN6_PM_RP_UP_EI_EXPIRED | GEN6_PM_RP_UP_THRESHOLD;
 
@@ -5016,7 +5058,7 @@ void gen6_rps_busy(struct drm_i915_private *dev_priv)
 {
 	mutex_lock(&dev_priv->rps.hw_lock);
 	if (dev_priv->rps.enabled) {
-		if (dev_priv->pm_rps_events & (GEN6_PM_RP_DOWN_EI_EXPIRED | GEN6_PM_RP_UP_EI_EXPIRED))
+		if (dev_priv->pm_rps_events & GEN6_PM_RP_UP_EI_EXPIRED)
 			gen6_rps_reset_ei(dev_priv);
 		I915_WRITE(GEN6_PMINTRMSK,
 			   gen6_rps_pm_mask(dev_priv, dev_priv->rps.cur_freq));
@@ -5114,19 +5156,23 @@ static void gen9_disable_rps(struct drm_i915_private *dev_priv)
 	I915_WRITE(GEN6_RP_CONTROL, 0);
 }
 
-static void gen6_disable_rps(struct drm_i915_private *dev_priv)
+static void gen6_disable_rc6(struct drm_i915_private *dev_priv)
 {
 	I915_WRITE(GEN6_RC_CONTROL, 0);
+}
+
+static void gen6_disable_rps(struct drm_i915_private *dev_priv)
+{
 	I915_WRITE(GEN6_RPNSWREQ, 1 << 31);
 	I915_WRITE(GEN6_RP_CONTROL, 0);
 }
 
-static void cherryview_disable_rps(struct drm_i915_private *dev_priv)
+static void cherryview_disable_rc6(struct drm_i915_private *dev_priv)
 {
 	I915_WRITE(GEN6_RC_CONTROL, 0);
 }
 
-static void valleyview_disable_rps(struct drm_i915_private *dev_priv)
+static void valleyview_disable_rc6(struct drm_i915_private *dev_priv)
 {
 	/* we're doing forcewake before Disabling RC6,
 	 * This what the BIOS expects when going into suspend */
@@ -5391,7 +5437,8 @@ static void gen9_enable_rc6(struct drm_i915_private *dev_priv)
 	I915_WRITE(GEN9_RENDER_PG_IDLE_HYSTERESIS, 25);
 
 	/* 3a: Enable RC6 */
-	if (intel_enable_rc6() & INTEL_RC6_ENABLE)
+	if (!dev_priv->rps.ctx_corrupted &&
+	    intel_enable_rc6() & INTEL_RC6_ENABLE)
 		rc6_mask = GEN6_RC_CTL_RC6_ENABLE;
 	DRM_INFO("RC6 %s\n", onoff(rc6_mask & GEN6_RC_CTL_RC6_ENABLE));
 	/* WaRsUseTimeoutMode */
@@ -5449,7 +5496,8 @@ static void gen8_enable_rps(struct drm_i915_private *dev_priv)
 		I915_WRITE(GEN6_RC6_THRESHOLD, 50000); /* 50/125ms per EI */
 
 	/* 3: Enable RC6 */
-	if (intel_enable_rc6() & INTEL_RC6_ENABLE)
+	if (!dev_priv->rps.ctx_corrupted &&
+	    intel_enable_rc6() & INTEL_RC6_ENABLE)
 		rc6_mask = GEN6_RC_CTL_RC6_ENABLE;
 	intel_print_rc6_info(dev_priv, rc6_mask);
 	if (IS_BROADWELL(dev_priv))
@@ -6620,6 +6668,95 @@ static void intel_init_emon(struct drm_i915_private *dev_priv)
 	dev_priv->ips.corr = (lcfuse & LCFUSE_HIV_MASK);
 }
 
+static bool i915_rc6_ctx_corrupted(struct drm_i915_private *dev_priv)
+{
+	return !I915_READ(GEN8_RC6_CTX_INFO);
+}
+
+static void i915_rc6_ctx_wa_init(struct drm_i915_private *i915)
+{
+	if (!NEEDS_RC6_CTX_CORRUPTION_WA(i915))
+		return;
+
+	if (i915_rc6_ctx_corrupted(i915)) {
+		DRM_INFO("RC6 context corrupted, disabling runtime power management\n");
+		i915->rps.ctx_corrupted = true;
+		intel_runtime_pm_get(i915);
+	}
+}
+
+static void i915_rc6_ctx_wa_cleanup(struct drm_i915_private *i915)
+{
+	if (i915->rps.ctx_corrupted) {
+		intel_runtime_pm_put(i915);
+		i915->rps.ctx_corrupted = false;
+	}
+}
+
+/**
+ * i915_rc6_ctx_wa_suspend - system suspend sequence for the RC6 CTX WA
+ * @i915: i915 device
+ *
+ * Perform any steps needed to clean up the RC6 CTX WA before system suspend.
+ */
+void i915_rc6_ctx_wa_suspend(struct drm_i915_private *i915)
+{
+	if (i915->rps.ctx_corrupted)
+		intel_runtime_pm_put(i915);
+}
+
+/**
+ * i915_rc6_ctx_wa_resume - system resume sequence for the RC6 CTX WA
+ * @i915: i915 device
+ *
+ * Perform any steps needed to re-init the RC6 CTX WA after system resume.
+ */
+void i915_rc6_ctx_wa_resume(struct drm_i915_private *i915)
+{
+	if (!i915->rps.ctx_corrupted)
+		return;
+
+	if (i915_rc6_ctx_corrupted(i915)) {
+		intel_runtime_pm_get(i915);
+		return;
+	}
+
+	DRM_INFO("RC6 context restored, re-enabling runtime power management\n");
+	i915->rps.ctx_corrupted = false;
+}
+
+static void intel_disable_rc6(struct drm_i915_private *dev_priv);
+
+/**
+ * i915_rc6_ctx_wa_check - check for a new RC6 CTX corruption
+ * @i915: i915 device
+ *
+ * Check if an RC6 CTX corruption has happened since the last check and if so
+ * disable RC6 and runtime power management.
+ *
+ * Return false if no context corruption has happened since the last call of
+ * this function, true otherwise.
+*/
+bool i915_rc6_ctx_wa_check(struct drm_i915_private *i915)
+{
+	if (!NEEDS_RC6_CTX_CORRUPTION_WA(i915))
+		return false;
+
+	if (i915->rps.ctx_corrupted)
+		return false;
+
+	if (!i915_rc6_ctx_corrupted(i915))
+		return false;
+
+	DRM_NOTE("RC6 context corruption, disabling runtime power management\n");
+
+	intel_disable_rc6(i915);
+	i915->rps.ctx_corrupted = true;
+	intel_runtime_pm_get_noresume(i915);
+
+	return true;
+}
+
 void intel_init_gt_powersave(struct drm_i915_private *dev_priv)
 {
 	/*
@@ -6633,6 +6770,8 @@ void intel_init_gt_powersave(struct drm_i915_private *dev_priv)
 
 	mutex_lock(&dev_priv->drm.struct_mutex);
 	mutex_lock(&dev_priv->rps.hw_lock);
+
+	i915_rc6_ctx_wa_init(dev_priv);
 
 	/* Initialize RPS limits (for userspace) */
 	if (IS_CHERRYVIEW(dev_priv))
@@ -6683,6 +6822,8 @@ void intel_cleanup_gt_powersave(struct drm_i915_private *dev_priv)
 	if (IS_VALLEYVIEW(dev_priv))
 		valleyview_cleanup_gt_powersave(dev_priv);
 
+	i915_rc6_ctx_wa_cleanup(dev_priv);
+
 	if (!i915.enable_rc6)
 		intel_runtime_pm_put(dev_priv);
 }
@@ -6714,6 +6855,35 @@ void intel_sanitize_gt_powersave(struct drm_i915_private *dev_priv)
 	gen6_reset_rps_interrupts(dev_priv);
 }
 
+static void __intel_disable_rc6(struct drm_i915_private *dev_priv)
+{
+	if (INTEL_GEN(dev_priv) >= 9)
+		gen9_disable_rc6(dev_priv);
+	else if (IS_CHERRYVIEW(dev_priv))
+		cherryview_disable_rc6(dev_priv);
+	else if (IS_VALLEYVIEW(dev_priv))
+		valleyview_disable_rc6(dev_priv);
+	else if (INTEL_GEN(dev_priv) >= 6)
+		gen6_disable_rc6(dev_priv);
+}
+
+static void intel_disable_rc6(struct drm_i915_private *dev_priv)
+{
+	mutex_lock(&dev_priv->rps.hw_lock);
+	__intel_disable_rc6(dev_priv);
+	mutex_unlock(&dev_priv->rps.hw_lock);
+}
+
+static void intel_disable_rps(struct drm_i915_private *dev_priv)
+{
+	if (INTEL_GEN(dev_priv) >= 9)
+		gen9_disable_rps(dev_priv);
+	else if (INTEL_GEN(dev_priv) >= 6)
+		gen6_disable_rps(dev_priv);
+	else if (IS_IRONLAKE_M(dev_priv))
+		ironlake_disable_drps(dev_priv);
+}
+
 void intel_disable_gt_powersave(struct drm_i915_private *dev_priv)
 {
 	if (!READ_ONCE(dev_priv->rps.enabled))
@@ -6721,20 +6891,11 @@ void intel_disable_gt_powersave(struct drm_i915_private *dev_priv)
 
 	mutex_lock(&dev_priv->rps.hw_lock);
 
-	if (INTEL_GEN(dev_priv) >= 9) {
-		gen9_disable_rc6(dev_priv);
-		gen9_disable_rps(dev_priv);
-	} else if (IS_CHERRYVIEW(dev_priv)) {
-		cherryview_disable_rps(dev_priv);
-	} else if (IS_VALLEYVIEW(dev_priv)) {
-		valleyview_disable_rps(dev_priv);
-	} else if (INTEL_GEN(dev_priv) >= 6) {
-		gen6_disable_rps(dev_priv);
-	}  else if (IS_IRONLAKE_M(dev_priv)) {
-		ironlake_disable_drps(dev_priv);
-	}
+	__intel_disable_rc6(dev_priv);
+	intel_disable_rps(dev_priv);
 
 	dev_priv->rps.enabled = false;
+
 	mutex_unlock(&dev_priv->rps.hw_lock);
 }
 
@@ -7878,8 +8039,8 @@ int sandybridge_pcode_read(struct drm_i915_private *dev_priv, u32 mbox, u32 *val
 	return 0;
 }
 
-int sandybridge_pcode_write(struct drm_i915_private *dev_priv,
-			    u32 mbox, u32 val)
+int sandybridge_pcode_write_timeout(struct drm_i915_private *dev_priv,
+				    u32 mbox, u32 val, int timeout_us)
 {
 	int status;
 
@@ -7900,7 +8061,7 @@ int sandybridge_pcode_write(struct drm_i915_private *dev_priv,
 
 	if (intel_wait_for_register_fw(dev_priv,
 				       GEN6_PCODE_MAILBOX, GEN6_PCODE_READY, 0,
-				       500)) {
+				       timeout_us)) {
 		DRM_ERROR("timeout waiting for pcode write (%d) to finish\n", mbox);
 		return -ETIMEDOUT;
 	}
@@ -7919,6 +8080,82 @@ int sandybridge_pcode_write(struct drm_i915_private *dev_priv,
 	}
 
 	return 0;
+}
+
+static bool skl_pcode_try_request(struct drm_i915_private *dev_priv, u32 mbox,
+				  u32 request, u32 reply_mask, u32 reply,
+				  u32 *status)
+{
+	u32 val = request;
+
+	*status = sandybridge_pcode_read(dev_priv, mbox, &val);
+
+	return *status || ((val & reply_mask) == reply);
+}
+
+/**
+ * skl_pcode_request - send PCODE request until acknowledgment
+ * @dev_priv: device private
+ * @mbox: PCODE mailbox ID the request is targeted for
+ * @request: request ID
+ * @reply_mask: mask used to check for request acknowledgment
+ * @reply: value used to check for request acknowledgment
+ * @timeout_base_ms: timeout for polling with preemption enabled
+ *
+ * Keep resending the @request to @mbox until PCODE acknowledges it, PCODE
+ * reports an error or an overall timeout of @timeout_base_ms+50 ms expires.
+ * The request is acknowledged once the PCODE reply dword equals @reply after
+ * applying @reply_mask. Polling is first attempted with preemption enabled
+ * for @timeout_base_ms and if this times out for another 50 ms with
+ * preemption disabled.
+ *
+ * Returns 0 on success, %-ETIMEDOUT in case of a timeout, <0 in case of some
+ * other error as reported by PCODE.
+ */
+int skl_pcode_request(struct drm_i915_private *dev_priv, u32 mbox, u32 request,
+		      u32 reply_mask, u32 reply, int timeout_base_ms)
+{
+	u32 status;
+	int ret;
+
+	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
+
+#define COND skl_pcode_try_request(dev_priv, mbox, request, reply_mask, reply, \
+				   &status)
+
+	/*
+	 * Prime the PCODE by doing a request first. Normally it guarantees
+	 * that a subsequent request, at most @timeout_base_ms later, succeeds.
+	 * _wait_for() doesn't guarantee when its passed condition is evaluated
+	 * first, so send the first request explicitly.
+	 */
+	if (COND) {
+		ret = 0;
+		goto out;
+	}
+	ret = _wait_for(COND, timeout_base_ms * 1000, 10);
+	if (!ret)
+		goto out;
+
+	/*
+	 * The above can time out if the number of requests was low (2 in the
+	 * worst case) _and_ PCODE was busy for some reason even after a
+	 * (queued) request and @timeout_base_ms delay. As a workaround retry
+	 * the poll with preemption disabled to maximize the number of
+	 * requests. Increase the timeout from @timeout_base_ms to 50ms to
+	 * account for interrupts that could reduce the number of these
+	 * requests, and for any quirks of the PCODE firmware that delays
+	 * the request completion.
+	 */
+	DRM_DEBUG_KMS("PCODE timeout, retrying with preemption disabled\n");
+	WARN_ON_ONCE(timeout_base_ms > 3);
+	preempt_disable();
+	ret = wait_for_atomic(COND, 50);
+	preempt_enable();
+
+out:
+	return ret ? ret : status;
+#undef COND
 }
 
 static int byt_gpu_freq(struct drm_i915_private *dev_priv, int val)

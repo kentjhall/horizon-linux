@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2012 Avionic Design GmbH
- * Copyright (C) 2012-2013 NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (C) 2012-2017 NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -66,7 +66,7 @@ struct tegra_drm_client;
 struct tegra_drm_context {
 	struct tegra_drm_client *client;
 	struct host1x_channel *channel;
-	struct list_head list;
+	unsigned int id;
 };
 
 struct tegra_drm_client_ops {

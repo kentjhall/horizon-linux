@@ -47,7 +47,8 @@ struct i2c_driver;
 union i2c_smbus_data;
 struct i2c_board_info;
 enum i2c_slave_event;
-typedef int (*i2c_slave_cb_t)(struct i2c_client *, enum i2c_slave_event, u8 *);
+typedef int (*i2c_slave_cb_t)(struct i2c_client *, enum i2c_slave_event,
+			      void *);
 
 struct module;
 
@@ -71,6 +72,10 @@ extern int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 /* Unlocked flavor */
 extern int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 			  int num);
+
+/* Change bus clock rate for i2c adapter */
+extern int i2c_set_adapter_bus_clk_rate(struct i2c_adapter *adap, int bus_rate);
+extern int i2c_get_adapter_bus_clk_rate(struct i2c_adapter *adap);
 
 /* This is the very generalized SMBus access routine. You probably do not
    want to use this, though; one of the functions below may be much easier,
@@ -237,6 +242,7 @@ struct i2c_client {
 	struct list_head detected;
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
 	i2c_slave_cb_t slave_cb;	/* callback for slave mode	*/
+	u32 buffer_size;		/* slave buffer size */
 #endif
 };
 #define to_i2c_client(d) container_of(d, struct i2c_client, dev)
@@ -268,14 +274,24 @@ enum i2c_slave_event {
 	I2C_SLAVE_WRITE_REQUESTED,
 	I2C_SLAVE_READ_PROCESSED,
 	I2C_SLAVE_WRITE_RECEIVED,
+	I2C_SLAVE_READ_BUFFER_REQUESTED,
+	I2C_SLAVE_WRITE_BUFFER_REQUESTED,
+	I2C_SLAVE_READ_BUFFER_PROCESSED,
+	I2C_SLAVE_WRITE_BUFFER_RECEIVED,
+	I2C_SLAVE_READ_BUFFER_COUNT,
 	I2C_SLAVE_STOP,
+};
+
+struct i2c_slave_data {
+	u8 *buf;
+	u32 size;
 };
 
 extern int i2c_slave_register(struct i2c_client *client, i2c_slave_cb_t slave_cb);
 extern int i2c_slave_unregister(struct i2c_client *client);
 
 static inline int i2c_slave_event(struct i2c_client *client,
-				  enum i2c_slave_event event, u8 *val)
+				  enum i2c_slave_event event, void *val)
 {
 	return client->slave_cb(client, event, val);
 }
@@ -558,6 +574,9 @@ struct i2c_adapter {
 	int retries;
 	struct device dev;		/* the adapter device */
 
+	bool atomic_xfer_only;
+	bool cancel_xfer_on_shutdown;
+
 	int nr;
 	char name[48];
 	struct completion dev_released;
@@ -567,6 +586,9 @@ struct i2c_adapter {
 
 	struct i2c_bus_recovery_info *bus_recovery_info;
 	const struct i2c_adapter_quirks *quirks;
+	unsigned long bus_clk_rate;
+	bool (*is_bus_clk_rate_supported)(void *data,
+			unsigned long bus_clk_rate);
 };
 #define to_i2c_adapter(d) container_of(d, struct i2c_adapter, dev)
 
@@ -584,7 +606,10 @@ static inline struct i2c_adapter *
 i2c_parent_is_i2c_adapter(const struct i2c_adapter *adapter)
 {
 #if IS_ENABLED(CONFIG_I2C_MUX)
-	struct device *parent = adapter->dev.parent;
+	struct device *parent = NULL;
+
+	if (adapter)
+		parent = adapter->dev.parent;
 
 	if (parent != NULL && parent->type == &i2c_adapter_type)
 		return to_i2c_adapter(parent);
@@ -648,6 +673,9 @@ i2c_unlock_adapter(struct i2c_adapter *adapter)
 {
 	i2c_unlock_bus(adapter, I2C_LOCK_ROOT_ADAPTER);
 }
+
+void i2c_shutdown_adapter(struct i2c_adapter *adapter);
+void i2c_shutdown_clear_adapter(struct i2c_adapter *adapter);
 
 /*flags for the client struct: */
 #define I2C_CLIENT_PEC		0x04	/* Use Packet Error Checking */

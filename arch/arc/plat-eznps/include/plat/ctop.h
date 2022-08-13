@@ -21,6 +21,7 @@
 #error "Incorrect ctop.h include"
 #endif
 
+#include <linux/types.h>
 #include <soc/nps/common.h>
 
 /* core auxiliary registers */
@@ -41,7 +42,6 @@
 #define CTOP_AUX_HW_COMPLY			(CTOP_AUX_BASE + 0x024)
 #define CTOP_AUX_LPC				(CTOP_AUX_BASE + 0x030)
 #define CTOP_AUX_EFLAGS				(CTOP_AUX_BASE + 0x080)
-#define CTOP_AUX_IACK				(CTOP_AUX_BASE + 0x088)
 #define CTOP_AUX_GPA1				(CTOP_AUX_BASE + 0x08C)
 #define CTOP_AUX_UDMC				(CTOP_AUX_BASE + 0x300)
 

@@ -34,8 +34,8 @@
  */
 struct adc_jack_cond {
 	unsigned int id;
-	u32 min_adc;
-	u32 max_adc;
+	int min_adc;
+	int max_adc;
 };
 
 /**
@@ -59,7 +59,7 @@ struct adc_jack_pdata {
 	const char *name;
 	const char *consumer_channel;
 
-	const enum extcon *cable_names;
+	unsigned int *cable_names;
 
 	/* The last entry's state should be 0 */
 	struct adc_jack_cond *adc_conditions;
@@ -67,6 +67,7 @@ struct adc_jack_pdata {
 	unsigned long irq_flags;
 	unsigned long handling_delay_ms; /* in ms */
 	bool wakeup_source;
+	int debounce_ms;
 };
 
 #endif /* _EXTCON_ADC_JACK_H */

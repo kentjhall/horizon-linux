@@ -13,7 +13,7 @@ of a virtual machine.  The ioctls belong to three classes
 
  - VM ioctls: These query and set attributes that affect an entire virtual
    machine, for example memory layout.  In addition a VM ioctl is used to
-   create virtual cpus (vcpus).
+   create virtual cpus (vcpus) and devices.
 
    Only run VM ioctls from the same process (address space) that was used
    to create the VM.
@@ -24,6 +24,11 @@ of a virtual machine.  The ioctls belong to three classes
    Only run vcpu ioctls from the same thread that was used to create the
    vcpu.
 
+ - device ioctls: These query and set attributes that control the operation
+   of a single device.
+
+   device ioctls must be issued from the same process (address space) that
+   was used to create the VM.
 
 2. File descriptors
 -------------------
@@ -32,10 +37,11 @@ The kvm API is centered around file descriptors.  An initial
 open("/dev/kvm") obtains a handle to the kvm subsystem; this handle
 can be used to issue system ioctls.  A KVM_CREATE_VM ioctl on this
 handle will create a VM file descriptor which can be used to issue VM
-ioctls.  A KVM_CREATE_VCPU ioctl on a VM fd will create a virtual cpu
-and return a file descriptor pointing to it.  Finally, ioctls on a vcpu
-fd can be used to control the vcpu, including the important task of
-actually running guest code.
+ioctls.  A KVM_CREATE_VCPU or KVM_CREATE_DEVICE ioctl on a VM fd will
+create a virtual cpu or device and return a file descriptor pointing to
+the new resource.  Finally, ioctls on a vcpu or device fd can be used
+to control the vcpu or device.  For vcpus, this includes the important
+task of actually running guest code.
 
 In general file descriptors can be migrated among processes by means
 of fork() and the SCM_RIGHTS facility of unix domain socket.  These
@@ -122,14 +128,15 @@ KVM_CAP_S390_UCONTROL and use the flag KVM_VM_S390_UCONTROL as
 privileged user (CAP_SYS_ADMIN).
 
 
-4.3 KVM_GET_MSR_INDEX_LIST
+4.3 KVM_GET_MSR_INDEX_LIST, KVM_GET_MSR_FEATURE_INDEX_LIST
 
-Capability: basic
+Capability: basic, KVM_CAP_GET_MSR_FEATURES for KVM_GET_MSR_FEATURE_INDEX_LIST
 Architectures: x86
-Type: system
+Type: system ioctl
 Parameters: struct kvm_msr_list (in/out)
 Returns: 0 on success; -1 on error
 Errors:
+  EFAULT:    the msr index list cannot be read from or written to
   E2BIG:     the msr index list is to be to fit in the array specified by
              the user.
 
@@ -138,15 +145,22 @@ struct kvm_msr_list {
 	__u32 indices[0];
 };
 
-This ioctl returns the guest msrs that are supported.  The list varies
-by kvm version and host processor, but does not change otherwise.  The
-user fills in the size of the indices array in nmsrs, and in return
-kvm adjusts nmsrs to reflect the actual number of msrs and fills in
-the indices array with their numbers.
+The user fills in the size of the indices array in nmsrs, and in return
+kvm adjusts nmsrs to reflect the actual number of msrs and fills in the
+indices array with their numbers.
+
+KVM_GET_MSR_INDEX_LIST returns the guest msrs that are supported.  The list
+varies by kvm version and host processor, but does not change otherwise.
 
 Note: if kvm indicates supports MCE (KVM_CAP_MCE), then the MCE bank MSRs are
 not returned in the MSR list, as different vcpus can have a different number
 of banks, as set via the KVM_X86_SETUP_MCE ioctl.
+
+KVM_GET_MSR_FEATURE_INDEX_LIST returns the list of MSRs that can be passed
+to the KVM_GET_MSRS system ioctl.  This lets userspace probe host capabilities
+and processor features that are exposed via MSRs (e.g., VMX capabilities).
+This list also varies by kvm version and host processor, but does not change
+otherwise.
 
 
 4.4 KVM_CHECK_EXTENSION
@@ -474,14 +488,22 @@ Support for this has been removed.  Use KVM_SET_GUEST_DEBUG instead.
 
 4.18 KVM_GET_MSRS
 
-Capability: basic
+Capability: basic (vcpu), KVM_CAP_GET_MSR_FEATURES (system)
 Architectures: x86
-Type: vcpu ioctl
+Type: system ioctl, vcpu ioctl
 Parameters: struct kvm_msrs (in/out)
-Returns: 0 on success, -1 on error
+Returns: number of msrs successfully returned;
+        -1 on error
 
+When used as a system ioctl:
+Reads the values of MSR-based features that are available for the VM.  This
+is similar to KVM_GET_SUPPORTED_CPUID, but it returns MSR indices and values.
+The list of msr-based features can be obtained using KVM_GET_MSR_FEATURE_INDEX_LIST
+in a system ioctl.
+
+When used as a vcpu ioctl:
 Reads model-specific registers from the vcpu.  Supported msr indices can
-be obtained using KVM_GET_MSR_INDEX_LIST.
+be obtained using KVM_GET_MSR_INDEX_LIST in a system ioctl.
 
 struct kvm_msrs {
 	__u32 nmsrs; /* number of msrs in entries */
@@ -2050,6 +2072,7 @@ registers, find a list below:
   PPC   | KVM_REG_PPC_TM_VSCR           | 32
   PPC   | KVM_REG_PPC_TM_DSCR           | 64
   PPC   | KVM_REG_PPC_TM_TAR            | 64
+  PPC   | KVM_REG_PPC_TM_XER            | 64
         |                               |
   MIPS  | KVM_REG_MIPS_R0               | 64
           ...
@@ -2117,6 +2140,9 @@ ARM 32-bit VFP control registers have the following id bit patterns:
 ARM 64-bit FP registers have the following id bit patterns:
   0x4030 0000 0012 0 <regno:12>
 
+ARM firmware pseudo-registers have the following bit pattern:
+  0x4030 0000 0014 <regno:16>
+
 
 arm64 registers are mapped using the lower 32 bits. The upper 16 of
 that is the register group type, or coprocessor number:
@@ -2132,6 +2158,9 @@ arm64 CCSIDR registers are demultiplexed by CSSELR value:
 
 arm64 system registers have the following id bit patterns:
   0x6030 0000 0013 <op0:2> <op1:3> <crn:4> <crm:4> <op2:3>
+
+arm64 firmware pseudo-registers have the following bit pattern:
+  0x6030 0000 0014 <regno:16>
 
 
 MIPS registers are mapped using the lower 32 bits.  The upper 16 of that is
@@ -2655,7 +2684,8 @@ Possible features:
 	  and execute guest code when KVM_RUN is called.
 	- KVM_ARM_VCPU_EL1_32BIT: Starts the CPU in a 32bit mode.
 	  Depends on KVM_CAP_ARM_EL1_32BIT (arm64 only).
-	- KVM_ARM_VCPU_PSCI_0_2: Emulate PSCI v0.2 for the CPU.
+	- KVM_ARM_VCPU_PSCI_0_2: Emulate PSCI v0.2 (or a future revision
+          backward compatible with v0.2) for the CPU.
 	  Depends on KVM_CAP_ARM_PSCI_0_2.
 	- KVM_ARM_VCPU_PMU_V3: Emulate PMUv3 for the CPU.
 	  Depends on KVM_CAP_ARM_PMU_V3.
@@ -3504,9 +3534,11 @@ EOI was received.
 #define KVM_EXIT_HYPERV_SYNIC          1
 #define KVM_EXIT_HYPERV_HCALL          2
 			__u32 type;
+			__u32 pad1;
 			union {
 				struct {
 					__u32 msr;
+					__u32 pad2;
 					__u64 control;
 					__u64 evt_page;
 					__u64 msg_page;

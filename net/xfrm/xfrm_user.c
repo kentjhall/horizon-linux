@@ -109,7 +109,8 @@ static inline int verify_sec_ctx_len(struct nlattr **attrs)
 		return 0;
 
 	uctx = nla_data(rt);
-	if (uctx->len != (sizeof(struct xfrm_user_sec_ctx) + uctx->ctx_len))
+	if (uctx->len > nla_len(rt) ||
+	    uctx->len != (sizeof(struct xfrm_user_sec_ctx) + uctx->ctx_len))
 		return -EINVAL;
 
 	return 0;
@@ -121,22 +122,17 @@ static inline int verify_replay(struct xfrm_usersa_info *p,
 	struct nlattr *rt = attrs[XFRMA_REPLAY_ESN_VAL];
 	struct xfrm_replay_state_esn *rs;
 
-	if (p->flags & XFRM_STATE_ESN) {
-		if (!rt)
-			return -EINVAL;
-
-		rs = nla_data(rt);
-
-		if (rs->bmp_len > XFRMA_REPLAY_ESN_MAX / sizeof(rs->bmp[0]) / 8)
-			return -EINVAL;
-
-		if (nla_len(rt) < xfrm_replay_state_esn_len(rs) &&
-		    nla_len(rt) != sizeof(*rs))
-			return -EINVAL;
-	}
-
 	if (!rt)
-		return 0;
+		return (p->flags & XFRM_STATE_ESN) ? -EINVAL : 0;
+
+	rs = nla_data(rt);
+
+	if (rs->bmp_len > XFRMA_REPLAY_ESN_MAX / sizeof(rs->bmp[0]) / 8)
+		return -EINVAL;
+
+	if (nla_len(rt) < xfrm_replay_state_esn_len(rs) &&
+	    nla_len(rt) != sizeof(*rs))
+		return -EINVAL;
 
 	/* As only ESP and AH support ESN feature. */
 	if ((p->id.proto != IPPROTO_ESP) && (p->id.proto != IPPROTO_AH))
@@ -160,6 +156,31 @@ static int verify_newsa_info(struct xfrm_usersa_info *p,
 
 	case AF_INET6:
 #if IS_ENABLED(CONFIG_IPV6)
+		break;
+#else
+		err = -EAFNOSUPPORT;
+		goto out;
+#endif
+
+	default:
+		goto out;
+	}
+
+	switch (p->sel.family) {
+	case AF_UNSPEC:
+		break;
+
+	case AF_INET:
+		if (p->sel.prefixlen_d > 32 || p->sel.prefixlen_s > 32)
+			goto out;
+
+		break;
+
+	case AF_INET6:
+#if IS_ENABLED(CONFIG_IPV6)
+		if (p->sel.prefixlen_d > 128 || p->sel.prefixlen_s > 128)
+			goto out;
+
 		break;
 #else
 		err = -EAFNOSUPPORT;
@@ -412,7 +433,14 @@ static inline int xfrm_replay_verify_len(struct xfrm_replay_state_esn *replay_es
 	up = nla_data(rp);
 	ulen = xfrm_replay_state_esn_len(up);
 
-	if (nla_len(rp) < ulen || xfrm_replay_state_esn_len(replay_esn) != ulen)
+	/* Check the overall length and the internal bitmap length to avoid
+	 * potential overflow. */
+	if (nla_len(rp) < ulen ||
+	    xfrm_replay_state_esn_len(replay_esn) != ulen ||
+	    replay_esn->bmp_len != up->bmp_len)
+		return -EINVAL;
+
+	if (up->replay_window > up->bmp_len * sizeof(__u32) * 8)
 		return -EINVAL;
 
 	return 0;
@@ -576,6 +604,9 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 	}
 
 	xfrm_mark_get(attrs, &x->mark);
+
+	if (attrs[XFRMA_OUTPUT_MARK])
+		x->props.output_mark = nla_get_u32(attrs[XFRMA_OUTPUT_MARK]);
 
 	err = __xfrm_init_state(x, false);
 	if (err)
@@ -862,6 +893,11 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 			      &x->replay);
 	if (ret)
 		goto out;
+	if (x->props.output_mark) {
+		ret = nla_put_u32(skb, XFRMA_OUTPUT_MARK, x->props.output_mark);
+		if (ret)
+			goto out;
+	}
 	if (x->security)
 		ret = copy_sec_ctx(x->security, skb);
 out:
@@ -873,6 +909,7 @@ static int dump_one_state(struct xfrm_state *x, int count, void *ptr)
 	struct xfrm_dump_info *sp = ptr;
 	struct sk_buff *in_skb = sp->in_skb;
 	struct sk_buff *skb = sp->out_skb;
+	struct xfrm_translator *xtr;
 	struct xfrm_usersa_info *p;
 	struct nlmsghdr *nlh;
 	int err;
@@ -890,6 +927,18 @@ static int dump_one_state(struct xfrm_state *x, int count, void *ptr)
 		return err;
 	}
 	nlmsg_end(skb, nlh);
+
+	xtr = xfrm_get_translator();
+	if (xtr) {
+		err = xtr->alloc_compat(skb, nlh);
+
+		xfrm_put_translator(xtr);
+		if (err) {
+			nlmsg_cancel(skb, nlh);
+			return err;
+		}
+	}
+
 	return 0;
 }
 
@@ -904,7 +953,6 @@ static int xfrm_dump_sa_done(struct netlink_callback *cb)
 	return 0;
 }
 
-static const struct nla_policy xfrma_policy[XFRMA_MAX+1];
 static int xfrm_dump_sa(struct sk_buff *skb, struct netlink_callback *cb)
 {
 	struct net *net = sock_net(skb->sk);
@@ -981,11 +1029,25 @@ static inline int xfrm_nlmsg_multicast(struct net *net, struct sk_buff *skb,
 				       u32 pid, unsigned int group)
 {
 	struct sock *nlsk = rcu_dereference(net->xfrm.nlsk);
+	struct xfrm_translator *xtr;
 
-	if (nlsk)
-		return nlmsg_multicast(nlsk, skb, pid, group, GFP_ATOMIC);
-	else
-		return -1;
+	if (!nlsk) {
+		kfree_skb(skb);
+		return -EPIPE;
+	}
+
+	xtr = xfrm_get_translator();
+	if (xtr) {
+		int err = xtr->alloc_compat(skb, nlmsg_hdr(skb));
+
+		xfrm_put_translator(xtr);
+		if (err) {
+			kfree_skb(skb);
+			return err;
+		}
+	}
+
+	return nlmsg_multicast(nlsk, skb, pid, group, GFP_ATOMIC);
 }
 
 static inline size_t xfrm_spdinfo_msgsize(void)
@@ -1202,6 +1264,7 @@ static int xfrm_alloc_userspi(struct sk_buff *skb, struct nlmsghdr *nlh,
 	struct net *net = sock_net(skb->sk);
 	struct xfrm_state *x;
 	struct xfrm_userspi_info *p;
+	struct xfrm_translator *xtr;
 	struct sk_buff *resp_skb;
 	xfrm_address_t *daddr;
 	int family;
@@ -1245,6 +1308,17 @@ static int xfrm_alloc_userspi(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (IS_ERR(resp_skb)) {
 		err = PTR_ERR(resp_skb);
 		goto out;
+	}
+
+	xtr = xfrm_get_translator();
+	if (xtr) {
+		err = xtr->alloc_compat(skb, nlmsg_hdr(skb));
+
+		xfrm_put_translator(xtr);
+		if (err) {
+			kfree_skb(resp_skb);
+			goto out;
+		}
 	}
 
 	err = nlmsg_unicast(net->xfrm.nlsk, resp_skb, NETLINK_CB(skb).portid);
@@ -1312,10 +1386,16 @@ static int verify_newpolicy_info(struct xfrm_userpolicy_info *p)
 
 	switch (p->sel.family) {
 	case AF_INET:
+		if (p->sel.prefixlen_d > 32 || p->sel.prefixlen_s > 32)
+			return -EINVAL;
+
 		break;
 
 	case AF_INET6:
 #if IS_ENABLED(CONFIG_IPV6)
+		if (p->sel.prefixlen_d > 128 || p->sel.prefixlen_s > 128)
+			return -EINVAL;
+
 		break;
 #else
 		return  -EAFNOSUPPORT;
@@ -1328,7 +1408,7 @@ static int verify_newpolicy_info(struct xfrm_userpolicy_info *p)
 	ret = verify_policy_dir(p->dir);
 	if (ret)
 		return ret;
-	if (p->index && ((p->index & XFRM_POLICY_MAX) != p->dir))
+	if (p->index && (xfrm_policy_id2dir(p->index) != p->dir))
 		return -EINVAL;
 
 	return 0;
@@ -1373,10 +1453,13 @@ static void copy_templates(struct xfrm_policy *xp, struct xfrm_user_tmpl *ut,
 
 static int validate_tmpl(int nr, struct xfrm_user_tmpl *ut, u16 family)
 {
+	u16 prev_family;
 	int i;
 
 	if (nr > XFRM_MAX_DEPTH)
 		return -EINVAL;
+
+	prev_family = family;
 
 	for (i = 0; i < nr; i++) {
 		/* We never validated the ut->family value, so many
@@ -1389,6 +1472,20 @@ static int validate_tmpl(int nr, struct xfrm_user_tmpl *ut, u16 family)
 		if (!ut[i].family)
 			ut[i].family = family;
 
+		switch (ut[i].mode) {
+		case XFRM_MODE_TUNNEL:
+		case XFRM_MODE_BEET:
+			break;
+		default:
+			if (ut[i].family != prev_family)
+				return -EINVAL;
+			break;
+		}
+		if (ut[i].mode >= XFRM_MODE_MAX)
+			return -EINVAL;
+
+		prev_family = ut[i].family;
+
 		switch (ut[i].family) {
 		case AF_INET:
 			break;
@@ -1399,6 +1496,9 @@ static int validate_tmpl(int nr, struct xfrm_user_tmpl *ut, u16 family)
 		default:
 			return -EINVAL;
 		}
+
+		if (!xfrm_id_proto_valid(ut[i].id.proto))
+			return -EINVAL;
 	}
 
 	return 0;
@@ -1602,9 +1702,11 @@ static inline size_t userpolicy_type_attrsize(void)
 #ifdef CONFIG_XFRM_SUB_POLICY
 static int copy_to_user_policy_type(u8 type, struct sk_buff *skb)
 {
-	struct xfrm_userpolicy_type upt = {
-		.type = type,
-	};
+	struct xfrm_userpolicy_type upt;
+
+	/* Sadly there are two holes in struct xfrm_userpolicy_type */
+	memset(&upt, 0, sizeof(upt));
+	upt.type = type;
 
 	return nla_put(skb, XFRMA_POLICY_TYPE, sizeof(upt), &upt);
 }
@@ -1622,6 +1724,7 @@ static int dump_one_policy(struct xfrm_policy *xp, int dir, int count, void *ptr
 	struct xfrm_userpolicy_info *p;
 	struct sk_buff *in_skb = sp->in_skb;
 	struct sk_buff *skb = sp->out_skb;
+	struct xfrm_translator *xtr;
 	struct nlmsghdr *nlh;
 	int err;
 
@@ -1644,36 +1747,50 @@ static int dump_one_policy(struct xfrm_policy *xp, int dir, int count, void *ptr
 		return err;
 	}
 	nlmsg_end(skb, nlh);
+
+	xtr = xfrm_get_translator();
+	if (xtr) {
+		err = xtr->alloc_compat(skb, nlh);
+
+		xfrm_put_translator(xtr);
+		if (err) {
+			nlmsg_cancel(skb, nlh);
+			return err;
+		}
+	}
+
 	return 0;
 }
 
 static int xfrm_dump_policy_done(struct netlink_callback *cb)
 {
-	struct xfrm_policy_walk *walk = (struct xfrm_policy_walk *) &cb->args[1];
+	struct xfrm_policy_walk *walk = (struct xfrm_policy_walk *)cb->args;
 	struct net *net = sock_net(cb->skb->sk);
 
 	xfrm_policy_walk_done(walk, net);
 	return 0;
 }
 
+static int xfrm_dump_policy_start(struct netlink_callback *cb)
+{
+	struct xfrm_policy_walk *walk = (struct xfrm_policy_walk *)cb->args;
+
+	BUILD_BUG_ON(sizeof(*walk) > sizeof(cb->args));
+
+	xfrm_policy_walk_init(walk, XFRM_POLICY_TYPE_ANY);
+	return 0;
+}
+
 static int xfrm_dump_policy(struct sk_buff *skb, struct netlink_callback *cb)
 {
 	struct net *net = sock_net(skb->sk);
-	struct xfrm_policy_walk *walk = (struct xfrm_policy_walk *) &cb->args[1];
+	struct xfrm_policy_walk *walk = (struct xfrm_policy_walk *)cb->args;
 	struct xfrm_dump_info info;
-
-	BUILD_BUG_ON(sizeof(struct xfrm_policy_walk) >
-		     sizeof(cb->args) - sizeof(cb->args[0]));
 
 	info.in_skb = cb->skb;
 	info.out_skb = skb;
 	info.nlmsg_seq = cb->nlh->nlmsg_seq;
 	info.nlmsg_flags = NLM_F_MULTI;
-
-	if (!cb->args[0]) {
-		cb->args[0] = 1;
-		xfrm_policy_walk_init(walk, XFRM_POLICY_TYPE_ANY);
-	}
 
 	(void) xfrm_policy_walk(net, walk, dump_one_policy, &info);
 
@@ -2118,6 +2235,9 @@ static int xfrm_add_acquire(struct sk_buff *skb, struct nlmsghdr *nlh,
 	err = verify_newpolicy_info(&ua->policy);
 	if (err)
 		goto free_state;
+	err = verify_sec_ctx_len(attrs);
+	if (err)
+		goto free_state;
 
 	/*   build an XP */
 	xp = xfrm_policy_construct(net, &ua->policy, attrs, &err);
@@ -2346,7 +2466,7 @@ static int xfrm_send_migrate(const struct xfrm_selector *sel, u8 dir, u8 type,
 
 #define XMSGSIZE(type) sizeof(struct type)
 
-static const int xfrm_msg_min[XFRM_NR_MSGTYPES] = {
+const int xfrm_msg_min[XFRM_NR_MSGTYPES] = {
 	[XFRM_MSG_NEWSA       - XFRM_MSG_BASE] = XMSGSIZE(xfrm_usersa_info),
 	[XFRM_MSG_DELSA       - XFRM_MSG_BASE] = XMSGSIZE(xfrm_usersa_id),
 	[XFRM_MSG_GETSA       - XFRM_MSG_BASE] = XMSGSIZE(xfrm_usersa_id),
@@ -2369,10 +2489,11 @@ static const int xfrm_msg_min[XFRM_NR_MSGTYPES] = {
 	[XFRM_MSG_NEWSPDINFO  - XFRM_MSG_BASE] = sizeof(u32),
 	[XFRM_MSG_GETSPDINFO  - XFRM_MSG_BASE] = sizeof(u32),
 };
+EXPORT_SYMBOL_GPL(xfrm_msg_min);
 
 #undef XMSGSIZE
 
-static const struct nla_policy xfrma_policy[XFRMA_MAX+1] = {
+const struct nla_policy xfrma_policy[XFRMA_MAX+1] = {
 	[XFRMA_SA]		= { .len = sizeof(struct xfrm_usersa_info)},
 	[XFRMA_POLICY]		= { .len = sizeof(struct xfrm_userpolicy_info)},
 	[XFRMA_LASTUSED]	= { .type = NLA_U64},
@@ -2399,7 +2520,9 @@ static const struct nla_policy xfrma_policy[XFRMA_MAX+1] = {
 	[XFRMA_SA_EXTRA_FLAGS]	= { .type = NLA_U32 },
 	[XFRMA_PROTO]		= { .type = NLA_U8 },
 	[XFRMA_ADDRESS_FILTER]	= { .len = sizeof(struct xfrm_address_filter) },
+	[XFRMA_OUTPUT_MARK]	= { .len = NLA_U32 },
 };
+EXPORT_SYMBOL_GPL(xfrma_policy);
 
 static const struct nla_policy xfrma_spd_policy[XFRMA_SPD_MAX+1] = {
 	[XFRMA_SPD_IPV4_HTHRESH] = { .len = sizeof(struct xfrmu_spdhthresh) },
@@ -2408,6 +2531,7 @@ static const struct nla_policy xfrma_spd_policy[XFRMA_SPD_MAX+1] = {
 
 static const struct xfrm_link {
 	int (*doit)(struct sk_buff *, struct nlmsghdr *, struct nlattr **);
+	int (*start)(struct netlink_callback *);
 	int (*dump)(struct sk_buff *, struct netlink_callback *);
 	int (*done)(struct netlink_callback *);
 	const struct nla_policy *nla_pol;
@@ -2421,6 +2545,7 @@ static const struct xfrm_link {
 	[XFRM_MSG_NEWPOLICY   - XFRM_MSG_BASE] = { .doit = xfrm_add_policy    },
 	[XFRM_MSG_DELPOLICY   - XFRM_MSG_BASE] = { .doit = xfrm_get_policy    },
 	[XFRM_MSG_GETPOLICY   - XFRM_MSG_BASE] = { .doit = xfrm_get_policy,
+						   .start = xfrm_dump_policy_start,
 						   .dump = xfrm_dump_policy,
 						   .done = xfrm_dump_policy_done },
 	[XFRM_MSG_ALLOCSPI    - XFRM_MSG_BASE] = { .doit = xfrm_alloc_userspi },
@@ -2446,12 +2571,8 @@ static int xfrm_user_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	struct net *net = sock_net(skb->sk);
 	struct nlattr *attrs[XFRMA_MAX+1];
 	const struct xfrm_link *link;
+	struct nlmsghdr *nlh64 = NULL;
 	int type, err;
-
-#ifdef CONFIG_COMPAT
-	if (in_compat_syscall())
-		return -EOPNOTSUPP;
-#endif
 
 	type = nlh->nlmsg_type;
 	if (type > XFRM_MSG_MAX)
@@ -2464,31 +2585,58 @@ static int xfrm_user_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	if (!netlink_net_capable(skb, CAP_NET_ADMIN))
 		return -EPERM;
 
+	/* Use the 64-bit / untranslated format on Android, even for compat */
+	if (!IS_ENABLED(CONFIG_ANDROID) || IS_ENABLED(CONFIG_XFRM_USER_COMPAT)) {
+		if (in_compat_syscall()) {
+			struct xfrm_translator *xtr = xfrm_get_translator();
+
+			if (!xtr)
+				return -EOPNOTSUPP;
+
+			nlh64 = xtr->rcv_msg_compat(nlh, link->nla_max,
+						    link->nla_pol);
+			xfrm_put_translator(xtr);
+			if (IS_ERR(nlh64))
+				return PTR_ERR(nlh64);
+			if (nlh64)
+				nlh = nlh64;
+		}
+	}
+
 	if ((type == (XFRM_MSG_GETSA - XFRM_MSG_BASE) ||
 	     type == (XFRM_MSG_GETPOLICY - XFRM_MSG_BASE)) &&
 	    (nlh->nlmsg_flags & NLM_F_DUMP)) {
-		if (link->dump == NULL)
-			return -EINVAL;
+		struct netlink_dump_control c = {
+			.start = link->start,
+			.dump = link->dump,
+			.done = link->done,
+		};
 
-		{
-			struct netlink_dump_control c = {
-				.dump = link->dump,
-				.done = link->done,
-			};
-			return netlink_dump_start(net->xfrm.nlsk, skb, nlh, &c);
+		if (link->dump == NULL) {
+			err = -EINVAL;
+			goto err;
 		}
+
+		err = netlink_dump_start(net->xfrm.nlsk, skb, nlh, &c);
+		goto err;
 	}
 
 	err = nlmsg_parse(nlh, xfrm_msg_min[type], attrs,
 			  link->nla_max ? : XFRMA_MAX,
 			  link->nla_pol ? : xfrma_policy);
 	if (err < 0)
-		return err;
+		goto err;
 
-	if (link->doit == NULL)
-		return -EINVAL;
+	if (link->doit == NULL) {
+		err = -EINVAL;
+		goto err;
+	}
 
-	return link->doit(skb, nlh, attrs);
+	err = link->doit(skb, nlh, attrs);
+
+err:
+	kvfree(nlh64);
+	return err;
 }
 
 static void xfrm_netlink_rcv(struct sk_buff *skb)
@@ -2615,6 +2763,8 @@ static inline size_t xfrm_sa_len(struct xfrm_state *x)
 		l += nla_total_size(sizeof(*x->coaddr));
 	if (x->props.extra_flags)
 		l += nla_total_size(sizeof(x->props.extra_flags));
+	if (x->props.output_mark)
+		l += nla_total_size(sizeof(x->props.output_mark));
 
 	/* Must count x->lastused as it may become non-zero behind our back. */
 	l += nla_total_size_64bit(sizeof(u64));

@@ -4,6 +4,10 @@
 
 # Options selectable by arch Kconfig
 
+# To change the sched_clock epoch to POR(Power on Reset)time.
+config SCHED_POR_TIME
+	bool
+
 # Watchdog function for clocksources to detect instabilities
 config CLOCKSOURCE_WATCHDOG
 	bool

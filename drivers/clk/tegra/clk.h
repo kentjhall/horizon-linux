@@ -1,5 +1,5 @@
-	/*
- * Copyright (c) 2012, NVIDIA CORPORATION.  All rights reserved.
+/*
+ * Copyright (c) 2012-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -19,6 +19,7 @@
 
 #include <linux/clk-provider.h>
 #include <linux/clkdev.h>
+#include <linux/delay.h>
 
 /**
  * struct tegra_clk_sync_source - external clock source from codec
@@ -38,9 +39,11 @@ struct tegra_clk_sync_source {
 
 extern const struct clk_ops tegra_clk_sync_source_ops;
 extern int *periph_clk_enb_refcnt;
+extern bool has_ccplex_therm_control;
+extern bool div1_5_not_allowed;
 
 struct clk *tegra_clk_register_sync_source(const char *name,
-		unsigned long fixed_rate, unsigned long max_rate);
+					   unsigned long max_rate);
 
 /**
  * struct tegra_clk_frac_div - fractional divider clock
@@ -88,6 +91,8 @@ struct clk *tegra_clk_register_divider(const char *name,
 		u8 frac_width, spinlock_t *lock);
 struct clk *tegra_clk_register_mc(const char *name, const char *parent_name,
 				  void __iomem *reg, spinlock_t *lock);
+struct clk *tegra_clk_register_mc_t210(const char *name,
+		const char *parent_name, void __iomem *reg, spinlock_t *lock);
 
 /*
  * Tegra PLL:
@@ -116,7 +121,7 @@ struct tegra_clk_pll_freq_table {
 	unsigned long	input_rate;
 	unsigned long	output_rate;
 	u32		n;
-	u16		m;
+	u32		m;
 	u8		p;
 	u8		cpcon;
 	u16		sdm_data;
@@ -184,6 +189,7 @@ struct tegra_clk_pll;
  * @sdm_din_mask:		Mask of SDM divider bits
  * @sdm_ctrl_reg:		Register offset where SDM enable is
  * @sdm_ctrl_en_mask:		Mask of SDM enable bit
+ * @sdm_ctrl_reset_mask:	Mask of SDM reset bit
  * @ssc_ctrl_reg:		Register offset where SSC settings are
  * @ssc_ctrl_en_mask:		Mask of SSC enable bit
  * @aux_reg:			AUX register offset
@@ -265,6 +271,7 @@ struct tegra_clk_pll_params {
 	u32		sdm_din_mask;
 	u32		sdm_ctrl_reg;
 	u32		sdm_ctrl_en_mask;
+	u32		sdm_ctrl_reset_mask;
 	u32		ssc_ctrl_reg;
 	u32		ssc_ctrl_en_mask;
 	u32		aux_reg;
@@ -309,6 +316,7 @@ struct tegra_clk_pll_params {
 #define TEGRA_MDIV_NEW BIT(11)
 #define TEGRA_PLLMB BIT(12)
 #define TEGRA_PLL_VCO_OUT BIT(13)
+#define TEGRA_PLLDP BIT(14)
 
 /**
  * struct tegra_clk_pll - Tegra PLL clock
@@ -342,6 +350,9 @@ struct tegra_audio_clk_info {
 	struct tegra_clk_pll_params *pll_params;
 	int clk_id;
 	char *parent;
+	struct clk *(*register_fn)(const char *name, const char *parent_name,
+		void __iomem *clk_base, void __iomem *pmc, unsigned long flags,
+		struct tegra_clk_pll_params *pll_params, spinlock_t *lock);
 };
 
 extern const struct clk_ops tegra_clk_pll_ops;
@@ -361,12 +372,6 @@ struct clk *tegra_clk_register_pllxc(const char *name, const char *parent_name,
 			    unsigned long flags,
 			    struct tegra_clk_pll_params *pll_params,
 			    spinlock_t *lock);
-
-struct clk *tegra_clk_register_pllxc_tegra210(const char *name,
-			const char *parent_name, void __iomem *clk_base,
-			void __iomem *pmc, unsigned long flags,
-			struct tegra_clk_pll_params *pll_params,
-			spinlock_t *lock);
 
 struct clk *tegra_clk_register_pllm(const char *name, const char *parent_name,
 			   void __iomem *clk_base, void __iomem *pmc,
@@ -556,6 +561,12 @@ struct clk *tegra_clk_register_periph_fixed(const char *name,
 					    unsigned int div,
 					    unsigned int num);
 
+struct tegra_clk_periph_reparent_policy {
+	u8 low_rate_parent_idx;
+	u8 high_rate_parent_idx;
+	unsigned long threshold;
+};
+
 /**
  * struct clk-periph - peripheral clock
  *
@@ -564,6 +575,7 @@ struct clk *tegra_clk_register_periph_fixed(const char *name,
  * @mux:	mux clock
  * @divider:	divider clock
  * @gate:	gate clock
+ * @rpolicy	reparent policy
  * @mux_ops:	mux clock ops
  * @div_ops:	divider clock ops
  * @gate_ops:	gate clock ops
@@ -574,6 +586,7 @@ struct tegra_clk_periph {
 	struct clk_mux		mux;
 	struct tegra_clk_frac_div	divider;
 	struct tegra_clk_periph_gate	gate;
+	struct tegra_clk_periph_reparent_policy	rpolicy;
 
 	const struct clk_ops	*mux_ops;
 	const struct clk_ops	*div_ops;
@@ -586,11 +599,11 @@ struct tegra_clk_periph {
 
 extern const struct clk_ops tegra_clk_periph_ops;
 struct clk *tegra_clk_register_periph(const char *name,
-		const char **parent_names, int num_parents,
+		const char * const *parent_names, int num_parents,
 		struct tegra_clk_periph *periph, void __iomem *clk_base,
 		u32 offset, unsigned long flags);
 struct clk *tegra_clk_register_periph_nodiv(const char *name,
-		const char **parent_names, int num_parents,
+		const char * const *parent_names, int num_parents,
 		struct tegra_clk_periph *periph, void __iomem *clk_base,
 		u32 offset);
 
@@ -626,7 +639,7 @@ struct tegra_periph_init_data {
 	const char *name;
 	int clk_id;
 	union {
-		const char **parent_names;
+		const char *const *parent_names;
 		const char *parent_name;
 	} p;
 	int num_parents;
@@ -686,6 +699,8 @@ struct tegra_periph_init_data {
 struct tegra_clk_super_mux {
 	struct clk_hw	hw;
 	void __iomem	*reg;
+	struct tegra_clk_frac_div frac_div;
+	const struct clk_ops	*div_ops;
 	u8		width;
 	u8		flags;
 	u8		div2_index;
@@ -702,6 +717,35 @@ struct clk *tegra_clk_register_super_mux(const char *name,
 		const char **parent_names, u8 num_parents,
 		unsigned long flags, void __iomem *reg, u8 clk_super_flags,
 		u8 width, u8 pllx_index, u8 div2_index, spinlock_t *lock);
+struct clk *tegra_clk_register_super_clk(const char *name,
+		const char * const *parent_names, u8 num_parents,
+		unsigned long flags, void __iomem *reg, u8 clk_super_flags,
+		spinlock_t *lock);
+
+/**
+ * struct tegra_sdmmc_mux - switch divider with Low Jitter inputs for SDMMC
+ *
+ * @hw:		handle between common and hardware-specific interfaces
+ * @reg:	register controlling mux and divider
+ * @flags:	hardware-specific flags
+ * @lock:	optional register lock
+ * @gate:	gate clock
+ * @gate_ops: 	gate clock ops
+ */
+struct tegra_sdmmc_mux {
+	struct clk_hw		hw;
+	void __iomem		*reg;
+	spinlock_t		*lock;
+	const struct clk_ops	*gate_ops;
+	struct tegra_clk_periph_gate	gate;
+	u8			div_flags;
+};
+
+#define to_clk_sdmmc_mux(_hw) container_of(_hw, struct tegra_sdmmc_mux, hw)
+
+struct clk *tegra_clk_register_sdmmc_mux_div(const char *name,
+	void __iomem *clk_base, u32 offset, u32 clk_num, u8 div_flags,
+	unsigned long flags, void *lock);
 
 /**
  * struct clk_init_table - clock initialization table
@@ -709,13 +753,17 @@ struct clk *tegra_clk_register_super_mux(const char *name,
  * @parent_id:	parent clock id as mentioned in device tree bindings
  * @rate:	rate to set
  * @state:	enable/disable
+ * @flags	clock initialization flags
  */
 struct tegra_clk_init_table {
 	unsigned int	clk_id;
 	unsigned int	parent_id;
 	unsigned long	rate;
 	int		state;
+	u32		flags;
 };
+
+#define TEGRA_TABLE_RATE_CHANGE_OVERCLOCK	BIT(0)
 
 /**
  * struct clk_duplicate - duplicate clocks
@@ -739,6 +787,7 @@ struct tegra_clk_duplicate {
 struct tegra_clk {
 	int			dt_id;
 	bool			present;
+	bool			use_integer_div;
 };
 
 struct tegra_devclk {
@@ -767,7 +816,7 @@ void tegra_register_devclks(struct tegra_devclk *dev_clks, int num);
 void tegra_audio_clk_init(void __iomem *clk_base,
 			void __iomem *pmc_base, struct tegra_clk *tegra_clks,
 			struct tegra_audio_clk_info *audio_info,
-			unsigned int num_plls);
+			unsigned int num_plls, unsigned long sync_max_rate);
 
 void tegra_periph_clk_init(void __iomem *clk_base, void __iomem *pmc_base,
 			struct tegra_clk *tegra_clks,
@@ -785,6 +834,21 @@ void tegra_super_clk_gen4_init(void __iomem *clk_base,
 void tegra_super_clk_gen5_init(void __iomem *clk_base,
 			void __iomem *pmc_base, struct tegra_clk *tegra_clks,
 			struct tegra_clk_pll_params *pll_params);
+void tegra210b01_pll_init(void __iomem *car, void __iomem *pmc,
+			  unsigned long osc, unsigned long ref,
+			  struct clk **clks);
+void tegra210b01_audio_clk_init(void __iomem *clk_base,
+				void __iomem *pmc_base,
+				struct tegra_clk *tegra_clks);
+void tegra210b01_super_clk_init(void __iomem *clk_base,
+				void __iomem *pmc_base,
+				struct tegra_clk *tegra_clks);
+int tegra210b01_init_pllu(void);
+struct tegra_clk_pll_params *tegra210b01_get_pllp_params(void);
+struct tegra_clk_pll_params *tegra210b01_get_pllc4_params(void);
+const struct clk_div_table *tegra210b01_get_pll_vco_post_div_table(void);
+void tegra210b01_clock_table_init(struct clk **clks);
+void tegra210b01_adjust_clks(struct tegra_clk *tegra_clks);
 
 #ifdef CONFIG_TEGRA_CLK_EMC
 struct clk *tegra_clk_register_emc(void __iomem *base, struct device_node *np,
@@ -798,6 +862,138 @@ static inline struct clk *tegra_clk_register_emc(void __iomem *base,
 }
 #endif
 
+/**
+  * struct clk-emc - emc clock
+  *
+  * @hw:                handle between common and hardware-specific interfaces
+  * @periph:    periph clock
+  * @periph_ops:        periph clock ops
+  * @emc_ops:   emc ops
+  */
+struct tegra_clk_emc {
+        struct clk_hw                   hw;
+        struct tegra_clk_periph         *periph;
+
+        const struct clk_ops            *periph_ops;
+        const struct emc_clk_ops        *emc_ops;
+};
+
+#define to_clk_emc(_hw) container_of(_hw, struct tegra_clk_emc, hw)
+
+struct clk *tegra_clk_register_emc_t210(const char *name,
+	const char **parent_names,
+	int num_parents, struct tegra_clk_periph *periph,
+	void __iomem *clk_base, u32 offset, unsigned long flags,
+	const struct emc_clk_ops *emc_ops);
+
+struct tegra_clk_skipper {
+	struct clk_hw hw;
+	void __iomem *reg;
+	spinlock_t *lock;
+};
+#define to_clk_skipper(_hw) container_of(_hw, struct tegra_clk_skipper, hw)
+
+struct clk *tegra_clk_register_skipper(const char *name,
+		const char *parent_name, void __iomem *reg,
+		unsigned long flags, spinlock_t *lock);
+
+enum shared_bus_users_mode {
+	SHARED_FLOOR = 0,
+	SHARED_BW,
+	SHARED_CEILING,
+	SHARED_CEILING_BUT_ISO,
+	SHARED_AUTO,
+	SHARED_OVERRIDE,
+};
+
+#define TEGRA_CLK_SHARED_MAGIC	0x18ce213d
+
+#define TEGRA_SHARED_BUS_RATE_LIMIT	BIT(0)
+#define TEGRA_SHARED_BUS_RETENTION	BIT(1)
+#define TEGRA_SHARED_BUS_RACE_TO_SLEEP	BIT(2)
+#define TEGRA_SHARED_BUS_ROUND_PASS_THRU	BIT(3)
+#define TEGRA_SHARED_BUS_EMC_NATIVE	BIT(4)
+
+struct clk_div_sel {
+	struct clk_hw *src;
+	u32 div; /* stored as a 7.1 divider */
+	unsigned long rate;
+};
+
+struct tegra_clk_cbus_shared {
+	u32			magic;
+	struct clk_hw		hw;
+	struct list_head	shared_bus_list;
+	struct clk		*shared_bus_backup;
+	u32			flags;
+	unsigned long		min_rate;
+	unsigned long		max_rate;
+	unsigned long		users_default_rate;
+	bool			rate_update_started;
+	bool			rate_updating;
+	bool			rate_propagating;
+	int			(*bus_update)(struct tegra_clk_cbus_shared *);
+	struct clk_hw		*top_user;
+	struct clk_hw		*slow_user;
+	struct clk		*top_clk;
+	unsigned long		override_rate;
+	union {
+		struct {
+			struct clk_hw	*mux_clk;
+			struct clk_hw	*div_clk;
+			struct clk_hw	*pclk;
+			struct clk_hw	*hclk;
+			struct clk_hw	*sclk_low;
+			struct clk_hw	*sclk_high;
+			struct clk_hw	*apb_bus;
+			struct clk_hw	*ahb_bus;
+			unsigned long	threshold;
+			int round_table_size;
+			bool fallback;
+			struct clk_div_sel *round_table;
+		} system;
+		struct {
+			struct list_head	node;
+			bool			enabled;
+			unsigned long		rate;
+			struct clk		*client;
+			u32			client_div;
+			enum shared_bus_users_mode mode;
+			struct clk		*inputs[2];
+		} shared_bus_user;
+	} u;
+};
+
+#define to_clk_cbus_shared(_hw) \
+			container_of(_hw, struct tegra_clk_cbus_shared, hw)
+
+struct clk *tegra_clk_register_shared(const char *name,
+		const char **parent, u8 num_parents, unsigned long flags,
+		enum shared_bus_users_mode mode, const char *client);
+struct clk *tegra_clk_register_cbus(const char *name,
+		const char *parent, unsigned long flags,
+		const char *backup, unsigned long min_rate,
+		unsigned long max_rate);
+struct clk *tegra_clk_register_gbus(const char *name,
+		const char *parent, unsigned long flags,
+		unsigned long min_rate, unsigned long max_rate);
+struct clk *tegra_clk_register_shared_master(const char *name,
+		const char *parent, unsigned long flags,
+		unsigned long min_rate, unsigned long max_rate);
+struct clk *tegra_clk_register_sbus_cmplx(const char *name,
+		const char *parent, const char *mux_clk, const char *div_clk,
+		unsigned long flags, const char *pclk, const char *hclk,
+		const char *sclk_low, const char *sclk_high,
+		unsigned long threshold, unsigned long min_rate,
+		unsigned long max_rate);
+struct clk *tegra_clk_register_cascade_master(const char *name,
+		const char *parent, const char *topclkname,
+		unsigned long flags);
+struct clk *tegra_clk_register_shared_connect(const char *name,
+		const char **parent, u8 num_parents, unsigned long flags,
+		enum shared_bus_users_mode mode, const char *client);
+void tegra_shared_clk_init(struct tegra_clk *tegra_clks);
+
 void tegra114_clock_tune_cpu_trimmers_high(void);
 void tegra114_clock_tune_cpu_trimmers_low(void);
 void tegra114_clock_tune_cpu_trimmers_init(void);
@@ -809,5 +1005,52 @@ extern tegra_clk_apply_init_table_func tegra_clk_apply_init_table;
 int tegra_pll_wait_for_lock(struct tegra_clk_pll *pll);
 u16 tegra_pll_get_fixed_mdiv(struct clk_hw *hw, unsigned long input_rate);
 int tegra_pll_p_div_to_hw(struct tegra_clk_pll *pll, u8 p_div);
+unsigned long tegra_pll_adjust_vco_min_sdm(struct tegra_clk_pll_params *params,
+				unsigned long parent_rate, u32 sdm_coeff);
+
+struct tegra_pto_table {
+	int clk_id;
+	int divider;
+	u32 pto_id;
+	u32 presel_value;
+	u32 presel_reg;
+	u32 presel_mask;
+	u8 cycle_count;
+};
+void tegra_register_ptos(struct tegra_pto_table *ptodefs, int num_pto_defs);
+void tegra_register_pto(struct clk *clk, struct tegra_pto_table *ptodef);
+
+/* add some extra nodes to debugfs */
+void tegra_clk_debugfs_add(struct clk *clk);
+
+int div71_get(unsigned long rate, unsigned parent_rate, u8 width,
+	      u8 frac_width, u8 flags);
+
+#ifdef CONFIG_PM_SLEEP
+void tegra_clk_pll_resume(struct clk *c, unsigned long rate);
+void tegra_clk_pllcx_resume(struct clk *c, unsigned long rate);
+void tegra_clk_pllxc_resume(struct clk *c, unsigned long rate);
+void tegra_clk_pllre_vco_resume(struct clk *c, unsigned long rate);
+void tegra_clk_pllu_resume(struct clk *c, unsigned long rate);
+void tegra_clk_pllss_resume(struct clk *c, unsigned long rate);
+void tegra_clk_divider_resume(struct clk_hw *hw, unsigned long rate);
+void tegra_clk_pll_out_resume(struct clk *clk, unsigned long rate);
+void tegra_clk_plle_tegra210_resume(struct clk *c);
+void tegra_clk_sync_state_pllcx(struct clk *c);
+void tegra_clk_sync_state_iddq(struct clk *c);
+void tegra_clk_sync_state_pll(struct clk *c);
+void tegra_clk_sync_state_pll_out(struct clk *clk);
+void tegra_clk_osc_resume(void __iomem *clk_base);
+void tegra_clk_periph_suspend(void __iomem *clk_base);
+void tegra_clk_periph_resume(void __iomem *clk_base);
+void tegra_clk_periph_force_on(u32 *clks_on, int count, void __iomem *clk_base);
+#endif
+
+/* Combined read fence with delay */
+#define fence_udelay(delay, reg)	\
+	do {				\
+		readl_relaxed(reg);	\
+		udelay(delay);		\
+	} while (0)
 
 #endif /* TEGRA_CLK_H */

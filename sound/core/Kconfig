@@ -13,7 +13,7 @@ config SND_PCM_IEC958
 	bool
 
 config SND_DMAENGINE_PCM
-	tristate
+	tristate "PCM DMA engine support"
 
 config SND_HWDEP
 	tristate

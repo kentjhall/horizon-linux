@@ -280,9 +280,13 @@ int test_pages_isolated(unsigned long start_pfn, unsigned long end_pfn,
 	return pfn < end_pfn ? -EBUSY : 0;
 }
 
+void mm_disable_congestion_wait(void);
+void mm_enable_congestion_wait(void);
+
 struct page *alloc_migrate_target(struct page *page, unsigned long private,
 				  int **resultp)
 {
+	struct page *ret_page;
 	gfp_t gfp_mask = GFP_USER | __GFP_MOVABLE;
 
 	/*
@@ -298,5 +302,8 @@ struct page *alloc_migrate_target(struct page *page, unsigned long private,
 	if (PageHighMem(page))
 		gfp_mask |= __GFP_HIGHMEM;
 
-	return alloc_page(gfp_mask);
+	mm_disable_congestion_wait();
+	ret_page = alloc_page(gfp_mask);
+	mm_enable_congestion_wait();
+	return ret_page;
 }

@@ -79,6 +79,7 @@ static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;/* Enable this card *
 /* Vendor/product IDs for this card */
 static int vid[SNDRV_CARDS] = { [0 ... (SNDRV_CARDS-1)] = -1 };
 static int pid[SNDRV_CARDS] = { [0 ... (SNDRV_CARDS-1)] = -1 };
+static int nrpacks = 8;		/* max. number of packets per urb */
 static int device_setup[SNDRV_CARDS]; /* device parameter for this card */
 static bool ignore_ctl_error;
 static bool autoclock = true;
@@ -94,6 +95,8 @@ module_param_array(vid, int, NULL, 0444);
 MODULE_PARM_DESC(vid, "Vendor ID for the USB audio device.");
 module_param_array(pid, int, NULL, 0444);
 MODULE_PARM_DESC(pid, "Product ID for the USB audio device.");
+module_param(nrpacks, int, 0644);
+MODULE_PARM_DESC(nrpacks, "Max. number of packets per URB.");
 module_param_array(device_setup, int, NULL, 0444);
 MODULE_PARM_DESC(device_setup, "Specific device setup (if needed).");
 module_param(ignore_ctl_error, bool, 0444);
@@ -206,7 +209,6 @@ static int snd_usb_create_stream(struct snd_usb_audio *chip, int ctrlif, int int
 	if (! snd_usb_parse_audio_interface(chip, interface)) {
 		usb_set_interface(dev, interface, 0); /* reset the current interface */
 		usb_driver_claim_interface(&usb_audio_driver, iface, (void *)-1L);
-		return -EINVAL;
 	}
 
 	return 0;
@@ -222,6 +224,7 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 	struct usb_interface_descriptor *altsd;
 	void *control_header;
 	int i, protocol;
+	int rest_bytes;
 
 	/* find audiocontrol interface */
 	host_iface = &usb_ifnum_to_if(dev, ctrlif)->altsetting[0];
@@ -236,6 +239,15 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 		return -EINVAL;
 	}
 
+	rest_bytes = (void *)(host_iface->extra + host_iface->extralen) -
+		control_header;
+
+	/* just to be sure -- this shouldn't hit at all */
+	if (rest_bytes <= 0) {
+		dev_err(&dev->dev, "invalid control header\n");
+		return -EINVAL;
+	}
+
 	switch (protocol) {
 	default:
 		dev_warn(&dev->dev,
@@ -246,8 +258,18 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 	case UAC_VERSION_1: {
 		struct uac1_ac_header_descriptor *h1 = control_header;
 
+		if (rest_bytes < sizeof(*h1)) {
+			dev_err(&dev->dev, "too short v1 buffer descriptor\n");
+			return -EINVAL;
+		}
+
 		if (!h1->bInCollection) {
 			dev_info(&dev->dev, "skipping empty audio interface (v1)\n");
+			return -EINVAL;
+		}
+
+		if (rest_bytes < h1->bLength) {
+			dev_err(&dev->dev, "invalid buffer length (v1)\n");
 			return -EINVAL;
 		}
 
@@ -377,6 +399,7 @@ static int snd_usb_audio_create(struct usb_interface *intf,
 	chip->dev = dev;
 	chip->card = card;
 	chip->setup = device_setup[idx];
+	chip->nrpacks = nrpacks;
 	chip->autoclock = autoclock;
 	atomic_set(&chip->active, 1); /* avoid autopm during probing */
 	atomic_set(&chip->usage_count, 0);
@@ -625,9 +648,12 @@ static int usb_audio_probe(struct usb_interface *intf,
 
  __error:
 	if (chip) {
+		/* chip->active is inside the chip->card object,
+		 * decrement before memory is possibly returned.
+		 */
+		atomic_dec(&chip->active);
 		if (!chip->num_interfaces)
 			snd_card_free(chip->card);
-		atomic_dec(&chip->active);
 	}
 	mutex_unlock(&register_mutex);
 	return err;
@@ -746,9 +772,6 @@ static int usb_audio_suspend(struct usb_interface *intf, pm_message_t message)
 	if (chip == (void *)-1L)
 		return 0;
 
-	chip->autosuspended = !!PMSG_IS_AUTO(message);
-	if (!chip->autosuspended)
-		snd_power_change_state(chip->card, SNDRV_CTL_POWER_D3hot);
 	if (!chip->num_suspended_intf++) {
 		list_for_each_entry(as, &chip->pcm_list, list) {
 			snd_pcm_suspend_all(as->pcm);
@@ -759,6 +782,11 @@ static int usb_audio_suspend(struct usb_interface *intf, pm_message_t message)
 			snd_usbmidi_suspend(p);
 		list_for_each_entry(mixer, &chip->mixer_list, list)
 			snd_usb_mixer_suspend(mixer);
+	}
+
+	if (!PMSG_IS_AUTO(message) && !chip->system_suspend) {
+		snd_power_change_state(chip->card, SNDRV_CTL_POWER_D3hot);
+		chip->system_suspend = chip->num_suspended_intf;
 	}
 
 	return 0;
@@ -773,10 +801,11 @@ static int __usb_audio_resume(struct usb_interface *intf, bool reset_resume)
 
 	if (chip == (void *)-1L)
 		return 0;
-	if (--chip->num_suspended_intf)
-		return 0;
 
 	atomic_inc(&chip->active); /* avoid autopm */
+	if (chip->num_suspended_intf > 1)
+		goto out;
+
 	/*
 	 * ALSA leaves material resumption to user space
 	 * we just notify and restart the mixers
@@ -791,9 +820,12 @@ static int __usb_audio_resume(struct usb_interface *intf, bool reset_resume)
 		snd_usbmidi_resume(p);
 	}
 
-	if (!chip->autosuspended)
+ out:
+	if (chip->num_suspended_intf == chip->system_suspend) {
 		snd_power_change_state(chip->card, SNDRV_CTL_POWER_D0);
-	chip->autosuspended = 0;
+		chip->system_suspend = 0;
+	}
+	chip->num_suspended_intf--;
 
 err_out:
 	atomic_dec(&chip->active); /* allow autopm after this point */

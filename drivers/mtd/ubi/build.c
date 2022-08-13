@@ -894,6 +894,17 @@ int ubi_attach_mtd_dev(struct mtd_info *mtd, int ubi_num,
 		return -EINVAL;
 	}
 
+	/*
+	 * Both UBI and UBIFS have been designed for SLC NAND and NOR flashes.
+	 * MLC NAND is different and needs special care, otherwise UBI or UBIFS
+	 * will die soon and you will lose all your data.
+	 */
+	if (mtd->type == MTD_MLCNANDFLASH) {
+		pr_err("ubi: refuse attaching mtd%d - MLC NAND is not supported\n",
+			mtd->index);
+		return -EINVAL;
+	}
+
 	if (ubi_num == UBI_DEV_NUM_AUTO) {
 		/* Search for an empty slot in the @ubi_devices array */
 		for (ubi_num = 0; ubi_num < UBI_MAX_DEVICES; ubi_num++)
@@ -1126,16 +1137,19 @@ int ubi_detach_mtd_dev(int ubi_num, int anyway)
 	 */
 	get_device(&ubi->dev);
 
+#ifdef CONFIG_MTD_UBI_FASTMAP
+	cancel_work_sync(&ubi->fm_work);
+#endif
 	ubi_debugfs_exit_dev(ubi);
 	uif_close(ubi);
 
 	ubi_wl_close(ubi);
 	ubi_free_internal_volumes(ubi);
 	vfree(ubi->vtbl);
-	put_mtd_device(ubi->mtd);
 	vfree(ubi->peb_buf);
 	vfree(ubi->fm_buf);
 	ubi_msg(ubi, "mtd%d is detached", ubi->mtd->index);
+	put_mtd_device(ubi->mtd);
 	put_device(&ubi->dev);
 	return 0;
 }
@@ -1389,7 +1403,7 @@ static int __init bytes_str_to_int(const char *str)
  * This function returns zero in case of success and a negative error code in
  * case of error.
  */
-static int __init ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
+static int __init ubi_mtd_param_parse(const char *val, const struct kernel_param *kp)
 {
 	int i, len;
 	struct mtd_dev_param *p;
@@ -1433,8 +1447,13 @@ static int __init ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
 	}
 
 	p = &mtd_dev_param[mtd_devs];
-	strcpy(&p->name[0], tokens[0]);
 
+	if (strlen(tokens[0]) > MTD_PARAM_LEN_MAX) {
+		pr_err("length of tokens[0] exceeds destination p->name[0]\n");
+		return -EINVAL;
+	}
+
+	strcpy(&p->name[0], tokens[0]);
 	token = tokens[1];
 	if (token) {
 		p->vid_hdr_offs = bytes_str_to_int(token);

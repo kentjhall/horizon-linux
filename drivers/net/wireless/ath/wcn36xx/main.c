@@ -158,7 +158,7 @@ static struct ieee80211_supported_band wcn_band_5ghz = {
 		.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16,
 		.mcs = {
 			.rx_mask = { 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, },
-			.rx_highest = cpu_to_le16(72),
+			.rx_highest = cpu_to_le16(150),
 			.tx_params = IEEE80211_HT_MCS_TX_DEFINED,
 		}
 	}
@@ -1165,11 +1165,12 @@ static int wcn36xx_remove(struct platform_device *pdev)
 	wcn36xx_dbg(WCN36XX_DBG_MAC, "platform remove\n");
 
 	release_firmware(wcn->nv);
-	mutex_destroy(&wcn->hal_mutex);
 
 	ieee80211_unregister_hw(hw);
 	iounmap(wcn->dxe_base);
 	iounmap(wcn->ccu_base);
+
+	mutex_destroy(&wcn->hal_mutex);
 	ieee80211_free_hw(hw);
 
 	return 0;

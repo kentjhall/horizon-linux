@@ -1466,9 +1466,9 @@ static void packetize_urb(struct usb_hcd *hcd,
 				packet_type = OUT_PID;
 			else
 				packet_type = IN_PID;
-		} else if (usb_pipebulk(urb->pipe)
-				&& (urb->transfer_flags & URB_ZERO_PACKET)
-				&& !(urb->transfer_buffer_length %
+		} else if (maxpacketsize && usb_pipebulk(urb->pipe) &&
+				(urb->transfer_flags & URB_ZERO_PACKET) &&
+				!(urb->transfer_buffer_length %
 							maxpacketsize)) {
 			one_more = 1;
 		}
@@ -1513,13 +1513,9 @@ static int isp1760_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
 		/* FIXME: Check bandwidth  */
 		ep_queue = &priv->qh_list[QH_INTERRUPT];
 		break;
-	case PIPE_ISOCHRONOUS:
+	default:
 		dev_err(hcd->self.controller, "%s: isochronous USB packets "
 							"not yet supported\n",
-							__func__);
-		return -EPIPE;
-	default:
-		dev_err(hcd->self.controller, "%s: unknown pipe type\n",
 							__func__);
 		return -EPIPE;
 	}

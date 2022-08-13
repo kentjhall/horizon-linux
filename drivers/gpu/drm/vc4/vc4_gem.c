@@ -110,8 +110,8 @@ vc4_get_hang_state_ioctl(struct drm_device *dev, void *data,
 					    &handle);
 
 		if (ret) {
-			state->bo_count = i - 1;
-			goto err;
+			state->bo_count = i;
+			goto err_delete_handle;
 		}
 		bo_state[i].handle = handle;
 		bo_state[i].paddr = vc4_bo->base.paddr;
@@ -123,13 +123,16 @@ vc4_get_hang_state_ioctl(struct drm_device *dev, void *data,
 			 state->bo_count * sizeof(*bo_state)))
 		ret = -EFAULT;
 
-	kfree(bo_state);
+err_delete_handle:
+	if (ret) {
+		for (i = 0; i < state->bo_count; i++)
+			drm_gem_handle_delete(file_priv, bo_state[i].handle);
+	}
 
 err_free:
-
 	vc4_free_hang_state(dev, kernel_state);
+	kfree(bo_state);
 
-err:
 	return ret;
 }
 
@@ -544,14 +547,15 @@ vc4_cl_lookup_bos(struct drm_device *dev,
 
 	handles = drm_malloc_ab(exec->bo_count, sizeof(uint32_t));
 	if (!handles) {
+		ret = -ENOMEM;
 		DRM_ERROR("Failed to allocate incoming GEM handles\n");
 		goto fail;
 	}
 
-	ret = copy_from_user(handles,
-			     (void __user *)(uintptr_t)args->bo_handles,
-			     exec->bo_count * sizeof(uint32_t));
-	if (ret) {
+	if (copy_from_user(handles,
+			   (void __user *)(uintptr_t)args->bo_handles,
+			   exec->bo_count * sizeof(uint32_t))) {
+		ret = -EFAULT;
 		DRM_ERROR("Failed to copy in GEM handles\n");
 		goto fail;
 	}
@@ -593,12 +597,14 @@ vc4_get_bcl(struct drm_device *dev, struct vc4_exec_info *exec)
 					  args->shader_rec_count);
 	struct vc4_bo *bo;
 
-	if (uniforms_offset < shader_rec_offset ||
+	if (shader_rec_offset < args->bin_cl_size ||
+	    uniforms_offset < shader_rec_offset ||
 	    exec_size < uniforms_offset ||
 	    args->shader_rec_count >= (UINT_MAX /
 					  sizeof(struct vc4_shader_state)) ||
 	    temp_size < exec_size) {
 		DRM_ERROR("overflow in exec arguments\n");
+		ret = -EINVAL;
 		goto fail;
 	}
 
@@ -708,8 +714,10 @@ vc4_complete_exec(struct drm_device *dev, struct vc4_exec_info *exec)
 	}
 
 	mutex_lock(&vc4->power_lock);
-	if (--vc4->power_refcount == 0)
-		pm_runtime_put(&vc4->v3d->pdev->dev);
+	if (--vc4->power_refcount == 0) {
+		pm_runtime_mark_last_busy(&vc4->v3d->pdev->dev);
+		pm_runtime_put_autosuspend(&vc4->v3d->pdev->dev);
+	}
 	mutex_unlock(&vc4->power_lock);
 
 	kfree(exec);

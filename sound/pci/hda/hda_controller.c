@@ -609,11 +609,9 @@ static int azx_pcm_open(struct snd_pcm_substream *substream)
 	}
 	runtime->private_data = azx_dev;
 
-	if (chip->gts_present)
-		azx_pcm_hw.info = azx_pcm_hw.info |
-			SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;
-
 	runtime->hw = azx_pcm_hw;
+	if (chip->gts_present)
+		runtime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;
 	runtime->hw.channels_min = hinfo->channels_min;
 	runtime->hw.channels_max = hinfo->channels_max;
 	runtime->hw.formats = hinfo->formats;
@@ -696,6 +694,41 @@ static int azx_pcm_mmap(struct snd_pcm_substream *substream,
 	return snd_pcm_lib_default_mmap(substream, area);
 }
 
+/* Instead of silence buffer, use a non-zero buffer of very low amplitude and
+ * frequency. This is done because some receivers enter low power mode with
+ * silence data which causes initial part of next valid audio to get cut off */
+static int azx_pcm_silence(struct snd_pcm_substream *substream,
+		int channel, snd_pcm_uframes_t pos, snd_pcm_uframes_t count)
+{
+	static int idle_sample_value = 1;
+	int16_t *buf16 = (int16_t *)((char *)substream->runtime->dma_area +
+		frames_to_bytes(substream->runtime, pos)), i, j;
+	int32_t *buf32 = (int32_t *)((char *)substream->runtime->dma_area +
+		frames_to_bytes(substream->runtime, pos));
+	struct azx_pcm *apcm = snd_pcm_substream_chip(substream);
+
+	if (!apcm->codec->comfort_noise) {
+		memset(buf16, 0, frames_to_bytes(substream->runtime, count));
+		return 0;
+	}
+
+	if (substream->runtime->format == SNDRV_PCM_FORMAT_S32_LE) {
+		for (i = 0; i < count; i++) {
+			for (j = 0; j < substream->runtime->channels; j++)
+				*buf32++ = idle_sample_value;
+			idle_sample_value = -idle_sample_value;
+		}
+	} else {
+		for (i = 0; i < count; i++) {
+			for (j = 0; j < substream->runtime->channels; j++)
+				*buf16++ = idle_sample_value;
+			idle_sample_value = -idle_sample_value;
+		}
+	}
+
+	return 0;
+}
+
 static const struct snd_pcm_ops azx_pcm_ops = {
 	.open = azx_pcm_open,
 	.close = azx_pcm_close,
@@ -708,6 +741,7 @@ static const struct snd_pcm_ops azx_pcm_ops = {
 	.get_time_info =  azx_get_time_info,
 	.mmap = azx_pcm_mmap,
 	.page = snd_pcm_sgbuf_ops_page,
+	.silence = azx_pcm_silence,
 };
 
 static void azx_pcm_free(struct snd_pcm *pcm)
@@ -748,8 +782,10 @@ int snd_hda_attach_pcm_stream(struct hda_bus *_bus, struct hda_codec *codec,
 		return err;
 	strlcpy(pcm->name, cpcm->name, sizeof(pcm->name));
 	apcm = kzalloc(sizeof(*apcm), GFP_KERNEL);
-	if (apcm == NULL)
+	if (apcm == NULL) {
+		snd_device_free(chip->card, pcm);
 		return -ENOMEM;
+	}
 	apcm->chip = chip;
 	apcm->pcm = pcm;
 	apcm->codec = codec;
@@ -866,10 +902,13 @@ static int azx_rirb_get_response(struct hdac_bus *bus, unsigned int addr,
 	 */
 	if (hbus->allow_bus_reset && !hbus->response_reset && !hbus->in_reset) {
 		hbus->response_reset = 1;
+		dev_err(chip->card->dev,
+			"No response from codec, resetting bus: last cmd=0x%08x\n",
+			bus->last_cmd[addr]);
 		return -EAGAIN; /* give a chance to retry */
 	}
 
-	dev_err(chip->card->dev,
+	dev_WARN(chip->card->dev,
 		"azx_get_response timeout, switching to single_cmd mode: last cmd=0x%08x\n",
 		bus->last_cmd[addr]);
 	chip->single_cmd = 1;
@@ -957,13 +996,19 @@ static int azx_single_get_response(struct hdac_bus *bus, unsigned int addr,
 static int azx_send_cmd(struct hdac_bus *bus, unsigned int val)
 {
 	struct azx *chip = bus_to_azx(bus);
+	unsigned int ret = 0;
 
 	if (chip->disabled)
 		return 0;
+
+	pm_runtime_get_sync(chip->card->dev);
 	if (chip->single_cmd)
-		return azx_single_send_cmd(bus, val);
+		ret = azx_single_send_cmd(bus, val);
 	else
-		return snd_hdac_bus_send_cmd(bus, val);
+		ret = snd_hdac_bus_send_cmd(bus, val);
+	pm_runtime_put(chip->card->dev);
+
+	return ret;
 }
 
 /* get a response */
@@ -972,12 +1017,18 @@ static int azx_get_response(struct hdac_bus *bus, unsigned int addr,
 {
 	struct azx *chip = bus_to_azx(bus);
 
+	unsigned int ret = 0;
 	if (chip->disabled)
 		return 0;
+
+	pm_runtime_get_sync(chip->card->dev);
 	if (chip->single_cmd)
-		return azx_single_get_response(bus, addr, res);
+		ret = azx_single_get_response(bus, addr, res);
 	else
-		return azx_rirb_get_response(bus, addr, res);
+		ret = azx_rirb_get_response(bus, addr, res);
+	pm_runtime_put(chip->card->dev);
+
+	return ret;
 }
 
 static int azx_link_power(struct hdac_bus *bus, bool enable)
@@ -1155,16 +1206,23 @@ irqreturn_t azx_interrupt(int irq, void *dev_id)
 		if (snd_hdac_bus_handle_stream_irq(bus, status, stream_update))
 			active = true;
 
-		/* clear rirb int */
 		status = azx_readb(chip, RIRBSTS);
 		if (status & RIRB_INT_MASK) {
+			/*
+			 * Clearing the interrupt status here ensures that no
+			 * interrupt gets masked after the RIRB wp is read in
+			 * snd_hdac_bus_update_rirb. This avoids a possible
+			 * race condition where codec response in RIRB may
+			 * remain unserviced by IRQ, eventually falling back
+			 * to polling mode in azx_rirb_get_response.
+			 */
+			azx_writeb(chip, RIRBSTS, RIRB_INT_MASK);
 			active = true;
 			if (status & RIRB_INT_RESPONSE) {
 				if (chip->driver_caps & AZX_DCAPS_CTX_WORKAROUND)
 					udelay(80);
 				snd_hdac_bus_update_rirb(bus);
 			}
-			azx_writeb(chip, RIRBSTS, RIRB_INT_MASK);
 		}
 	} while (active && ++repeat < 10);
 
@@ -1333,8 +1391,12 @@ EXPORT_SYMBOL_GPL(azx_probe_codecs);
 /* configure each codec instance */
 int azx_codec_configure(struct azx *chip)
 {
-	struct hda_codec *codec;
-	list_for_each_codec(codec, &chip->bus) {
+	struct hda_codec *codec, *next;
+
+	/* use _safe version here since snd_hda_codec_configure() deregisters
+	 * the device upon error and deletes itself from the bus list.
+	 */
+	list_for_each_codec_safe(codec, next, &chip->bus) {
 		snd_hda_codec_configure(codec);
 	}
 	return 0;

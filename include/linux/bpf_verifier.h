@@ -18,19 +18,12 @@
 
 struct bpf_reg_state {
 	enum bpf_reg_type type;
-	/*
-	 * Used to determine if any memory access using this register will
-	 * result in a bad access.
-	 */
-	s64 min_value;
-	u64 max_value;
 	union {
 		/* valid when type == CONST_IMM | PTR_TO_STACK | UNKNOWN_VALUE */
 		s64 imm;
 
 		/* valid when type == PTR_TO_PACKET* */
 		struct {
-			u32 id;
 			u16 off;
 			u16 range;
 		};
@@ -40,6 +33,14 @@ struct bpf_reg_state {
 		 */
 		struct bpf_map *map_ptr;
 	};
+	u32 id;
+	/* Used to determine if any memory access using this register will
+	 * result in a bad access. These two fields must be last.
+	 * See states_equal()
+	 */
+	s64 min_value;
+	u64 max_value;
+	bool value_from_signed;
 };
 
 enum bpf_stack_slot_type {
@@ -66,7 +67,12 @@ struct bpf_verifier_state_list {
 };
 
 struct bpf_insn_aux_data {
-	enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
+	union {
+		enum bpf_reg_type ptr_type;     /* pointer type for load/store insns */
+		struct bpf_map *map_ptr;        /* pointer for call insn into lookup_elem */
+	};
+	int sanitize_stack_off; /* stack slot to be cleared */
+	bool seen; /* this insn was processed by the verifier */
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */

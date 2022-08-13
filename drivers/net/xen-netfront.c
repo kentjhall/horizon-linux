@@ -62,6 +62,8 @@ module_param_named(max_queues, xennet_max_queues, uint, 0644);
 MODULE_PARM_DESC(max_queues,
 		 "Maximum number of queues per virtual interface");
 
+#define XENNET_TIMEOUT  (5 * HZ)
+
 static const struct ethtool_ops xennet_ethtool_ops;
 
 struct netfront_cb {
@@ -85,6 +87,8 @@ struct netfront_cb {
 
 /* IRQ name is queue name with "-tx" or "-rx" appended */
 #define IRQ_NAME_SIZE (QUEUE_NAME_SIZE + 3)
+
+static DECLARE_WAIT_QUEUE_HEAD(module_wq);
 
 struct netfront_stats {
 	u64			packets;
@@ -236,7 +240,7 @@ static void rx_refill_timeout(unsigned long data)
 static int netfront_tx_slot_available(struct netfront_queue *queue)
 {
 	return (queue->tx.req_prod_pvt - queue->tx.rsp_cons) <
-		(NET_TX_RING_SIZE - MAX_SKB_FRAGS - 2);
+		(NET_TX_RING_SIZE - XEN_NETIF_NR_SLOTS_MIN - 1);
 }
 
 static void xennet_maybe_wake_tx(struct netfront_queue *queue)
@@ -281,6 +285,7 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 {
 	RING_IDX req_prod = queue->rx.req_prod_pvt;
 	int notify;
+	int err = 0;
 
 	if (unlikely(!netif_carrier_ok(queue->info->netdev)))
 		return;
@@ -295,8 +300,10 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 		struct xen_netif_rx_request *req;
 
 		skb = xennet_alloc_one_rx_buffer(queue);
-		if (!skb)
+		if (!skb) {
+			err = -ENOMEM;
 			break;
+		}
 
 		id = xennet_rxidx(req_prod);
 
@@ -320,8 +327,13 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 
 	queue->rx.req_prod_pvt = req_prod;
 
-	/* Not enough requests? Try again later. */
-	if (req_prod - queue->rx.rsp_cons < NET_RX_SLOTS_MIN) {
+	/* Try again later if there are not enough requests or skb allocation
+	 * failed.
+	 * Enough requests is quantified as the sum of newly created slots and
+	 * the unconsumed slots at the backend.
+	 */
+	if (req_prod - queue->rx.rsp_cons < NET_RX_SLOTS_MIN ||
+	    unlikely(err)) {
 		mod_timer(&queue->rx_refill_timer, jiffies + (HZ/10));
 		return;
 	}
@@ -339,6 +351,9 @@ static int xennet_open(struct net_device *dev)
 	unsigned int num_queues = dev->real_num_tx_queues;
 	unsigned int i = 0;
 	struct netfront_queue *queue = NULL;
+
+	if (!np->queues)
+		return -ENODEV;
 
 	for (i = 0; i < num_queues; ++i) {
 		queue = &np->queues[i];
@@ -776,7 +791,7 @@ static int xennet_get_responses(struct netfront_queue *queue,
 	RING_IDX cons = queue->rx.rsp_cons;
 	struct sk_buff *skb = xennet_get_rx_skb(queue, cons);
 	grant_ref_t ref = xennet_get_rx_ref(queue, cons);
-	int max = MAX_SKB_FRAGS + (rx->status <= RX_COPY_THRESHOLD);
+	int max = XEN_NETIF_NR_SLOTS_MIN + (rx->status <= RX_COPY_THRESHOLD);
 	int slots = 1;
 	int err = 0;
 	unsigned long ret;
@@ -875,11 +890,10 @@ static int xennet_set_skb_gso(struct sk_buff *skb,
 	return 0;
 }
 
-static RING_IDX xennet_fill_frags(struct netfront_queue *queue,
-				  struct sk_buff *skb,
-				  struct sk_buff_head *list)
+static int xennet_fill_frags(struct netfront_queue *queue,
+			     struct sk_buff *skb,
+			     struct sk_buff_head *list)
 {
-	struct skb_shared_info *shinfo = skb_shinfo(skb);
 	RING_IDX cons = queue->rx.rsp_cons;
 	struct sk_buff *nskb;
 
@@ -888,22 +902,29 @@ static RING_IDX xennet_fill_frags(struct netfront_queue *queue,
 			RING_GET_RESPONSE(&queue->rx, ++cons);
 		skb_frag_t *nfrag = &skb_shinfo(nskb)->frags[0];
 
-		if (shinfo->nr_frags == MAX_SKB_FRAGS) {
+		if (skb_shinfo(skb)->nr_frags == MAX_SKB_FRAGS) {
 			unsigned int pull_to = NETFRONT_SKB_CB(skb)->pull_to;
 
-			BUG_ON(pull_to <= skb_headlen(skb));
+			BUG_ON(pull_to < skb_headlen(skb));
 			__pskb_pull_tail(skb, pull_to - skb_headlen(skb));
 		}
-		BUG_ON(shinfo->nr_frags >= MAX_SKB_FRAGS);
+		if (unlikely(skb_shinfo(skb)->nr_frags >= MAX_SKB_FRAGS)) {
+			queue->rx.rsp_cons = ++cons + skb_queue_len(list);
+			kfree_skb(nskb);
+			return -ENOENT;
+		}
 
-		skb_add_rx_frag(skb, shinfo->nr_frags, skb_frag_page(nfrag),
+		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
+				skb_frag_page(nfrag),
 				rx->offset, rx->status, PAGE_SIZE);
 
 		skb_shinfo(nskb)->nr_frags = 0;
 		kfree_skb(nskb);
 	}
 
-	return cons;
+	queue->rx.rsp_cons = cons;
+
+	return 0;
 }
 
 static int checksum_setup(struct net_device *dev, struct sk_buff *skb)
@@ -1029,7 +1050,8 @@ err:
 		skb->data_len = rx->status;
 		skb->len += rx->status;
 
-		i = xennet_fill_frags(queue, skb, &tmpq);
+		if (unlikely(xennet_fill_frags(queue, skb, &tmpq)))
+			goto err;
 
 		if (rx->flags & XEN_NETRXF_csum_blank)
 			skb->ip_summed = CHECKSUM_PARTIAL;
@@ -1038,7 +1060,7 @@ err:
 
 		__skb_queue_tail(&rxq, skb);
 
-		queue->rx.rsp_cons = ++i;
+		i = ++queue->rx.rsp_cons;
 		work_done++;
 	}
 
@@ -1335,6 +1357,15 @@ static struct net_device *xennet_create_dev(struct xenbus_device *dev)
 
 	netif_carrier_off(netdev);
 
+	do {
+		xenbus_switch_state(dev, XenbusStateInitialising);
+		err = wait_event_timeout(module_wq,
+				 xenbus_read_driver_state(dev->otherend) !=
+				 XenbusStateClosed &&
+				 xenbus_read_driver_state(dev->otherend) !=
+				 XenbusStateUnknown, XENNET_TIMEOUT);
+	} while (!err);
+
 	return netdev;
 
  exit:
@@ -1366,18 +1397,8 @@ static int netfront_probe(struct xenbus_device *dev,
 #ifdef CONFIG_SYSFS
 	info->netdev->sysfs_groups[0] = &xennet_dev_group;
 #endif
-	err = register_netdev(info->netdev);
-	if (err) {
-		pr_warn("%s: register_netdev err=%d\n", __func__, err);
-		goto fail;
-	}
 
 	return 0;
-
- fail:
-	xennet_free_netdev(netdev);
-	dev_set_drvdata(&dev->dev, NULL);
-	return err;
 }
 
 static void xennet_end_access(int ref, void *page)
@@ -1396,6 +1417,8 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 
 	for (i = 0; i < num_queues && info->queues; ++i) {
 		struct netfront_queue *queue = &info->queues[i];
+
+		del_timer_sync(&queue->rx_refill_timer);
 
 		if (queue->tx_irq && (queue->tx_irq == queue->rx_irq))
 			unbind_from_irqhandler(queue->tx_irq, queue);
@@ -1610,6 +1633,7 @@ static int xennet_init_queue(struct netfront_queue *queue)
 {
 	unsigned short i;
 	int err = 0;
+	char *devid;
 
 	spin_lock_init(&queue->tx_lock);
 	spin_lock_init(&queue->rx_lock);
@@ -1617,8 +1641,9 @@ static int xennet_init_queue(struct netfront_queue *queue)
 	setup_timer(&queue->rx_refill_timer, rx_refill_timeout,
 		    (unsigned long)queue);
 
-	snprintf(queue->name, sizeof(queue->name), "%s-q%u",
-		 queue->info->netdev->name, queue->id);
+	devid = strrchr(queue->info->xbdev->nodename, '/') + 1;
+	snprintf(queue->name, sizeof(queue->name), "vif%s-q%u",
+		 devid, queue->id);
 
 	/* Initialise tx_skbs as a free chain containing every entry. */
 	queue->tx_skb_freelist = 0;
@@ -1744,18 +1769,13 @@ static void xennet_destroy_queues(struct netfront_info *info)
 {
 	unsigned int i;
 
-	rtnl_lock();
-
 	for (i = 0; i < info->netdev->real_num_tx_queues; i++) {
 		struct netfront_queue *queue = &info->queues[i];
 
 		if (netif_running(info->netdev))
 			napi_disable(&queue->napi);
-		del_timer_sync(&queue->rx_refill_timer);
 		netif_napi_del(&queue->napi);
 	}
-
-	rtnl_unlock();
 
 	kfree(info->queues);
 	info->queues = NULL;
@@ -1772,8 +1792,6 @@ static int xennet_create_queues(struct netfront_info *info,
 	if (!info->queues)
 		return -ENOMEM;
 
-	rtnl_lock();
-
 	for (i = 0; i < *num_queues; i++) {
 		struct netfront_queue *queue = &info->queues[i];
 
@@ -1782,7 +1800,7 @@ static int xennet_create_queues(struct netfront_info *info,
 
 		ret = xennet_init_queue(queue);
 		if (ret < 0) {
-			dev_warn(&info->netdev->dev,
+			dev_warn(&info->xbdev->dev,
 				 "only created %d queues\n", i);
 			*num_queues = i;
 			break;
@@ -1796,10 +1814,8 @@ static int xennet_create_queues(struct netfront_info *info,
 
 	netif_set_real_num_tx_queues(info->netdev, *num_queues);
 
-	rtnl_unlock();
-
 	if (*num_queues == 0) {
-		dev_err(&info->netdev->dev, "no queues\n");
+		dev_err(&info->xbdev->dev, "no queues\n");
 		return -EINVAL;
 	}
 	return 0;
@@ -1838,34 +1854,28 @@ static int talk_to_netback(struct xenbus_device *dev,
 	err = xen_net_read_mac(dev, info->netdev->dev_addr);
 	if (err) {
 		xenbus_dev_fatal(dev, err, "parsing %s/mac", dev->nodename);
-		goto out;
+		goto out_unlocked;
 	}
 
+	rtnl_lock();
 	if (info->queues)
 		xennet_destroy_queues(info);
 
 	err = xennet_create_queues(info, &num_queues);
-	if (err < 0)
-		goto destroy_ring;
+	if (err < 0) {
+		xenbus_dev_fatal(dev, err, "creating queues");
+		kfree(info->queues);
+		info->queues = NULL;
+		goto out;
+	}
+	rtnl_unlock();
 
 	/* Create shared ring, alloc event channel -- for each queue */
 	for (i = 0; i < num_queues; ++i) {
 		queue = &info->queues[i];
 		err = setup_netfront(dev, queue, feature_split_evtchn);
-		if (err) {
-			/* setup_netfront() will tidy up the current
-			 * queue on error, but we need to clean up
-			 * those already allocated.
-			 */
-			if (i > 0) {
-				rtnl_lock();
-				netif_set_real_num_tx_queues(info->netdev, i);
-				rtnl_unlock();
-				goto destroy_ring;
-			} else {
-				goto out;
-			}
-		}
+		if (err)
+			goto destroy_ring;
 	}
 
 again:
@@ -1955,9 +1965,12 @@ abort_transaction_no_dev_fatal:
 	xenbus_transaction_end(xbt, 1);
  destroy_ring:
 	xennet_disconnect_backend(info);
-	kfree(info->queues);
-	info->queues = NULL;
+	rtnl_lock();
+	xennet_destroy_queues(info);
  out:
+	rtnl_unlock();
+out_unlocked:
+	device_unregister(&dev->dev);
 	return err;
 }
 
@@ -1987,6 +2000,15 @@ static int xennet_connect(struct net_device *dev)
 
 	/* talk_to_netback() sets the correct number of queues */
 	num_queues = dev->real_num_tx_queues;
+
+	if (dev->reg_state == NETREG_UNINITIALIZED) {
+		err = register_netdev(dev);
+		if (err) {
+			pr_warn("%s: register_netdev err=%d\n", __func__, err);
+			device_unregister(&np->xbdev->dev);
+			return err;
+		}
+	}
 
 	rtnl_lock();
 	netdev_update_features(dev);
@@ -2028,6 +2050,8 @@ static void netback_changed(struct xenbus_device *dev,
 	struct net_device *netdev = np->netdev;
 
 	dev_dbg(&dev->dev, "%s\n", xenbus_strstate(backend_state));
+
+	wake_up_all(&module_wq);
 
 	switch (backend_state) {
 	case XenbusStateInitialising:
@@ -2153,18 +2177,53 @@ static const struct attribute_group xennet_dev_group = {
 };
 #endif /* CONFIG_SYSFS */
 
+static void xennet_bus_close(struct xenbus_device *dev)
+{
+	int ret;
+
+	if (xenbus_read_driver_state(dev->otherend) == XenbusStateClosed)
+		return;
+	do {
+		xenbus_switch_state(dev, XenbusStateClosing);
+		ret = wait_event_timeout(module_wq,
+				   xenbus_read_driver_state(dev->otherend) ==
+				   XenbusStateClosing ||
+				   xenbus_read_driver_state(dev->otherend) ==
+				   XenbusStateClosed ||
+				   xenbus_read_driver_state(dev->otherend) ==
+				   XenbusStateUnknown,
+				   XENNET_TIMEOUT);
+	} while (!ret);
+
+	if (xenbus_read_driver_state(dev->otherend) == XenbusStateClosed)
+		return;
+
+	do {
+		xenbus_switch_state(dev, XenbusStateClosed);
+		ret = wait_event_timeout(module_wq,
+				   xenbus_read_driver_state(dev->otherend) ==
+				   XenbusStateClosed ||
+				   xenbus_read_driver_state(dev->otherend) ==
+				   XenbusStateUnknown,
+				   XENNET_TIMEOUT);
+	} while (!ret);
+}
+
 static int xennet_remove(struct xenbus_device *dev)
 {
 	struct netfront_info *info = dev_get_drvdata(&dev->dev);
 
-	dev_dbg(&dev->dev, "%s\n", dev->nodename);
-
+	xennet_bus_close(dev);
 	xennet_disconnect_backend(info);
 
-	unregister_netdev(info->netdev);
+	if (info->netdev->reg_state == NETREG_REGISTERED)
+		unregister_netdev(info->netdev);
 
-	if (info->queues)
+	if (info->queues) {
+		rtnl_lock();
 		xennet_destroy_queues(info);
+		rtnl_unlock();
+	}
 	xennet_free_netdev(info->netdev);
 
 	return 0;

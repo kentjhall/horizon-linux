@@ -723,7 +723,7 @@ static size_t nilfs_lookup_dirty_data_buffers(struct inode *inode,
 
 		lock_page(page);
 		if (!page_has_buffers(page))
-			create_empty_buffers(page, 1 << inode->i_blkbits, 0);
+			create_empty_buffers(page, i_blocksize(inode), 0);
 		unlock_page(page);
 
 		bh = head = page_buffers(page);
@@ -1956,8 +1956,6 @@ static int nilfs_segctor_collect_dirty_files(struct nilfs_sc_info *sci,
 					  err, ii->vfs_inode.i_ino);
 				return err;
 			}
-			mark_buffer_dirty(ibh);
-			nilfs_mdt_mark_dirty(ifile);
 			spin_lock(&nilfs->ns_inode_lock);
 			if (likely(!ii->i_bh))
 				ii->i_bh = ibh;
@@ -1965,6 +1963,10 @@ static int nilfs_segctor_collect_dirty_files(struct nilfs_sc_info *sci,
 				brelse(ibh);
 			goto retry;
 		}
+
+		// Always redirty the buffer to avoid race condition
+		mark_buffer_dirty(ii->i_bh);
+		nilfs_mdt_mark_dirty(ifile);
 
 		clear_bit(NILFS_I_QUEUED, &ii->i_state);
 		set_bit(NILFS_I_BUSY, &ii->i_state);
@@ -2790,6 +2792,8 @@ int nilfs_attach_log_writer(struct super_block *sb, struct nilfs_root *root)
 	nilfs->ns_writer = nilfs_segctor_new(sb, root);
 	if (!nilfs->ns_writer)
 		return -ENOMEM;
+
+	inode_attach_wb(nilfs->ns_bdev->bd_inode, NULL);
 
 	err = nilfs_segctor_start_thread(nilfs->ns_writer);
 	if (err) {

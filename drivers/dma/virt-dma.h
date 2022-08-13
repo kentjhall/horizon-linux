@@ -26,7 +26,7 @@ struct virt_dma_chan {
 	struct tasklet_struct task;
 	void (*desc_free)(struct virt_dma_desc *);
 
-	spinlock_t lock;
+	raw_spinlock_t lock;
 
 	/* protected by vc.lock */
 	struct list_head desc_allocated;
@@ -64,9 +64,9 @@ static inline struct dma_async_tx_descriptor *vchan_tx_prep(struct virt_dma_chan
 	vd->tx.tx_submit = vchan_tx_submit;
 	vd->tx.desc_free = vchan_tx_desc_free;
 
-	spin_lock_irqsave(&vc->lock, flags);
+	raw_spin_lock_irqsave(&vc->lock, flags);
 	list_add_tail(&vd->node, &vc->desc_allocated);
-	spin_unlock_irqrestore(&vc->lock, flags);
+	raw_spin_unlock_irqrestore(&vc->lock, flags);
 
 	return &vd->tx;
 }
@@ -152,11 +152,11 @@ static inline void vchan_free_chan_resources(struct virt_dma_chan *vc)
 	unsigned long flags;
 	LIST_HEAD(head);
 
-	spin_lock_irqsave(&vc->lock, flags);
+	raw_spin_lock_irqsave(&vc->lock, flags);
 	vchan_get_all_descriptors(vc, &head);
 	list_for_each_entry(vd, &head, node)
 		dmaengine_desc_clear_reuse(&vd->tx);
-	spin_unlock_irqrestore(&vc->lock, flags);
+	raw_spin_unlock_irqrestore(&vc->lock, flags);
 
 	vchan_dma_desc_free_list(vc, &head);
 }

@@ -4,6 +4,7 @@
  *  Copyright (C) 2008 Intel Corp
  *  Copyright (C) 2008 Zhang Rui <rui.zhang@intel.com>
  *  Copyright (C) 2008 Sujith Thomas <sujith.thomas@intel.com>
+ *  Copyright (c) 2016-2019, NVIDIA CORPORATION.  All rights reserved.
  *
  *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *
@@ -64,7 +65,7 @@ static atomic_t in_suspend;
 
 static struct thermal_governor *def_governor;
 
-static struct thermal_governor *__find_governor(const char *name)
+struct thermal_governor *thermal_find_governor(const char *name)
 {
 	struct thermal_governor *pos;
 
@@ -142,7 +143,7 @@ int thermal_register_governor(struct thermal_governor *governor)
 	mutex_lock(&thermal_governor_lock);
 
 	err = -EBUSY;
-	if (__find_governor(governor->name) == NULL) {
+	if (thermal_find_governor(governor->name) == NULL) {
 		err = 0;
 		list_add(&governor->governor_list, &thermal_governor_list);
 		if (!def_governor && !strncmp(governor->name,
@@ -188,7 +189,7 @@ void thermal_unregister_governor(struct thermal_governor *governor)
 
 	mutex_lock(&thermal_governor_lock);
 
-	if (__find_governor(governor->name) == NULL)
+	if (thermal_find_governor(governor->name) == NULL)
 		goto exit;
 
 	mutex_lock(&thermal_list_lock);
@@ -278,7 +279,7 @@ static void print_bind_err_msg(struct thermal_zone_device *tz,
 				tz->type, cdev->type, ret);
 }
 
-static void __bind(struct thermal_zone_device *tz, int mask,
+static void __bind(struct thermal_zone_device *tz, u64 mask,
 			struct thermal_cooling_device *cdev,
 			unsigned long *limits,
 			unsigned int weight)
@@ -286,7 +287,7 @@ static void __bind(struct thermal_zone_device *tz, int mask,
 	int i, ret;
 
 	for (i = 0; i < tz->trips; i++) {
-		if (mask & (1 << i)) {
+		if (mask & (1ULL << i)) {
 			unsigned long upper, lower;
 
 			upper = THERMAL_NO_LIMIT;
@@ -304,13 +305,13 @@ static void __bind(struct thermal_zone_device *tz, int mask,
 	}
 }
 
-static void __unbind(struct thermal_zone_device *tz, int mask,
+static void __unbind(struct thermal_zone_device *tz, u64 mask,
 			struct thermal_cooling_device *cdev)
 {
 	int i;
 
 	for (i = 0; i < tz->trips; i++)
-		if (mask & (1 << i))
+		if (mask & (1ULL << i))
 			thermal_zone_unbind_cooling_device(tz, i, cdev);
 }
 
@@ -446,6 +447,8 @@ static void handle_critical_trips(struct thermal_zone_device *tz,
 		dev_emerg(&tz->device,
 			  "critical temperature reached(%d C),shutting down\n",
 			  tz->temperature / 1000);
+		tz->passive_delay = 0;
+		tz->polling_delay = 0;
 		orderly_poweroff(true);
 	}
 }
@@ -488,7 +491,8 @@ int thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp)
 	int crit_temp = INT_MAX;
 	enum thermal_trip_type type;
 
-	if (!tz || IS_ERR(tz) || !tz->ops->get_temp)
+	if (!tz || IS_ERR(tz) || !tz->ops->get_temp ||
+			!device_is_registered(&tz->device))
 		goto exit;
 
 	mutex_lock(&tz->lock);
@@ -547,10 +551,6 @@ void thermal_zone_set_trips(struct thermal_zone_device *tz)
 			high = trip_temp;
 	}
 
-	/* No need to change trip points */
-	if (tz->prev_low_trip == low && tz->prev_high_trip == high)
-		goto exit;
-
 	tz->prev_low_trip = low;
 	tz->prev_high_trip = high;
 
@@ -570,7 +570,7 @@ exit:
 }
 EXPORT_SYMBOL_GPL(thermal_zone_set_trips);
 
-static void update_temperature(struct thermal_zone_device *tz)
+static int update_temperature(struct thermal_zone_device *tz)
 {
 	int temp, ret;
 
@@ -580,7 +580,7 @@ static void update_temperature(struct thermal_zone_device *tz)
 			dev_warn(&tz->device,
 				 "failed to read out thermal zone (%d)\n",
 				 ret);
-		return;
+		return ret;
 	}
 
 	mutex_lock(&tz->lock);
@@ -595,16 +595,22 @@ static void update_temperature(struct thermal_zone_device *tz)
 	else
 		dev_dbg(&tz->device, "last_temperature=%d, current_temperature=%d\n",
 			tz->last_temperature, tz->temperature);
+
+	return 0;
+}
+
+static void thermal_zone_device_init(struct thermal_zone_device *tz)
+{
+	struct thermal_instance *pos;
+	tz->temperature = THERMAL_TEMP_INVALID;
+	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
+		pos->initialized = false;
 }
 
 static void thermal_zone_device_reset(struct thermal_zone_device *tz)
 {
-	struct thermal_instance *pos;
-
-	tz->temperature = THERMAL_TEMP_INVALID;
 	tz->passive = 0;
-	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
-		pos->initialized = false;
+	thermal_zone_device_init(tz);
 }
 
 void thermal_zone_device_update(struct thermal_zone_device *tz,
@@ -618,7 +624,8 @@ void thermal_zone_device_update(struct thermal_zone_device *tz,
 	if (!tz->ops->get_temp)
 		return;
 
-	update_temperature(tz);
+	if (update_temperature(tz))
+		return;
 
 	thermal_zone_set_trips(tz);
 
@@ -895,6 +902,54 @@ passive_show(struct device *dev, struct device_attribute *attr,
 }
 
 static ssize_t
+passive_delay_store(struct device *dev, struct device_attribute *attr,
+		    const char *buf, size_t count)
+{
+	struct thermal_zone_device *tz = to_thermal_zone(dev);
+	int passive_delay;
+
+	if (!sscanf(buf, "%d\n", &passive_delay))
+		return -EINVAL;
+
+	tz->passive_delay = passive_delay;
+	thermal_zone_device_update(tz, THERMAL_EVENT_UNSPECIFIED);
+	return count;
+}
+
+static ssize_t
+passive_delay_show(struct device *dev, struct device_attribute *attr,
+		   char *buf)
+{
+	struct thermal_zone_device *tz = to_thermal_zone(dev);
+
+	return sprintf(buf, "%d\n", tz->passive_delay);
+}
+
+static ssize_t
+polling_delay_store(struct device *dev, struct device_attribute *attr,
+		    const char *buf, size_t count)
+{
+	struct thermal_zone_device *tz = to_thermal_zone(dev);
+	int polling_delay;
+
+	if (!sscanf(buf, "%d\n", &polling_delay))
+		return -EINVAL;
+
+	tz->polling_delay = polling_delay;
+	thermal_zone_device_update(tz, THERMAL_EVENT_UNSPECIFIED);
+	return count;
+}
+
+static ssize_t
+polling_delay_show(struct device *dev, struct device_attribute *attr,
+		   char *buf)
+{
+	struct thermal_zone_device *tz = to_thermal_zone(dev);
+
+	return sprintf(buf, "%d\n", tz->polling_delay);
+}
+
+static ssize_t
 policy_store(struct device *dev, struct device_attribute *attr,
 		    const char *buf, size_t count)
 {
@@ -908,7 +963,7 @@ policy_store(struct device *dev, struct device_attribute *attr,
 	mutex_lock(&thermal_governor_lock);
 	mutex_lock(&tz->lock);
 
-	gov = __find_governor(strim(name));
+	gov = thermal_find_governor((const char *)strim(name));
 	if (!gov)
 		goto exit;
 
@@ -1163,6 +1218,10 @@ static DEVICE_ATTR(type, 0444, type_show, NULL);
 static DEVICE_ATTR(temp, 0444, temp_show, NULL);
 static DEVICE_ATTR(mode, 0644, mode_show, mode_store);
 static DEVICE_ATTR(passive, S_IRUGO | S_IWUSR, passive_show, passive_store);
+static DEVICE_ATTR(passive_delay, S_IRUGO | S_IWUSR,
+		   passive_delay_show, passive_delay_store);
+static DEVICE_ATTR(polling_delay, S_IRUGO | S_IWUSR,
+		   polling_delay_show, polling_delay_store);
 static DEVICE_ATTR(policy, S_IRUGO | S_IWUSR, policy_show, policy_store);
 static DEVICE_ATTR(available_policies, S_IRUGO, available_policies_show, NULL);
 
@@ -1213,13 +1272,20 @@ thermal_cooling_device_cur_state_store(struct device *dev,
 				       const char *buf, size_t count)
 {
 	struct thermal_cooling_device *cdev = to_cooling_device(dev);
-	unsigned long state;
-	int result;
+	unsigned long state, max_state;
+	int result, ret;
 
 	if (!sscanf(buf, "%ld\n", &state))
 		return -EINVAL;
 
 	if ((long)state < 0)
+		return -EINVAL;
+
+	ret = cdev->ops->get_max_state(cdev, &max_state);
+	if (ret)
+		return ret;
+
+	if (state > max_state)
 		return -EINVAL;
 
 	result = cdev->ops->set_cur_state(cdev, state);
@@ -1726,6 +1792,23 @@ void thermal_notify_framework(struct thermal_zone_device *tz, int trip)
 }
 EXPORT_SYMBOL_GPL(thermal_notify_framework);
 
+struct thermal_zone_device *thermal_zone_device_find(void *data,
+	int (*match)(struct thermal_zone_device *, void *))
+{
+	struct thermal_zone_device *thz;
+
+	mutex_lock(&thermal_list_lock);
+	list_for_each_entry(thz, &thermal_tz_list, node)
+		if (match(thz, data)) {
+			mutex_unlock(&thermal_list_lock);
+			return thz;
+		}
+
+	mutex_unlock(&thermal_list_lock);
+	return NULL;
+}
+EXPORT_SYMBOL(thermal_zone_device_find);
+
 /**
  * create_trip_attrs() - create attributes for trip points
  * @tz:		the thermal zone device
@@ -1736,7 +1819,7 @@ EXPORT_SYMBOL_GPL(thermal_notify_framework);
  *
  * Return: 0 on success, the proper error value otherwise.
  */
-static int create_trip_attrs(struct thermal_zone_device *tz, int mask)
+static int create_trip_attrs(struct thermal_zone_device *tz, u64 mask)
 {
 	int indx;
 	int size = sizeof(struct thermal_attr) * tz->trips;
@@ -1785,7 +1868,7 @@ static int create_trip_attrs(struct thermal_zone_device *tz, int mask)
 		tz->trip_temp_attrs[indx].attr.attr.mode = S_IRUGO;
 		tz->trip_temp_attrs[indx].attr.show = trip_point_temp_show;
 		if (IS_ENABLED(CONFIG_THERMAL_WRITABLE_TRIPS) &&
-		    mask & (1 << indx)) {
+		    mask & (1ULL << indx)) {
 			tz->trip_temp_attrs[indx].attr.attr.mode |= S_IWUSR;
 			tz->trip_temp_attrs[indx].attr.store =
 							trip_point_temp_store;
@@ -1860,7 +1943,7 @@ static void remove_trip_attrs(struct thermal_zone_device *tz)
  * IS_ERR*() helpers.
  */
 struct thermal_zone_device *thermal_zone_device_register(const char *type,
-	int trips, int mask, void *devdata,
+	int trips, u64 mask, void *devdata,
 	struct thermal_zone_device_ops *ops,
 	struct thermal_zone_params *tzp,
 	int passive_delay, int polling_delay)
@@ -1972,6 +2055,16 @@ struct thermal_zone_device *thermal_zone_device_register(const char *type,
 	if (result)
 		goto unregister;
 
+	/* Create passive_delay attribute */
+	result = device_create_file(&tz->device, &dev_attr_passive_delay);
+	if (result)
+		goto unregister;
+
+	/* Create polling_delay attribute */
+	result = device_create_file(&tz->device, &dev_attr_polling_delay);
+	if (result)
+		goto unregister;
+
 	/* Create available_policies attribute */
 	result = device_create_file(&tz->device, &dev_attr_available_policies);
 	if (result)
@@ -1980,8 +2073,19 @@ struct thermal_zone_device *thermal_zone_device_register(const char *type,
 	/* Update 'this' zone's governor information */
 	mutex_lock(&thermal_governor_lock);
 
-	if (tz->tzp)
-		governor = __find_governor(tz->tzp->governor_name);
+	if (tz->tzp) {
+		governor = thermal_find_governor(tz->tzp->governor_name);
+		/*
+		 * This situation can arise if a governor is not enabled from a config
+		 * file but is used in the device tree
+		 */
+		if (!governor) {
+			dev_info(&tz->device,
+					"%s gov not in list. using default\n",
+					tz->tzp->governor_name);
+			governor = def_governor;
+		}
+	}
 	else
 		governor = def_governor;
 
@@ -2013,6 +2117,8 @@ struct thermal_zone_device *thermal_zone_device_register(const char *type,
 	if (atomic_cmpxchg(&tz->need_update, 1, 0))
 		thermal_zone_device_update(tz, THERMAL_EVENT_UNSPECIFIED);
 
+	dev_info(&tz->device, "Registering thermal zone %s for type %s\n",
+			dev_name(&tz->device), type);
 	return tz;
 
 unregister:
@@ -2069,13 +2175,15 @@ void thermal_zone_device_unregister(struct thermal_zone_device *tz)
 
 	mutex_unlock(&thermal_list_lock);
 
-	thermal_zone_device_set_polling(tz, 0);
+	cancel_delayed_work_sync(&tz->poll_queue);
 
 	if (tz->type[0])
 		device_remove_file(&tz->device, &dev_attr_type);
 	device_remove_file(&tz->device, &dev_attr_temp);
 	if (tz->ops->get_mode)
 		device_remove_file(&tz->device, &dev_attr_mode);
+	device_remove_file(&tz->device, &dev_attr_passive_delay);
+	device_remove_file(&tz->device, &dev_attr_polling_delay);
 	device_remove_file(&tz->device, &dev_attr_policy);
 	device_remove_file(&tz->device, &dev_attr_available_policies);
 	remove_trip_attrs(tz);
@@ -2127,6 +2235,37 @@ exit:
 	return ref;
 }
 EXPORT_SYMBOL_GPL(thermal_zone_get_zone_by_name);
+
+/**
+* thermal_zone_get_zone_by_node() - search for a zone and returns its ref
+* @node: device node of the thermal zone
+*
+* When thermal zone is found with the passed device node, returns a reference
+* to it.
+*
+* Return: On success returns a reference to an unique thermal zone with
+* matching device node, an ERR_PTR otherwise (-EINVAL for invalid
+* paramenters, -ENODEV for not found).
+*/
+struct thermal_zone_device *
+thermal_zone_get_zone_by_node(struct device_node *node)
+{
+	struct thermal_zone_device *pos = NULL, *ref = ERR_PTR(-ENODEV);
+
+	if (!node)
+		return ERR_PTR(-EINVAL);
+
+	mutex_lock(&thermal_list_lock);
+	list_for_each_entry(pos, &thermal_tz_list, node)
+		if (node == pos->np) {
+			ref = pos;
+			break;
+		}
+	mutex_unlock(&thermal_list_lock);
+
+	return ref;
+}
+EXPORT_SYMBOL_GPL(thermal_zone_get_zone_by_node);
 
 /**
  * thermal_zone_get_slope - return the slope attribute of the thermal zone
@@ -2253,6 +2392,10 @@ static int __init thermal_register_governors(void)
 {
 	int result;
 
+	result = thermal_gov_continuous_register();
+	if (result)
+		return result;
+
 	result = thermal_gov_step_wise_register();
 	if (result)
 		return result;
@@ -2262,6 +2405,10 @@ static int __init thermal_register_governors(void)
 		return result;
 
 	result = thermal_gov_bang_bang_register();
+	if (result)
+		return result;
+
+	result = pid_thermal_gov_register();
 	if (result)
 		return result;
 
@@ -2277,6 +2424,7 @@ static void thermal_unregister_governors(void)
 	thermal_gov_step_wise_unregister();
 	thermal_gov_fair_share_unregister();
 	thermal_gov_bang_bang_unregister();
+	pid_thermal_gov_unregister();
 	thermal_gov_user_space_unregister();
 	thermal_gov_power_allocator_unregister();
 }
@@ -2297,7 +2445,7 @@ static int thermal_pm_notify(struct notifier_block *nb,
 	case PM_POST_SUSPEND:
 		atomic_set(&in_suspend, 0);
 		list_for_each_entry(tz, &thermal_tz_list, node) {
-			thermal_zone_device_reset(tz);
+			thermal_zone_device_init(tz);
 			thermal_zone_device_update(tz,
 						   THERMAL_EVENT_UNSPECIFIED);
 		}

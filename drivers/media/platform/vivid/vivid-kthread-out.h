@@ -22,5 +22,6 @@
 
 int vivid_start_generating_vid_out(struct vivid_dev *dev, bool *pstreaming);
 void vivid_stop_generating_vid_out(struct vivid_dev *dev, bool *pstreaming);
+void vivid_thread_vid_out_tick(struct vivid_dev *dev);
 
 #endif

@@ -3,6 +3,7 @@
  *
  * Copyright 2011 Realtek Microelectronics
  * Author: Johnny Hsu <johnnyhsu@realtek.com>
+ * Copyright (c) 2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -2111,6 +2112,8 @@ struct rt5640_priv {
 	int pll_in;
 	int pll_out;
 
+	int sel_jd_source;
+
 	bool hp_mute;
 	bool asrc_en;
 };
@@ -2120,4 +2123,8 @@ int rt5640_dmic_enable(struct snd_soc_codec *codec,
 int rt5640_sel_asrc_clk_src(struct snd_soc_codec *codec,
 		unsigned int filter_mask, unsigned int clk_src);
 
+int rt5640_irq_jd_reg_init(struct snd_soc_codec *codec);
+
+int rt5640_headset_detect(struct snd_soc_codec *codec,
+	struct snd_soc_jack *jack, int jack_insert);
 #endif

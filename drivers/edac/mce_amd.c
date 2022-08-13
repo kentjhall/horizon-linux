@@ -948,7 +948,7 @@ int amd_decode_mce(struct notifier_block *nb, unsigned long val, void *data)
 
 	pr_emerg(HW_ERR "CPU:%d (%x:%x:%x) MC%d_STATUS[%s|%s|%s|%s|%s",
 		m->extcpu,
-		c->x86, c->x86_model, c->x86_mask,
+		c->x86, c->x86_model, c->x86_stepping,
 		m->bank,
 		((m->status & MCI_STATUS_OVER)	? "Over"  : "-"),
 		((m->status & MCI_STATUS_UC)	? "UE"	  :
@@ -981,20 +981,19 @@ int amd_decode_mce(struct notifier_block *nb, unsigned long val, void *data)
 	pr_cont("]: 0x%016llx\n", m->status);
 
 	if (m->status & MCI_STATUS_ADDRV)
-		pr_emerg(HW_ERR "Error Addr: 0x%016llx", m->addr);
+		pr_emerg(HW_ERR "Error Addr: 0x%016llx\n", m->addr);
 
 	if (boot_cpu_has(X86_FEATURE_SMCA)) {
+		pr_emerg(HW_ERR "IPID: 0x%016llx", m->ipid);
+
 		if (m->status & MCI_STATUS_SYNDV)
 			pr_cont(", Syndrome: 0x%016llx", m->synd);
-
-		pr_cont(", IPID: 0x%016llx", m->ipid);
 
 		pr_cont("\n");
 
 		decode_smca_errors(m);
 		goto err_code;
-	} else
-		pr_cont("\n");
+	}
 
 	if (!fam_ops)
 		goto err_code;

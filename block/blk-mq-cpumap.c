@@ -64,7 +64,8 @@ int blk_mq_map_queues(struct blk_mq_tag_set *set)
 		 * there are no thread siblings to take into account. Do
 		 * 1:1 if enough, or sequential mapping if less.
 		 */
-		if (nr_queues >= nr_cpus || nr_cpus == nr_uniq_cpus) {
+		if (((nr_queues >= nr_cpus) || (nr_cpus == nr_uniq_cpus)) &&
+		    nr_cpus) {
 			map[i] = cpu_to_queue_index(nr_cpus, nr_queues, queue);
 			queue++;
 			continue;
@@ -76,7 +77,7 @@ int blk_mq_map_queues(struct blk_mq_tag_set *set)
 		 * queue.
 		 */
 		first_sibling = get_first_sibling(i);
-		if (first_sibling == i) {
+		if (nr_uniq_cpus && (first_sibling == i)) {
 			map[i] = cpu_to_queue_index(nr_uniq_cpus, nr_queues,
 							queue);
 			queue++;

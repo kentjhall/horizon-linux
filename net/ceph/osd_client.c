@@ -672,7 +672,8 @@ void osd_req_op_extent_update(struct ceph_osd_request *osd_req,
 	BUG_ON(length > previous);
 
 	op->extent.length = length;
-	op->indata_len -= previous - length;
+	if (op->op == CEPH_OSD_OP_WRITE || op->op == CEPH_OSD_OP_WRITEFULL)
+		op->indata_len -= previous - length;
 }
 EXPORT_SYMBOL(osd_req_op_extent_update);
 
@@ -2878,7 +2879,9 @@ static void handle_reply(struct ceph_osd *osd, struct ceph_msg *msg)
 		 * supported.
 		 */
 		req->r_t.target_oloc.pool = m.redirect.oloc.pool;
-		req->r_flags |= CEPH_OSD_FLAG_REDIRECTED;
+		req->r_flags |= CEPH_OSD_FLAG_REDIRECTED |
+				CEPH_OSD_FLAG_IGNORE_OVERLAY |
+				CEPH_OSD_FLAG_IGNORE_CACHE;
 		req->r_tid = 0;
 		__submit_request(req, false);
 		goto out_unlock_osdc;
@@ -4477,14 +4480,24 @@ static struct ceph_auth_handshake *get_authorizer(struct ceph_connection *con,
 	return auth;
 }
 
-
-static int verify_authorizer_reply(struct ceph_connection *con, int len)
+static int add_authorizer_challenge(struct ceph_connection *con,
+				    void *challenge_buf, int challenge_buf_len)
 {
 	struct ceph_osd *o = con->private;
 	struct ceph_osd_client *osdc = o->o_osdc;
 	struct ceph_auth_client *ac = osdc->client->monc.auth;
 
-	return ceph_auth_verify_authorizer_reply(ac, o->o_auth.authorizer, len);
+	return ceph_auth_add_authorizer_challenge(ac, o->o_auth.authorizer,
+					    challenge_buf, challenge_buf_len);
+}
+
+static int verify_authorizer_reply(struct ceph_connection *con)
+{
+	struct ceph_osd *o = con->private;
+	struct ceph_osd_client *osdc = o->o_osdc;
+	struct ceph_auth_client *ac = osdc->client->monc.auth;
+
+	return ceph_auth_verify_authorizer_reply(ac, o->o_auth.authorizer);
 }
 
 static int invalidate_authorizer(struct ceph_connection *con)
@@ -4518,6 +4531,7 @@ static const struct ceph_connection_operations osd_con_ops = {
 	.put = put_osd_con,
 	.dispatch = dispatch,
 	.get_authorizer = get_authorizer,
+	.add_authorizer_challenge = add_authorizer_challenge,
 	.verify_authorizer_reply = verify_authorizer_reply,
 	.invalidate_authorizer = invalidate_authorizer,
 	.alloc_msg = alloc_msg,

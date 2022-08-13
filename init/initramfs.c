@@ -18,6 +18,8 @@
 #include <linux/dirent.h>
 #include <linux/syscalls.h>
 #include <linux/utime.h>
+#include <linux/initramfs.h>
+#include <linux/file.h>
 
 static ssize_t __init xwrite(int fd, const char *p, size_t count)
 {
@@ -89,7 +91,7 @@ static char __init *find_link(int major, int minor, int ino,
 	q->minor = minor;
 	q->ino = ino;
 	q->mode = mode;
-	strcpy(q->name, name);
+	strlcpy(q->name, name, sizeof(q->name));
 	q->next = NULL;
 	*p = q;
 	return NULL;
@@ -605,9 +607,33 @@ static void __init clean_rootfs(void)
 }
 #endif
 
+static int __initdata do_skip_initramfs;
+
+static int __init skip_initramfs_param(char *str)
+{
+	if (*str)
+		return 0;
+#ifdef CONFIG_DIAG_KERNEL
+	pr_info("Diag kernel: ignore skip_initramfs to disable system as root\n");
+	do_skip_initramfs = 0;
+#else
+	do_skip_initramfs = 1;
+#endif
+	return 1;
+}
+__setup("skip_initramfs", skip_initramfs_param);
+
 static int __init populate_rootfs(void)
 {
-	char *err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
+	char *err;
+
+	if (do_skip_initramfs) {
+		if (initrd_start)
+			free_initrd();
+		return default_rootfs();
+	}
+
+	err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
 	if (err)
 		panic("%s", err); /* Failed to decompress INTERNAL initramfs */
 	if (initrd_start) {
@@ -647,6 +673,7 @@ static int __init populate_rootfs(void)
 			printk(KERN_EMERG "Initramfs unpacking failed: %s\n", err);
 		free_initrd();
 #endif
+		flush_delayed_fput();
 		/*
 		 * Try loading default modules from initramfs.  This gives
 		 * us a chance to load before device_initcalls.

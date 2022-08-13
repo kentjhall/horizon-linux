@@ -47,12 +47,6 @@ void notrace __cpu_suspend_exit(void)
 	cpu_uninstall_idmap();
 
 	/*
-	 * Restore per-cpu offset before any kernel
-	 * subsystem relying on it has a chance to run.
-	 */
-	set_my_cpu_offset(per_cpu_offset(cpu));
-
-	/*
 	 * PSTATE was not saved over suspend/resume, re-enable any detected
 	 * features that might not have been set correctly.
 	 */
@@ -67,6 +61,14 @@ void notrace __cpu_suspend_exit(void)
 	 */
 	if (hw_breakpoint_restore)
 		hw_breakpoint_restore(cpu);
+
+	/*
+	 * On resume, firmware implementing dynamic mitigation will
+	 * have turned the mitigation on. If the user has forcefully
+	 * disabled it, make sure their wishes are obeyed.
+	 */
+	if (arm64_get_ssbd_state() == ARM64_SSBD_FORCE_DISABLE)
+		arm64_set_ssbd_mitigation(false);
 }
 
 /*

@@ -153,7 +153,7 @@ void __giveup_fpu(struct task_struct *tsk)
 
 	save_fpu(tsk);
 	msr = tsk->thread.regs->msr;
-	msr &= ~MSR_FP;
+	msr &= ~(MSR_FP|MSR_FE0|MSR_FE1);
 #ifdef CONFIG_VSX
 	if (cpu_has_feature(CPU_FTR_VSX))
 		msr &= ~MSR_VSX;
@@ -359,7 +359,8 @@ void enable_kernel_vsx(void)
 
 	cpumsr = msr_check_and_set(MSR_FP|MSR_VEC|MSR_VSX);
 
-	if (current->thread.regs && (current->thread.regs->msr & MSR_VSX)) {
+	if (current->thread.regs &&
+	    (current->thread.regs->msr & (MSR_VSX|MSR_VEC|MSR_FP))) {
 		check_if_tm_restore_required(current);
 		/*
 		 * If a thread has already been reclaimed then the
@@ -383,7 +384,7 @@ void flush_vsx_to_thread(struct task_struct *tsk)
 {
 	if (tsk->thread.regs) {
 		preempt_disable();
-		if (tsk->thread.regs->msr & MSR_VSX) {
+		if (tsk->thread.regs->msr & (MSR_VSX|MSR_VEC|MSR_FP)) {
 			BUG_ON(tsk != current);
 			giveup_vsx(tsk);
 		}
@@ -475,13 +476,14 @@ void giveup_all(struct task_struct *tsk)
 	if (!tsk->thread.regs)
 		return;
 
+	check_if_tm_restore_required(tsk);
+
 	usermsr = tsk->thread.regs->msr;
 
 	if ((usermsr & msr_all_available) == 0)
 		return;
 
 	msr_check_and_set(msr_all_available);
-	check_if_tm_restore_required(tsk);
 
 #ifdef CONFIG_PPC_FPU
 	if (usermsr & MSR_FP)
@@ -574,12 +576,11 @@ void flush_all_to_thread(struct task_struct *tsk)
 	if (tsk->thread.regs) {
 		preempt_disable();
 		BUG_ON(tsk != current);
-		save_all(tsk);
-
 #ifdef CONFIG_SPE
 		if (tsk->thread.regs->msr & MSR_SPE)
 			tsk->thread.spefscr = mfspr(SPRN_SPEFSCR);
 #endif
+		save_all(tsk);
 
 		preempt_enable();
 	}
@@ -838,6 +839,25 @@ static void tm_reclaim_thread(struct thread_struct *thr,
 	 */
 	if (!MSR_TM_SUSPENDED(mfmsr()))
 		return;
+
+	/*
+	 * If we are in a transaction and FP is off then we can't have
+	 * used FP inside that transaction. Hence the checkpointed
+	 * state is the same as the live state. We need to copy the
+	 * live state to the checkpointed state so that when the
+	 * transaction is restored, the checkpointed state is correct
+	 * and the aborted transaction sees the correct state. We use
+	 * ckpt_regs.msr here as that's what tm_reclaim will use to
+	 * determine if it's going to write the checkpointed state or
+	 * not. So either this will write the checkpointed registers,
+	 * or reclaim will. Similarly for VMX.
+	 */
+	if ((thr->ckpt_regs.msr & MSR_FP) == 0)
+		memcpy(&thr->ckfp_state, &thr->fp_state,
+		       sizeof(struct thread_fp_state));
+	if ((thr->ckpt_regs.msr & MSR_VEC) == 0)
+		memcpy(&thr->ckvr_state, &thr->vr_state,
+		       sizeof(struct thread_vr_state));
 
 	giveup_all(container_of(thr, struct task_struct, thread));
 
@@ -1640,6 +1660,7 @@ void start_thread(struct pt_regs *regs, unsigned long start, unsigned long sp)
 #ifdef CONFIG_VSX
 	current->thread.used_vsr = 0;
 #endif
+	current->thread.load_fp = 0;
 	memset(&current->thread.fp_state, 0, sizeof(current->thread.fp_state));
 	current->thread.fp_save_area = NULL;
 #ifdef CONFIG_ALTIVEC
@@ -1648,6 +1669,7 @@ void start_thread(struct pt_regs *regs, unsigned long start, unsigned long sp)
 	current->thread.vr_save_area = NULL;
 	current->thread.vrsave = 0;
 	current->thread.used_vr = 0;
+	current->thread.load_vec = 0;
 #endif /* CONFIG_ALTIVEC */
 #ifdef CONFIG_SPE
 	memset(current->thread.evr, 0, sizeof(current->thread.evr));
@@ -1659,6 +1681,7 @@ void start_thread(struct pt_regs *regs, unsigned long start, unsigned long sp)
 	current->thread.tm_tfhar = 0;
 	current->thread.tm_texasr = 0;
 	current->thread.tm_tfiar = 0;
+	current->thread.load_tm = 0;
 #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
 }
 EXPORT_SYMBOL(start_thread);

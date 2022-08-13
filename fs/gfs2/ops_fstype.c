@@ -71,13 +71,13 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
 	if (!sdp)
 		return NULL;
 
-	sb->s_fs_info = sdp;
 	sdp->sd_vfs = sb;
 	sdp->sd_lkstats = alloc_percpu(struct gfs2_pcpu_lkstats);
 	if (!sdp->sd_lkstats) {
 		kfree(sdp);
 		return NULL;
 	}
+	sb->s_fs_info = sdp;
 
 	set_bit(SDF_NOJOURNALID, &sdp->sd_flags);
 	gfs2_tune_init(&sdp->sd_tune);
@@ -160,15 +160,19 @@ static int gfs2_check_sb(struct gfs2_sbd *sdp, int silent)
 		return -EINVAL;
 	}
 
-	/*  If format numbers match exactly, we're done.  */
+	if (sb->sb_fs_format != GFS2_FORMAT_FS ||
+	    sb->sb_multihost_format != GFS2_FORMAT_MULTI) {
+		fs_warn(sdp, "Unknown on-disk format, unable to mount\n");
+		return -EINVAL;
+	}
 
-	if (sb->sb_fs_format == GFS2_FORMAT_FS &&
-	    sb->sb_multihost_format == GFS2_FORMAT_MULTI)
-		return 0;
+	if (sb->sb_bsize < 512 || sb->sb_bsize > PAGE_SIZE ||
+	    (sb->sb_bsize & (sb->sb_bsize - 1))) {
+		pr_warn("Invalid superblock size\n");
+		return -EINVAL;
+	}
 
-	fs_warn(sdp, "Unknown on-disk format, unable to mount\n");
-
-	return -EINVAL;
+	return 0;
 }
 
 static void end_bio_io_page(struct bio *bio)
@@ -920,7 +924,7 @@ fail:
 }
 
 static const match_table_t nolock_tokens = {
-	{ Opt_jid, "jid=%d\n", },
+	{ Opt_jid, "jid=%d", },
 	{ Opt_err, NULL },
 };
 
@@ -1226,7 +1230,7 @@ static int set_gfs2_super(struct super_block *s, void *data)
 	 * We set the bdi here to the queue backing, file systems can
 	 * overwrite this in ->fill_super()
 	 */
-	s->s_bdi = &bdev_get_queue(s->s_bdev)->backing_dev_info;
+	s->s_bdi = bdev_get_queue(s->s_bdev)->backing_dev_info;
 	return 0;
 }
 
@@ -1354,6 +1358,9 @@ static struct dentry *gfs2_mount_meta(struct file_system_type *fs_type,
 	struct gfs2_sbd *sdp;
 	struct path path;
 	int error;
+
+	if (!dev_name || !*dev_name)
+		return ERR_PTR(-EINVAL);
 
 	error = kern_path(dev_name, LOOKUP_FOLLOW, &path);
 	if (error) {

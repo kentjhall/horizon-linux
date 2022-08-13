@@ -146,6 +146,10 @@ static int create_pnp_modalias(struct acpi_device *acpi_dev, char *modalias,
 	int count;
 	struct acpi_hardware_id *id;
 
+	/* Avoid unnecessarily loading modules for non present devices. */
+	if (!acpi_device_is_present(acpi_dev))
+		return 0;
+
 	/*
 	 * Since we skip ACPI_DT_NAMESPACE_HID from the modalias below, 0 should
 	 * be returned if ACPI_DT_NAMESPACE_HID is the only ACPI/PNP ID in the
@@ -198,11 +202,15 @@ static int create_of_modalias(struct acpi_device *acpi_dev, char *modalias,
 {
 	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER };
 	const union acpi_object *of_compatible, *obj;
+	acpi_status status;
 	int len, count;
 	int i, nval;
 	char *c;
 
-	acpi_get_name(acpi_dev->handle, ACPI_SINGLE_NAME, &buf);
+	status = acpi_get_name(acpi_dev->handle, ACPI_SINGLE_NAME, &buf);
+	if (ACPI_FAILURE(status))
+		return -ENODEV;
+
 	/* DT strings are all in lower case */
 	for (c = buf.pointer; *c != '\0'; c++)
 		*c = tolower(*c);

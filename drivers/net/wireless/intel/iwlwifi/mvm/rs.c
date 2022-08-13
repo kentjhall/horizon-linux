@@ -1207,7 +1207,11 @@ void iwl_mvm_rs_tx_status(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 	    !(info->flags & IEEE80211_TX_STAT_AMPDU))
 		return;
 
-	rs_rate_from_ucode_rate(tx_resp_hwrate, info->band, &tx_resp_rate);
+	if (rs_rate_from_ucode_rate(tx_resp_hwrate, info->band,
+				    &tx_resp_rate)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
 
 #ifdef CONFIG_MAC80211_DEBUGFS
 	/* Disable last tx check if we are debugging with fixed rate but
@@ -1263,7 +1267,10 @@ void iwl_mvm_rs_tx_status(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 	 */
 	table = &lq_sta->lq;
 	lq_hwrate = le32_to_cpu(table->rs_table[0]);
-	rs_rate_from_ucode_rate(lq_hwrate, info->band, &lq_rate);
+	if (rs_rate_from_ucode_rate(lq_hwrate, info->band, &lq_rate)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
 
 	/* Here we actually compare this rate to the latest LQ command */
 	if (!rs_rate_equal(&tx_resp_rate, &lq_rate, allow_ant_mismatch)) {
@@ -1365,8 +1372,12 @@ void iwl_mvm_rs_tx_status(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 		/* Collect data for each rate used during failed TX attempts */
 		for (i = 0; i <= retries; ++i) {
 			lq_hwrate = le32_to_cpu(table->rs_table[i]);
-			rs_rate_from_ucode_rate(lq_hwrate, info->band,
-						&lq_rate);
+			if (rs_rate_from_ucode_rate(lq_hwrate, info->band,
+						    &lq_rate)) {
+				WARN_ON_ONCE(1);
+				return;
+			}
+
 			/*
 			 * Only collect stats if retried rate is in the same RS
 			 * table as active/search.
@@ -1867,12 +1878,10 @@ static int rs_switch_to_column(struct iwl_mvm *mvm,
 	struct rs_rate *rate = &search_tbl->rate;
 	const struct rs_tx_column *column = &rs_tx_columns[col_id];
 	const struct rs_tx_column *curr_column = &rs_tx_columns[tbl->column];
-	u32 sz = (sizeof(struct iwl_scale_tbl_info) -
-		  (sizeof(struct iwl_rate_scale_data) * IWL_RATE_COUNT));
 	unsigned long rate_mask = 0;
 	u32 rate_idx = 0;
 
-	memcpy(search_tbl, tbl, sz);
+	memcpy(search_tbl, tbl, offsetof(struct iwl_scale_tbl_info, win));
 
 	rate->sgi = column->sgi;
 	rate->ant = column->ant;
@@ -2711,7 +2720,8 @@ static void rs_get_initial_rate(struct iwl_mvm *mvm,
 				struct ieee80211_sta *sta,
 				struct iwl_lq_sta *lq_sta,
 				enum nl80211_band band,
-				struct rs_rate *rate)
+				struct rs_rate *rate,
+				bool init)
 {
 	int i, nentries;
 	unsigned long active_rate;
@@ -2765,14 +2775,25 @@ static void rs_get_initial_rate(struct iwl_mvm *mvm,
 	 */
 	if (sta->vht_cap.vht_supported &&
 	    best_rssi > IWL_RS_LOW_RSSI_THRESHOLD) {
-		switch (sta->bandwidth) {
-		case IEEE80211_STA_RX_BW_160:
-		case IEEE80211_STA_RX_BW_80:
-		case IEEE80211_STA_RX_BW_40:
+		/*
+		 * In AP mode, when a new station associates, rs is initialized
+		 * immediately upon association completion, before the phy
+		 * context is updated with the association parameters, so the
+		 * sta bandwidth might be wider than the phy context allows.
+		 * To avoid this issue, always initialize rs with 20mhz
+		 * bandwidth rate, and after authorization, when the phy context
+		 * is already up-to-date, re-init rs with the correct bw.
+		 */
+		u32 bw = init ? RATE_MCS_CHAN_WIDTH_20 : rs_bw_from_sta_bw(sta);
+
+		switch (bw) {
+		case RATE_MCS_CHAN_WIDTH_40:
+		case RATE_MCS_CHAN_WIDTH_80:
+		case RATE_MCS_CHAN_WIDTH_160:
 			initial_rates = rs_optimal_rates_vht;
 			nentries = ARRAY_SIZE(rs_optimal_rates_vht);
 			break;
-		case IEEE80211_STA_RX_BW_20:
+		case RATE_MCS_CHAN_WIDTH_20:
 			initial_rates = rs_optimal_rates_vht_20mhz;
 			nentries = ARRAY_SIZE(rs_optimal_rates_vht_20mhz);
 			break;
@@ -2783,7 +2804,7 @@ static void rs_get_initial_rate(struct iwl_mvm *mvm,
 
 		active_rate = lq_sta->active_siso_rate;
 		rate->type = LQ_VHT_SISO;
-		rate->bw = rs_bw_from_sta_bw(sta);
+		rate->bw = bw;
 	} else if (sta->ht_cap.ht_supported &&
 		   best_rssi > IWL_RS_LOW_RSSI_THRESHOLD) {
 		initial_rates = rs_optimal_rates_ht;
@@ -2865,7 +2886,7 @@ static void rs_initialize_lq(struct iwl_mvm *mvm,
 	tbl = &(lq_sta->lq_info[active_tbl]);
 	rate = &tbl->rate;
 
-	rs_get_initial_rate(mvm, sta, lq_sta, band, rate);
+	rs_get_initial_rate(mvm, sta, lq_sta, band, rate, init);
 	rs_init_optimal_rate(mvm, sta, lq_sta);
 
 	WARN_ON_ONCE(rate->ant != ANT_A && rate->ant != ANT_B);
@@ -3251,7 +3272,10 @@ static void rs_build_rates_table_from_fixed(struct iwl_mvm *mvm,
 	for (i = 0; i < num_rates; i++)
 		lq_cmd->rs_table[i] = ucode_rate_le32;
 
-	rs_rate_from_ucode_rate(ucode_rate, band, &rate);
+	if (rs_rate_from_ucode_rate(ucode_rate, band, &rate)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
 
 	if (is_mimo(&rate))
 		lq_cmd->mimo_delim = num_rates - 1;

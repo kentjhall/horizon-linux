@@ -1,0 +1,26 @@
+DS90UB948-Q1 1080p FPDLINK III to OpenLDI DeSerializer driver
+
+Required properties:
+- compatible : should be "ti,ds90uh948".
+- reg : i2c regmap address
+
+Optional properties:
+- ti,enable-bchnl-i2c : Enable I2C passthrough
+- ti,enable-2clock-filter : Enable/disable HSync/Vsync/Data-Enable inputs
+- ti,enable-gpio3 : Enable/Disable GPIO3 configuration for DS90UB948
+- ti,gpio3-dir : Set GPIO3 direction as input/output/tri-state
+- ti,gpio3-val : GPIO3 output value to drive pin low or high
+
+Examples:
+        i2c@3160000 {
+                ds90uh948@30 {
+                        compatible = "ti,ds90uh948";
+                        status = "okay";
+                        reg = <0x30>;
+                        ti,enable-bchnl-i2c = <1>;
+                        ti,enable-2clock-filter = <0>;
+                        ti,enable-gpio3 = <1>;
+                        ti,gpio3-dir = <0>;
+                        ti,gpio3-val = <1>;
+                };
+}

@@ -3,3 +3,4 @@
 #
 
 obj-$(CONFIG_FORCEDETH) += forcedeth.o
+obj-$(CONFIG_EQOS) += eqos/

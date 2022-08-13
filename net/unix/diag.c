@@ -10,7 +10,8 @@
 
 static int sk_diag_dump_name(struct sock *sk, struct sk_buff *nlskb)
 {
-	struct unix_address *addr = unix_sk(sk)->addr;
+	/* might or might not have unix_table_lock */
+	struct unix_address *addr = smp_load_acquire(&unix_sk(sk)->addr);
 
 	if (!addr)
 		return 0;
@@ -257,6 +258,8 @@ static int unix_diag_get_exact(struct sk_buff *in_skb,
 	err = -ENOENT;
 	if (sk == NULL)
 		goto out_nosk;
+	if (!net_eq(sock_net(sk), net))
+		goto out;
 
 	err = sock_diag_check_cookie(sk, req->udiag_cookie);
 	if (err)

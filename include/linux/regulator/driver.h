@@ -74,6 +74,8 @@ struct regulator_linear_range {
  * @disable: Configure the regulator as disabled.
  * @is_enabled: Return 1 if the regulator is enabled, 0 if not.
  *		May also return negative errno.
+ * @post_enable: Post enable call, specially when it is GPIO controlled.
+ * @post_disable: Post disable call, specially when it is GPIO controlled.
  *
  * @set_voltage: Set the voltage for the regulator within the range specified.
  *               The driver should select the voltage closest to min_uV.
@@ -108,6 +110,9 @@ struct regulator_linear_range {
  *
  * @set_bypass: Set the regulator in bypass mode.
  * @get_bypass: Get the regulator bypass mode state.
+ *
+ * @set_control_mode: Set the control mode for the regulator.
+ * @get_control_mode: Get the control mode for the regulator.
  *
  * @enable_time: Time taken for the regulator voltage output voltage to
  *               stabilise after being enabled, in microseconds.
@@ -148,6 +153,8 @@ struct regulator_ops {
 			    unsigned *selector);
 	int (*map_voltage)(struct regulator_dev *, int min_uV, int max_uV);
 	int (*set_voltage_sel) (struct regulator_dev *, unsigned selector);
+	int (*set_sleep_voltage_sel) (struct regulator_dev *,
+				unsigned selector);
 	int (*get_voltage) (struct regulator_dev *);
 	int (*get_voltage_sel) (struct regulator_dev *);
 
@@ -164,10 +171,20 @@ struct regulator_ops {
 	int (*enable) (struct regulator_dev *);
 	int (*disable) (struct regulator_dev *);
 	int (*is_enabled) (struct regulator_dev *);
+	int (*post_enable) (struct regulator_dev *);
+	int (*post_disable) (struct regulator_dev *);
 
 	/* get/set regulator operating mode (defined in consumer.h) */
 	int (*set_mode) (struct regulator_dev *, unsigned int mode);
 	unsigned int (*get_mode) (struct regulator_dev *);
+
+	/* get/set regulator sleep mode (defined in consumer.h) */
+	int (*set_sleep_mode) (struct regulator_dev *, unsigned int sleep_mode);
+	unsigned int (*get_sleep_mode) (struct regulator_dev *);
+	
+	/* get/set regulator control mode (defined in consumer.h) */
+	int (*set_control_mode) (struct regulator_dev *, unsigned int mode);
+	unsigned int (*get_control_mode) (struct regulator_dev *);
 
 	/* Time taken to enable or set voltage on the regulator */
 	int (*enable_time) (struct regulator_dev *);
@@ -192,6 +209,9 @@ struct regulator_ops {
 					  int output_uV, int load_uA);
 	/* set the load on the regulator */
 	int (*set_load)(struct regulator_dev *, int load_uA);
+
+	/* set regulator voltage selector access as volatile or cached */
+	int (*set_vsel_volatile) (struct regulator_dev *, bool is_volatile);
 
 	/* control and report on bypass mode */
 	int (*set_bypass)(struct regulator_dev *dev, bool enable);
@@ -414,6 +434,7 @@ struct regulator_dev {
 	struct regulator *supply;	/* for tree */
 	const char *supply_name;
 	struct regmap *regmap;
+	int machine_constraints;
 
 	struct delayed_work disable_work;
 	int deferred_disables;
@@ -421,9 +442,12 @@ struct regulator_dev {
 	void *reg_data;		/* regulator_dev data */
 
 	struct dentry *debugfs;
+	struct dentry *pdebugfs;
 
 	struct regulator_enable_gpio *ena_pin;
 	unsigned int ena_gpio_state:1;
+
+	unsigned int is_switch:1;
 
 	/* time when this regulator was disabled last time */
 	unsigned long last_off_jiffy;

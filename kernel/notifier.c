@@ -220,7 +220,7 @@ int blocking_notifier_chain_register(struct blocking_notifier_head *nh,
 	 * not yet working and interrupts must remain disabled.  At
 	 * such times we must not call down_write().
 	 */
-	if (unlikely(system_state == SYSTEM_BOOTING))
+	if (unlikely(system_state <= SYSTEM_BOOTING))
 		return notifier_chain_register(&nh->head, n);
 
 	down_write(&nh->rwsem);
@@ -552,7 +552,7 @@ NOKPROBE_SYMBOL(notify_die);
 
 int register_die_notifier(struct notifier_block *nb)
 {
-	vmalloc_sync_all();
+	vmalloc_sync_mappings();
 	return atomic_notifier_chain_register(&die_chain, nb);
 }
 EXPORT_SYMBOL_GPL(register_die_notifier);

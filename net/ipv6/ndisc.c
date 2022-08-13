@@ -196,6 +196,8 @@ static inline int ndisc_is_useropt(const struct net_device *dev,
 {
 	return opt->nd_opt_type == ND_OPT_RDNSS ||
 		opt->nd_opt_type == ND_OPT_DNSSL ||
+		opt->nd_opt_type == ND_OPT_CAPTIVE_PORTAL ||
+		opt->nd_opt_type == ND_OPT_PREF64 ||
 		ndisc_ops_is_useropt(dev, opt->nd_opt_type);
 }
 
@@ -1395,6 +1397,8 @@ skip_linkparms:
 			if (ri->prefix_len == 0 &&
 			    !in6_dev->cnf.accept_ra_defrtr)
 				continue;
+			if (ri->prefix_len < in6_dev->cnf.accept_ra_rt_info_min_plen)
+				continue;
 			if (ri->prefix_len > in6_dev->cnf.accept_ra_rt_info_max_plen)
 				continue;
 			rt6_route_rcv(skb->dev, (u8 *)p, (p->nd_opt_len) << 3,
@@ -1516,7 +1520,8 @@ static void ndisc_fill_redirect_hdr_option(struct sk_buff *skb,
 	*(opt++) = (rd_len >> 3);
 	opt += 6;
 
-	memcpy(opt, ipv6_hdr(orig_skb), rd_len - 8);
+	skb_copy_bits(orig_skb, skb_network_offset(orig_skb), opt,
+		      rd_len - 8);
 }
 
 void ndisc_send_redirect(struct sk_buff *skb, const struct in6_addr *target)
@@ -1536,6 +1541,12 @@ void ndisc_send_redirect(struct sk_buff *skb, const struct in6_addr *target)
 	u8 ha_buf[MAX_ADDR_LEN], *ha = NULL,
 	   ops_data_buf[NDISC_OPS_REDIRECT_DATA_SPACE], *ops_data = NULL;
 	bool ret;
+
+	if (netif_is_l3_master(skb->dev)) {
+		dev = __dev_get_by_index(dev_net(skb->dev), IPCB(skb)->iif);
+		if (!dev)
+			return;
+	}
 
 	if (ipv6_get_lladdr(dev, &saddr_buf, IFA_F_TENTATIVE)) {
 		ND_PRINTK(2, warn, "Redirect: no link-local address on %s\n",
@@ -1685,10 +1696,9 @@ int ndisc_rcv(struct sk_buff *skb)
 		return 0;
 	}
 
-	memset(NEIGH_CB(skb), 0, sizeof(struct neighbour_cb));
-
 	switch (msg->icmph.icmp6_type) {
 	case NDISC_NEIGHBOUR_SOLICITATION:
+		memset(NEIGH_CB(skb), 0, sizeof(struct neighbour_cb));
 		ndisc_recv_ns(skb);
 		break;
 
@@ -1723,6 +1733,8 @@ static int ndisc_netdev_event(struct notifier_block *this, unsigned long event, 
 	case NETDEV_CHANGEADDR:
 		neigh_changeaddr(&nd_tbl, dev);
 		fib6_run_gc(0, net, false);
+		/* fallthrough */
+	case NETDEV_UP:
 		idev = in6_dev_get(dev);
 		if (!idev)
 			break;

@@ -35,7 +35,7 @@ static int raid0_congested(struct mddev *mddev, int bits)
 	for (i = 0; i < raid_disks && !ret ; i++) {
 		struct request_queue *q = bdev_get_queue(devlist[i]->bdev);
 
-		ret |= bdi_congested(&q->backing_dev_info, bits);
+		ret |= bdi_congested(q->backing_dev_info, bits);
 	}
 	return ret;
 }
@@ -82,7 +82,7 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 	char b[BDEVNAME_SIZE];
 	char b2[BDEVNAME_SIZE];
 	struct r0conf *conf = kzalloc(sizeof(*conf), GFP_KERNEL);
-	unsigned short blksize = 512;
+	unsigned blksize = 512;
 
 	*private_conf = ERR_PTR(-ENOMEM);
 	if (!conf)
@@ -415,8 +415,8 @@ static int raid0_run(struct mddev *mddev)
 		 */
 		int stripe = mddev->raid_disks *
 			(mddev->chunk_sectors << 9) / PAGE_SIZE;
-		if (mddev->queue->backing_dev_info.ra_pages < 2* stripe)
-			mddev->queue->backing_dev_info.ra_pages = 2* stripe;
+		if (mddev->queue->backing_dev_info->ra_pages < 2* stripe)
+			mddev->queue->backing_dev_info->ra_pages = 2* stripe;
 	}
 
 	dump_zones(mddev);

@@ -63,6 +63,10 @@ static struct property *dlpar_parse_cc_property(struct cc_workarea *ccwa)
 
 	name = (char *)ccwa + be32_to_cpu(ccwa->name_offset);
 	prop->name = kstrdup(name, GFP_KERNEL);
+	if (!prop->name) {
+		dlpar_free_cc_property(prop);
+		return NULL;
+	}
 
 	prop->length = be32_to_cpu(ccwa->prop_length);
 	value = (char *)ccwa + be32_to_cpu(ccwa->prop_offset);
@@ -288,7 +292,8 @@ int dlpar_detach_node(struct device_node *dn)
 	if (rc)
 		return rc;
 
-	of_node_put(dn); /* Must decrement the refcount */
+	of_node_put(dn);
+
 	return 0;
 }
 

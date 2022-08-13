@@ -110,7 +110,7 @@ static int crypto_aead_report(struct sk_buff *skb, struct crypto_alg *alg)
 	struct aead_alg *aead = container_of(alg, struct aead_alg, base);
 
 	strncpy(raead.type, "aead", sizeof(raead.type));
-	strncpy(raead.geniv, "<none>", sizeof(raead.geniv));
+	strlcpy(raead.geniv, "<none>", sizeof(raead.geniv));
 
 	raead.blocksize = alg->cra_blocksize;
 	raead.maxauthsize = aead->maxauthsize;

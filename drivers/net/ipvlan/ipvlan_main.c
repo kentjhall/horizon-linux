@@ -63,32 +63,52 @@ static int ipvlan_set_port_mode(struct ipvl_port *port, u16 nval)
 {
 	struct ipvl_dev *ipvlan;
 	struct net_device *mdev = port->dev;
-	int err = 0;
+	unsigned int flags;
+	int err;
 
 	ASSERT_RTNL();
 	if (port->mode != nval) {
+		list_for_each_entry(ipvlan, &port->ipvlans, pnode) {
+			flags = ipvlan->dev->flags;
+			if (nval == IPVLAN_MODE_L3 || nval == IPVLAN_MODE_L3S) {
+				err = dev_change_flags(ipvlan->dev,
+						       flags | IFF_NOARP);
+			} else {
+				err = dev_change_flags(ipvlan->dev,
+						       flags & ~IFF_NOARP);
+			}
+			if (unlikely(err))
+				goto fail;
+		}
 		if (nval == IPVLAN_MODE_L3S) {
 			/* New mode is L3S */
 			err = ipvlan_register_nf_hook();
 			if (!err) {
 				mdev->l3mdev_ops = &ipvl_l3mdev_ops;
-				mdev->priv_flags |= IFF_L3MDEV_MASTER;
+				mdev->priv_flags |= IFF_L3MDEV_RX_HANDLER;
 			} else
-				return err;
+				goto fail;
 		} else if (port->mode == IPVLAN_MODE_L3S) {
 			/* Old mode was L3S */
-			mdev->priv_flags &= ~IFF_L3MDEV_MASTER;
+			mdev->priv_flags &= ~IFF_L3MDEV_RX_HANDLER;
 			ipvlan_unregister_nf_hook();
 			mdev->l3mdev_ops = NULL;
 		}
-		list_for_each_entry(ipvlan, &port->ipvlans, pnode) {
-			if (nval == IPVLAN_MODE_L3 || nval == IPVLAN_MODE_L3S)
-				ipvlan->dev->flags |= IFF_NOARP;
-			else
-				ipvlan->dev->flags &= ~IFF_NOARP;
-		}
 		port->mode = nval;
 	}
+	return 0;
+
+fail:
+	/* Undo the flags changes that have been done so far. */
+	list_for_each_entry_continue_reverse(ipvlan, &port->ipvlans, pnode) {
+		flags = ipvlan->dev->flags;
+		if (port->mode == IPVLAN_MODE_L3 ||
+		    port->mode == IPVLAN_MODE_L3S)
+			dev_change_flags(ipvlan->dev, flags | IFF_NOARP);
+		else
+			dev_change_flags(ipvlan->dev, flags & ~IFF_NOARP);
+	}
+
 	return err;
 }
 
@@ -138,7 +158,7 @@ static void ipvlan_port_destroy(struct net_device *dev)
 
 	dev->priv_flags &= ~IFF_IPVLAN_MASTER;
 	if (port->mode == IPVLAN_MODE_L3S) {
-		dev->priv_flags &= ~IFF_L3MDEV_MASTER;
+		dev->priv_flags &= ~IFF_L3MDEV_RX_HANDLER;
 		ipvlan_unregister_nf_hook();
 		dev->l3mdev_ops = NULL;
 	}
@@ -148,11 +168,20 @@ static void ipvlan_port_destroy(struct net_device *dev)
 	kfree_rcu(port, rcu);
 }
 
+#define IPVLAN_ALWAYS_ON_OFLOADS \
+	(NETIF_F_SG | NETIF_F_HW_CSUM | \
+	 NETIF_F_GSO_ROBUST | NETIF_F_GSO_SOFTWARE | NETIF_F_GSO_ENCAP_ALL)
+
+#define IPVLAN_ALWAYS_ON \
+	(IPVLAN_ALWAYS_ON_OFLOADS | NETIF_F_LLTX | NETIF_F_VLAN_CHALLENGED)
+
 #define IPVLAN_FEATURES \
 	(NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_HIGHDMA | NETIF_F_FRAGLIST | \
 	 NETIF_F_GSO | NETIF_F_TSO | NETIF_F_UFO | NETIF_F_GSO_ROBUST | \
 	 NETIF_F_TSO_ECN | NETIF_F_TSO6 | NETIF_F_GRO | NETIF_F_RXCSUM | \
 	 NETIF_F_HW_VLAN_CTAG_FILTER | NETIF_F_HW_VLAN_STAG_FILTER)
+
+	/* NETIF_F_GSO_ENCAP_ALL NETIF_F_GSO_SOFTWARE Newly added */
 
 #define IPVLAN_STATE_MASK \
 	((1<<__LINK_STATE_NOCARRIER) | (1<<__LINK_STATE_DORMANT))
@@ -166,7 +195,9 @@ static int ipvlan_init(struct net_device *dev)
 	dev->state = (dev->state & ~IPVLAN_STATE_MASK) |
 		     (phy_dev->state & IPVLAN_STATE_MASK);
 	dev->features = phy_dev->features & IPVLAN_FEATURES;
-	dev->features |= NETIF_F_LLTX;
+	dev->features |= IPVLAN_ALWAYS_ON;
+	dev->vlan_features = phy_dev->vlan_features & IPVLAN_FEATURES;
+	dev->vlan_features |= IPVLAN_ALWAYS_ON_OFLOADS;
 	dev->gso_max_size = phy_dev->gso_max_size;
 	dev->gso_max_segs = phy_dev->gso_max_segs;
 	dev->hard_header_len = phy_dev->hard_header_len;
@@ -197,7 +228,6 @@ static void ipvlan_uninit(struct net_device *dev)
 static int ipvlan_open(struct net_device *dev)
 {
 	struct ipvl_dev *ipvlan = netdev_priv(dev);
-	struct net_device *phy_dev = ipvlan->phy_dev;
 	struct ipvl_addr *addr;
 
 	if (ipvlan->port->mode == IPVLAN_MODE_L3 ||
@@ -209,7 +239,7 @@ static int ipvlan_open(struct net_device *dev)
 	list_for_each_entry(addr, &ipvlan->addrs, anode)
 		ipvlan_ht_addr_add(ipvlan, addr);
 
-	return dev_uc_add(phy_dev, phy_dev->dev_addr);
+	return 0;
 }
 
 static int ipvlan_stop(struct net_device *dev)
@@ -220,8 +250,6 @@ static int ipvlan_stop(struct net_device *dev)
 
 	dev_uc_unsync(phy_dev, dev);
 	dev_mc_unsync(phy_dev, dev);
-
-	dev_uc_del(phy_dev, phy_dev->dev_addr);
 
 	list_for_each_entry(addr, &ipvlan->addrs, anode)
 		ipvlan_ht_addr_del(addr);
@@ -257,7 +285,14 @@ static netdev_features_t ipvlan_fix_features(struct net_device *dev,
 {
 	struct ipvl_dev *ipvlan = netdev_priv(dev);
 
-	return features & (ipvlan->sfeatures | ~IPVLAN_FEATURES);
+	features |= NETIF_F_ALL_FOR_ALL;
+	features &= (ipvlan->sfeatures | ~IPVLAN_FEATURES);
+	features = netdev_increment_features(ipvlan->phy_dev->features,
+					     features, features);
+	features |= IPVLAN_ALWAYS_ON;
+	features &= (IPVLAN_FEATURES | IPVLAN_ALWAYS_ON);
+
+	return features;
 }
 
 static void ipvlan_change_rx_flags(struct net_device *dev, int change)
@@ -443,7 +478,12 @@ static int ipvlan_nl_changelink(struct net_device *dev,
 	struct ipvl_port *port = ipvlan_port_get_rtnl(ipvlan->phy_dev);
 	int err = 0;
 
-	if (data && data[IFLA_IPVLAN_MODE]) {
+	if (!data)
+		return 0;
+	if (!ns_capable(dev_net(ipvlan->phy_dev)->user_ns, CAP_NET_ADMIN))
+		return -EPERM;
+
+	if (data[IFLA_IPVLAN_MODE]) {
 		u16 nmode = nla_get_u16(data[IFLA_IPVLAN_MODE]);
 
 		err = ipvlan_set_port_mode(port, nmode);
@@ -510,6 +550,8 @@ static int ipvlan_link_new(struct net *src_net, struct net_device *dev,
 		struct ipvl_dev *tmp = netdev_priv(phy_dev);
 
 		phy_dev = tmp->phy_dev;
+		if (!ns_capable(dev_net(phy_dev)->user_ns, CAP_NET_ADMIN))
+			return -EPERM;
 	} else if (!netif_is_ipvlan_port(phy_dev)) {
 		err = ipvlan_port_create(phy_dev);
 		if (err < 0)
@@ -525,7 +567,8 @@ static int ipvlan_link_new(struct net *src_net, struct net_device *dev,
 	ipvlan->dev = dev;
 	ipvlan->port = port;
 	ipvlan->sfeatures = IPVLAN_FEATURES;
-	ipvlan_adjust_mtu(ipvlan, phy_dev);
+	if (!tb[IFLA_MTU])
+		ipvlan_adjust_mtu(ipvlan, phy_dev);
 	INIT_LIST_HEAD(&ipvlan->addrs);
 
 	/* TODO Probably put random address here to be presented to the
@@ -650,10 +693,9 @@ static int ipvlan_device_event(struct notifier_block *unused,
 
 	case NETDEV_FEAT_CHANGE:
 		list_for_each_entry(ipvlan, &port->ipvlans, pnode) {
-			ipvlan->dev->features = dev->features & IPVLAN_FEATURES;
 			ipvlan->dev->gso_max_size = dev->gso_max_size;
 			ipvlan->dev->gso_max_segs = dev->gso_max_segs;
-			netdev_features_change(ipvlan->dev);
+			netdev_update_features(ipvlan->dev);
 		}
 		break;
 

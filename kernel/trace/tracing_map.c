@@ -90,8 +90,8 @@ static int tracing_map_cmp_atomic64(void *val_a, void *val_b)
 #define DEFINE_TRACING_MAP_CMP_FN(type)					\
 static int tracing_map_cmp_##type(void *val_a, void *val_b)		\
 {									\
-	type a = *(type *)val_a;					\
-	type b = *(type *)val_b;					\
+	type a = (type)(*(u64 *)val_a);					\
+	type b = (type)(*(u64 *)val_b);					\
 									\
 	return (a > b) ? 1 : ((a < b) ? -1 : 0);			\
 }
@@ -221,16 +221,19 @@ void tracing_map_array_free(struct tracing_map_array *a)
 	if (!a)
 		return;
 
-	if (!a->pages) {
-		kfree(a);
-		return;
-	}
+	if (!a->pages)
+		goto free;
 
 	for (i = 0; i < a->n_pages; i++) {
 		if (!a->pages[i])
 			break;
 		free_page((unsigned long)a->pages[i]);
 	}
+
+	kfree(a->pages);
+
+ free:
+	kfree(a);
 }
 
 struct tracing_map_array *tracing_map_array_alloc(unsigned int n_elts,

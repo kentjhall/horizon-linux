@@ -1,3 +1,5 @@
+subdir-ccflags-y += -Werror
+
 obj-y += core.o
 obj-y += hisilicon/
 obj-$(CONFIG_ARCH_STI) += sti/

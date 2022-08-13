@@ -98,7 +98,7 @@ static int tpm_tcg_read_bytes(struct tpm_tis_data *data, u32 addr, u16 len,
 }
 
 static int tpm_tcg_write_bytes(struct tpm_tis_data *data, u32 addr, u16 len,
-			       u8 *value)
+			       const u8 *value)
 {
 	struct tpm_tis_tcg_phy *phy = to_tpm_tis_tcg_phy(data);
 
@@ -421,7 +421,7 @@ err_pnp:
 	acpi_bus_unregister_driver(&tis_acpi_driver);
 err_acpi:
 #endif
-	platform_device_unregister(force_pdev);
+	platform_driver_unregister(&tis_drv);
 err_platform:
 	if (force_pdev)
 		platform_device_unregister(force_pdev);

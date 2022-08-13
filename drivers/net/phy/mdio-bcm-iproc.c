@@ -81,8 +81,6 @@ static int iproc_mdio_read(struct mii_bus *bus, int phy_id, int reg)
 	if (rc)
 		return rc;
 
-	iproc_mdio_config_clk(priv->base);
-
 	/* Prepare the read operation */
 	cmd = (MII_DATA_TA_VAL << MII_DATA_TA_SHIFT) |
 		(reg << MII_DATA_RA_SHIFT) |
@@ -111,8 +109,6 @@ static int iproc_mdio_write(struct mii_bus *bus, int phy_id,
 	rc = iproc_mdio_wait_for_idle(priv->base);
 	if (rc)
 		return rc;
-
-	iproc_mdio_config_clk(priv->base);
 
 	/* Prepare the write operation */
 	cmd = (MII_DATA_TA_VAL << MII_DATA_TA_SHIFT) |
@@ -163,6 +159,8 @@ static int iproc_mdio_probe(struct platform_device *pdev)
 	bus->read = iproc_mdio_read;
 	bus->write = iproc_mdio_write;
 
+	iproc_mdio_config_clk(priv->base);
+
 	rc = of_mdiobus_register(bus, pdev->dev.of_node);
 	if (rc) {
 		dev_err(&pdev->dev, "MDIO bus registration failed\n");
@@ -190,6 +188,23 @@ static int iproc_mdio_remove(struct platform_device *pdev)
 	return 0;
 }
 
+#ifdef CONFIG_PM_SLEEP
+int iproc_mdio_resume(struct device *dev)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct iproc_mdio_priv *priv = platform_get_drvdata(pdev);
+
+	/* restore the mii clock configuration */
+	iproc_mdio_config_clk(priv->base);
+
+	return 0;
+}
+
+static const struct dev_pm_ops iproc_mdio_pm_ops = {
+	.resume = iproc_mdio_resume
+};
+#endif /* CONFIG_PM_SLEEP */
+
 static const struct of_device_id iproc_mdio_of_match[] = {
 	{ .compatible = "brcm,iproc-mdio", },
 	{ /* sentinel */ },
@@ -200,6 +215,9 @@ static struct platform_driver iproc_mdio_driver = {
 	.driver = {
 		.name = "iproc-mdio",
 		.of_match_table = iproc_mdio_of_match,
+#ifdef CONFIG_PM_SLEEP
+		.pm = &iproc_mdio_pm_ops,
+#endif
 	},
 	.probe = iproc_mdio_probe,
 	.remove = iproc_mdio_remove,

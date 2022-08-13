@@ -522,7 +522,7 @@ struct pmic_wrapper_type {
 	u32 int_en_all;
 	u32 spi_w;
 	u32 wdt_src;
-	int has_bridge:1;
+	unsigned int has_bridge:1;
 	int (*init_reg_clock)(struct pmic_wrapper *wrp);
 	int (*init_soc_specific)(struct pmic_wrapper *wrp);
 };
@@ -778,7 +778,7 @@ static bool pwrap_is_pmic_cipher_ready(struct pmic_wrapper *wrp)
 static int pwrap_init_cipher(struct pmic_wrapper *wrp)
 {
 	int ret;
-	u32 rdata;
+	u32 rdata = 0;
 
 	pwrap_writel(wrp, 0x1, PWRAP_CIPHER_SWRST);
 	pwrap_writel(wrp, 0x0, PWRAP_CIPHER_SWRST);

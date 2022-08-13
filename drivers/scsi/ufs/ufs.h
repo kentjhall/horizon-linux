@@ -3,6 +3,7 @@
  *
  * This code is based on drivers/scsi/ufs/ufs.h
  * Copyright (C) 2011-2013 Samsung India Software Operations
+ * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * Authors:
  *	Santosh Yaraganavi <santosh.sy@samsung.com>
@@ -46,6 +47,7 @@
 #define QUERY_DESC_HDR_SIZE       2
 #define QUERY_OSF_SIZE            (GENERAL_UPIU_REQUEST_SIZE - \
 					(sizeof(struct utp_upiu_header)))
+#define RESPONSE_UPIU_SENSE_DATA_LENGTH	18
 
 #define UPIU_HEADER_DWORD(byte3, byte2, byte1, byte0)\
 			cpu_to_be32((byte3 << 24) | (byte2 << 16) |\
@@ -132,20 +134,26 @@ enum flag_idn {
 	QUERY_FLAG_IDN_FDEVICEINIT      = 0x01,
 	QUERY_FLAG_IDN_PWR_ON_WPE	= 0x03,
 	QUERY_FLAG_IDN_BKOPS_EN         = 0x04,
+	QUERY_FLAG_IDN_MAX		= 0x0E,
 };
 
 /* Attribute idn for Query requests */
 enum attr_idn {
+	QUERY_ATTR_IDN_BOOTLUN_EN	= 0x0,
+	QUERY_ATTR_IDN_PWR_MODE		= 0x02,
 	QUERY_ATTR_IDN_ACTIVE_ICC_LVL	= 0x03,
 	QUERY_ATTR_IDN_BKOPS_STATUS	= 0x05,
+	QUERY_ATTR_IDN_REF_CLK_FREQ	= 0x0A,
+	QUERY_ATTR_IDN_CONF_DESC_LCK	= 0x0B,
 	QUERY_ATTR_IDN_EE_CONTROL	= 0x0D,
 	QUERY_ATTR_IDN_EE_STATUS	= 0x0E,
+	QUERY_ATTR_IDN_MAX		= 0x30,
 };
 
 /* Descriptor idn for Query requests */
 enum desc_idn {
 	QUERY_DESC_IDN_DEVICE		= 0x0,
-	QUERY_DESC_IDN_CONFIGURAION	= 0x1,
+	QUERY_DESC_IDN_CONFIGURATION	= 0x1,
 	QUERY_DESC_IDN_UNIT		= 0x2,
 	QUERY_DESC_IDN_RFU_0		= 0x3,
 	QUERY_DESC_IDN_INTERCONNECT	= 0x4,
@@ -153,6 +161,7 @@ enum desc_idn {
 	QUERY_DESC_IDN_RFU_1		= 0x6,
 	QUERY_DESC_IDN_GEOMETRY		= 0x7,
 	QUERY_DESC_IDN_POWER		= 0x8,
+	QUERY_DESC_IDN_DEVICE_HEALTH	= 0x9,
 	QUERY_DESC_IDN_MAX,
 };
 
@@ -161,19 +170,13 @@ enum desc_header_offset {
 	QUERY_DESC_DESC_TYPE_OFFSET	= 0x01,
 };
 
-enum ufs_desc_max_size {
-	QUERY_DESC_DEVICE_MAX_SIZE		= 0x1F,
-	QUERY_DESC_CONFIGURAION_MAX_SIZE	= 0x90,
-	QUERY_DESC_UNIT_MAX_SIZE		= 0x23,
-	QUERY_DESC_INTERCONNECT_MAX_SIZE	= 0x06,
-	/*
-	 * Max. 126 UNICODE characters (2 bytes per character) plus 2 bytes
-	 * of descriptor header.
-	 */
-	QUERY_DESC_STRING_MAX_SIZE		= 0xFE,
-	QUERY_DESC_GEOMETRY_MAX_SIZE		= 0x44,
-	QUERY_DESC_POWER_MAX_SIZE		= 0x62,
-	QUERY_DESC_RFU_MAX_SIZE			= 0x00,
+enum ufs_desc_def_size {
+	QUERY_DESC_DEVICE_DEF_SIZE		= 0x40,
+	QUERY_DESC_CONFIGURATION_DEF_SIZE	= 0x90,
+	QUERY_DESC_UNIT_DEF_SIZE		= 0x23,
+	QUERY_DESC_INTERCONNECT_DEF_SIZE	= 0x06,
+	QUERY_DESC_GEOMETRY_DEF_SIZE		= 0x44,
+	QUERY_DESC_POWER_DEF_SIZE		= 0x62,
 };
 
 /* Unit descriptor parameters offsets in bytes*/
@@ -416,7 +419,7 @@ struct utp_cmd_rsp {
 	__be32 residual_transfer_count;
 	__be32 reserved[4];
 	__be16 sense_data_len;
-	u8 sense_data[18];
+	u8 sense_data[RESPONSE_UPIU_SENSE_DATA_LENGTH];
 };
 
 /**
@@ -520,6 +523,18 @@ struct ufs_dev_info {
 	bool f_power_on_wp_en;
 	/* Keeps information if any of the LU is power on write protected */
 	bool is_lu_power_on_wp;
+};
+
+#define MAX_MODEL_LEN 16
+/**
+ * ufs_dev_desc - ufs device details from the device descriptor
+ *
+ * @wmanufacturerid: card details
+ * @model: card model
+ */
+struct ufs_dev_desc {
+	u16 wmanufacturerid;
+	char model[MAX_MODEL_LEN + 1];
 };
 
 #endif /* End of Header */

@@ -1,7 +1,7 @@
 #
 # Makefile for the industrial I/O core.
 #
-
+subdir-ccflags-y += -Werror
 obj-$(CONFIG_IIO) += industrialio.o
 industrialio-y := industrialio-core.o industrialio-event.o inkern.o
 industrialio-$(CONFIG_IIO_BUFFER) += industrialio-buffer.o

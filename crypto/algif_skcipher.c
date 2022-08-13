@@ -86,8 +86,13 @@ static void skcipher_free_async_sgls(struct skcipher_async_req *sreq)
 	}
 	sgl = sreq->tsg;
 	n = sg_nents(sgl);
-	for_each_sg(sgl, sg, n, i)
-		put_page(sg_page(sg));
+	for_each_sg(sgl, sg, n, i) {
+		struct page *page = sg_page(sg);
+
+		/* some SGs may not have a page mapped */
+		if (page && page_ref_count(page))
+			put_page(page);
+	}
 
 	kfree(sreq->tsg);
 }
@@ -138,8 +143,10 @@ static int skcipher_alloc_sgl(struct sock *sk)
 		sg_init_table(sgl->sg, MAX_SGL_ENTS + 1);
 		sgl->cur = 0;
 
-		if (sg)
+		if (sg) {
 			sg_chain(sg, MAX_SGL_ENTS + 1, sgl->sg);
+			sg_unmark_end(sg + (MAX_SGL_ENTS - 1));
+		}
 
 		list_add_tail(&sgl->list, &ctx->tsgl);
 	}
@@ -531,7 +538,7 @@ static int skcipher_recvmsg_async(struct socket *sock, struct msghdr *msg,
 	lock_sock(sk);
 	tx_nents = skcipher_all_sg_nents(ctx);
 	sreq->tsg = kcalloc(tx_nents, sizeof(*sg), GFP_KERNEL);
-	if (unlikely(!sreq->tsg))
+	if (unlikely(ZERO_OR_NULL_PTR(sreq->tsg)))
 		goto unlock;
 	sg_init_table(sreq->tsg, tx_nents);
 	memcpy(iv, ctx->iv, ivsize);
@@ -767,7 +774,7 @@ static int skcipher_check_key(struct socket *sock)
 	struct alg_sock *ask = alg_sk(sk);
 
 	lock_sock(sk);
-	if (ask->refcnt)
+	if (!atomic_read(&ask->nokey_refcnt))
 		goto unlock_child;
 
 	psk = ask->parent;
@@ -779,11 +786,8 @@ static int skcipher_check_key(struct socket *sock)
 	if (!tfm->has_key)
 		goto unlock;
 
-	if (!pask->refcnt++)
-		sock_hold(psk);
-
-	ask->refcnt = 1;
-	sock_put(psk);
+	atomic_dec(&pask->nokey_refcnt);
+	atomic_set(&ask->nokey_refcnt, 0);
 
 	err = 0;
 

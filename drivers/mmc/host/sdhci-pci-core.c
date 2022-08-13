@@ -412,6 +412,8 @@ static void sdhci_intel_set_power(struct sdhci_host *host, unsigned char mode,
 	if (mode == MMC_POWER_OFF)
 		return;
 
+	spin_unlock_irq(&host->lock);
+
 	/*
 	 * Bus power might not enable after D3 -> D0 transition due to the
 	 * present state not yet having propagated. Retry for up to 2ms.
@@ -424,6 +426,8 @@ static void sdhci_intel_set_power(struct sdhci_host *host, unsigned char mode,
 		reg |= SDHCI_POWER_ON;
 		sdhci_writeb(host, reg, SDHCI_POWER_CONTROL);
 	}
+
+	spin_lock_irq(&host->lock);
 }
 
 static const struct sdhci_ops sdhci_intel_byt_ops = {
@@ -488,6 +492,8 @@ static int intel_mrfld_mmc_probe_slot(struct sdhci_pci_slot *slot)
 		slot->host->quirks2 |= SDHCI_QUIRK2_NO_1_8_V;
 		break;
 	case INTEL_MRFLD_SDIO:
+		/* Advertise 2.0v for compatibility with the SDIO card's OCR */
+		slot->host->ocr_mask = MMC_VDD_20_21 | MMC_VDD_165_195;
 		slot->host->mmc->caps |= MMC_CAP_NONREMOVABLE |
 					 MMC_CAP_POWER_OFF_CARD;
 		break;

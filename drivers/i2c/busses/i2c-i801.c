@@ -135,6 +135,7 @@
 
 #define SBREG_BAR		0x10
 #define SBREG_SMBCTRL		0xc6000c
+#define SBREG_SMBCTRL_DNV	0xcf000c
 
 /* Host status bits for SMBPCISTS */
 #define SMBPCISTS_INTS		0x08
@@ -243,6 +244,7 @@ struct i801_priv {
 	struct i2c_adapter adapter;
 	unsigned long smba;
 	unsigned char original_hstcfg;
+	unsigned char original_slvcmd;
 	struct pci_dev *pci_dev;
 	unsigned int features;
 
@@ -962,11 +964,22 @@ static int i801_enable_host_notify(struct i2c_adapter *adapter)
 	if (!priv->host_notify)
 		return -ENOMEM;
 
-	outb_p(SMBSLVCMD_HST_NTFY_INTREN, SMBSLVCMD(priv));
+	if (!(SMBSLVCMD_HST_NTFY_INTREN & priv->original_slvcmd))
+		outb_p(SMBSLVCMD_HST_NTFY_INTREN | priv->original_slvcmd,
+		       SMBSLVCMD(priv));
+
 	/* clear Host Notify bit to allow a new notification */
 	outb_p(SMBSLVSTS_HST_NTFY_STS, SMBSLVSTS(priv));
 
 	return 0;
+}
+
+static void i801_disable_host_notify(struct i801_priv *priv)
+{
+	if (!(priv->features & FEATURE_HOST_NOTIFY))
+		return;
+
+	outb_p(priv->original_slvcmd, SMBSLVCMD(priv));
 }
 
 static const struct i2c_algorithm smbus_algorithm = {
@@ -1375,7 +1388,11 @@ static void i801_add_tco(struct i801_priv *priv)
 	spin_unlock(&p2sb_spinlock);
 
 	res = &tco_res[ICH_RES_MEM_OFF];
-	res->start = (resource_size_t)base64_addr + SBREG_SMBCTRL;
+	if (pci_dev->device == PCI_DEVICE_ID_INTEL_DNV_SMBUS)
+		res->start = (resource_size_t)base64_addr + SBREG_SMBCTRL_DNV;
+	else
+		res->start = (resource_size_t)base64_addr + SBREG_SMBCTRL;
+
 	res->end = res->start + 3;
 	res->flags = IORESOURCE_MEM;
 
@@ -1391,6 +1408,13 @@ static void i801_add_tco(struct i801_priv *priv)
 }
 
 #ifdef CONFIG_ACPI
+static bool i801_acpi_is_smbus_ioport(const struct i801_priv *priv,
+				      acpi_physical_address address)
+{
+	return address >= priv->smba &&
+	       address <= pci_resource_end(priv->pci_dev, SMBBAR);
+}
+
 static acpi_status
 i801_acpi_io_handler(u32 function, acpi_physical_address address, u32 bits,
 		     u64 *value, void *handler_context, void *region_context)
@@ -1406,7 +1430,7 @@ i801_acpi_io_handler(u32 function, acpi_physical_address address, u32 bits,
 	 */
 	mutex_lock(&priv->acpi_lock);
 
-	if (!priv->acpi_reserved) {
+	if (!priv->acpi_reserved && i801_acpi_is_smbus_ioport(priv, address)) {
 		priv->acpi_reserved = true;
 
 		dev_warn(&pdev->dev, "BIOS is accessing SMBus registers\n");
@@ -1589,8 +1613,15 @@ static int i801_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		outb_p(inb_p(SMBAUXCTL(priv)) &
 		       ~(SMBAUXCTL_CRC | SMBAUXCTL_E32B), SMBAUXCTL(priv));
 
+	/* Remember original Host Notify setting */
+	if (priv->features & FEATURE_HOST_NOTIFY)
+		priv->original_slvcmd = inb_p(SMBSLVCMD(priv));
+
 	/* Default timeout in interrupt mode: 200 ms */
 	priv->adapter.timeout = HZ / 5;
+
+	if (dev->irq == IRQ_NOTCONNECTED)
+		priv->features &= ~FEATURE_IRQ;
 
 	if (priv->features & FEATURE_IRQ) {
 		u16 pcictl, pcists;
@@ -1663,6 +1694,7 @@ static void i801_remove(struct pci_dev *dev)
 	pm_runtime_forbid(&dev->dev);
 	pm_runtime_get_noresume(&dev->dev);
 
+	i801_disable_host_notify(priv);
 	i801_del_mux(priv);
 	i2c_del_adapter(&priv->adapter);
 	i801_acpi_remove(priv);
@@ -1674,6 +1706,15 @@ static void i801_remove(struct pci_dev *dev)
 	 * do not call pci_disable_device(dev) since it can cause hard hangs on
 	 * some systems during power-off (eg. Fujitsu-Siemens Lifebook E8010)
 	 */
+}
+
+static void i801_shutdown(struct pci_dev *dev)
+{
+	struct i801_priv *priv = pci_get_drvdata(dev);
+
+	/* Restore config registers to avoid hard hang on some systems */
+	i801_disable_host_notify(priv);
+	pci_write_config_byte(dev, SMBHSTCFG, priv->original_hstcfg);
 }
 
 #ifdef CONFIG_PM
@@ -1708,6 +1749,7 @@ static struct pci_driver i801_driver = {
 	.id_table	= i801_ids,
 	.probe		= i801_probe,
 	.remove		= i801_remove,
+	.shutdown	= i801_shutdown,
 	.driver		= {
 		.pm	= &i801_pm_ops,
 	},

@@ -2050,6 +2050,9 @@ void bond_3ad_unbind_slave(struct slave *slave)
 		   aggregator->aggregator_identifier);
 
 	/* Tell the partner that this port is not suitable for aggregation */
+	port->actor_oper_port_state &= ~AD_STATE_SYNCHRONIZATION;
+	port->actor_oper_port_state &= ~AD_STATE_COLLECTING;
+	port->actor_oper_port_state &= ~AD_STATE_DISTRIBUTING;
 	port->actor_oper_port_state &= ~AD_STATE_AGGREGATION;
 	__update_lacpdu_from_port(port);
 	ad_lacpdu_send(port);
@@ -2573,7 +2576,7 @@ int __bond_3ad_get_active_agg_info(struct bonding *bond,
 		return -1;
 
 	ad_info->aggregator_id = aggregator->aggregator_identifier;
-	ad_info->ports = aggregator->num_of_ports;
+	ad_info->ports = __agg_active_ports(aggregator);
 	ad_info->actor_key = aggregator->actor_oper_aggregator_key;
 	ad_info->partner_key = aggregator->partner_oper_aggregator_key;
 	ether_addr_copy(ad_info->partner_system,

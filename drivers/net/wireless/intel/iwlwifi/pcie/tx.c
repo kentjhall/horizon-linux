@@ -416,7 +416,7 @@ static void iwl_pcie_tfd_unmap(struct iwl_trans *trans,
 	/* Sanity check on number of chunks */
 	num_tbs = iwl_pcie_tfd_get_num_tbs(trans, tfd);
 
-	if (num_tbs >= trans_pcie->max_tbs) {
+	if (num_tbs > trans_pcie->max_tbs) {
 		IWL_ERR(trans, "Too many chunks: %i\n", num_tbs);
 		/* @todo issue fatal error, it is quite serious situation */
 		return;
@@ -438,6 +438,8 @@ static void iwl_pcie_tfd_unmap(struct iwl_trans *trans,
 								 i),
 					 DMA_TO_DEVICE);
 	}
+
+	meta->tbs = 0;
 
 	if (trans->cfg->use_tfh) {
 		struct iwl_tfh_tfd *tfd_fh = (void *)tfd;
@@ -2096,6 +2098,7 @@ static int iwl_fill_data_tbs_amsdu(struct iwl_trans *trans, struct sk_buff *skb,
 				   struct iwl_cmd_meta *out_meta,
 				   struct iwl_device_cmd *dev_cmd, u16 tb1_len)
 {
+	struct iwl_tx_cmd *tx_cmd = (void *)dev_cmd->payload;
 	struct iwl_trans_pcie *trans_pcie = txq->trans_pcie;
 	struct ieee80211_hdr *hdr = (void *)skb->data;
 	unsigned int snap_ip_tcp_hdrlen, ip_hdrlen, total_len, hdr_room;
@@ -2145,6 +2148,13 @@ static int iwl_fill_data_tbs_amsdu(struct iwl_trans *trans, struct sk_buff *skb,
 	 */
 	skb_pull(skb, hdr_len + iv_len);
 
+	/*
+	 * Remove the length of all the headers that we don't actually
+	 * have in the MPDU by themselves, but that we duplicate into
+	 * all the different MSDUs inside the A-MSDU.
+	 */
+	le16_add_cpu(&tx_cmd->len, -snap_ip_tcp_hdrlen);
+
 	tso_start(skb, &tso);
 
 	while (total_len) {
@@ -2155,7 +2165,7 @@ static int iwl_fill_data_tbs_amsdu(struct iwl_trans *trans, struct sk_buff *skb,
 		unsigned int hdr_tb_len;
 		dma_addr_t hdr_tb_phys;
 		struct tcphdr *tcph;
-		u8 *iph;
+		u8 *iph, *subf_hdrs_start = hdr_page->pos;
 
 		total_len -= data_left;
 
@@ -2216,6 +2226,8 @@ static int iwl_fill_data_tbs_amsdu(struct iwl_trans *trans, struct sk_buff *skb,
 				       hdr_tb_len, false);
 		trace_iwlwifi_dev_tx_tso_chunk(trans->dev, start_hdr,
 					       hdr_tb_len);
+		/* add this subframe's headers' length to the tx_cmd */
+		le16_add_cpu(&tx_cmd->len, hdr_page->pos - subf_hdrs_start);
 
 		/* prepare the start_hdr for the next subframe */
 		start_hdr = hdr_page->pos;
@@ -2408,9 +2420,10 @@ int iwl_trans_pcie_tx(struct iwl_trans *trans, struct sk_buff *skb,
 		tb1_len = len;
 	}
 
-	/* The first TB points to bi-directional DMA data */
-	memcpy(&txq->first_tb_bufs[txq->write_ptr], &dev_cmd->hdr,
-	       IWL_FIRST_TB_SIZE);
+	/*
+	 * The first TB points to bi-directional DMA data, we'll
+	 * memcpy the data into it later.
+	 */
 	iwl_pcie_txq_build_tfd(trans, txq, tb0_phys,
 			       IWL_FIRST_TB_SIZE, true);
 
@@ -2433,6 +2446,10 @@ int iwl_trans_pcie_tx(struct iwl_trans *trans, struct sk_buff *skb,
 				       out_meta, dev_cmd, tb1_len))) {
 		goto out_err;
 	}
+
+	/* building the A-MSDU might have changed this data, so memcpy it now */
+	memcpy(&txq->first_tb_bufs[txq->write_ptr], &dev_cmd->hdr,
+	       IWL_FIRST_TB_SIZE);
 
 	tfd = iwl_pcie_get_tfd(trans_pcie, txq, txq->write_ptr);
 	/* Set up entry for this TFD in Tx byte-count array */

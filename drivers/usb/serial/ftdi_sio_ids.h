@@ -38,6 +38,16 @@
 
 #define FTDI_LUMEL_PD12_PID	0x6002
 
+/*
+ * Custom USB adapters made by Falconia Partners LLC
+ * for FreeCalypso project, ID codes allocated to Falconia by FTDI.
+ */
+#define FTDI_FALCONIA_JTAG_BUF_PID	0x7150
+#define FTDI_FALCONIA_JTAG_UNBUF_PID	0x7151
+
+/* Sienna Serial Interface by Secyourit GmbH */
+#define FTDI_SIENNA_PID		0x8348
+
 /* Cyber Cortex AV by Fabulous Silicon (http://fabuloussilicon.com) */
 #define CYBER_CORTEX_AV_PID	0x8698
 
@@ -156,6 +166,7 @@
 #define XSENS_AWINDA_DONGLE_PID 0x0102
 #define XSENS_MTW_PID		0x0200	/* Xsens MTw */
 #define XSENS_MTDEVBOARD_PID	0x0300	/* Motion Tracker Development Board */
+#define XSENS_MTIUSBCONVERTER_PID	0x0301	/* MTi USB converter */
 #define XSENS_CONVERTER_PID	0xD00D	/* Xsens USB-serial converter */
 
 /* Xsens devices using FTDI VID */
@@ -566,7 +577,9 @@
 /*
  * NovaTech product ids (FTDI_VID)
  */
-#define FTDI_NT_ORIONLXM_PID	0x7c90	/* OrionLXm Substation Automation Platform */
+#define FTDI_NT_ORIONLXM_PID		0x7c90	/* OrionLXm Substation Automation Platform */
+#define FTDI_NT_ORIONLX_PLUS_PID	0x7c91	/* OrionLX+ Substation Automation Platform */
+#define FTDI_NT_ORION_IO_PID		0x7c92	/* Orion I/O */
 
 /*
  * Synapse Wireless product ids (FTDI_VID)
@@ -608,6 +621,13 @@
 #define ADI_VID			0x0456
 #define ADI_GNICE_PID		0xF000
 #define ADI_GNICEPLUS_PID	0xF001
+
+/*
+ * Cypress WICED USB UART
+ */
+#define CYPRESS_VID			0x04B4
+#define CYPRESS_WICED_BT_USB_PID	0x009B
+#define CYPRESS_WICED_WL_USB_PID	0xF900
 
 /*
  * Microchip Technology, Inc.
@@ -677,6 +697,12 @@
 #define BANDB_TTL5USB9M_PID	0xAC49
 #define BANDB_TTL3USB9M_PID	0xAC50
 #define BANDB_ZZ_PROG1_USB_PID	0xBA02
+
+/*
+ * Echelon USB Serial Interface
+ */
+#define ECHELON_VID		0x0920
+#define ECHELON_U20_PID		0x7500
 
 /*
  * Intrepid Control Systems (http://www.intrepidcs.com/) ValueCAN and NeoVI
@@ -873,9 +899,17 @@
 #define	FIC_VID			0x1457
 #define	FIC_NEO1973_DEBUG_PID	0x5118
 
+/*
+ * Actel / Microsemi
+ */
+#define ACTEL_VID				0x1514
+#define MICROSEMI_ARROW_SF2PLUS_BOARD_PID	0x2008
+
 /* Olimex */
 #define OLIMEX_VID			0x15BA
 #define OLIMEX_ARM_USB_OCD_PID		0x0003
+#define OLIMEX_ARM_USB_TINY_PID	0x0004
+#define OLIMEX_ARM_USB_TINY_H_PID	0x002a
 #define OLIMEX_ARM_USB_OCD_H_PID	0x002b
 
 /*
@@ -899,8 +933,17 @@
 #define ICPDAS_I7563U_PID		0x0105
 
 /*
+ * Airbus Defence and Space
+ */
+#define AIRBUS_DS_VID			0x1e8e  /* Vendor ID */
+#define AIRBUS_DS_P8GR			0x6001  /* Tetra P8GR */
+
+/*
  * RT Systems programming cables for various ham radios
  */
+/* This device uses the VID of FTDI */
+#define RTSYSTEMS_USB_VX8_PID   0x9e50  /* USB-VX8 USB to 7 pin modular plug for Yaesu VX-8 radio */
+
 #define RTSYSTEMS_VID		0x2100	/* Vendor ID */
 #define RTSYSTEMS_USB_S03_PID	0x9001	/* RTS-03 USB to Serial Adapter */
 #define RTSYSTEMS_USB_59_PID	0x9e50	/* USB-59 USB to 8 pin plug */
@@ -1284,6 +1327,12 @@
 #define IONICS_PLUGCOMPUTER_PID		0x0102
 
 /*
+ * EZPrototypes (PID reseller)
+ */
+#define EZPROTOTYPES_VID		0x1c40
+#define HJELMSLUND_USB485_ISO_PID	0x0477
+
+/*
  * Dresden Elektronik Sensor Terminal Board
  */
 #define DE_VID			0x1cf1 /* Vendor ID */
@@ -1420,6 +1469,12 @@
 #define FTDI_CINTERION_MC55I_PID	0xA951
 
 /*
+ * Product: FirmwareHubEmulator
+ * Manufacturer: Harman Becker Automotive Systems
+ */
+#define FTDI_FHE_PID		0xA9A0
+
+/*
  * Product: Comet Caller ID decoder
  * Manufacturer: Crucible Technologies
  */
@@ -1504,3 +1559,16 @@
 #define CHETCO_SEASMART_DISPLAY_PID	0xA5AD /* SeaSmart NMEA2000 Display */
 #define CHETCO_SEASMART_LITE_PID	0xA5AE /* SeaSmart Lite USB Adapter */
 #define CHETCO_SEASMART_ANALOG_PID	0xA5AF /* SeaSmart Analog Adapter */
+
+/*
+ * Unjo AB
+ */
+#define UNJO_VID			0x22B7
+#define UNJO_ISODEBUG_V1_PID		0x150D
+
+/*
+ * U-Blox products (http://www.u-blox.com).
+ */
+#define UBLOX_VID			0x1546
+#define UBLOX_C099F9P_ZED_PID		0x0502
+#define UBLOX_C099F9P_ODIN_PID		0x0503

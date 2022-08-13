@@ -85,6 +85,11 @@ static inline uint8_t elf_sym__type(const GElf_Sym *sym)
 	return GELF_ST_TYPE(sym->st_info);
 }
 
+static inline uint8_t elf_sym__visibility(const GElf_Sym *sym)
+{
+	return GELF_ST_VISIBILITY(sym->st_other);
+}
+
 #ifndef STT_GNU_IFUNC
 #define STT_GNU_IFUNC 10
 #endif
@@ -109,7 +114,9 @@ static inline int elf_sym__is_label(const GElf_Sym *sym)
 	return elf_sym__type(sym) == STT_NOTYPE &&
 		sym->st_name != 0 &&
 		sym->st_shndx != SHN_UNDEF &&
-		sym->st_shndx != SHN_ABS;
+		sym->st_shndx != SHN_ABS &&
+		elf_sym__visibility(sym) != STV_HIDDEN &&
+		elf_sym__visibility(sym) != STV_INTERNAL;
 }
 
 static bool elf_sym__is_a(GElf_Sym *sym, enum map_type type)
@@ -537,6 +544,12 @@ int sysfs__read_build_id(const char *filename, void *build_id, size_t size)
 				break;
 		} else {
 			int n = namesz + descsz;
+
+			if (n > (int)sizeof(bf)) {
+				n = sizeof(bf);
+				pr_debug("%s: truncating reading of build id in sysfs file %s: n_namesz=%u, n_descsz=%u.\n",
+					 __func__, filename, nhdr.n_namesz, nhdr.n_descsz);
+			}
 			if (read(fd, bf, n) != n)
 				break;
 		}
@@ -1408,6 +1421,7 @@ struct kcore_copy_info {
 	u64 first_symbol;
 	u64 last_symbol;
 	u64 first_module;
+	u64 first_module_symbol;
 	u64 last_module_symbol;
 	struct phdr_data kernel_map;
 	struct phdr_data modules_map;
@@ -1422,6 +1436,8 @@ static int kcore_copy__process_kallsyms(void *arg, const char *name, char type,
 		return 0;
 
 	if (strchr(name, '[')) {
+		if (!kci->first_module_symbol || start < kci->first_module_symbol)
+			kci->first_module_symbol = start;
 		if (start > kci->last_module_symbol)
 			kci->last_module_symbol = start;
 		return 0;
@@ -1465,7 +1481,7 @@ static int kcore_copy__parse_kallsyms(struct kcore_copy_info *kci,
 
 static int kcore_copy__process_modules(void *arg,
 				       const char *name __maybe_unused,
-				       u64 start)
+				       u64 start, u64 size __maybe_unused)
 {
 	struct kcore_copy_info *kci = arg;
 
@@ -1545,6 +1561,10 @@ static int kcore_copy__calc_maps(struct kcore_copy_info *kci, const char *dir,
 		kci->etext = round_up(kci->last_symbol, page_size);
 		kci->etext += page_size;
 	}
+
+	if (kci->first_module_symbol &&
+	    (!kci->first_module || kci->first_module_symbol < kci->first_module))
+		kci->first_module = kci->first_module_symbol;
 
 	kci->first_module = round_down(kci->first_module, page_size);
 

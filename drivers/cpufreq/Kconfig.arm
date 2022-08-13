@@ -222,14 +222,14 @@ config ARM_STI_CPUFREQ
 
 config ARM_TEGRA20_CPUFREQ
 	bool "Tegra20 CPUFreq support"
-	depends on ARCH_TEGRA
+	depends on ARCH_TEGRA && !ARM64
 	default y
 	help
 	  This adds the CPUFreq driver support for Tegra20 SOCs.
 
 config ARM_TEGRA124_CPUFREQ
 	tristate "Tegra124 CPUFreq support"
-	depends on ARCH_TEGRA && CPUFREQ_DT && REGULATOR
+	depends on ARCH_TEGRA && CPUFREQ_DT && REGULATOR && !ARM64
 	default y
 	help
 	  This adds the CPUFreq driver support for Tegra124 SOCs.
@@ -244,7 +244,7 @@ config ARM_PXA2xx_CPUFREQ
 
 config ACPI_CPPC_CPUFREQ
 	tristate "CPUFreq driver based on the ACPI CPPC spec"
-	depends on ACPI
+	depends on ACPI_PROCESSOR
 	select ACPI_CPPC_LIB
 	default n
 	help

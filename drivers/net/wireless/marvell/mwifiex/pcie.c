@@ -101,7 +101,6 @@ static int mwifiex_pcie_suspend(struct device *dev)
 {
 	struct mwifiex_adapter *adapter;
 	struct pcie_service_card *card;
-	int hs_actived;
 	struct pci_dev *pdev = to_pci_dev(dev);
 
 	if (pdev) {
@@ -117,7 +116,15 @@ static int mwifiex_pcie_suspend(struct device *dev)
 
 	adapter = card->adapter;
 
-	hs_actived = mwifiex_enable_hs(adapter);
+	/* Enable the Host Sleep */
+	if (!mwifiex_enable_hs(adapter)) {
+		mwifiex_dbg(adapter, ERROR,
+			    "cmd: failed to suspend\n");
+		adapter->hs_enabling = false;
+		return -EFAULT;
+	}
+
+	flush_workqueue(adapter->workqueue);
 
 	/* Indicate device suspended */
 	adapter->is_suspended = true;
@@ -625,8 +632,11 @@ static int mwifiex_pcie_init_evt_ring(struct mwifiex_adapter *adapter)
 		skb_put(skb, MAX_EVENT_SIZE);
 
 		if (mwifiex_map_pci_memory(adapter, skb, MAX_EVENT_SIZE,
-					   PCI_DMA_FROMDEVICE))
+					   PCI_DMA_FROMDEVICE)) {
+			kfree_skb(skb);
+			kfree(card->evtbd_ring_vbase);
 			return -1;
+		}
 
 		buf_pa = MWIFIEX_SKB_DMA_ADDR(skb);
 
@@ -966,8 +976,10 @@ static int mwifiex_pcie_alloc_cmdrsp_buf(struct mwifiex_adapter *adapter)
 	}
 	skb_put(skb, MWIFIEX_UPLD_SIZE);
 	if (mwifiex_map_pci_memory(adapter, skb, MWIFIEX_UPLD_SIZE,
-				   PCI_DMA_FROMDEVICE))
+				   PCI_DMA_FROMDEVICE)) {
+		kfree_skb(skb);
 		return -1;
+	}
 
 	card->cmdrsp_buf = skb;
 
@@ -995,6 +1007,7 @@ static int mwifiex_pcie_delete_cmdrsp_buf(struct mwifiex_adapter *adapter)
 	if (card && card->cmd_buf) {
 		mwifiex_unmap_pci_memory(adapter, card->cmd_buf,
 					 PCI_DMA_TODEVICE);
+		dev_kfree_skb_any(card->cmd_buf);
 	}
 	return 0;
 }
@@ -1561,6 +1574,11 @@ mwifiex_pcie_send_cmd(struct mwifiex_adapter *adapter, struct sk_buff *skb)
 		return -1;
 
 	card->cmd_buf = skb;
+	/*
+	 * Need to keep a reference, since core driver might free up this
+	 * buffer before we've unmapped it.
+	 */
+	skb_get(skb);
 
 	/* To send a command, the driver will:
 		1. Write the 64bit physical address of the data buffer to
@@ -1658,6 +1676,7 @@ static int mwifiex_pcie_process_cmd_complete(struct mwifiex_adapter *adapter)
 	if (card->cmd_buf) {
 		mwifiex_unmap_pci_memory(adapter, card->cmd_buf,
 					 PCI_DMA_TODEVICE);
+		dev_kfree_skb_any(card->cmd_buf);
 		card->cmd_buf = NULL;
 	}
 
@@ -1669,9 +1688,6 @@ static int mwifiex_pcie_process_cmd_complete(struct mwifiex_adapter *adapter)
 
 	if (!adapter->curr_cmd) {
 		if (adapter->ps_state == PS_STATE_SLEEP_CFM) {
-			mwifiex_process_sleep_confirm_resp(adapter, skb->data,
-							   skb->len);
-			mwifiex_pcie_enable_host_int(adapter);
 			if (mwifiex_write_reg(adapter,
 					      PCIE_CPU_INT_EVENT,
 					      CPU_INTR_SLEEP_CFM_DONE)) {
@@ -1684,6 +1700,9 @@ static int mwifiex_pcie_process_cmd_complete(struct mwifiex_adapter *adapter)
 			while (reg->sleep_cookie && (count++ < 10) &&
 			       mwifiex_pcie_ok_to_access_hw(adapter))
 				usleep_range(50, 60);
+			mwifiex_pcie_enable_host_int(adapter);
+			mwifiex_process_sleep_confirm_resp(adapter, skb->data,
+							   skb->len);
 		} else {
 			mwifiex_dbg(adapter, ERROR,
 				    "There is no command but got cmdrsp\n");
@@ -2322,6 +2341,8 @@ static int mwifiex_process_pcie_int(struct mwifiex_adapter *adapter)
 			ret = mwifiex_pcie_process_cmd_complete(adapter);
 			if (ret)
 				return ret;
+			if (adapter->hs_activated)
+				return ret;
 		}
 
 		if (card->msi_enable) {
@@ -2700,6 +2721,21 @@ static void mwifiex_pcie_device_dump(struct mwifiex_adapter *adapter)
 	schedule_work(&pcie_work);
 }
 
+static void mwifiex_pcie_free_buffers(struct mwifiex_adapter *adapter)
+{
+	struct pcie_service_card *card = adapter->card;
+	const struct mwifiex_pcie_card_reg *reg = card->pcie.reg;
+
+	if (reg->sleep_cookie)
+		mwifiex_pcie_delete_sleep_cookie_buf(adapter);
+
+	mwifiex_pcie_delete_cmdrsp_buf(adapter);
+	mwifiex_pcie_delete_evtbd_ring(adapter);
+	mwifiex_pcie_delete_rxbd_ring(adapter);
+	mwifiex_pcie_delete_txbd_ring(adapter);
+	card->cmdrsp_buf = NULL;
+}
+
 /*
  * This function initializes the PCI-E host memory space, WCB rings, etc.
  *
@@ -2812,13 +2848,6 @@ err_enable_dev:
 
 /*
  * This function cleans up the allocated card buffers.
- *
- * The following are freed by this function -
- *      - TXBD ring buffers
- *      - RXBD ring buffers
- *      - Event BD ring buffers
- *      - Command response ring buffer
- *      - Sleep cookie buffer
  */
 static void mwifiex_pcie_cleanup(struct mwifiex_adapter *adapter)
 {
@@ -2833,6 +2862,8 @@ static void mwifiex_pcie_cleanup(struct mwifiex_adapter *adapter)
 			mwifiex_dbg(adapter, ERROR,
 				    "Failed to write driver not-ready signature\n");
 	}
+
+	mwifiex_pcie_free_buffers(adapter);
 
 	if (pdev) {
 		pci_iounmap(pdev, card->pci_mmap);
@@ -3080,10 +3111,7 @@ err_cre_txbd:
 	pci_iounmap(pdev, card->pci_mmap1);
 }
 
-/* This function cleans up the PCI-E host memory space.
- * Some code is extracted from mwifiex_unregister_dev()
- *
- */
+/* This function cleans up the PCI-E host memory space. */
 static void mwifiex_pcie_down_dev(struct mwifiex_adapter *adapter)
 {
 	struct pcie_service_card *card = adapter->card;
@@ -3095,16 +3123,8 @@ static void mwifiex_pcie_down_dev(struct mwifiex_adapter *adapter)
 	adapter->seq_num = 0;
 	adapter->tx_buf_size = MWIFIEX_TX_DATA_BUF_SIZE_4K;
 
-	if (card) {
-		if (reg->sleep_cookie)
-			mwifiex_pcie_delete_sleep_cookie_buf(adapter);
-
-		mwifiex_pcie_delete_cmdrsp_buf(adapter);
-		mwifiex_pcie_delete_evtbd_ring(adapter);
-		mwifiex_pcie_delete_rxbd_ring(adapter);
-		mwifiex_pcie_delete_txbd_ring(adapter);
-		card->cmdrsp_buf = NULL;
-	}
+	if (card)
+		mwifiex_pcie_free_buffers(adapter);
 
 	return;
 }

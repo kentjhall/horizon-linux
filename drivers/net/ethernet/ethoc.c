@@ -710,6 +710,8 @@ static int ethoc_open(struct net_device *dev)
 	if (ret)
 		return ret;
 
+	napi_enable(&priv->napi);
+
 	ethoc_init_ring(priv, dev->mem_start);
 	ethoc_reset(priv);
 
@@ -722,7 +724,6 @@ static int ethoc_open(struct net_device *dev)
 	}
 
 	phy_start(dev->phydev);
-	napi_enable(&priv->napi);
 
 	if (netif_msg_ifup(priv)) {
 		dev_info(&dev->dev, "I/O: %08lx Memory: %08lx-%08lx\n",
@@ -1189,7 +1190,7 @@ static int ethoc_probe(struct platform_device *pdev)
 	ret = mdiobus_register(priv->mdio);
 	if (ret) {
 		dev_err(&netdev->dev, "failed to register MDIO bus\n");
-		goto free2;
+		goto free3;
 	}
 
 	ret = ethoc_mdio_probe(netdev);
@@ -1221,6 +1222,7 @@ error2:
 	netif_napi_del(&priv->napi);
 error:
 	mdiobus_unregister(priv->mdio);
+free3:
 	mdiobus_free(priv->mdio);
 free2:
 	if (priv->clk)

@@ -313,7 +313,7 @@ do
   if test -x /sys/class/vtconsole/vtcon$i; then
       if [ `cat /sys/class/vtconsole/vtcon$i/name | grep -c "frame buffer"` \
            = 1 ]; then
-	  echo Unbinding vtcon$i
+	  echo Binding vtcon$i
 	  echo 1 > /sys/class/vtconsole/vtcon$i/bind
       fi
   fi

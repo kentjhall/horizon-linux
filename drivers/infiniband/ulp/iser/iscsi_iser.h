@@ -197,7 +197,7 @@ struct iser_data_buf {
 	struct scatterlist *sg;
 	int                size;
 	unsigned long      data_len;
-	unsigned int       dma_nents;
+	int                dma_nents;
 };
 
 /* fwd declarations */
@@ -430,6 +430,7 @@ struct iser_fr_desc {
 	struct list_head		  list;
 	struct iser_reg_resources	  rsc;
 	struct iser_pi_context		 *pi_ctx;
+	struct list_head                  all_list;
 };
 
 /**
@@ -443,6 +444,7 @@ struct iser_fr_pool {
 	struct list_head        list;
 	spinlock_t              lock;
 	int                     size;
+	struct list_head        all_list;
 };
 
 /**

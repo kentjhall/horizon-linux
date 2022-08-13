@@ -136,7 +136,10 @@ int udl_handle_damage(struct udl_framebuffer *fb, int x, int y,
 
 	if (cmd > (char *) urb->transfer_buffer) {
 		/* Send partial buffer remaining before exiting */
-		int len = cmd - (char *) urb->transfer_buffer;
+		int len;
+		if (cmd < (char *) urb->transfer_buffer + urb->transfer_buffer_length)
+			*cmd++ = 0xAF;
+		len = cmd - (char *) urb->transfer_buffer;
 		ret = udl_submit_urb(dev, urb, len);
 		bytes_sent += len;
 	} else
@@ -158,10 +161,15 @@ static int udl_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
 {
 	unsigned long start = vma->vm_start;
 	unsigned long size = vma->vm_end - vma->vm_start;
-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
+	unsigned long offset;
 	unsigned long page, pos;
 
-	if (offset + size > info->fix.smem_len)
+	if (vma->vm_pgoff > (~0UL >> PAGE_SHIFT))
+		return -EINVAL;
+
+	offset = vma->vm_pgoff << PAGE_SHIFT;
+
+	if (offset > info->fix.smem_len || size > info->fix.smem_len - offset)
 		return -EINVAL;
 
 	pos = (unsigned long)info->fix.smem_start + offset;
@@ -209,7 +217,7 @@ static int udl_fb_open(struct fb_info *info, int user)
 
 		struct fb_deferred_io *fbdefio;
 
-		fbdefio = kmalloc(sizeof(struct fb_deferred_io), GFP_KERNEL);
+		fbdefio = kzalloc(sizeof(struct fb_deferred_io), GFP_KERNEL);
 
 		if (fbdefio) {
 			fbdefio->delay = DL_DEFIO_WRITE_DELAY;
@@ -286,6 +294,7 @@ static int udl_user_framebuffer_dirty(struct drm_framebuffer *fb,
 
 	if (ufb->obj->base.import_attach) {
 		ret = dma_buf_begin_cpu_access(ufb->obj->base.import_attach->dmabuf,
+					       0, ufb->obj->base.size,
 					       DMA_FROM_DEVICE);
 		if (ret)
 			goto unlock;
@@ -300,8 +309,9 @@ static int udl_user_framebuffer_dirty(struct drm_framebuffer *fb,
 	}
 
 	if (ufb->obj->base.import_attach) {
-		ret = dma_buf_end_cpu_access(ufb->obj->base.import_attach->dmabuf,
-					     DMA_FROM_DEVICE);
+		dma_buf_end_cpu_access(ufb->obj->base.import_attach->dmabuf,
+				       0, ufb->obj->base.size,
+				       DMA_FROM_DEVICE);
 	}
 
  unlock:

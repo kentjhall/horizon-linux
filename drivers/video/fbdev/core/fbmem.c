@@ -425,6 +425,9 @@ static void fb_do_show_logo(struct fb_info *info, struct fb_image *image,
 {
 	unsigned int x;
 
+	if (image->width > info->var.xres || image->height > info->var.yres)
+		return;
+
 	if (rotate == FB_ROTATE_UR) {
 		for (x = 0;
 		     x < num && image->dx + image->width <= info->var.xres;
@@ -433,7 +436,9 @@ static void fb_do_show_logo(struct fb_info *info, struct fb_image *image,
 			image->dx += image->width + 8;
 		}
 	} else if (rotate == FB_ROTATE_UD) {
-		for (x = 0; x < num; x++) {
+		u32 dx = image->dx;
+
+		for (x = 0; x < num && image->dx <= dx; x++) {
 			info->fbops->fb_imageblit(info, image);
 			image->dx -= image->width + 8;
 		}
@@ -445,7 +450,9 @@ static void fb_do_show_logo(struct fb_info *info, struct fb_image *image,
 			image->dy += image->height + 8;
 		}
 	} else if (rotate == FB_ROTATE_CCW) {
-		for (x = 0; x < num; x++) {
+		u32 dy = image->dy;
+
+		for (x = 0; x < num && image->dy <= dy; x++) {
 			info->fbops->fb_imageblit(info, image);
 			image->dy -= image->height + 8;
 		}
@@ -1012,6 +1019,15 @@ fb_set_var(struct fb_info *info, struct fb_var_screeninfo *var)
 
 			old_var = info->var;
 			info->var = *var;
+#if defined(CONFIG_FRAMEBUFFER_CONSOLE)
+			/*
+			 * If bpp is not specified, use the one from earlier
+			 * mode
+			 */
+			if (!info->var.bits_per_pixel)
+				info->var.bits_per_pixel =
+						old_var.bits_per_pixel;
+#endif
 
 			if (info->fbops->fb_set_par) {
 				ret = info->fbops->fb_set_par(info);
@@ -1054,7 +1070,7 @@ EXPORT_SYMBOL(fb_set_var);
 
 int
 fb_blank(struct fb_info *info, int blank)
-{	
+{
 	struct fb_event event;
 	int ret = -EINVAL, early_ret;
 
@@ -1125,7 +1141,7 @@ static long do_fb_ioctl(struct fb_info *info, unsigned int cmd,
 	case FBIOGET_FSCREENINFO:
 		if (!lock_fb_info(info))
 			return -ENODEV;
-		fix = info->fix;
+		memcpy(&fix, &info->fix, sizeof(fix));
 		unlock_fb_info(info);
 
 		ret = copy_to_user(argp, &fix, sizeof(fix)) ? -EFAULT : 0;
@@ -1248,7 +1264,9 @@ struct fb_fix_screeninfo32 {
 	compat_caddr_t		mmio_start;
 	u32			mmio_len;
 	u32			accel;
-	u16			reserved[3];
+	u16			capabilities;
+	u16			max_clk_rate;
+	u16			colorimetry;
 };
 
 struct fb_cmap32 {
@@ -1320,8 +1338,9 @@ static int do_fscreeninfo_to_user(struct fb_fix_screeninfo *fix,
 
 	err |= put_user(fix->mmio_len, &fix32->mmio_len);
 	err |= put_user(fix->accel, &fix32->accel);
-	err |= copy_to_user(fix32->reserved, fix->reserved,
-			    sizeof(fix->reserved));
+	err |= put_user(fix->capabilities, &fix32->capabilities);
+	err |= put_user(fix->max_clk_rate, &fix32->max_clk_rate);
+	err |= put_user(fix->colorimetry, &fix32->colorimetry);
 
 	if (err)
 		return -EFAULT;
@@ -1658,7 +1677,7 @@ static int do_register_framebuffer(struct fb_info *fb_info)
 			fb_info->pixmap.access_align = 32;
 			fb_info->pixmap.flags = FB_PIXMAP_DEFAULT;
 		}
-	}	
+	}
 	fb_info->pixmap.offset = 0;
 
 	if (!fb_info->pixmap.blit_x)
@@ -1695,12 +1714,12 @@ static int do_register_framebuffer(struct fb_info *fb_info)
 	return 0;
 }
 
-static int do_unregister_framebuffer(struct fb_info *fb_info)
+static int unbind_console(struct fb_info *fb_info)
 {
 	struct fb_event event;
-	int i, ret = 0;
+	int ret;
+	int i = fb_info->node;
 
-	i = fb_info->node;
 	if (i < 0 || i >= FB_MAX || registered_fb[i] != fb_info)
 		return -EINVAL;
 
@@ -1715,17 +1734,29 @@ static int do_unregister_framebuffer(struct fb_info *fb_info)
 	unlock_fb_info(fb_info);
 	console_unlock();
 
+	return ret;
+}
+
+static int __unlink_framebuffer(struct fb_info *fb_info);
+
+static int do_unregister_framebuffer(struct fb_info *fb_info)
+{
+	struct fb_event event;
+	int ret;
+
+	ret = unbind_console(fb_info);
+
 	if (ret)
 		return -EINVAL;
 
 	pm_vt_switch_unregister(fb_info->dev);
 
-	unlink_framebuffer(fb_info);
+	__unlink_framebuffer(fb_info);
 	if (fb_info->pixmap.addr &&
 	    (fb_info->pixmap.flags & FB_PIXMAP_DEFAULT))
 		kfree(fb_info->pixmap.addr);
 	fb_destroy_modelist(&fb_info->modelist);
-	registered_fb[i] = NULL;
+	registered_fb[fb_info->node] = NULL;
 	num_registered_fb--;
 	fb_cleanup_device(fb_info);
 	event.info = fb_info;
@@ -1738,7 +1769,7 @@ static int do_unregister_framebuffer(struct fb_info *fb_info)
 	return 0;
 }
 
-int unlink_framebuffer(struct fb_info *fb_info)
+static int __unlink_framebuffer(struct fb_info *fb_info)
 {
 	int i;
 
@@ -1750,6 +1781,20 @@ int unlink_framebuffer(struct fb_info *fb_info)
 		device_destroy(fb_class, MKDEV(FB_MAJOR, i));
 		fb_info->dev = NULL;
 	}
+
+	return 0;
+}
+
+int unlink_framebuffer(struct fb_info *fb_info)
+{
+	int ret;
+
+	ret = __unlink_framebuffer(fb_info);
+	if (ret)
+		return ret;
+
+	unbind_console(fb_info);
+
 	return 0;
 }
 EXPORT_SYMBOL(unlink_framebuffer);

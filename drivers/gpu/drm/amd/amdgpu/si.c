@@ -1301,6 +1301,7 @@ static void si_init_golden_registers(struct amdgpu_device *adev)
 		amdgpu_program_register_sequence(adev,
 						 pitcairn_mgcg_cgcg_init,
 						 (const u32)ARRAY_SIZE(pitcairn_mgcg_cgcg_init));
+		break;
 	case CHIP_VERDE:
 		amdgpu_program_register_sequence(adev,
 						 verde_golden_registers,
@@ -1325,6 +1326,7 @@ static void si_init_golden_registers(struct amdgpu_device *adev)
 		amdgpu_program_register_sequence(adev,
 						 oland_mgcg_cgcg_init,
 						 (const u32)ARRAY_SIZE(oland_mgcg_cgcg_init));
+		break;
 	case CHIP_HAINAN:
 		amdgpu_program_register_sequence(adev,
 						 hainan_golden_registers,
@@ -1604,7 +1606,7 @@ static void si_program_aspm(struct amdgpu_device *adev)
 			if (orig != data)
 				si_pif_phy1_wreg(adev,PB1_PIF_PWRDOWN_1, data);
 
-			if ((adev->family != CHIP_OLAND) && (adev->family != CHIP_HAINAN)) {
+			if ((adev->asic_type != CHIP_OLAND) && (adev->asic_type != CHIP_HAINAN)) {
 				orig = data = si_pif_phy0_rreg(adev,PB0_PIF_PWRDOWN_0);
 				data &= ~PLL_RAMP_UP_TIME_0_MASK;
 				if (orig != data)
@@ -1653,14 +1655,14 @@ static void si_program_aspm(struct amdgpu_device *adev)
 
 			orig = data = si_pif_phy0_rreg(adev,PB0_PIF_CNTL);
 			data &= ~LS2_EXIT_TIME_MASK;
-			if ((adev->family == CHIP_OLAND) || (adev->family == CHIP_HAINAN))
+			if ((adev->asic_type == CHIP_OLAND) || (adev->asic_type == CHIP_HAINAN))
 				data |= LS2_EXIT_TIME(5);
 			if (orig != data)
 				si_pif_phy0_wreg(adev,PB0_PIF_CNTL, data);
 
 			orig = data = si_pif_phy1_rreg(adev,PB1_PIF_CNTL);
 			data &= ~LS2_EXIT_TIME_MASK;
-			if ((adev->family == CHIP_OLAND) || (adev->family == CHIP_HAINAN))
+			if ((adev->asic_type == CHIP_OLAND) || (adev->asic_type == CHIP_HAINAN))
 				data |= LS2_EXIT_TIME(5);
 			if (orig != data)
 				si_pif_phy1_wreg(adev,PB1_PIF_CNTL, data);

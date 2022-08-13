@@ -1299,11 +1299,6 @@ kiblnd_connect_peer(struct kib_peer *peer)
 		goto failed2;
 	}
 
-	LASSERT(cmid->device);
-	CDEBUG(D_NET, "%s: connection bound to %s:%pI4h:%s\n",
-	       libcfs_nid2str(peer->ibp_nid), dev->ibd_ifname,
-	       &dev->ibd_ifip, cmid->device->name);
-
 	return;
 
  failed2:
@@ -1650,8 +1645,13 @@ kiblnd_send(lnet_ni_t *ni, void *private, lnet_msg_t *lntmsg)
 	ibmsg = tx->tx_msg;
 	ibmsg->ibm_u.immediate.ibim_hdr = *hdr;
 
-	copy_from_iter(&ibmsg->ibm_u.immediate.ibim_payload, IBLND_MSG_SIZE,
-		       &from);
+	rc = copy_from_iter(&ibmsg->ibm_u.immediate.ibim_payload, payload_nob,
+			    &from);
+	if (rc != payload_nob) {
+		kiblnd_pool_free_node(&tx->tx_pool->tpo_pool, &tx->tx_list);
+		return -EFAULT;
+	}
+
 	nob = offsetof(struct kib_immediate_msg, ibim_payload[payload_nob]);
 	kiblnd_init_tx_msg(ni, tx, IBLND_MSG_IMMEDIATE, nob);
 
@@ -1751,8 +1751,14 @@ kiblnd_recv(lnet_ni_t *ni, void *private, lnet_msg_t *lntmsg, int delayed,
 			break;
 		}
 
-		copy_to_iter(&rxmsg->ibm_u.immediate.ibim_payload,
-			     IBLND_MSG_SIZE, to);
+		rc = copy_to_iter(&rxmsg->ibm_u.immediate.ibim_payload, rlen,
+				  to);
+		if (rc != rlen) {
+			rc = -EFAULT;
+			break;
+		}
+
+		rc = 0;
 		lnet_finalize(ni, lntmsg, 0);
 		break;
 
@@ -2994,8 +3000,19 @@ kiblnd_cm_callback(struct rdma_cm_id *cmid, struct rdma_cm_event *event)
 		} else {
 			rc = rdma_resolve_route(
 				cmid, *kiblnd_tunables.kib_timeout * 1000);
-			if (!rc)
+			if (!rc) {
+				struct kib_net *net = peer->ibp_ni->ni_data;
+				struct kib_dev *dev = net->ibn_dev;
+
+				CDEBUG(D_NET, "%s: connection bound to "\
+				       "%s:%pI4h:%s\n",
+				       libcfs_nid2str(peer->ibp_nid),
+				       dev->ibd_ifname,
+				       &dev->ibd_ifip, cmid->device->name);
+
 				return 0;
+			}
+
 			/* Can't initiate route resolution */
 			CERROR("Can't resolve route for %s: %d\n",
 			       libcfs_nid2str(peer->ibp_nid), rc);
@@ -3312,11 +3329,13 @@ kiblnd_connd(void *arg)
 			spin_unlock_irqrestore(lock, flags);
 			dropped_lock = 1;
 
-			kiblnd_destroy_conn(conn, !peer);
+			kiblnd_destroy_conn(conn);
 
 			spin_lock_irqsave(lock, flags);
-			if (!peer)
+			if (!peer) {
+				kfree(conn);
 				continue;
+			}
 
 			conn->ibc_peer = peer;
 			if (peer->ibp_reconnected < KIB_RECONN_HIGH_RACE)

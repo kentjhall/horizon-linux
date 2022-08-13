@@ -5,6 +5,8 @@
  * Copyright (C) 2011 Samsung Electronics
  * MyungJoo Ham <myungjoo.ham@samsung.com>
  *
+ * Copyright (c) 2013-2017, NVIDIA CORPORATION.  All rights reserved.
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -75,7 +77,7 @@ enum max17042_register {
 	MAX17042_RelaxCFG	= 0x2A,
 	MAX17042_MiscCFG	= 0x2B,
 	MAX17042_TGAIN		= 0x2C,
-	MAx17042_TOFF		= 0x2D,
+	MAX17042_TOFF		= 0x2D,
 	MAX17042_CGAIN		= 0x2E,
 	MAX17042_COFF		= 0x2F,
 
@@ -99,7 +101,7 @@ enum max17042_register {
 	MAX17042_dPacc		= 0x46,
 
 	MAX17042_VFSOC0		= 0x48,
-
+	MAX17042_QH0		= 0x4C,
 	MAX17042_QH		= 0x4D,
 	MAX17042_QL		= 0x4E,
 
@@ -219,6 +221,9 @@ struct max17042_platform_data {
 	int         vmax;	/* in millivolts */
 	int         temp_min;	/* in tenths of degree Celsius */
 	int         temp_max;	/* in tenths of degree Celsius */
+	u32 threshold_soc;
+	u32 maximum_soc;
+	bool is_battery_present;
 };
 
 #endif /* __MAX17042_BATTERY_H_ */

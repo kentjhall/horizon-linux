@@ -223,6 +223,8 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
 #define GEN8_CONFIG0			_MMIO(0xD00)
 #define  GEN9_DEFAULT_FIXES		(1 << 3 | 1 << 2 | 1 << 1)
 
+#define GEN8_RC6_CTX_INFO		_MMIO(0x8504)
+
 #define GAC_ECO_BITS			_MMIO(0x14090)
 #define   ECOBITS_SNB_BIT		(1<<13)
 #define   ECOBITS_PPGTT_CACHE64B	(3<<8)
@@ -295,7 +297,6 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
  * Instruction field definitions used by the command parser
  */
 #define INSTR_CLIENT_SHIFT      29
-#define INSTR_CLIENT_MASK       0xE0000000
 #define   INSTR_MI_CLIENT       0x0
 #define   INSTR_BC_CLIENT       0x2
 #define   INSTR_RC_CLIENT       0x3
@@ -568,6 +569,10 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
  * Registers used only by the command parser
  */
 #define BCS_SWCTRL _MMIO(0x22200)
+
+/* There are 16 GPR registers */
+#define BCS_GPR(n)	_MMIO(0x22600 + (n) * 8)
+#define BCS_GPR_UDW(n)	_MMIO(0x22600 + (n) * 8 + 4)
 
 #define GPGPU_THREADS_DISPATCHED        _MMIO(0x2290)
 #define GPGPU_THREADS_DISPATCHED_UDW	_MMIO(0x2290 + 4)
@@ -5935,6 +5940,10 @@ enum {
 #define SKL_CSR_DC3_DC5_COUNT	_MMIO(0x80030)
 #define SKL_CSR_DC5_DC6_COUNT	_MMIO(0x8002C)
 #define BXT_CSR_DC3_DC5_COUNT	_MMIO(0x80038)
+
+/* Display Internal Timeout Register */
+#define RM_TIMEOUT		_MMIO(0x42060)
+#define  MMIO_TIMEOUT_US(us)	((us) << 0)
 
 /* interrupts */
 #define DE_MASTER_IRQ_CONTROL   (1 << 31)

@@ -1,0 +1,9 @@
+
+menu "USB Power Delivery and Type-C drivers"
+
+config TYPEC
+	tristate
+
+source "drivers/usb/typec/ucsi/Kconfig"
+
+endmenu

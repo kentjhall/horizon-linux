@@ -2293,6 +2293,10 @@ int cx231xx_set_power_mode(struct cx231xx *dev, enum AV_MODE mode)
 	case POLARIS_AVMODE_ANALOGT_TV:
 
 		tmp |= PWR_DEMOD_EN;
+		if (is_model_avermedia_h837_series(dev->model))
+			tmp |= I2C_DEMOD_EN;
+		if (dev->model == CX231XX_BOARD_AVERMEDIA_H837B)
+			tmp &= ~PWR_DEMOD_EN;
 		value[0] = (u8) tmp;
 		value[1] = (u8) (tmp >> 8);
 		value[2] = (u8) (tmp >> 16);
@@ -2389,6 +2393,8 @@ int cx231xx_set_power_mode(struct cx231xx *dev, enum AV_MODE mode)
 
 		tmp &= (~PWR_AV_MODE);
 		tmp |= POLARIS_AVMODE_DIGITAL;
+		if (is_model_avermedia_h837_series(dev->model))
+			tmp |= I2C_DEMOD_EN;
 		value[0] = (u8) tmp;
 		value[1] = (u8) (tmp >> 8);
 		value[2] = (u8) (tmp >> 16);
@@ -2396,8 +2402,19 @@ int cx231xx_set_power_mode(struct cx231xx *dev, enum AV_MODE mode)
 		status = cx231xx_write_ctrl_reg(dev, VRT_SET_REGISTER,
 						PWR_CTL_EN, value, 4);
 		msleep(PWR_SLEEP_INTERVAL);
-
-		if (!(tmp & PWR_DEMOD_EN)) {
+		if (is_model_avermedia_h837_series(dev->model)) {
+			if (dev->model == CX231XX_BOARD_AVERMEDIA_H837B)
+				tmp |= PWR_DEMOD_EN;
+			else
+				tmp &= ~PWR_DEMOD_EN;
+			value[0] = (u8) tmp;
+			value[1] = (u8) (tmp >> 8);
+			value[2] = (u8) (tmp >> 16);
+			value[3] = (u8) (tmp >> 24);
+			status = cx231xx_write_ctrl_reg(dev, VRT_SET_REGISTER,
+							PWR_CTL_EN, value, 4);
+			msleep(5 * PWR_SLEEP_INTERVAL);
+		} else if (!(tmp & PWR_DEMOD_EN)) {
 			tmp |= PWR_DEMOD_EN;
 			value[0] = (u8) tmp;
 			value[1] = (u8) (tmp >> 8);
@@ -2415,6 +2432,22 @@ int cx231xx_set_power_mode(struct cx231xx *dev, enum AV_MODE mode)
 
 			if (dev->cx231xx_reset_analog_tuner)
 				dev->cx231xx_reset_analog_tuner(dev);
+		}
+		break;
+
+	case POLARIS_AVMODE_DEFAULT:
+		if (is_model_avermedia_h837_series(dev->model)) {
+			tmp &= ~PWR_MODE_MASK;
+			if (dev->model == CX231XX_BOARD_AVERMEDIA_H837A ||
+			    dev->model == CX231XX_BOARD_AVERMEDIA_H837M)
+				tmp |= PWR_DEMOD_EN;
+			value[0] = (u8) tmp;
+			value[1] = (u8) (tmp >> 8);
+			value[2] = (u8) (tmp >> 16);
+			value[3] = (u8) (tmp >> 24);
+			cx231xx_write_ctrl_reg(dev, VRT_SET_REGISTER, PWR_CTL_EN, value, 4);
+			msleep(PWR_SLEEP_INTERVAL);
+			return 0;
 		}
 		break;
 
@@ -2592,8 +2625,13 @@ int cx231xx_initialize_stream_xfer(struct cx231xx *dev, u32 media_type)
 				dev_dbg(dev->dev, "%s: BDA\n", __func__);
 				status = cx231xx_mode_register(dev,
 							 TS_MODE_REG, 0x101);
-				status = cx231xx_mode_register(dev,
+				if (is_model_avermedia_h837_series(dev->model)) {
+					status = cx231xx_mode_register(dev,
+							TS1_CFG_REG, 0x408);
+				} else {
+					status = cx231xx_mode_register(dev,
 							TS1_CFG_REG, 0x010);
+				}
 			}
 			break;
 

@@ -1020,13 +1020,23 @@ out:
 	return ret;
 }
 
+static int socfpga_is_a10(void)
+{
+	return of_machine_is_compatible("altr,socfpga-arria10");
+}
+
 static int validate_parent_available(struct device_node *np);
 static const struct of_device_id altr_edac_a10_device_of_match[];
 static int __init __maybe_unused altr_init_a10_ecc_device_type(char *compat)
 {
 	int irq;
-	struct device_node *child, *np = of_find_compatible_node(NULL, NULL,
-					"altr,socfpga-a10-ecc-manager");
+	struct device_node *child, *np;
+
+	if (!socfpga_is_a10())
+		return -ENODEV;
+
+	np = of_find_compatible_node(NULL, NULL,
+				     "altr,socfpga-a10-ecc-manager");
 	if (!np) {
 		edac_printk(KERN_ERR, EDAC_DEVICE, "ECC Manager not found\n");
 		return -ENODEV;
@@ -1101,7 +1111,7 @@ static void *ocram_alloc_mem(size_t size, void **other)
 
 static void ocram_free_mem(void *p, size_t size, void *other)
 {
-	gen_pool_free((struct gen_pool *)other, (u32)p, size);
+	gen_pool_free((struct gen_pool *)other, (unsigned long)p, size);
 }
 
 static const struct edac_device_prv_data ocramecc_data = {
@@ -1542,8 +1552,12 @@ static const struct edac_device_prv_data a10_sdmmceccb_data = {
 static int __init socfpga_init_sdmmc_ecc(void)
 {
 	int rc = -ENODEV;
-	struct device_node *child = of_find_compatible_node(NULL, NULL,
-						"altr,socfpga-sdmmc-ecc");
+	struct device_node *child;
+
+	if (!socfpga_is_a10())
+		return -ENODEV;
+
+	child = of_find_compatible_node(NULL, NULL, "altr,socfpga-sdmmc-ecc");
 	if (!child) {
 		edac_printk(KERN_WARNING, EDAC_DEVICE, "SDMMC node not found\n");
 		return -ENODEV;
@@ -1637,6 +1651,7 @@ static void altr_edac_a10_irq_handler(struct irq_desc *desc)
 	struct altr_arria10_edac *edac = irq_desc_get_handler_data(desc);
 	struct irq_chip *chip = irq_desc_get_chip(desc);
 	int irq = irq_desc_get_irq(desc);
+	unsigned long bits;
 
 	dberr = (irq == edac->db_irq) ? 1 : 0;
 	sm_offset = dberr ? A10_SYSMGR_ECC_INTSTAT_DERR_OFST :
@@ -1646,7 +1661,8 @@ static void altr_edac_a10_irq_handler(struct irq_desc *desc)
 
 	regmap_read(edac->ecc_mgr_map, sm_offset, &irq_status);
 
-	for_each_set_bit(bit, (unsigned long *)&irq_status, 32) {
+	bits = irq_status;
+	for_each_set_bit(bit, &bits, 32) {
 		irq = irq_linear_revmap(edac->domain, dberr * 32 + bit);
 		if (irq)
 			generic_handle_irq(irq);

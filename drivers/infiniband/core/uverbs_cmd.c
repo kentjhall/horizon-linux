@@ -2342,6 +2342,11 @@ ssize_t ib_uverbs_modify_qp(struct ib_uverbs_file *file,
 	if (copy_from_user(&cmd, buf, sizeof cmd))
 		return -EFAULT;
 
+	if ((cmd.attr_mask & IB_QP_PORT) &&
+	    (cmd.port_num < rdma_start_port(ib_dev) ||
+	     cmd.port_num > rdma_end_port(ib_dev)))
+		return -EINVAL;
+
 	INIT_UDATA(&udata, buf + sizeof cmd, NULL, in_len - sizeof cmd,
 		   out_len);
 
@@ -2486,9 +2491,13 @@ ssize_t ib_uverbs_destroy_qp(struct ib_uverbs_file *file,
 
 static void *alloc_wr(size_t wr_size, __u32 num_sge)
 {
+	if (num_sge >= (U32_MAX - ALIGN(wr_size, sizeof (struct ib_sge))) /
+		       sizeof (struct ib_sge))
+		return NULL;
+
 	return kmalloc(ALIGN(wr_size, sizeof (struct ib_sge)) +
 			 num_sge * sizeof (struct ib_sge), GFP_KERNEL);
-};
+}
 
 ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
 			    struct ib_device *ib_dev,
@@ -2715,6 +2724,13 @@ static struct ib_recv_wr *ib_uverbs_unmarshall_recv(const char __user *buf,
 			goto err;
 		}
 
+		if (user_wr->num_sge >=
+		    (U32_MAX - ALIGN(sizeof *next, sizeof (struct ib_sge))) /
+		    sizeof (struct ib_sge)) {
+			ret = -EINVAL;
+			goto err;
+		}
+
 		next = kmalloc(ALIGN(sizeof *next, sizeof (struct ib_sge)) +
 			       user_wr->num_sge * sizeof (struct ib_sge),
 			       GFP_KERNEL);
@@ -2881,6 +2897,10 @@ ssize_t ib_uverbs_create_ah(struct ib_uverbs_file *file,
 
 	if (copy_from_user(&cmd, buf, sizeof cmd))
 		return -EFAULT;
+
+	if (cmd.attr.port_num < rdma_start_port(ib_dev) ||
+	    cmd.attr.port_num > rdma_end_port(ib_dev))
+		return -EINVAL;
 
 	uobj = kmalloc(sizeof *uobj, GFP_KERNEL);
 	if (!uobj)
@@ -3703,6 +3723,11 @@ int ib_uverbs_ex_create_flow(struct ib_uverbs_file *file,
 	if (!qp) {
 		err = -EINVAL;
 		goto err_uobj;
+	}
+
+	if (qp->qp_type != IB_QPT_UD && qp->qp_type != IB_QPT_RAW_PACKET) {
+		err = -EINVAL;
+		goto err_put;
 	}
 
 	flow_attr = kzalloc(sizeof(*flow_attr) + cmd.flow_attr.num_of_specs *

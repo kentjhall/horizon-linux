@@ -1,5 +1,6 @@
 /*
  * Mailbox: Common code for Mailbox controllers and users
+ * Copyright (c) 2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * Copyright (C) 2013-2014 Linaro Ltd.
  * Author: Jassi Brar <jassisinghbrar@gmail.com>
@@ -104,11 +105,14 @@ static void tx_tick(struct mbox_chan *chan, int r)
 	/* Submit next message */
 	msg_submit(chan);
 
+	if (!mssg)
+		return;
+
 	/* Notify the client */
-	if (mssg && chan->cl->tx_done)
+	if (chan->cl->tx_done)
 		chan->cl->tx_done(chan->cl, mssg, r);
 
-	if (chan->cl->tx_block)
+	if (r != -ETIME && chan->cl->tx_block)
 		complete(&chan->tx_complete);
 }
 
@@ -223,6 +227,29 @@ bool mbox_client_peek_data(struct mbox_chan *chan)
 EXPORT_SYMBOL_GPL(mbox_client_peek_data);
 
 /**
+ * mbox_get_max_txsize - For client to query the maximum tx message
+ *			 size to send to the remote.
+ * @chan: Mailbox channel assigned to this client.
+ *
+ * Queries the controller driver for the maximum tx message size that
+ * can be transmitted.
+ *
+ * Return: max tx size on success
+ *	   Negative value on failure.
+ */
+int mbox_get_max_txsize(struct mbox_chan *chan)
+{
+	if (!chan || !chan->cl)
+		return -EINVAL;
+
+	if (!chan->mbox->ops->get_max_txsize)
+		return INT_MAX;
+
+	return chan->mbox->ops->get_max_txsize(chan);
+}
+EXPORT_SYMBOL_GPL(mbox_get_max_txsize);
+
+/**
  * mbox_send_message -	For client to submit a message to be
  *				sent to the remote.
  * @chan: Mailbox channel assigned to this client.
@@ -261,7 +288,7 @@ int mbox_send_message(struct mbox_chan *chan, void *mssg)
 
 	msg_submit(chan);
 
-	if (chan->cl->tx_block && chan->active_req) {
+	if (chan->cl->tx_block) {
 		unsigned long wait;
 		int ret;
 
@@ -272,8 +299,8 @@ int mbox_send_message(struct mbox_chan *chan, void *mssg)
 
 		ret = wait_for_completion_timeout(&chan->tx_complete, wait);
 		if (ret == 0) {
-			t = -EIO;
-			tx_tick(chan, -EIO);
+			t = -ETIME;
+			tx_tick(chan, t);
 		}
 	}
 
@@ -386,11 +413,13 @@ struct mbox_chan *mbox_request_channel_byname(struct mbox_client *cl,
 
 	of_property_for_each_string(np, "mbox-names", prop, mbox_name) {
 		if (!strncmp(name, mbox_name, strlen(name)))
-			break;
+			return mbox_request_channel(cl, index);
 		index++;
 	}
 
-	return mbox_request_channel(cl, index);
+	dev_err(cl->dev, "%s() could not locate channel named \"%s\"\n",
+		__func__, name);
+	return ERR_PTR(-EINVAL);
 }
 EXPORT_SYMBOL_GPL(mbox_request_channel_byname);
 

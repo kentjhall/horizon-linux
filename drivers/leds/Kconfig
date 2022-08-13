@@ -401,6 +401,15 @@ config LEDS_DAC124S085
 	  This option enables support for DAC124S085 SPI DAC from NatSemi,
 	  which can be used to control up to four LEDs.
 
+config LEDS_THINE350X
+	tristate "LED Support for THL350x controller"
+	depends on LEDS_CLASS
+	depends on SPI
+	help
+	  This option enables support for SPI based LED controllers from
+	  THine with series THL3502, THL3504 etc.,
+	  which can control up to 24 LEDs.
+
 config LEDS_PWM
 	tristate "PWM driven LED Support"
 	depends on LEDS_CLASS

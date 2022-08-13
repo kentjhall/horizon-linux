@@ -48,7 +48,7 @@
 #define NFC_V1_V2_CONFIG		(host->regs + 0x0a)
 #define NFC_V1_V2_ECC_STATUS_RESULT	(host->regs + 0x0c)
 #define NFC_V1_V2_RSLTMAIN_AREA		(host->regs + 0x0e)
-#define NFC_V1_V2_RSLTSPARE_AREA	(host->regs + 0x10)
+#define NFC_V21_RSLTSPARE_AREA		(host->regs + 0x10)
 #define NFC_V1_V2_WRPROT		(host->regs + 0x12)
 #define NFC_V1_UNLOCKSTART_BLKADDR	(host->regs + 0x14)
 #define NFC_V1_UNLOCKEND_BLKADDR	(host->regs + 0x16)
@@ -877,6 +877,8 @@ static void mxc_do_addr_cycle(struct mtd_info *mtd, int column, int page_addr)
 	}
 }
 
+#define MXC_V1_ECCBYTES		5
+
 static int mxc_v1_ooblayout_ecc(struct mtd_info *mtd, int section,
 				struct mtd_oob_region *oobregion)
 {
@@ -886,7 +888,7 @@ static int mxc_v1_ooblayout_ecc(struct mtd_info *mtd, int section,
 		return -ERANGE;
 
 	oobregion->offset = (section * 16) + 6;
-	oobregion->length = nand_chip->ecc.bytes;
+	oobregion->length = MXC_V1_ECCBYTES;
 
 	return 0;
 }
@@ -908,8 +910,7 @@ static int mxc_v1_ooblayout_free(struct mtd_info *mtd, int section,
 			oobregion->length = 4;
 		}
 	} else {
-		oobregion->offset = ((section - 1) * 16) +
-				    nand_chip->ecc.bytes + 6;
+		oobregion->offset = ((section - 1) * 16) + MXC_V1_ECCBYTES + 6;
 		if (section < nand_chip->ecc.steps)
 			oobregion->length = (section * 16) + 6 -
 					    oobregion->offset;
@@ -1119,6 +1120,9 @@ static void preset_v2(struct mtd_info *mtd)
 
 	writew(config1, NFC_V1_V2_CONFIG1);
 	/* preset operation */
+
+	/* spare area size in 16-bit half-words */
+	writew(mtd->oobsize / 2, NFC_V21_RSLTSPARE_AREA);
 
 	/* Unlock the internal RAM Buffer */
 	writew(0x2, NFC_V1_V2_CONFIG);
@@ -1834,7 +1838,7 @@ static int mxcnd_remove(struct platform_device *pdev)
 {
 	struct mxc_nand_host *host = platform_get_drvdata(pdev);
 
-	nand_release(nand_to_mtd(&host->nand));
+	nand_release(&host->nand);
 	if (host->clk_act)
 		clk_disable_unprepare(host->clk);
 

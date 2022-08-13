@@ -15,6 +15,7 @@ config ARM64
 	select ARCH_HAS_SG_CHAIN
 	select ARCH_HAS_TICK_BROADCAST if GENERIC_CLOCKEVENTS_BROADCAST
 	select ARCH_USE_CMPXCHG_LOCKREF
+	select ARCH_SUPPORTS_LTO_CLANG
 	select ARCH_SUPPORTS_ATOMIC_RMW
 	select ARCH_SUPPORTS_NUMA_BALANCING
 	select ARCH_WANT_COMPAT_IPC_PARSE_VERSION
@@ -109,6 +110,7 @@ config ARM64
 	select POWER_SUPPLY
 	select SPARSE_IRQ
 	select SYSCTL_EXCEPTION_TRACE
+	select THREAD_INFO_IN_TASK
 	help
 	  ARM 64-bit (AArch64) Linux support.
 
@@ -179,6 +181,9 @@ config LOCKDEP_SUPPORT
 config TRACE_IRQFLAGS_SUPPORT
 	def_bool y
 
+config FIQ_GLUE
+	bool
+
 config RWSEM_XCHGADD_ALGORITHM
 	def_bool y
 
@@ -219,6 +224,7 @@ config SMP
 
 config SWIOTLB
 	def_bool y
+	depends on !ARCH_TEGRA
 
 config IOMMU_HELPER
 	def_bool SWIOTLB
@@ -237,6 +243,9 @@ config PGTABLE_LEVELS
 	default 3 if ARM64_4K_PAGES && ARM64_VA_BITS_39
 	default 3 if ARM64_16K_PAGES && ARM64_VA_BITS_47
 	default 4 if !ARM64_64K_PAGES && ARM64_VA_BITS_48
+
+config ARM64_NON_SHARED_TLBI
+	def_bool n
 
 source "init/Kconfig"
 
@@ -417,13 +426,27 @@ config ARM64_ERRATUM_845719
 
 config ARM64_ERRATUM_843419
 	bool "Cortex-A53: 843419: A load or store might access an incorrect address"
-	default y
+	default y if !LTO_CLANG
 	select ARM64_MODULE_CMODEL_LARGE if MODULES
 	help
 	  This option links the kernel with '--fix-cortex-a53-843419' and
 	  builds modules using the large memory model in order to avoid the use
 	  of the ADRP instruction, which can cause a subsequent memory access
 	  to use an incorrect address on Cortex-A53 parts up to r0p4.
+
+	  If unsure, say Y.
+
+config ARM64_ERRATUM_1024718
+	bool "Cortex-A55: 1024718: Update of DBM/AP bits without break before make might result in incorrect update"
+	default y
+	help
+	  This option adds work around for Arm Cortex-A55 Erratum 1024718.
+
+	  Affected Cortex-A55 cores (r0p0, r0p1, r1p0) could cause incorrect
+	  update of the hardware dirty bit when the DBM/AP bits are updated
+	  without a break-before-make. The work around is to disable the usage
+	  of hardware DBM locally on the affected cores. CPUs not affected by
+	  erratum will continue to use the feature.
 
 	  If unsure, say Y.
 
@@ -471,6 +494,16 @@ config CAVIUM_ERRATUM_27456
 	  instructions may cause the icache to become corrupted if it
 	  contains data for a non-current ASID.  The fix is to
 	  invalidate the icache when changing the mm context.
+
+	  If unsure, say Y.
+
+config QCOM_QDF2400_ERRATUM_0065
+	bool "QDF2400 E0065: Incorrect GITS_TYPER.ITT_Entry_size"
+	default y
+	help
+	  On Qualcomm Datacenter Technologies QDF2400 SoC, ITS hardware reports
+	  ITE size incorrectly. The GITS_TYPER.ITT_Entry_size field should have
+	  been indicated as 16Bytes (0xf), not 8Bytes (0x7).
 
 	  If unsure, say Y.
 
@@ -576,6 +609,13 @@ config HOTPLUG_CPU
 	  Say Y here to experiment with turning CPUs off and on.  CPUs
 	  can be controlled through /sys/devices/system/cpu.
 
+config ARCH_ENABLE_MEMORY_HOTPLUG
+    depends on !NUMA
+	def_bool y
+
+config ARCH_ENABLE_MEMORY_HOTREMOVE
+	def_bool y
+
 # Common NUMA Features
 config NUMA
 	bool "Numa Memory Allocation and Scheduler Support"
@@ -608,6 +648,9 @@ config HAVE_SETUP_PER_CPU_AREA
 config NEED_PER_CPU_EMBED_FIRST_CHUNK
 	def_bool y
 	depends on NUMA
+
+config HOLES_IN_ZONE
+	def_bool y
 
 source kernel/Kconfig.preempt
 source kernel/Kconfig.hz
@@ -645,6 +688,10 @@ config ARCH_HAS_CACHE_LINE_SIZE
 	def_bool y
 
 source "mm/Kconfig"
+
+config ARCH_MEMORY_PROBE
+	def_bool y
+	depends on MEMORY_HOTPLUG
 
 config SECCOMP
 	bool "Enable seccomp to safely compute untrusted bytecode"
@@ -723,6 +770,60 @@ config FORCE_MAX_ZONEORDER
 	  However for 4K, we choose a higher default value, 11 as opposed to 10, giving us
 	  4M allocations matching the default size used by generic code.
 
+config HARDEN_BRANCH_PREDICTOR
+	bool "Harden the branch predictor against aliasing attacks" if EXPERT
+	default y
+	help
+	  Speculation attacks against some high-performance processors rely on
+	  being able to manipulate the branch predictor for a victim context by
+	  executing aliasing branches in the attacker context.  Such attacks
+	  can be partially mitigated against by clearing internal branch
+	  predictor state and limiting the prediction logic in some situations.
+
+	  This config option will take CPU-specific actions to harden the
+	  branch predictor against aliasing attacks and may rely on specific
+	  control bits being set by the system firmware.
+
+	  If unsure, say Y.
+
+config UNMAP_KERNEL_AT_EL0
+	bool "Unmap kernel when running in userspace (aka \"KAISER\")" if EXPERT
+	default y
+	help
+	  Speculation attacks against some high-performance processors can
+	  be used to bypass MMU permission checks and leak kernel data to
+	  userspace. This can be defended against by unmapping the kernel
+	  when running in userspace, mapping it back in on exception entry
+	  via a trampoline page in the vector table.
+
+	  If unsure, say Y.
+
+config HARDEN_BRANCH_PREDICTOR
+	bool "Harden the branch predictor against aliasing attacks" if EXPERT
+	default y
+	help
+	  Speculation attacks against some high-performance processors rely on
+	  being able to manipulate the branch predictor for a victim context by
+	  executing aliasing branches in the attacker context.  Such attacks
+	  can be partially mitigated against by clearing internal branch
+	  predictor state and limiting the prediction logic in some situations.
+
+	  This config option will take CPU-specific actions to harden the
+	  branch predictor against aliasing attacks and may rely on specific
+	  instruction sequences or control bits being set by the system
+	  firmware.
+
+	  If unsure, say Y.
+
+config ARM64_SSBD
+	bool "Speculative Store Bypass Disable" if EXPERT
+	default y
+	help
+	  This enables mitigation of the bypassing of previous stores
+	  by speculative loads.
+
+	  If unsure, say Y.
+
 menuconfig ARMV8_DEPRECATED
 	bool "Emulate deprecated/obsolete ARMv8 instructions"
 	depends on COMPAT
@@ -789,6 +890,14 @@ config SETEND_EMULATION
 
 	  If unsure, say Y
 endif
+
+config ARM64_SW_TTBR0_PAN
+	bool "Emulate Privileged Access Never using TTBR0_EL1 switching"
+	help
+	  Enabling this option prevents the kernel from accessing
+	  user-space memory directly by pointing TTBR0_EL1 to a reserved
+	  zeroed area and reserved ASID. The user access routines
+	  restore the valid TTBR0_EL1 temporarily.
 
 menu "ARMv8.1 architectural features"
 
@@ -915,7 +1024,7 @@ config RANDOMIZE_BASE
 
 config RANDOMIZE_MODULE_REGION_FULL
 	bool "Randomize the module region independently from the core kernel"
-	depends on RANDOMIZE_BASE && !DYNAMIC_FTRACE
+	depends on RANDOMIZE_BASE && !DYNAMIC_FTRACE && !LTO_CLANG
 	default y
 	help
 	  Randomizes the location of the module region without considering the
@@ -949,6 +1058,23 @@ config CMDLINE
 	  entering them here. As a minimum, you should specify the the
 	  root device (e.g. root=/dev/nfs).
 
+choice
+	prompt "Kernel command line type" if CMDLINE != ""
+	default CMDLINE_FROM_BOOTLOADER
+
+config CMDLINE_FROM_BOOTLOADER
+	bool "Use bootloader kernel arguments if available"
+	help
+	  Uses the command-line options passed by the boot loader. If
+	  the boot loader doesn't provide any, the default kernel command
+	  string provided in CMDLINE will be used.
+
+config CMDLINE_EXTEND
+	bool "Extend bootloader kernel arguments"
+	help
+	  The command-line arguments provided by the boot loader will be
+	  appended to the default kernel command string.
+
 config CMDLINE_FORCE
 	bool "Always use the default kernel command string"
 	help
@@ -956,6 +1082,7 @@ config CMDLINE_FORCE
 	  loader passes other arguments to the kernel.
 	  This is useful if you cannot or don't want to change the
 	  command-line options your boot loader passes to the kernel.
+endchoice
 
 config EFI_STUB
 	bool
@@ -988,6 +1115,41 @@ config DMI
 	  However, even with this option, the resultant kernel should
 	  continue to boot on existing non-UEFI platforms.
 
+config BUILD_ARM64_APPENDED_DTB_IMAGE
+	bool "Build a concatenated Image.gz/dtb by default"
+	depends on OF
+	help
+	  Enabling this option will cause a concatenated Image.gz and list of
+	  DTBs to be built by default (instead of a standalone Image.gz.)
+	  The image will built in arch/arm64/boot/Image.gz-dtb
+
+choice
+	prompt "Appended DTB Kernel Image name"
+	depends on BUILD_ARM64_APPENDED_DTB_IMAGE
+	help
+	  Enabling this option will cause a specific kernel image Image or
+	  Image.gz to be used for final image creation.
+	  The image will built in arch/arm64/boot/IMAGE-NAME-dtb
+
+	config IMG_GZ_DTB
+		bool "Image.gz-dtb"
+	config IMG_DTB
+		bool "Image-dtb"
+endchoice
+
+config BUILD_ARM64_APPENDED_KERNEL_IMAGE_NAME
+	string
+	depends on BUILD_ARM64_APPENDED_DTB_IMAGE
+	default "Image.gz-dtb" if IMG_GZ_DTB
+	default "Image-dtb" if IMG_DTB
+
+config BUILD_ARM64_APPENDED_DTB_IMAGE_NAMES
+	string "Default dtb names"
+	depends on BUILD_ARM64_APPENDED_DTB_IMAGE
+	help
+	  Space separated list of names of dtbs to append when
+	  building a concatenated Image.gz-dtb.
+
 endmenu
 
 menu "Userspace binary formats"
@@ -997,7 +1159,7 @@ source "fs/Kconfig.binfmt"
 config COMPAT
 	bool "Kernel support for 32-bit EL0"
 	depends on ARM64_4K_PAGES || EXPERT
-	select COMPAT_BINFMT_ELF
+	select COMPAT_BINFMT_ELF if BINFMT_ELF
 	select HAVE_UID16
 	select OLD_SIGSUSPEND3
 	select COMPAT_OLD_SIGACTION
@@ -1017,6 +1179,10 @@ config SYSVIPC_COMPAT
 	def_bool y
 	depends on COMPAT && SYSVIPC
 
+config KEYS_COMPAT
+	def_bool y
+	depends on COMPAT && KEYS
+
 endmenu
 
 menu "Power management options"
@@ -1035,6 +1201,12 @@ config ARCH_SUSPEND_POSSIBLE
 	def_bool y
 
 endmenu
+
+config SERROR_HANDLER
+	bool "Platform specific SError handler support"
+	help
+	  This option configures the arm64 kernel to call a platform specific
+	  SError (system error) handler.
 
 menu "CPU Power Management"
 
@@ -1066,3 +1238,5 @@ source "arch/arm64/crypto/Kconfig"
 endif
 
 source "lib/Kconfig"
+
+source "drivers/firmware/tegra/Kconfig"

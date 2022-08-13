@@ -569,9 +569,9 @@ static struct kmemleak_object *create_object(unsigned long ptr, size_t size,
 	if (in_irq()) {
 		object->pid = 0;
 		strncpy(object->comm, "hardirq", sizeof(object->comm));
-	} else if (in_softirq()) {
+	} else if (in_serving_softirq()) {
 		object->pid = 0;
-		strncpy(object->comm, "softirq", sizeof(object->comm));
+		strlcpy(object->comm, "softirq", sizeof(object->comm));
 	} else {
 		object->pid = current->pid;
 		/*
@@ -580,7 +580,7 @@ static struct kmemleak_object *create_object(unsigned long ptr, size_t size,
 		 * dependency issues with current->alloc_lock. In the worst
 		 * case, the command line is not correct.
 		 */
-		strncpy(object->comm, current->comm, sizeof(object->comm));
+		strlcpy(object->comm, current->comm, sizeof(object->comm));
 	}
 
 	/* kernel backtrace */
@@ -1442,6 +1442,8 @@ static void kmemleak_scan(void)
 			if (page_count(page) == 0)
 				continue;
 			scan_block(page, page + 1, NULL);
+			if (!(pfn % (MAX_SCAN_SIZE / sizeof(*page))))
+				cond_resched();
 		}
 	}
 	put_online_mems();
@@ -1521,16 +1523,10 @@ static void kmemleak_scan(void)
 
 }
 
-/*
- * Thread function performing automatic memory scanning. Unreferenced objects
- * at the end of a memory scan are reported but only the first time.
- */
-static int kmemleak_scan_thread(void *arg)
+static void sleep_on_first_run(void)
 {
+#ifdef CONFIG_DEBUG_KMEMLEAK_SCAN_ON
 	static int first_run = 1;
-
-	pr_info("Automatic memory scanning thread started\n");
-	set_user_nice(current, 10);
 
 	/*
 	 * Wait before the first scan to allow the system to fully initialize.
@@ -1541,6 +1537,19 @@ static int kmemleak_scan_thread(void *arg)
 		while (timeout && !kthread_should_stop())
 			timeout = schedule_timeout_interruptible(timeout);
 	}
+#endif
+}
+
+/*
+ * Thread function performing automatic memory scanning. Unreferenced objects
+ * at the end of a memory scan are reported but only the first time.
+ */
+static int kmemleak_scan_thread(void *arg)
+{
+	pr_info("Automatic memory scanning thread started\n");
+	set_user_nice(current, 10);
+
+	sleep_on_first_run();
 
 	while (!kthread_should_stop()) {
 		signed long timeout = jiffies_scan_wait;
@@ -1575,8 +1584,7 @@ static void start_scan_thread(void)
 }
 
 /*
- * Stop the automatic memory scanning thread. This function must be called
- * with the scan_mutex held.
+ * Stop the automatic memory scanning thread.
  */
 static void stop_scan_thread(void)
 {
@@ -1839,12 +1847,15 @@ static void kmemleak_do_cleanup(struct work_struct *work)
 {
 	stop_scan_thread();
 
+	mutex_lock(&scan_mutex);
 	/*
-	 * Once the scan thread has stopped, it is safe to no longer track
-	 * object freeing. Ordering of the scan thread stopping and the memory
-	 * accesses below is guaranteed by the kthread_stop() function.
+	 * Once it is made sure that kmemleak_scan has stopped, it is safe to no
+	 * longer track object freeing. Ordering of the scan thread stopping and
+	 * the memory accesses below is guaranteed by the kthread_stop()
+	 * function.
 	 */
 	kmemleak_free_enabled = 0;
+	mutex_unlock(&scan_mutex);
 
 	if (!kmemleak_found_leaks)
 		__kmemleak_do_cleanup();
@@ -2014,9 +2025,11 @@ static int __init kmemleak_late_init(void)
 				     &kmemleak_fops);
 	if (!dentry)
 		pr_warn("Failed to create the debugfs kmemleak file\n");
+#ifdef CONFIG_DEBUG_KMEMLEAK_SCAN_ON
 	mutex_lock(&scan_mutex);
 	start_scan_thread();
 	mutex_unlock(&scan_mutex);
+#endif
 
 	pr_info("Kernel memory leak detector initialized\n");
 

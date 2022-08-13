@@ -172,7 +172,7 @@ int sun4i_backend_update_layer_formats(struct sun4i_backend *backend,
 	ret = sun4i_backend_drm_format_to_layer(plane, fb->pixel_format, &val);
 	if (ret) {
 		DRM_DEBUG_DRIVER("Invalid format\n");
-		return val;
+		return ret;
 	}
 
 	regmap_update_bits(backend->regs, SUN4I_BACKEND_ATTCTL_REG1(layer),
@@ -408,6 +408,7 @@ static int sun4i_backend_remove(struct platform_device *pdev)
 
 static const struct of_device_id sun4i_backend_of_table[] = {
 	{ .compatible = "allwinner,sun5i-a13-display-backend" },
+	{ .compatible = "allwinner,sun6i-a31-display-backend" },
 	{ .compatible = "allwinner,sun8i-a33-display-backend" },
 	{ }
 };

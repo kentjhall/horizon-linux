@@ -24,6 +24,7 @@
 #include <asm/geode.h>
 #include <asm/apic.h>
 #include <asm/intel-family.h>
+#include <asm/i8259.h>
 
 unsigned int __read_mostly cpu_khz;	/* TSC clocks / usec, not used here */
 EXPORT_SYMBOL(cpu_khz);
@@ -366,6 +367,8 @@ static int __init tsc_setup(char *str)
 		tsc_clocksource_reliable = 1;
 	if (!strncmp(str, "noirqtime", 9))
 		no_sched_irq_time = 1;
+	if (!strcmp(str, "unstable"))
+		mark_tsc_unstable("boot parameter");
 	return 1;
 }
 
@@ -407,7 +410,7 @@ static unsigned long calc_hpet_ref(u64 deltatsc, u64 hpet1, u64 hpet2)
 	hpet2 -= hpet1;
 	tmp = ((u64)hpet2 * hpet_readl(HPET_PERIOD));
 	do_div(tmp, 1000000);
-	do_div(deltatsc, tmp);
+	deltatsc = div64_u64(deltatsc, tmp);
 
 	return (unsigned long) deltatsc;
 }
@@ -453,6 +456,20 @@ static unsigned long pit_calibrate_tsc(u32 latch, unsigned long ms, int loopmin)
 	u64 tsc, t1, t2, delta;
 	unsigned long tscmin, tscmax;
 	int pitcnt;
+
+	if (!has_legacy_pic()) {
+		/*
+		 * Relies on tsc_early_delay_calibrate() to have given us semi
+		 * usable udelay(), wait for the same 50ms we would have with
+		 * the PIT loop below.
+		 */
+		udelay(10 * USEC_PER_MSEC);
+		udelay(10 * USEC_PER_MSEC);
+		udelay(10 * USEC_PER_MSEC);
+		udelay(10 * USEC_PER_MSEC);
+		udelay(10 * USEC_PER_MSEC);
+		return ULONG_MAX;
+	}
 
 	/* Set the Gate high, disable speaker */
 	outb((inb(0x61) & ~0x02) | 0x01, 0x61);
@@ -578,6 +595,9 @@ static unsigned long quick_pit_calibrate(void)
 	u64 tsc, delta;
 	unsigned long d1, d2;
 
+	if (!has_legacy_pic())
+		return 0;
+
 	/* Set the Gate high, disable speaker */
 	outb((inb(0x61) & ~0x02) | 0x01, 0x61);
 
@@ -693,7 +713,7 @@ unsigned long native_calibrate_tsc(void)
 		case INTEL_FAM6_KABYLAKE_DESKTOP:
 			crystal_khz = 24000;	/* 24.0 MHz */
 			break;
-		case INTEL_FAM6_SKYLAKE_X:
+		case INTEL_FAM6_ATOM_GOLDMONT_X:
 			crystal_khz = 25000;	/* 25.0 MHz */
 			break;
 		case INTEL_FAM6_ATOM_GOLDMONT:
@@ -1287,6 +1307,8 @@ static int __init init_tsc_clocksource(void)
 	 * exporting a reliable TSC.
 	 */
 	if (boot_cpu_has(X86_FEATURE_TSC_RELIABLE)) {
+		if (boot_cpu_has(X86_FEATURE_ART))
+			art_related_clocksource = &clocksource_tsc;
 		clocksource_register_khz(&clocksource_tsc, tsc_khz);
 		return 0;
 	}
@@ -1379,12 +1401,10 @@ void __init tsc_init(void)
 unsigned long calibrate_delay_is_known(void)
 {
 	int sibling, cpu = smp_processor_id();
-	struct cpumask *mask = topology_core_cpumask(cpu);
+	int constant_tsc = cpu_has(&cpu_data(cpu), X86_FEATURE_CONSTANT_TSC);
+	const struct cpumask *mask = topology_core_cpumask(cpu);
 
-	if (!tsc_disabled && !cpu_has(&cpu_data(cpu), X86_FEATURE_CONSTANT_TSC))
-		return 0;
-
-	if (!mask)
+	if (tsc_disabled || !constant_tsc || !mask)
 		return 0;
 
 	sibling = cpumask_any_but(mask, cpu);

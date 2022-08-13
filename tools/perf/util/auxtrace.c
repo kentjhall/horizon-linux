@@ -195,6 +195,9 @@ static int auxtrace_queues__grow(struct auxtrace_queues *queues,
 	for (i = 0; i < queues->nr_queues; i++) {
 		list_splice_tail(&queues->queue_array[i].head,
 				 &queue_array[i].head);
+		queue_array[i].tid = queues->queue_array[i].tid;
+		queue_array[i].cpu = queues->queue_array[i].cpu;
+		queue_array[i].set = queues->queue_array[i].set;
 		queue_array[i].priv = queues->queue_array[i].priv;
 	}
 
@@ -1241,9 +1244,9 @@ static int __auxtrace_mmap__read(struct auxtrace_mmap *mm,
 	}
 
 	/* padding must be written by fn() e.g. record__process_auxtrace() */
-	padding = size & 7;
+	padding = size & (PERF_AUXTRACE_RECORD_ALIGNMENT - 1);
 	if (padding)
-		padding = 8 - padding;
+		padding = PERF_AUXTRACE_RECORD_ALIGNMENT - padding;
 
 	memset(&ev, 0, sizeof(ev));
 	ev.auxtrace.header.type = PERF_RECORD_AUXTRACE;
@@ -1826,7 +1829,7 @@ static int addr_filter__resolve_kernel_syms(struct addr_filter *filt)
 		filt->addr = start;
 		if (filt->range && !filt->size && !filt->sym_to) {
 			filt->size = size;
-			no_size = !!size;
+			no_size = !size;
 		}
 	}
 
@@ -1840,7 +1843,7 @@ static int addr_filter__resolve_kernel_syms(struct addr_filter *filt)
 		if (err)
 			return err;
 		filt->size = start + size - filt->addr;
-		no_size = !!size;
+		no_size = !size;
 	}
 
 	/* The very last symbol in kallsyms does not imply a particular size */

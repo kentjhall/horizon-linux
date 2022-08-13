@@ -543,6 +543,7 @@ static int uvcg_control_class_allow_link(struct config_item *src,
 unlock:
 	mutex_unlock(&opts->lock);
 out:
+	config_item_put(header);
 	mutex_unlock(su_mutex);
 	return ret;
 }
@@ -584,6 +585,7 @@ static int uvcg_control_class_drop_link(struct config_item *src,
 unlock:
 	mutex_unlock(&opts->lock);
 out:
+	config_item_put(header);
 	mutex_unlock(su_mutex);
 	return ret;
 }
@@ -770,6 +772,7 @@ static int uvcg_streaming_header_allow_link(struct config_item *src,
 	format_ptr->fmt = target_fmt;
 	list_add_tail(&format_ptr->entry, &src_hdr->formats);
 	++src_hdr->num_fmt;
+	++target_fmt->linked;
 
 out:
 	mutex_unlock(&opts->lock);
@@ -807,6 +810,8 @@ static int uvcg_streaming_header_drop_link(struct config_item *src,
 			--src_hdr->num_fmt;
 			break;
 		}
+
+	--target_fmt->linked;
 
 out:
 	mutex_unlock(&opts->lock);
@@ -1880,7 +1885,7 @@ static int __uvcg_cnt_strm(void *priv1, void *priv2, void *priv3, int n,
 	break;
 	case UVCG_FRAME: {
 		struct uvcg_frame *frm = priv1;
-		int sz = sizeof(frm->dw_frame_interval);
+		size_t sz = sizeof(frm->dw_frame_interval);
 
 		*size += sizeof(frm->frame);
 		*size += frm->frame.b_frame_interval_type * sz;
@@ -2047,6 +2052,7 @@ static int uvcg_streaming_class_allow_link(struct config_item *src,
 unlock:
 	mutex_unlock(&opts->lock);
 out:
+	config_item_put(header);
 	mutex_unlock(su_mutex);
 	return ret;
 }
@@ -2091,6 +2097,7 @@ static int uvcg_streaming_class_drop_link(struct config_item *src,
 unlock:
 	mutex_unlock(&opts->lock);
 out:
+	config_item_put(header);
 	mutex_unlock(su_mutex);
 	return ret;
 }
@@ -2140,7 +2147,7 @@ static struct configfs_item_operations uvc_item_ops = {
 	.release		= uvc_attr_release,
 };
 
-#define UVCG_OPTS_ATTR(cname, conv, str2u, uxx, vnoc, limit)		\
+#define UVCG_OPTS_ATTR(cname, aname, conv, str2u, uxx, vnoc, limit)	\
 static ssize_t f_uvc_opts_##cname##_show(				\
 	struct config_item *item, char *page)				\
 {									\
@@ -2183,16 +2190,16 @@ end:									\
 	return ret;							\
 }									\
 									\
-UVC_ATTR(f_uvc_opts_, cname, aname)
+UVC_ATTR(f_uvc_opts_, cname, cname)
 
 #define identity_conv(x) (x)
 
-UVCG_OPTS_ATTR(streaming_interval, identity_conv, kstrtou8, u8, identity_conv,
-	       16);
-UVCG_OPTS_ATTR(streaming_maxpacket, le16_to_cpu, kstrtou16, u16, le16_to_cpu,
-	       3072);
-UVCG_OPTS_ATTR(streaming_maxburst, identity_conv, kstrtou8, u8, identity_conv,
-	       15);
+UVCG_OPTS_ATTR(streaming_interval, streaming_interval, identity_conv,
+	       kstrtou8, u8, identity_conv, 16);
+UVCG_OPTS_ATTR(streaming_maxpacket, streaming_maxpacket, le16_to_cpu,
+	       kstrtou16, u16, le16_to_cpu, 3072);
+UVCG_OPTS_ATTR(streaming_maxburst, streaming_maxburst, identity_conv,
+	       kstrtou8, u8, identity_conv, 15);
 
 #undef identity_conv
 

@@ -155,16 +155,36 @@ static const char driver_name [] = "rtl8150";
 */
 static int get_registers(rtl8150_t * dev, u16 indx, u16 size, void *data)
 {
-	return usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
-			       RTL8150_REQ_GET_REGS, RTL8150_REQT_READ,
-			       indx, 0, data, size, 500);
+	void *buf;
+	int ret;
+
+	buf = kmalloc(size, GFP_NOIO);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+			      RTL8150_REQ_GET_REGS, RTL8150_REQT_READ,
+			      indx, 0, buf, size, 500);
+	if (ret > 0 && ret <= size)
+		memcpy(data, buf, ret);
+	kfree(buf);
+	return ret;
 }
 
-static int set_registers(rtl8150_t * dev, u16 indx, u16 size, void *data)
+static int set_registers(rtl8150_t * dev, u16 indx, u16 size, const void *data)
 {
-	return usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
-			       RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE,
-			       indx, 0, data, size, 500);
+	void *buf;
+	int ret;
+
+	buf = kmemdup(data, size, GFP_NOIO);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
+			      RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE,
+			      indx, 0, buf, size, 500);
+	kfree(buf);
+	return ret;
 }
 
 static void async_set_reg_cb(struct urb *urb)
@@ -257,12 +277,20 @@ static int write_mii_word(rtl8150_t * dev, u8 phy, __u8 indx, u16 reg)
 		return 1;
 }
 
-static inline void set_ethernet_addr(rtl8150_t * dev)
+static void set_ethernet_addr(rtl8150_t *dev)
 {
-	u8 node_id[6];
+	u8 node_id[ETH_ALEN];
+	int ret;
 
-	get_registers(dev, IDR, sizeof(node_id), node_id);
-	memcpy(dev->netdev->dev_addr, node_id, sizeof(node_id));
+	ret = get_registers(dev, IDR, sizeof(node_id), node_id);
+
+	if (ret == sizeof(node_id)) {
+		ether_addr_copy(dev->netdev->dev_addr, node_id);
+	} else {
+		eth_hw_addr_random(dev->netdev);
+		netdev_notice(dev->netdev, "Assigned a random MAC address: %pM\n",
+			      dev->netdev->dev_addr);
+	}
 }
 
 static int rtl8150_set_mac_address(struct net_device *netdev, void *p)
@@ -621,8 +649,7 @@ static int enable_net_traffic(rtl8150_t * dev)
 	rcr = 0x9e;
 	tcr = 0xd8;
 	cr = 0x0c;
-	if (!(rcr & 0x80))
-		set_bit(RTL8150_HW_CRC, &dev->flags);
+
 	set_registers(dev, RCR, 1, &rcr);
 	set_registers(dev, TCR, 1, &tcr);
 	set_registers(dev, CR, 1, &cr);
@@ -661,7 +688,7 @@ static void rtl8150_set_multicast(struct net_device *netdev)
 		   (netdev->flags & IFF_ALLMULTI)) {
 		rx_creg &= 0xfffe;
 		rx_creg |= 0x0002;
-		dev_info(&netdev->dev, "%s: allmulti set\n", netdev->name);
+		dev_dbg(&netdev->dev, "%s: allmulti set\n", netdev->name);
 	} else {
 		/* ~RX_MULTICAST, ~RX_PROMISCUOUS */
 		rx_creg &= 0x00fc;

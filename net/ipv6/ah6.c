@@ -423,7 +423,9 @@ static int ah6_output(struct xfrm_state *x, struct sk_buff *skb)
 	ah->seq_no = htonl(XFRM_SKB_CB(skb)->seq.output.low);
 
 	sg_init_table(sg, nfrags + sglists);
-	skb_to_sgvec_nomark(skb, sg, 0, skb->len);
+	err = skb_to_sgvec_nomark(skb, sg, 0, skb->len);
+	if (unlikely(err < 0))
+		goto out_free;
 
 	if (x->props.flags & XFRM_STATE_ESN) {
 		/* Attach seqhi sg right after packet payload */
@@ -593,7 +595,8 @@ static int ah6_input(struct xfrm_state *x, struct sk_buff *skb)
 	memcpy(auth_data, ah->auth_data, ahp->icv_trunc_len);
 	memset(ah->auth_data, 0, ahp->icv_trunc_len);
 
-	if (ipv6_clear_mutable_options(ip6h, hdr_len, XFRM_POLICY_IN))
+	err = ipv6_clear_mutable_options(ip6h, hdr_len, XFRM_POLICY_IN);
+	if (err)
 		goto out_free;
 
 	ip6h->priority    = 0;
@@ -603,7 +606,9 @@ static int ah6_input(struct xfrm_state *x, struct sk_buff *skb)
 	ip6h->hop_limit   = 0;
 
 	sg_init_table(sg, nfrags + sglists);
-	skb_to_sgvec_nomark(skb, sg, 0, skb->len);
+	err = skb_to_sgvec_nomark(skb, sg, 0, skb->len);
+	if (unlikely(err < 0))
+		goto out_free;
 
 	if (x->props.flags & XFRM_STATE_ESN) {
 		/* Attach seqhi sg right after packet payload */
@@ -662,9 +667,10 @@ static int ah6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 		return 0;
 
 	if (type == NDISC_REDIRECT)
-		ip6_redirect(skb, net, skb->dev->ifindex, 0);
+		ip6_redirect(skb, net, skb->dev->ifindex, 0,
+			     sock_net_uid(net, NULL));
 	else
-		ip6_update_pmtu(skb, net, info, 0, 0);
+		ip6_update_pmtu(skb, net, info, 0, 0, sock_net_uid(net, NULL));
 	xfrm_state_put(x);
 
 	return 0;

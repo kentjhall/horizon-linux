@@ -409,7 +409,7 @@ static int __parse_flow_nlattrs(const struct nlattr *attr,
 			return -EINVAL;
 		}
 
-		if (!nz || !is_all_zero(nla_data(nla), expected_len)) {
+		if (!nz || !is_all_zero(nla_data(nla), nla_len(nla))) {
 			attrs |= 1 << type;
 			a[type] = nla;
 		}
@@ -588,7 +588,7 @@ static int ip_tun_from_nlattr(const struct nlattr *attr,
 			ipv4 = true;
 			break;
 		case OVS_TUNNEL_KEY_ATTR_IPV6_SRC:
-			SW_FLOW_KEY_PUT(match, tun_key.u.ipv6.dst,
+			SW_FLOW_KEY_PUT(match, tun_key.u.ipv6.src,
 					nla_get_in6_addr(a), is_mask);
 			ipv6 = true;
 			break;
@@ -648,6 +648,8 @@ static int ip_tun_from_nlattr(const struct nlattr *attr,
 
 			tun_flags |= TUNNEL_VXLAN_OPT;
 			opts_type = type;
+			break;
+		case OVS_TUNNEL_KEY_ATTR_PAD:
 			break;
 		default:
 			OVS_NLERR(log, "Unknown IP tunnel attribute %d",
@@ -1294,13 +1296,10 @@ static void nlattr_set(struct nlattr *attr, u8 val,
 
 	/* The nlattr stream should already have been validated */
 	nla_for_each_nested(nla, attr, rem) {
-		if (tbl[nla_type(nla)].len == OVS_ATTR_NESTED) {
-			if (tbl[nla_type(nla)].next)
-				tbl = tbl[nla_type(nla)].next;
-			nlattr_set(nla, val, tbl);
-		} else {
+		if (tbl[nla_type(nla)].len == OVS_ATTR_NESTED)
+			nlattr_set(nla, val, tbl[nla_type(nla)].next ? : tbl);
+		else
 			memset(nla_data(nla), val, nla_len(nla));
-		}
 
 		if (nla_type(nla) == OVS_KEY_ATTR_CT_STATE)
 			*(u32 *)nla_data(nla) &= CT_SUPPORTED_MASK;
@@ -1787,14 +1786,11 @@ int ovs_nla_put_mask(const struct sw_flow *flow, struct sk_buff *skb)
 
 #define MAX_ACTIONS_BUFSIZE	(32 * 1024)
 
-static struct sw_flow_actions *nla_alloc_flow_actions(int size, bool log)
+static struct sw_flow_actions *nla_alloc_flow_actions(int size)
 {
 	struct sw_flow_actions *sfa;
 
-	if (size > MAX_ACTIONS_BUFSIZE) {
-		OVS_NLERR(log, "Flow action size %u bytes exceeds max", size);
-		return ERR_PTR(-EINVAL);
-	}
+	WARN_ON_ONCE(size > MAX_ACTIONS_BUFSIZE);
 
 	sfa = kmalloc(sizeof(*sfa) + size, GFP_KERNEL);
 	if (!sfa)
@@ -1857,22 +1853,25 @@ static struct nlattr *reserve_sfa_size(struct sw_flow_actions **sfa,
 
 	struct sw_flow_actions *acts;
 	int new_acts_size;
-	int req_size = NLA_ALIGN(attr_len);
+	size_t req_size = NLA_ALIGN(attr_len);
 	int next_offset = offsetof(struct sw_flow_actions, actions) +
 					(*sfa)->actions_len;
 
 	if (req_size <= (ksize(*sfa) - next_offset))
 		goto out;
 
-	new_acts_size = ksize(*sfa) * 2;
+	new_acts_size = max(next_offset + req_size, ksize(*sfa) * 2);
 
 	if (new_acts_size > MAX_ACTIONS_BUFSIZE) {
-		if ((MAX_ACTIONS_BUFSIZE - next_offset) < req_size)
+		if ((MAX_ACTIONS_BUFSIZE - next_offset) < req_size) {
+			OVS_NLERR(log, "Flow action size exceeds max %u",
+				  MAX_ACTIONS_BUFSIZE);
 			return ERR_PTR(-EMSGSIZE);
+		}
 		new_acts_size = MAX_ACTIONS_BUFSIZE;
 	}
 
-	acts = nla_alloc_flow_actions(new_acts_size, log);
+	acts = nla_alloc_flow_actions(new_acts_size);
 	if (IS_ERR(acts))
 		return (void *)acts;
 
@@ -2498,7 +2497,7 @@ int ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 {
 	int err;
 
-	*sfa = nla_alloc_flow_actions(nla_len(attr), log);
+	*sfa = nla_alloc_flow_actions(min(nla_len(attr), MAX_ACTIONS_BUFSIZE));
 	if (IS_ERR(*sfa))
 		return PTR_ERR(*sfa);
 

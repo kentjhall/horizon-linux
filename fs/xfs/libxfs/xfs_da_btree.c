@@ -263,7 +263,7 @@ xfs_da3_node_read(
 
 	err = xfs_da_read_buf(tp, dp, bno, mappedbno, bpp,
 					which_fork, &xfs_da3_node_buf_ops);
-	if (!err && tp) {
+	if (!err && tp && *bpp) {
 		struct xfs_da_blkinfo	*info = (*bpp)->b_addr;
 		int			type;
 
@@ -2633,7 +2633,7 @@ out_free:
 /*
  * Readahead the dir/attr block.
  */
-xfs_daddr_t
+int
 xfs_da_reada_buf(
 	struct xfs_inode	*dp,
 	xfs_dablk_t		bno,
@@ -2664,7 +2664,5 @@ out_free:
 	if (mapp != &map)
 		kmem_free(mapp);
 
-	if (error)
-		return -1;
-	return mappedbno;
+	return error;
 }

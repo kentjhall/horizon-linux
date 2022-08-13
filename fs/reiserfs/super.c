@@ -90,7 +90,9 @@ static void flush_old_commits(struct work_struct *work)
 	s = sbi->s_journal->j_work_sb;
 
 	spin_lock(&sbi->old_work_lock);
-	sbi->work_queued = 0;
+	/* Avoid clobbering the cancel state... */
+	if (sbi->work_queued == 1)
+		sbi->work_queued = 0;
 	spin_unlock(&sbi->old_work_lock);
 
 	reiserfs_sync_fs(s, 1);
@@ -117,21 +119,22 @@ void reiserfs_schedule_old_flush(struct super_block *s)
 	spin_unlock(&sbi->old_work_lock);
 }
 
-static void cancel_old_flush(struct super_block *s)
+void reiserfs_cancel_old_flush(struct super_block *s)
 {
 	struct reiserfs_sb_info *sbi = REISERFS_SB(s);
 
-	cancel_delayed_work_sync(&REISERFS_SB(s)->old_work);
 	spin_lock(&sbi->old_work_lock);
-	sbi->work_queued = 0;
+	/* Make sure no new flushes will be queued */
+	sbi->work_queued = 2;
 	spin_unlock(&sbi->old_work_lock);
+	cancel_delayed_work_sync(&REISERFS_SB(s)->old_work);
 }
 
 static int reiserfs_freeze(struct super_block *s)
 {
 	struct reiserfs_transaction_handle th;
 
-	cancel_old_flush(s);
+	reiserfs_cancel_old_flush(s);
 
 	reiserfs_write_lock(s);
 	if (!(s->s_flags & MS_RDONLY)) {
@@ -152,7 +155,13 @@ static int reiserfs_freeze(struct super_block *s)
 
 static int reiserfs_unfreeze(struct super_block *s)
 {
+	struct reiserfs_sb_info *sbi = REISERFS_SB(s);
+
 	reiserfs_allow_writes(s);
+	spin_lock(&sbi->old_work_lock);
+	/* Allow old_work to run again */
+	sbi->work_queued = 0;
+	spin_unlock(&sbi->old_work_lock);
 	return 0;
 }
 
@@ -590,6 +599,7 @@ static void reiserfs_put_super(struct super_block *s)
 	reiserfs_write_unlock(s);
 	mutex_destroy(&REISERFS_SB(s)->lock);
 	destroy_workqueue(REISERFS_SB(s)->commit_wq);
+	kfree(REISERFS_SB(s)->s_jdev);
 	kfree(s->s_fs_info);
 	s->s_fs_info = NULL;
 }
@@ -1224,6 +1234,10 @@ static int reiserfs_parse_options(struct super_block *s,
 						 "turned on.");
 				return 0;
 			}
+			if (qf_names[qtype] !=
+			    REISERFS_SB(s)->s_qf_names[qtype])
+				kfree(qf_names[qtype]);
+			qf_names[qtype] = NULL;
 			if (*arg) {	/* Some filename specified? */
 				if (REISERFS_SB(s)->s_qf_names[qtype]
 				    && strcmp(REISERFS_SB(s)->s_qf_names[qtype],
@@ -1253,10 +1267,6 @@ static int reiserfs_parse_options(struct super_block *s,
 				else
 					*mount_options |= 1 << REISERFS_GRPQUOTA;
 			} else {
-				if (qf_names[qtype] !=
-				    REISERFS_SB(s)->s_qf_names[qtype])
-					kfree(qf_names[qtype]);
-				qf_names[qtype] = NULL;
 				if (qtype == USRQUOTA)
 					*mount_options &= ~(1 << REISERFS_USRQUOTA);
 				else
@@ -1918,7 +1928,7 @@ static int reiserfs_fill_super(struct super_block *s, void *data, int silent)
 		if (!sbi->s_jdev) {
 			SWARN(silent, s, "", "Cannot allocate memory for "
 				"journal device name");
-			goto error;
+			goto error_unlocked;
 		}
 	}
 #ifdef CONFIG_QUOTA
@@ -2016,6 +2026,8 @@ static int reiserfs_fill_super(struct super_block *s, void *data, int silent)
 
 	if (replay_only(s))
 		goto error_unlocked;
+
+	s->s_xattr = reiserfs_xattr_handlers;
 
 	if (bdev_read_only(s->s_bdev) && !(s->s_flags & MS_RDONLY)) {
 		SWARN(silent, s, "clm-7000",
@@ -2194,7 +2206,7 @@ error_unlocked:
 	if (sbi->commit_wq)
 		destroy_workqueue(sbi->commit_wq);
 
-	cancel_delayed_work_sync(&REISERFS_SB(s)->old_work);
+	reiserfs_cancel_old_flush(s);
 
 	reiserfs_free_bitmap_cache(s);
 	if (SB_BUFFER_WITH_SB(s))
@@ -2206,6 +2218,7 @@ error_unlocked:
 			kfree(qf_names[j]);
 	}
 #endif
+	kfree(sbi->s_jdev);
 	kfree(sbi);
 
 	s->s_fs_info = NULL;
@@ -2521,7 +2534,6 @@ out:
 		return err;
 	if (inode->i_size < off + len - towrite)
 		i_size_write(inode, off + len - towrite);
-	inode->i_version++;
 	inode->i_mtime = inode->i_ctime = current_time(inode);
 	mark_inode_dirty(inode);
 	return len - towrite;

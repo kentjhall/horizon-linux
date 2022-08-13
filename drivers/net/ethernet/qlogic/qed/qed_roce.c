@@ -1059,23 +1059,16 @@ static void qed_rdma_copy_gids(struct qed_rdma_qp *qp, __le32 *src_gid,
 
 static enum roce_flavor qed_roce_mode_to_flavor(enum roce_mode roce_mode)
 {
-	enum roce_flavor flavor;
-
 	switch (roce_mode) {
 	case ROCE_V1:
-		flavor = PLAIN_ROCE;
-		break;
+		return PLAIN_ROCE;
 	case ROCE_V2_IPV4:
-		flavor = RROCE_IPV4;
-		break;
+		return RROCE_IPV4;
 	case ROCE_V2_IPV6:
-		flavor = ROCE_V2_IPV6;
-		break;
+		return RROCE_IPV6;
 	default:
-		flavor = MAX_ROCE_MODE;
-		break;
+		return MAX_ROCE_FLAVOR;
 	}
-	return flavor;
 }
 
 static int qed_roce_alloc_cid(struct qed_hwfn *p_hwfn, u16 *cid)
@@ -1766,12 +1759,12 @@ static int qed_roce_query_qp(struct qed_hwfn *p_hwfn,
 	if (rc)
 		goto err_resp;
 
-	dma_free_coherent(&p_hwfn->cdev->pdev->dev, sizeof(*p_resp_ramrod_res),
-			  p_resp_ramrod_res, resp_ramrod_res_phys);
-
 	out_params->rq_psn = le32_to_cpu(p_resp_ramrod_res->psn);
 	rq_err_state = GET_FIELD(le32_to_cpu(p_resp_ramrod_res->err_flag),
 				 ROCE_QUERY_QP_RESP_OUTPUT_PARAMS_ERROR_FLG);
+
+	dma_free_coherent(&p_hwfn->cdev->pdev->dev, sizeof(*p_resp_ramrod_res),
+			  p_resp_ramrod_res, resp_ramrod_res_phys);
 
 	if (!(qp->req_offloaded)) {
 		/* Don't send query qp for the requester */
@@ -1813,15 +1806,15 @@ static int qed_roce_query_qp(struct qed_hwfn *p_hwfn,
 	if (rc)
 		goto err_req;
 
-	dma_free_coherent(&p_hwfn->cdev->pdev->dev, sizeof(*p_req_ramrod_res),
-			  p_req_ramrod_res, req_ramrod_res_phys);
-
 	out_params->sq_psn = le32_to_cpu(p_req_ramrod_res->psn);
 	sq_err_state = GET_FIELD(le32_to_cpu(p_req_ramrod_res->flags),
 				 ROCE_QUERY_QP_REQ_OUTPUT_PARAMS_ERR_FLG);
 	sq_draining =
 		GET_FIELD(le32_to_cpu(p_req_ramrod_res->flags),
 			  ROCE_QUERY_QP_REQ_OUTPUT_PARAMS_SQ_DRAINING_FLG);
+
+	dma_free_coherent(&p_hwfn->cdev->pdev->dev, sizeof(*p_req_ramrod_res),
+			  p_req_ramrod_res, req_ramrod_res_phys);
 
 	out_params->draining = false;
 

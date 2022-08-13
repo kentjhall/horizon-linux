@@ -415,6 +415,44 @@ config PWM_TEGRA
 	  To compile this driver as a module, choose M here: the module
 	  will be called pwm-tegra.
 
+config PWM_TEGRA_TACHOMETER
+	tristate "NVIDIA Tegra Tachometer PWM driver "
+	depends on ARCH_TEGRA
+	help
+	  NVIDIA Tegra Tachometer reads the PWM signal and reports the PWM
+	  signal periods. This helps in measuign the fan speed where Fan
+	  output for speed is PWM signal.
+
+	  This driver support the Tachometer driver in PWM framwork.
+
+config PWM_TEGRA_PMC_BLINK
+	tristate "NVIDIA Tegra PMC blink PWM support"
+	depends on ARCH_TEGRA
+	help
+	  PWM driver support for the Tegra PMC blink module found on NVIDIA
+	  Tegra SoCs.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called pwm-tegra-blink.
+
+config PWM_TEGRA_DFLL
+	tristate "NVIDIA Tegra DFLL PWM support"
+	depends on ARCH_TEGRA
+	help
+	  PWM driver support for the Tegra DFLL module found on NVIDIA
+	  Tegra SoCs.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called pwm-tegra-dfll.
+
+config PWM_TEGRA_PMC_SOFT_LED_BLINK
+	tristate "NVIDIA Tegra PMC Soft LED Blink driver"
+	depends on ARCH_TEGRA
+	help
+	  NVIDIA Tegra PMC LED soft blink control the LED blinking and
+	  blinking control is a PWM signal,PWM driver support for the
+	  PMC LED soft blink module found on NVIDIA Tegra SoCs.
+
 config  PWM_TIECAP
 	tristate "ECAP PWM support"
 	depends on ARCH_OMAP2PLUS || ARCH_DAVINCI_DA8XX

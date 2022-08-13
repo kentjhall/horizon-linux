@@ -132,17 +132,119 @@ static int cea_sampling_frequencies[8] = {
 	SNDRV_PCM_RATE_192000,	/* 7: 192000Hz */
 };
 
+#define ELD_BYTE_MASK 0x80000000
+
+static int snd_hda_use_custom_eld_info(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_BYTES;
+	/* +1 to indicate the size of ELD passed */
+	uinfo->count = ELD_MAX_SIZE+1;
+
+	return 0;
+}
+
+static int snd_hda_use_custom_eld_put(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	int i = 0;
+
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+
+	if (ucontrol->value.bytes.data[0] == 0) {
+		if  (codec->custom_eld_data)
+			kfree(codec->custom_eld_data);
+		codec->custom_eld_data = NULL;
+		codec->custom_eld_size = 0;
+		return 0;
+	}
+
+	if (codec->custom_eld_size != ucontrol->value.bytes.data[0]) {
+		codec->custom_eld_size = ucontrol->value.bytes.data[0]+1;
+		/* free up old memory if any */
+		if (codec->custom_eld_data) {
+			kfree(codec->custom_eld_data);
+			codec->custom_eld_data = NULL;
+		}
+		/* allocate new memory for size difference */
+		codec->custom_eld_data = kzalloc(codec->custom_eld_size
+					* sizeof(unsigned int), GFP_KERNEL);
+		if (!codec->custom_eld_data) {
+			codec_err(codec,
+				"Memory allocation for custom ELD failed!\n");
+			codec->custom_eld_size = 0;
+			return 0;
+		}
+	}
+
+	for (i = 0; i < codec->custom_eld_size; i++)
+		codec->custom_eld_data[i] = (ELD_BYTE_MASK
+				| (0xFF & ucontrol->value.bytes.data[i+1]));
+
+	return 0;
+}
+
+static struct snd_kcontrol_new custom_eld_ctl = {
+	.access = SNDRV_CTL_ELEM_ACCESS_WRITE,
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "HDA Custom ELD",
+	.info = snd_hda_use_custom_eld_info,
+	.put = snd_hda_use_custom_eld_put,
+};
+
+int hdmi_create_custom_eld_ctl(struct hda_codec *codec,
+			hda_nid_t associated_nid, int device)
+{
+	struct snd_kcontrol *kctl;
+	int err;
+
+	kctl = snd_ctl_new1(&custom_eld_ctl, codec);
+	if (!kctl)
+		return -ENOMEM;
+
+	kctl->id.device = device;
+
+	err = snd_hda_ctl_add(codec, associated_nid, kctl);
+	if (err < 0)
+		return err;
+
+	return 0;
+}
+
 static unsigned int hdmi_get_eld_data(struct hda_codec *codec, hda_nid_t nid,
 					int byte_index)
 {
 	unsigned int val;
 
-	val = snd_hda_codec_read(codec, nid, 0,
-					AC_VERB_GET_HDMI_ELDD, byte_index);
+	if (codec->custom_eld_data) {
+		codec_dbg(codec, "HDMI: Warning! Using custom ELD values!!\n");
+		val = codec->custom_eld_data[byte_index];
+	} else {
+		/* return from SOR registers */
+		val = snd_hda_codec_read(codec, nid, 0,
+			AC_VERB_GET_HDMI_ELDD, byte_index);
+	}
+
 #ifdef BE_PARANOID
 	codec_info(codec, "HDMI: ELD data byte %d: 0x%x\n", byte_index, val);
 #endif
 	return val;
+}
+
+static unsigned char hdmi_get_eld_byte(struct hda_codec *codec, hda_nid_t nid,
+					int byte_index)
+{
+	unsigned int val;
+
+	val = hdmi_get_eld_data(codec, nid, byte_index);
+
+	if ((val & AC_ELDD_ELD_VALID) == 0) {
+		codec_info(codec, "HDMI: invalid ELD data byte %d\n",
+								byte_index);
+		val = 0;
+	}
+
+	return val & AC_ELDD_ELD_DATA;
 }
 
 #define GRAB_BITS(buf, byte, lowbit, bits) 		\
@@ -298,10 +400,118 @@ out_fail:
 	return -EINVAL;
 }
 
+#define GET_BITS(val, lowbit, bits) 			\
+({							\
+	BUILD_BUG_ON(lowbit > 7);			\
+	BUILD_BUG_ON(bits > 8);				\
+	BUILD_BUG_ON(bits <= 0);			\
+							\
+	(val >> (lowbit)) & ((1 << (bits)) - 1);	\
+})
+
+/* update ELD information relevant for getting PCM info */
+int hdmi_update_lpcm_sad_eld (struct hda_codec *codec, hda_nid_t nid,
+				     struct hdmi_eld *e)
+{
+	int i, j;
+	u32 val, sad_base;
+	int size;
+	struct cea_sad *a;
+
+	size = snd_hdmi_get_eld_size(codec, nid);
+	if (size == 0) {
+		/* wfg: workaround for ASUS P5E-VM HDMI board */
+		codec_info(codec, "HDMI: ELD buf size is 0, force 128\n");
+		size = 128;
+	}
+	if (size < ELD_FIXED_BYTES || size > ELD_MAX_SIZE) {
+		codec_info(codec, "HDMI: invalid ELD buf size %d\n", size);
+		return -ERANGE;
+	}
+
+	val = hdmi_get_eld_byte(codec, nid, 0);
+	e->info.eld_ver = GET_BITS(val, 3, 5);
+	if (e->info.eld_ver != ELD_VER_CEA_861D &&
+	    e->info.eld_ver != ELD_VER_PARTIAL) {
+		codec_info(codec, "HDMI: Unknown ELD version %d\n",
+								e->info.eld_ver);
+		goto out_fail;
+	}
+
+	val = hdmi_get_eld_byte(codec, nid, 4);
+	sad_base = GET_BITS(val, 0, 5);
+	sad_base += ELD_FIXED_BYTES;
+
+	val = hdmi_get_eld_byte(codec, nid, 5);
+	e->info.sad_count = GET_BITS(val, 4, 4);
+
+	for (i = 0; i < e->info.sad_count; i++, sad_base += 3) {
+		if ((sad_base + 3) > size) {
+			codec_info(codec, "HDMI: out of range SAD %d\n", i);
+			goto out_fail;
+		}
+		a = &e->info.sad[i];
+
+		val = hdmi_get_eld_byte(codec, nid, sad_base);
+		a->format = GET_BITS(val, 3, 4);
+		a->channels = GET_BITS(val, 0, 3);
+		a->channels++;
+
+		a->rates = 0;
+		a->sample_bits = 0;
+		a->max_bitrate = 0;
+
+		if (a->format != AUDIO_CODING_TYPE_LPCM)
+			continue;
+
+		val = hdmi_get_eld_byte(codec, nid, sad_base + 1);
+		val = GET_BITS(val, 0, 7);
+		for (j = 0; j < 7; j++)
+			if (val & (1 << j))
+				a->rates |= cea_sampling_frequencies[j + 1];
+
+		val = hdmi_get_eld_byte(codec, nid, sad_base + 2);
+		val = GET_BITS(val, 0, 3);
+		for (j = 0; j < 3; j++)
+			if (val & (1 << j))
+				a->sample_bits |= cea_sample_sizes[j + 1];
+	}
+
+	e->info.lpcm_sad_ready = 1;
+
+	codec->recv_dec_cap = 0;
+	codec->max_pcm_channels = 0;
+	for (i = 0; i < e->info.sad_count; i++) {
+		if (e->info.sad[i].format == AUDIO_CODING_TYPE_AC3) {
+			codec->recv_dec_cap |= (1 << AUDIO_CODING_TYPE_AC3);
+		} else if (e->info.sad[i].format == AUDIO_CODING_TYPE_DTS) {
+			codec->recv_dec_cap |= (1 << AUDIO_CODING_TYPE_DTS);
+		} else if (e->info.sad[i].format == AUDIO_CODING_TYPE_EAC3) {
+			codec->recv_dec_cap |= (1 << AUDIO_CODING_TYPE_EAC3);
+		} else if (e->info.sad[i].format == AUDIO_CODING_TYPE_LPCM) {
+			codec->max_pcm_channels =
+				e->info.sad[i].channels > codec->max_pcm_channels ?
+				e->info.sad[i].channels : codec->max_pcm_channels;
+		}
+	}
+
+	return 0;
+
+out_fail:
+	e->info.eld_ver = 0;
+	return -EINVAL;
+}
+
 int snd_hdmi_get_eld_size(struct hda_codec *codec, hda_nid_t nid)
 {
-	return snd_hda_codec_read(codec, nid, 0, AC_VERB_GET_HDMI_DIP_SIZE,
-						 AC_DIPSIZE_ELD_BUF);
+	int size = snd_hda_codec_read(codec, nid, 0, AC_VERB_GET_HDMI_DIP_SIZE,
+							AC_DIPSIZE_ELD_BUF);
+
+	/* Hardcode ELD SIZE based on the presence of custom eld array */
+	if (codec->custom_eld_data)
+		size = codec->custom_eld_size;
+
+	return size;
 }
 
 int snd_hdmi_get_eld(struct hda_codec *codec, hda_nid_t nid,
@@ -373,7 +583,7 @@ static void hdmi_print_pcm_rates(int pcm, char *buf, int buflen)
 
 	for (i = 0, j = 0; i < ARRAY_SIZE(alsa_rates); i++)
 		if (pcm & (1 << i))
-			j += snprintf(buf + j, buflen - j,  " %d",
+			j += scnprintf(buf + j, buflen - j,  " %d",
 				alsa_rates[i]);
 
 	buf[j] = '\0'; /* necessary when j == 0 */
@@ -599,6 +809,9 @@ void snd_hdmi_eld_update_pcm_info(struct parsed_hdmi_eld *e,
 					maxbps = 24;
 			}
 		}
+		/* Allow 192khz in card if sink is EAC3 decode capable */
+		if (a->format == AUDIO_CODING_TYPE_EAC3)
+			rates |= SNDRV_PCM_RATE_192000;
 	}
 
 	/* restrict the parameters by the values the codec provides */

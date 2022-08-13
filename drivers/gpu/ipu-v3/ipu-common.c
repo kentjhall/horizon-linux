@@ -715,15 +715,16 @@ void ipu_set_ic_src_mux(struct ipu_soc *ipu, int csi_id, bool vdi)
 	spin_lock_irqsave(&ipu->lock, flags);
 
 	val = ipu_cm_read(ipu, IPU_CONF);
-	if (vdi) {
+	if (vdi)
 		val |= IPU_CONF_IC_INPUT;
-	} else {
+	else
 		val &= ~IPU_CONF_IC_INPUT;
-		if (csi_id == 1)
-			val |= IPU_CONF_CSI_SEL;
-		else
-			val &= ~IPU_CONF_CSI_SEL;
-	}
+
+	if (csi_id == 1)
+		val |= IPU_CONF_CSI_SEL;
+	else
+		val &= ~IPU_CONF_CSI_SEL;
+
 	ipu_cm_write(ipu, val, IPU_CONF);
 
 	spin_unlock_irqrestore(&ipu->lock, flags);
@@ -883,8 +884,8 @@ static struct ipu_devtype ipu_type_imx51 = {
 	.cpmem_ofs = 0x1f000000,
 	.srm_ofs = 0x1f040000,
 	.tpm_ofs = 0x1f060000,
-	.csi0_ofs = 0x1f030000,
-	.csi1_ofs = 0x1f038000,
+	.csi0_ofs = 0x1e030000,
+	.csi1_ofs = 0x1e038000,
 	.ic_ofs = 0x1e020000,
 	.disp0_ofs = 0x1e040000,
 	.disp1_ofs = 0x1e048000,
@@ -899,8 +900,8 @@ static struct ipu_devtype ipu_type_imx53 = {
 	.cpmem_ofs = 0x07000000,
 	.srm_ofs = 0x07040000,
 	.tpm_ofs = 0x07060000,
-	.csi0_ofs = 0x07030000,
-	.csi1_ofs = 0x07038000,
+	.csi0_ofs = 0x06030000,
+	.csi1_ofs = 0x06038000,
 	.ic_ofs = 0x06020000,
 	.disp0_ofs = 0x06040000,
 	.disp1_ofs = 0x06048000,

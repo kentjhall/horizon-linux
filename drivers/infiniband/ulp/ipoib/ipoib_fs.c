@@ -283,6 +283,7 @@ void ipoib_delete_debug_files(struct net_device *dev)
 
 	debugfs_remove(priv->mcg_dentry);
 	debugfs_remove(priv->path_dentry);
+	priv->mcg_dentry = priv->path_dentry = NULL;
 }
 
 int ipoib_register_debugfs(void)

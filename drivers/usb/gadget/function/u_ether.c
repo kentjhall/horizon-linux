@@ -4,6 +4,7 @@
  * Copyright (C) 2003-2005,2008 David Brownell
  * Copyright (C) 2003-2004 Robert Schwebel, Benedikt Spranger
  * Copyright (C) 2008 Nokia Corporation
+ * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -97,7 +98,7 @@ struct eth_dev {
 static inline int qlen(struct usb_gadget *gadget, unsigned qmult)
 {
 	if (gadget_is_dualspeed(gadget) && (gadget->speed == USB_SPEED_HIGH ||
-					    gadget->speed == USB_SPEED_SUPER))
+					    gadget->speed >= USB_SPEED_SUPER))
 		return qmult * DEFAULT_QLEN;
 	else
 		return DEFAULT_QLEN;
@@ -198,11 +199,12 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 		out = dev->port_usb->out_ep;
 	else
 		out = NULL;
-	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (!out)
+	{
+		spin_unlock_irqrestore(&dev->lock, flags);
 		return -ENOTCONN;
-
+	}
 
 	/* Padding up to RX_EXTRA handles minor disagreements with host.
 	 * Normally we use the USB "terminate on short read" convention;
@@ -223,6 +225,7 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 
 	if (dev->port_usb->is_fixed)
 		size = max_t(size_t, size, dev->port_usb->fixed_out_len);
+	spin_unlock_irqrestore(&dev->lock, flags);
 
 	skb = alloc_skb(size + NET_IP_ALIGN, gfp_flags);
 	if (skb == NULL) {
@@ -486,11 +489,15 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 	unsigned long		flags;
 	struct usb_ep		*in;
 	u16			cdc_filter;
+	bool			is_fixed = false;
+	u32			fixed_in_len = 0;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	if (dev->port_usb) {
 		in = dev->port_usb->in_ep;
 		cdc_filter = dev->port_usb->cdc_filter;
+		is_fixed = dev->port_usb->is_fixed;
+		fixed_in_len = dev->port_usb->fixed_in_len;
 	} else {
 		in = NULL;
 		cdc_filter = 0;
@@ -571,9 +578,7 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 	req->complete = tx_complete;
 
 	/* NCM requires no zlp if transfer is dwNtbInMaxSize */
-	if (dev->port_usb &&
-	    dev->port_usb->is_fixed &&
-	    length == dev->port_usb->fixed_in_len &&
+	if (is_fixed && length == fixed_in_len &&
 	    (length % in->maxpacket) == 0)
 		req->zero = 0;
 	else

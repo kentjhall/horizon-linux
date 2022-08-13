@@ -42,10 +42,10 @@ void ieee802154_xmit_worker(struct work_struct *work)
 	if (res)
 		goto err_tx;
 
-	ieee802154_xmit_complete(&local->hw, skb, false);
-
 	dev->stats.tx_packets++;
 	dev->stats.tx_bytes += skb->len;
+
+	ieee802154_xmit_complete(&local->hw, skb, false);
 
 	return;
 
@@ -63,8 +63,21 @@ ieee802154_tx(struct ieee802154_local *local, struct sk_buff *skb)
 	int ret;
 
 	if (!(local->hw.flags & IEEE802154_HW_TX_OMIT_CKSUM)) {
-		u16 crc = crc_ccitt(0, skb->data, skb->len);
+		struct sk_buff *nskb;
+		u16 crc;
 
+		if (unlikely(skb_tailroom(skb) < IEEE802154_FCS_LEN)) {
+			nskb = skb_copy_expand(skb, 0, IEEE802154_FCS_LEN,
+					       GFP_ATOMIC);
+			if (likely(nskb)) {
+				consume_skb(skb);
+				skb = nskb;
+			} else {
+				goto err_tx;
+			}
+		}
+
+		crc = crc_ccitt(0, skb->data, skb->len);
 		put_unaligned_le16(crc, skb_put(skb, 2));
 	}
 
@@ -73,6 +86,8 @@ ieee802154_tx(struct ieee802154_local *local, struct sk_buff *skb)
 
 	/* async is priority, otherwise sync is fallback */
 	if (local->ops->xmit_async) {
+		unsigned int len = skb->len;
+
 		ret = drv_xmit_async(local, skb);
 		if (ret) {
 			ieee802154_wake_queue(&local->hw);
@@ -80,7 +95,7 @@ ieee802154_tx(struct ieee802154_local *local, struct sk_buff *skb)
 		}
 
 		dev->stats.tx_packets++;
-		dev->stats.tx_bytes += skb->len;
+		dev->stats.tx_bytes += len;
 	} else {
 		local->tx_skb = skb;
 		queue_work(local->workqueue, &local->tx_work);

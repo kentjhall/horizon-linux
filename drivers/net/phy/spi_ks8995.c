@@ -162,6 +162,14 @@ static const struct spi_device_id ks8995_id[] = {
 };
 MODULE_DEVICE_TABLE(spi, ks8995_id);
 
+static const struct of_device_id ks8895_spi_of_match[] = {
+        { .compatible = "micrel,ks8995" },
+        { .compatible = "micrel,ksz8864" },
+        { .compatible = "micrel,ksz8795" },
+        { },
+ };
+MODULE_DEVICE_TABLE(of, ks8895_spi_of_match);
+
 static inline u8 get_chip_id(u8 val)
 {
 	return (val >> ID1_CHIPID_S) & ID1_CHIPID_M;
@@ -491,13 +499,14 @@ static int ks8995_probe(struct spi_device *spi)
 	if (err)
 		return err;
 
-	ks->regs_attr.size = ks->chip->regs_size;
 	memcpy(&ks->regs_attr, &ks8995_registers_attr, sizeof(ks->regs_attr));
+	ks->regs_attr.size = ks->chip->regs_size;
 
 	err = ks8995_reset(ks);
 	if (err)
 		return err;
 
+	sysfs_attr_init(&ks->regs_attr.attr);
 	err = sysfs_create_bin_file(&spi->dev.kobj, &ks->regs_attr);
 	if (err) {
 		dev_err(&spi->dev, "unable to create sysfs file, err=%d\n",
@@ -528,6 +537,7 @@ static int ks8995_remove(struct spi_device *spi)
 static struct spi_driver ks8995_driver = {
 	.driver = {
 		.name	    = "spi-ks8995",
+		.of_match_table = of_match_ptr(ks8895_spi_of_match),
 	},
 	.probe	  = ks8995_probe,
 	.remove	  = ks8995_remove,

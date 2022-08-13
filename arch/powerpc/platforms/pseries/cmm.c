@@ -391,6 +391,10 @@ static struct bus_type cmm_subsys = {
 	.dev_name = "cmm",
 };
 
+static void cmm_release_device(struct device *dev)
+{
+}
+
 /**
  * cmm_sysfs_register - Register with sysfs
  *
@@ -406,6 +410,7 @@ static int cmm_sysfs_register(struct device *dev)
 
 	dev->id = 0;
 	dev->bus = &cmm_subsys;
+	dev->release = cmm_release_device;
 
 	if ((rc = device_register(dev)))
 		goto subsys_unregister;
@@ -708,7 +713,7 @@ static void cmm_exit(void)
  * Return value:
  * 	0 on success / other on failure
  **/
-static int cmm_set_disable(const char *val, struct kernel_param *kp)
+static int cmm_set_disable(const char *val, const struct kernel_param *kp)
 {
 	int disable = simple_strtoul(val, NULL, 10);
 

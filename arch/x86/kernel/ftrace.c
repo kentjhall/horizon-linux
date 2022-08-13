@@ -26,6 +26,7 @@
 
 #include <asm/cacheflush.h>
 #include <asm/kprobes.h>
+#include <asm/sections.h>
 #include <asm/ftrace.h>
 #include <asm/nops.h>
 
@@ -982,6 +983,18 @@ void prepare_ftrace_return(unsigned long self_addr, unsigned long *parent,
 	struct ftrace_graph_ent trace;
 	unsigned long return_hooker = (unsigned long)
 				&return_to_handler;
+
+	/*
+	 * When resuming from suspend-to-ram, this function can be indirectly
+	 * called from early CPU startup code while the CPU is in real mode,
+	 * which would fail miserably.  Make sure the stack pointer is a
+	 * virtual address.
+	 *
+	 * This check isn't as accurate as virt_addr_valid(), but it should be
+	 * good enough for this purpose, and it's fast.
+	 */
+	if (unlikely((long)__builtin_frame_address(0) >= 0))
+		return;
 
 	if (unlikely(ftrace_graph_is_dead()))
 		return;

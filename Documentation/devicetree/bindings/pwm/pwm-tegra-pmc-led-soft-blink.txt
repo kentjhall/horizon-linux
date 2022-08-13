@@ -1,0 +1,21 @@
+NVIDIA Tegra PMC LED Soft Blink driver
+
+Required properties:
+- compatible: "nvidia,tegra210b01-pwm-led-soft-blink"
+- #pwm-cells: should be 2. See pwm.txt in this directory for a description of
+  the cells format.
+
+Optional properties:
+- pwm,led-breathing-ramp-time-ns: led breathing ramp up and ramp down time
+- pwm,led-breathing-short-period-ns: led breathing short low period, breath out
+	duration between two cones.
+
+Example:
+
+	tegra-pmc-blink-pwm {
+		compatible = "nvidia,tegra210b01-pwm-led-soft-blink";
+		pwm,led-breathing-ramp-time-ns = <240000000>;
+		pwm,led-breathing-short-period-ns = <100000000>;
+                #pwm-cells = <2>;
+	};
+

@@ -23,7 +23,6 @@
 #include <linux/tty_flip.h>
 #include <linux/module.h>
 #include <linux/spinlock.h>
-#include <linux/workqueue.h>
 #include <linux/uaccess.h>
 #include <linux/usb.h>
 #include <linux/wait.h>
@@ -201,14 +200,12 @@ struct digi_port {
 	int dp_throttle_restart;
 	wait_queue_head_t dp_flush_wait;
 	wait_queue_head_t dp_close_wait;	/* wait queue for close */
-	struct work_struct dp_wakeup_work;
 	struct usb_serial_port *dp_port;
 };
 
 
 /* Local Function Declarations */
 
-static void digi_wakeup_write_lock(struct work_struct *work);
 static int digi_write_oob_command(struct usb_serial_port *port,
 	unsigned char *buf, int count, int interruptible);
 static int digi_write_inb_command(struct usb_serial_port *port,
@@ -353,26 +350,6 @@ __releases(lock)
 	finish_wait(q, &wait);
 
 	return timeout;
-}
-
-
-/*
- *  Digi Wakeup Write
- *
- *  Wake up port, line discipline, and tty processes sleeping
- *  on writes.
- */
-
-static void digi_wakeup_write_lock(struct work_struct *work)
-{
-	struct digi_port *priv =
-			container_of(work, struct digi_port, dp_wakeup_work);
-	struct usb_serial_port *port = priv->dp_port;
-	unsigned long flags;
-
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-	tty_port_tty_wakeup(&port->port);
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
 }
 
 /*
@@ -985,6 +962,7 @@ static void digi_write_bulk_callback(struct urb *urb)
 	struct digi_serial *serial_priv;
 	int ret = 0;
 	int status = urb->status;
+	bool wakeup;
 
 	/* port and serial sanity check */
 	if (port == NULL || (priv = usb_get_serial_port_data(port)) == NULL) {
@@ -1011,6 +989,7 @@ static void digi_write_bulk_callback(struct urb *urb)
 	}
 
 	/* try to send any buffered data on this port */
+	wakeup = true;
 	spin_lock(&priv->dp_port_lock);
 	priv->dp_write_urb_in_use = 0;
 	if (priv->dp_out_buf_len > 0) {
@@ -1026,19 +1005,18 @@ static void digi_write_bulk_callback(struct urb *urb)
 		if (ret == 0) {
 			priv->dp_write_urb_in_use = 1;
 			priv->dp_out_buf_len = 0;
+			wakeup = false;
 		}
 	}
-	/* wake up processes sleeping on writes immediately */
-	tty_port_tty_wakeup(&port->port);
-	/* also queue up a wakeup at scheduler time, in case we */
-	/* lost the race in write_chan(). */
-	schedule_work(&priv->dp_wakeup_work);
-
 	spin_unlock(&priv->dp_port_lock);
+
 	if (ret && ret != -EPERM)
 		dev_err_console(port,
 			"%s: usb_submit_urb failed, ret=%d, port=%d\n",
 			__func__, ret, priv->dp_port_num);
+
+	if (wakeup)
+		tty_port_tty_wakeup(&port->port);
 }
 
 static int digi_write_room(struct tty_struct *tty)
@@ -1238,7 +1216,6 @@ static int digi_port_init(struct usb_serial_port *port, unsigned port_num)
 	init_waitqueue_head(&priv->dp_transmit_idle_wait);
 	init_waitqueue_head(&priv->dp_flush_wait);
 	init_waitqueue_head(&priv->dp_close_wait);
-	INIT_WORK(&priv->dp_wakeup_work, digi_wakeup_write_lock);
 	priv->dp_port = port;
 
 	init_waitqueue_head(&port->write_wait);
@@ -1398,25 +1375,30 @@ static int digi_read_inb_callback(struct urb *urb)
 {
 	struct usb_serial_port *port = urb->context;
 	struct digi_port *priv = usb_get_serial_port_data(port);
-	int opcode = ((unsigned char *)urb->transfer_buffer)[0];
-	int len = ((unsigned char *)urb->transfer_buffer)[1];
-	int port_status = ((unsigned char *)urb->transfer_buffer)[2];
-	unsigned char *data = ((unsigned char *)urb->transfer_buffer) + 3;
+	unsigned char *buf = urb->transfer_buffer;
+	int opcode;
+	int len;
+	int port_status;
+	unsigned char *data;
 	int flag, throttled;
-	int status = urb->status;
-
-	/* do not process callbacks on closed ports */
-	/* but do continue the read chain */
-	if (urb->status == -ENOENT)
-		return 0;
 
 	/* short/multiple packet check */
+	if (urb->actual_length < 2) {
+		dev_warn(&port->dev, "short packet received\n");
+		return -1;
+	}
+
+	opcode = buf[0];
+	len = buf[1];
+
 	if (urb->actual_length != len + 2) {
-		dev_err(&port->dev, "%s: INCOMPLETE OR MULTIPLE PACKET, "
-			"status=%d, port=%d, opcode=%d, len=%d, "
-			"actual_length=%d, status=%d\n", __func__, status,
-			priv->dp_port_num, opcode, len, urb->actual_length,
-			port_status);
+		dev_err(&port->dev, "malformed packet received: port=%d, opcode=%d, len=%d, actual_length=%u\n",
+			priv->dp_port_num, opcode, len, urb->actual_length);
+		return -1;
+	}
+
+	if (opcode == DIGI_CMD_RECEIVE_DATA && len < 1) {
+		dev_err(&port->dev, "malformed data packet received\n");
 		return -1;
 	}
 
@@ -1430,6 +1412,9 @@ static int digi_read_inb_callback(struct urb *urb)
 
 	/* receive data */
 	if (opcode == DIGI_CMD_RECEIVE_DATA) {
+		port_status = buf[2];
+		data = &buf[3];
+
 		/* get flag from port_status */
 		flag = 0;
 
@@ -1482,16 +1467,20 @@ static int digi_read_oob_callback(struct urb *urb)
 	struct usb_serial *serial = port->serial;
 	struct tty_struct *tty;
 	struct digi_port *priv = usb_get_serial_port_data(port);
+	unsigned char *buf = urb->transfer_buffer;
 	int opcode, line, status, val;
 	int i;
 	unsigned int rts;
 
+	if (urb->actual_length < 4)
+		return -1;
+
 	/* handle each oob command */
-	for (i = 0; i < urb->actual_length - 3;) {
-		opcode = ((unsigned char *)urb->transfer_buffer)[i++];
-		line = ((unsigned char *)urb->transfer_buffer)[i++];
-		status = ((unsigned char *)urb->transfer_buffer)[i++];
-		val = ((unsigned char *)urb->transfer_buffer)[i++];
+	for (i = 0; i < urb->actual_length - 3; i += 4) {
+		opcode = buf[i];
+		line = buf[i + 1];
+		status = buf[i + 2];
+		val = buf[i + 3];
 
 		dev_dbg(&port->dev, "digi_read_oob_callback: opcode=%d, line=%d, status=%d, val=%d\n",
 			opcode, line, status, val);
@@ -1512,13 +1501,14 @@ static int digi_read_oob_callback(struct urb *urb)
 			rts = C_CRTSCTS(tty);
 
 		if (tty && opcode == DIGI_CMD_READ_INPUT_SIGNALS) {
+			bool wakeup = false;
+
 			spin_lock(&priv->dp_port_lock);
 			/* convert from digi flags to termiox flags */
 			if (val & DIGI_READ_INPUT_SIGNALS_CTS) {
 				priv->dp_modem_signals |= TIOCM_CTS;
-				/* port must be open to use tty struct */
 				if (rts)
-					tty_port_tty_wakeup(&port->port);
+					wakeup = true;
 			} else {
 				priv->dp_modem_signals &= ~TIOCM_CTS;
 				/* port must be open to use tty struct */
@@ -1537,6 +1527,9 @@ static int digi_read_oob_callback(struct urb *urb)
 				priv->dp_modem_signals &= ~TIOCM_CD;
 
 			spin_unlock(&priv->dp_port_lock);
+
+			if (wakeup)
+				tty_port_tty_wakeup(&port->port);
 		} else if (opcode == DIGI_CMD_TRANSMIT_IDLE) {
 			spin_lock(&priv->dp_port_lock);
 			priv->dp_transmit_idle = 1;

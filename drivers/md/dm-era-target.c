@@ -961,15 +961,15 @@ static int metadata_commit(struct era_metadata *md)
 		}
 	}
 
-	r = save_sm_root(md);
-	if (r) {
-		DMERR("%s: save_sm_root failed", __func__);
-		return r;
-	}
-
 	r = dm_tm_pre_commit(md->tm);
 	if (r) {
 		DMERR("%s: pre commit failed", __func__);
+		return r;
+	}
+
+	r = save_sm_root(md);
+	if (r) {
+		DMERR("%s: save_sm_root failed", __func__);
 		return r;
 	}
 
@@ -1379,7 +1379,7 @@ static void stop_worker(struct era *era)
 static int dev_is_congested(struct dm_dev *dev, int bdi_bits)
 {
 	struct request_queue *q = bdev_get_queue(dev->bdev);
-	return bdi_congested(&q->backing_dev_info, bdi_bits);
+	return bdi_congested(q->backing_dev_info, bdi_bits);
 }
 
 static int era_is_congested(struct dm_target_callbacks *cb, int bdi_bits)

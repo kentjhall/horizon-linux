@@ -778,8 +778,11 @@ int dss_runtime_get(void)
 	DSSDBG("dss_runtime_get\n");
 
 	r = pm_runtime_get_sync(&dss.pdev->dev);
-	WARN_ON(r < 0);
-	return r < 0 ? r : 0;
+	if (WARN_ON(r < 0)) {
+		pm_runtime_put_sync(&dss.pdev->dev);
+		return r;
+	}
+	return 0;
 }
 
 void dss_runtime_put(void)
@@ -843,7 +846,7 @@ static const struct dss_features omap34xx_dss_feats = {
 };
 
 static const struct dss_features omap3630_dss_feats = {
-	.fck_div_max		=	32,
+	.fck_div_max		=	31,
 	.dss_fck_multiplier	=	1,
 	.parent_clk_name	=	"dpll4_ck",
 	.dpi_select_source	=	&dss_dpi_select_source_omap2_omap3,
@@ -941,11 +944,13 @@ static int dss_init_features(struct platform_device *pdev)
 	return 0;
 }
 
+static void dss_uninit_ports(struct platform_device *pdev);
+
 static int dss_init_ports(struct platform_device *pdev)
 {
 	struct device_node *parent = pdev->dev.of_node;
 	struct device_node *port;
-	int r;
+	int r, ret = 0;
 
 	if (parent == NULL)
 		return 0;
@@ -972,17 +977,21 @@ static int dss_init_ports(struct platform_device *pdev)
 
 		switch (port_type) {
 		case OMAP_DISPLAY_TYPE_DPI:
-			dpi_init_port(pdev, port);
+			ret = dpi_init_port(pdev, port);
 			break;
 		case OMAP_DISPLAY_TYPE_SDI:
-			sdi_init_port(pdev, port);
+			ret = sdi_init_port(pdev, port);
 			break;
 		default:
 			break;
 		}
-	} while ((port = omapdss_of_get_next_port(parent, port)) != NULL);
+	} while (!ret &&
+		 (port = omapdss_of_get_next_port(parent, port)) != NULL);
 
-	return 0;
+	if (ret)
+		dss_uninit_ports(pdev);
+
+	return ret;
 }
 
 static void dss_uninit_ports(struct platform_device *pdev)

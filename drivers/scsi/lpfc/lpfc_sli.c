@@ -116,9 +116,13 @@ lpfc_sli4_wq_put(struct lpfc_queue *q, union lpfc_wqe *wqe)
 	/* set consumption flag every once in a while */
 	if (!((q->host_index + 1) % q->entry_repost))
 		bf_set(wqe_wqec, &wqe->generic.wqe_com, 1);
+	else
+		bf_set(wqe_wqec, &wqe->generic.wqe_com, 0);
 	if (q->phba->sli3_options & LPFC_SLI4_PHWQ_ENABLED)
 		bf_set(wqe_wqid, &wqe->generic.wqe_com, q->queue_id);
 	lpfc_sli_pcimem_bcopy(wqe, temp_wqe, q->entry_size);
+	/* ensure WQE bcopy flushed before doorbell write */
+	wmb();
 
 	/* Update the host index before invoking device */
 	host_index = q->host_index;
@@ -2206,6 +2210,8 @@ lpfc_sli_def_mbox_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 	    !pmb->u.mb.mbxStatus) {
 		rpi = pmb->u.mb.un.varWords[0];
 		vpi = pmb->u.mb.un.varRegLogin.vpi;
+		if (phba->sli_rev == LPFC_SLI_REV4)
+			vpi -= phba->sli4_hba.max_cfg_param.vpi_base;
 		lpfc_unreg_login(phba, vpi, rpi, pmb);
 		pmb->vport = vport;
 		pmb->mbox_cmpl = lpfc_sli_def_mbox_cmpl;
@@ -3508,6 +3514,7 @@ lpfc_sli_handle_slow_ring_event_s4(struct lpfc_hba *phba,
 	struct hbq_dmabuf *dmabuf;
 	struct lpfc_cq_event *cq_event;
 	unsigned long iflag;
+	int count = 0;
 
 	spin_lock_irqsave(&phba->hbalock, iflag);
 	phba->hba_flag &= ~HBA_SP_QUEUE_EVT;
@@ -3529,16 +3536,22 @@ lpfc_sli_handle_slow_ring_event_s4(struct lpfc_hba *phba,
 			if (irspiocbq)
 				lpfc_sli_sp_handle_rspiocb(phba, pring,
 							   irspiocbq);
+			count++;
 			break;
 		case CQE_CODE_RECEIVE:
 		case CQE_CODE_RECEIVE_V1:
 			dmabuf = container_of(cq_event, struct hbq_dmabuf,
 					      cq_event);
 			lpfc_sli4_handle_received_buffer(phba, dmabuf);
+			count++;
 			break;
 		default:
 			break;
 		}
+
+		/* Limit the number of events to 64 to avoid soft lockups */
+		if (count == 64)
+			break;
 	}
 }
 
@@ -5951,18 +5964,25 @@ lpfc_sli4_alloc_resource_identifiers(struct lpfc_hba *phba)
 
  free_vfi_bmask:
 	kfree(phba->sli4_hba.vfi_bmask);
+	phba->sli4_hba.vfi_bmask = NULL;
  free_xri_ids:
 	kfree(phba->sli4_hba.xri_ids);
+	phba->sli4_hba.xri_ids = NULL;
  free_xri_bmask:
 	kfree(phba->sli4_hba.xri_bmask);
+	phba->sli4_hba.xri_bmask = NULL;
  free_vpi_ids:
 	kfree(phba->vpi_ids);
+	phba->vpi_ids = NULL;
  free_vpi_bmask:
 	kfree(phba->vpi_bmask);
+	phba->vpi_bmask = NULL;
  free_rpi_ids:
 	kfree(phba->sli4_hba.rpi_ids);
+	phba->sli4_hba.rpi_ids = NULL;
  free_rpi_bmask:
 	kfree(phba->sli4_hba.rpi_bmask);
+	phba->sli4_hba.rpi_bmask = NULL;
  err_exit:
 	return rc;
 }
@@ -9997,6 +10017,7 @@ lpfc_sli_abort_iotag_issue(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		iabt->ulpCommand = CMD_CLOSE_XRI_CN;
 
 	abtsiocbp->iocb_cmpl = lpfc_sli_abort_els_cmpl;
+	abtsiocbp->vport = vport;
 
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_SLI,
 			 "0339 Abort xri x%x, original iotag x%x, "
@@ -11943,13 +11964,19 @@ send_current_mbox:
 	phba->sli.sli_flag &= ~LPFC_SLI_MBOX_ACTIVE;
 	/* Setting active mailbox pointer need to be in sync to flag clear */
 	phba->sli.mbox_active = NULL;
+	if (bf_get(lpfc_trailer_consumed, mcqe))
+		lpfc_sli4_mq_release(phba->sli4_hba.mbx_wq);
 	spin_unlock_irqrestore(&phba->hbalock, iflags);
 	/* Wake up worker thread to post the next pending mailbox command */
 	lpfc_worker_wake_up(phba);
+	return workposted;
+
 out_no_mqe_complete:
+	spin_lock_irqsave(&phba->hbalock, iflags);
 	if (bf_get(lpfc_trailer_consumed, mcqe))
 		lpfc_sli4_mq_release(phba->sli4_hba.mbx_wq);
-	return workposted;
+	spin_unlock_irqrestore(&phba->hbalock, iflags);
+	return false;
 }
 
 /**
@@ -13678,7 +13705,7 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 			       LPFC_WQ_WQE_SIZE_128);
 			bf_set(lpfc_mbx_wq_create_page_size,
 			       &wq_create->u.request_1,
-			       (PAGE_SIZE/SLI4_PAGE_SIZE));
+			       LPFC_WQ_PAGE_SIZE_4096);
 			page = wq_create->u.request_1.page;
 			break;
 		}
@@ -13686,6 +13713,9 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 	case LPFC_Q_CREATE_VERSION_1:
 		bf_set(lpfc_mbx_wq_create_wqe_count, &wq_create->u.request_1,
 		       wq->entry_count);
+		bf_set(lpfc_mbox_hdr_version, &shdr->request,
+		       LPFC_Q_CREATE_VERSION_1);
+
 		switch (wq->entry_size) {
 		default:
 		case 64:
@@ -13704,8 +13734,9 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 			       LPFC_WQ_WQE_SIZE_128);
 			break;
 		}
-		bf_set(lpfc_mbx_wq_create_page_size, &wq_create->u.request_1,
-		       (PAGE_SIZE/SLI4_PAGE_SIZE));
+		bf_set(lpfc_mbx_wq_create_page_size,
+		       &wq_create->u.request_1,
+		       LPFC_WQ_PAGE_SIZE_4096);
 		page = wq_create->u.request_1.page;
 		break;
 	default:
@@ -13891,7 +13922,7 @@ lpfc_rq_create(struct lpfc_hba *phba, struct lpfc_queue *hrq,
 		       LPFC_RQE_SIZE_8);
 		bf_set(lpfc_rq_context_page_size,
 		       &rq_create->u.request.context,
-		       (PAGE_SIZE/SLI4_PAGE_SIZE));
+		       LPFC_RQ_PAGE_SIZE_4096);
 	} else {
 		switch (hrq->entry_count) {
 		default:
@@ -15617,6 +15648,10 @@ lpfc_prep_seq(struct lpfc_vport *vport, struct hbq_dmabuf *seq_dmabuf)
 			list_add_tail(&iocbq->list, &first_iocbq->list);
 		}
 	}
+	/* Free the sequence's header buffer */
+	if (!first_iocbq)
+		lpfc_in_buf_free(vport->phba, &seq_dmabuf->dbuf);
+
 	return first_iocbq;
 }
 
@@ -15966,6 +16001,13 @@ lpfc_sli4_alloc_rpi(struct lpfc_hba *phba)
 static void
 __lpfc_sli4_free_rpi(struct lpfc_hba *phba, int rpi)
 {
+	/*
+	 * if the rpi value indicates a prior unreg has already
+	 * been done, skip the unreg.
+	 */
+	if (rpi == LPFC_RPI_ALLOC_ERROR)
+		return;
+
 	if (test_and_clear_bit(rpi, phba->sli4_hba.rpi_bmask)) {
 		phba->sli4_hba.rpi_count--;
 		phba->sli4_hba.max_cfg_param.rpi_used--;
@@ -16530,15 +16572,8 @@ next_priority:
 			goto initial_priority;
 		lpfc_printf_log(phba, KERN_WARNING, LOG_FIP,
 				"2844 No roundrobin failover FCF available\n");
-		if (next_fcf_index >= LPFC_SLI4_FCF_TBL_INDX_MAX)
-			return LPFC_FCOE_FCF_NEXT_NONE;
-		else {
-			lpfc_printf_log(phba, KERN_WARNING, LOG_FIP,
-				"3063 Only FCF available idx %d, flag %x\n",
-				next_fcf_index,
-			phba->fcf.fcf_pri[next_fcf_index].fcf_rec.flag);
-			return next_fcf_index;
-		}
+
+		return LPFC_FCOE_FCF_NEXT_NONE;
 	}
 
 	if (next_fcf_index < LPFC_SLI4_FCF_TBL_INDX_MAX &&

@@ -714,7 +714,8 @@ xfs_btree_firstrec(
 	 * Get the block pointer for this level.
 	 */
 	block = xfs_btree_get_block(cur, level, &bp);
-	xfs_btree_check_block(cur, block, level, bp);
+	if (xfs_btree_check_block(cur, block, level, bp))
+		return 0;
 	/*
 	 * It's empty, there is no such record.
 	 */
@@ -743,7 +744,8 @@ xfs_btree_lastrec(
 	 * Get the block pointer for this level.
 	 */
 	block = xfs_btree_get_block(cur, level, &bp);
-	xfs_btree_check_block(cur, block, level, bp);
+	if (xfs_btree_check_block(cur, block, level, bp))
+		return 0;
 	/*
 	 * It's empty, there is no such record.
 	 */
@@ -810,7 +812,8 @@ xfs_btree_read_bufl(
 	xfs_daddr_t		d;		/* real disk block address */
 	int			error;
 
-	ASSERT(fsbno != NULLFSBLOCK);
+	if (!XFS_FSB_SANITY_CHECK(mp, fsbno))
+		return -EFSCORRUPTED;
 	d = XFS_FSB_TO_DADDR(mp, fsbno);
 	error = xfs_trans_read_buf(mp, tp, mp->m_ddev_targp, d,
 				   mp->m_bsize, lock, &bp, ops);
@@ -1769,8 +1772,29 @@ xfs_btree_lookup_get_block(
 	if (error)
 		return error;
 
+	/* Check the inode owner since the verifiers don't. */
+	if (xfs_sb_version_hascrc(&cur->bc_mp->m_sb) &&
+	    !(cur->bc_private.b.flags & XFS_BTCUR_BPRV_INVALID_OWNER) &&
+	    (cur->bc_flags & XFS_BTREE_LONG_PTRS) &&
+	    be64_to_cpu((*blkp)->bb_u.l.bb_owner) !=
+			cur->bc_private.b.ip->i_ino)
+		goto out_bad;
+
+	/* Did we get the level we were looking for? */
+	if (be16_to_cpu((*blkp)->bb_level) != level)
+		goto out_bad;
+
+	/* Check that internal nodes have at least one record. */
+	if (level != 0 && be16_to_cpu((*blkp)->bb_numrecs) == 0)
+		goto out_bad;
+
 	xfs_btree_setbuf(cur, level, bp);
 	return 0;
+
+out_bad:
+	*blkp = NULL;
+	xfs_trans_brelse(cur->bc_tp, bp);
+	return -EFSCORRUPTED;
 }
 
 /*
@@ -4355,7 +4379,7 @@ xfs_btree_visit_blocks(
 			xfs_btree_readahead_ptr(cur, ptr, 1);
 
 			/* save for the next iteration of the loop */
-			lptr = *ptr;
+			xfs_btree_copy_ptrs(cur, &lptr, ptr, 1);
 		}
 
 		/* for each buffer in the level */
@@ -4411,10 +4435,15 @@ xfs_btree_block_change_owner(
 
 	/* modify the owner */
 	block = xfs_btree_get_block(cur, level, &bp);
-	if (cur->bc_flags & XFS_BTREE_LONG_PTRS)
+	if (cur->bc_flags & XFS_BTREE_LONG_PTRS) {
+		if (block->bb_u.l.bb_owner == cpu_to_be64(bbcoi->new_owner))
+			return 0;
 		block->bb_u.l.bb_owner = cpu_to_be64(bbcoi->new_owner);
-	else
+	} else {
+		if (block->bb_u.s.bb_owner == cpu_to_be32(bbcoi->new_owner))
+			return 0;
 		block->bb_u.s.bb_owner = cpu_to_be32(bbcoi->new_owner);
+	}
 
 	/*
 	 * If the block is a root block hosted in an inode, we might not have a
@@ -4423,16 +4452,19 @@ xfs_btree_block_change_owner(
 	 * block is formatted into the on-disk inode fork. We still change it,
 	 * though, so everything is consistent in memory.
 	 */
-	if (bp) {
-		if (cur->bc_tp) {
-			xfs_trans_ordered_buf(cur->bc_tp, bp);
-			xfs_btree_log_block(cur, bp, XFS_BB_OWNER);
-		} else {
-			xfs_buf_delwri_queue(bp, bbcoi->buffer_list);
-		}
-	} else {
+	if (!bp) {
 		ASSERT(cur->bc_flags & XFS_BTREE_ROOT_IN_INODE);
 		ASSERT(level == cur->bc_nlevels - 1);
+		return 0;
+	}
+
+	if (cur->bc_tp) {
+		if (!xfs_trans_ordered_buf(cur->bc_tp, bp)) {
+			xfs_btree_log_block(cur, bp, XFS_BB_OWNER);
+			return -EAGAIN;
+		}
+	} else {
+		xfs_buf_delwri_queue(bp, bbcoi->buffer_list);
 	}
 
 	return 0;

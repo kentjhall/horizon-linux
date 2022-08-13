@@ -947,9 +947,9 @@ enum rate_info_flags {
  * @RATE_INFO_BW_160: 160 MHz bandwidth
  */
 enum rate_info_bw {
+	RATE_INFO_BW_20 = 0,
 	RATE_INFO_BW_5,
 	RATE_INFO_BW_10,
-	RATE_INFO_BW_20,
 	RATE_INFO_BW_40,
 	RATE_INFO_BW_80,
 	RATE_INFO_BW_160,
@@ -4182,6 +4182,17 @@ const u8 *cfg80211_find_vendor_ie(unsigned int oui, int oui_type,
 				  const u8 *ies, int len);
 
 /**
+ * cfg80211_send_layer2_update - send layer 2 update frame
+ *
+ * @dev: network device
+ * @addr: STA MAC address
+ *
+ * Wireless drivers can use this function to update forwarding tables in bridge
+ * devices upon STA association.
+ */
+void cfg80211_send_layer2_update(struct net_device *dev, const u8 *addr);
+
+/**
  * DOC: Regulatory enforcement infrastructure
  *
  * TODO
@@ -4584,6 +4595,17 @@ void cfg80211_rx_assoc_resp(struct net_device *dev,
 void cfg80211_assoc_timeout(struct net_device *dev, struct cfg80211_bss *bss);
 
 /**
+ * cfg80211_abandon_assoc - notify cfg80211 of abandoned association attempt
+ * @dev: network device
+ * @bss: The BSS entry with which association was abandoned.
+ *
+ * Call this whenever - for reasons reported through other API, like deauth RX,
+ * an association attempt was abandoned.
+ * This function may sleep. The caller must hold the corresponding wdev's mutex.
+ */
+void cfg80211_abandon_assoc(struct net_device *dev, struct cfg80211_bss *bss);
+
+/**
  * cfg80211_tx_mlme_mgmt - notification of transmitted deauth/disassoc frame
  * @dev: network device
  * @buf: 802.11 frame (header + body)
@@ -4718,6 +4740,13 @@ struct sk_buff *__cfg80211_alloc_reply_skb(struct wiphy *wiphy,
 					   enum nl80211_attrs attr,
 					   int approxlen);
 
+struct sk_buff *__cfg80211_alloc_event_net_skb(struct net_device *ndev,
+					   struct wiphy *wiphy,
+					   enum nl80211_commands cmd,
+					   enum nl80211_attrs attr,
+					   int vendor_event_idx,
+					   int approxlen, gfp_t gfp);
+
 struct sk_buff *__cfg80211_alloc_event_skb(struct wiphy *wiphy,
 					   struct wireless_dev *wdev,
 					   enum nl80211_commands cmd,
@@ -4801,6 +4830,14 @@ cfg80211_vendor_event_alloc(struct wiphy *wiphy, struct wireless_dev *wdev,
 					  event_idx, approxlen, gfp);
 }
 
+static inline struct sk_buff *
+cfg80211_vendor_event_skb_alloc(struct net_device *ndev, struct wiphy *wiphy, int approxlen,
+			    int event_idx, gfp_t gfp)
+{
+	return __cfg80211_alloc_event_net_skb(ndev, wiphy, NL80211_CMD_VENDOR,
+					  NL80211_ATTR_VENDOR_DATA,
+					  event_idx, approxlen, gfp);
+}
 /**
  * cfg80211_vendor_event - send the event
  * @skb: The skb, must have been allocated with cfg80211_vendor_event_alloc()

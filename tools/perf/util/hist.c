@@ -1,6 +1,7 @@
 #include "util.h"
 #include "build-id.h"
 #include "hist.h"
+#include "map.h"
 #include "session.h"
 #include "sort.h"
 #include "evlist.h"
@@ -864,7 +865,7 @@ iter_prepare_cumulative_entry(struct hist_entry_iter *iter,
 	 * cumulated only one time to prevent entries more than 100%
 	 * overhead.
 	 */
-	he_cache = malloc(sizeof(*he_cache) * (iter->max_stack + 1));
+	he_cache = malloc(sizeof(*he_cache) * (callchain_cursor.nr + 1));
 	if (he_cache == NULL)
 		return -ENOMEM;
 
@@ -1019,13 +1020,17 @@ int hist_entry_iter__add(struct hist_entry_iter *iter, struct addr_location *al,
 			 int max_stack_depth, void *arg)
 {
 	int err, err2;
+	struct map *alm = NULL;
+
+	if (al && al->map)
+		alm = map__get(al->map);
 
 	err = sample__resolve_callchain(iter->sample, &callchain_cursor, &iter->parent,
 					iter->evsel, al, max_stack_depth);
-	if (err)
+	if (err) {
+		map__put(alm);
 		return err;
-
-	iter->max_stack = max_stack_depth;
+	}
 
 	err = iter->ops->prepare_entry(iter, al);
 	if (err)
@@ -1057,6 +1062,8 @@ out:
 	err2 = iter->ops->finish_entry(iter, al);
 	if (!err)
 		err = err2;
+
+	map__put(alm);
 
 	return err;
 }
@@ -1478,7 +1485,7 @@ int hists__collapse_resort(struct hists *hists, struct ui_progress *prog)
 	return 0;
 }
 
-static int hist_entry__sort(struct hist_entry *a, struct hist_entry *b)
+static int64_t hist_entry__sort(struct hist_entry *a, struct hist_entry *b)
 {
 	struct hists *hists = a->hists;
 	struct perf_hpp_fmt *fmt;

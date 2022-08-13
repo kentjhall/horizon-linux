@@ -658,7 +658,6 @@ config PANEL_LCD_PIN_E
 	---help---
 	  This describes the number of the parallel port pin to which the LCD 'E'
 	  signal has been connected. It can be :
-
 	          0 : no connection (eg: connected to ground)
 	      1..17 : directly connected to any of these pins on the DB25 plug
 	    -1..-17 : connected to the same pin through an inverter (eg: transistor).
@@ -766,6 +765,50 @@ config PANEL_BOOT_MESSAGE
 	  An empty message will only clear the display at driver init time. Any other
 	  printf()-formatted message is valid with newline and escape codes.
 
+config UID_SYS_STATS
+	bool "Per-UID statistics"
+	depends on PROFILING && TASK_XACCT && TASK_IO_ACCOUNTING
+	help
+	  Per UID based cpu time statistics exported to /proc/uid_cputime
+	  Per UID based io statistics exported to /proc/uid_io
+	  Per UID based procstat control in /proc/uid_procstat
+
+config UID_SYS_STATS_DEBUG
+	bool "Per-TASK statistics"
+	depends on UID_SYS_STATS
+	default n
+	help
+	  Per TASK based io statistics exported to /proc/uid_io
+
+config MEMORY_STATE_TIME
+	tristate "Memory freq/bandwidth time statistics"
+	depends on PROFILING
+	help
+	  Memory time statistics exported to /sys/kernel/memory_state_time
+
+config GPS_HWGEOFENCING
+	tristate "hw geofencing support"
+	---help---
+	This driver provides gps enable, hw geofencing and host wake capability.
+
+config BLUEDROID_PM
+	tristate "Bluedroid_pm driver support"
+	help
+	  Bluetooth Bluedroid power management Driver.
+	  This driver provides power control and dynamic active power saving
+	  mechanism for bluetooth radio devices.
+
+	  Say Y here to compile support for bluedroid_pm support into the kernel
+	  or say M to compile it as module (bluedroid_pm).
+
+config CPULOAD_MONITOR
+	bool "Publish cpu load measures in sysfs"
+	depends on CPU_FREQ
+	default y
+	---help---
+	  Publish cpu load measured in sysfs, to be used by user space cpu
+	  frequency controllers.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"
@@ -778,4 +821,5 @@ source "drivers/misc/mic/Kconfig"
 source "drivers/misc/genwqe/Kconfig"
 source "drivers/misc/echo/Kconfig"
 source "drivers/misc/cxl/Kconfig"
+source "drivers/misc/inter-tegra/Kconfig"
 endmenu

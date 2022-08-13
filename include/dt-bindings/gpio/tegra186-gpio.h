@@ -36,6 +36,7 @@
 #define TEGRA_MAIN_GPIO_PORT_Y 20
 #define TEGRA_MAIN_GPIO_PORT_BB 21
 #define TEGRA_MAIN_GPIO_PORT_CC 22
+#define TEGRA_MAIN_GPIO_PORT_DD 23
 
 #define TEGRA_MAIN_GPIO(port, offset) \
 	((TEGRA_MAIN_GPIO_PORT_##port * 8) + offset)
@@ -52,5 +53,49 @@
 
 #define TEGRA_AON_GPIO(port, offset) \
 	((TEGRA_AON_GPIO_PORT_##port * 8) + offset)
+
+/* All pins */
+#define TEGRA_PIN_BASE_ID_A 0
+#define TEGRA_PIN_BASE_ID_B 1
+#define TEGRA_PIN_BASE_ID_C 2
+#define TEGRA_PIN_BASE_ID_D 3
+#define TEGRA_PIN_BASE_ID_E 4
+#define TEGRA_PIN_BASE_ID_F 5
+#define TEGRA_PIN_BASE_ID_G 6
+#define TEGRA_PIN_BASE_ID_H 7
+#define TEGRA_PIN_BASE_ID_I 8
+#define TEGRA_PIN_BASE_ID_J 9
+#define TEGRA_PIN_BASE_ID_K 10
+#define TEGRA_PIN_BASE_ID_L 11
+#define TEGRA_PIN_BASE_ID_M 12
+#define TEGRA_PIN_BASE_ID_N 13
+#define TEGRA_PIN_BASE_ID_O 14
+#define TEGRA_PIN_BASE_ID_P 15
+#define TEGRA_PIN_BASE_ID_Q 16
+#define TEGRA_PIN_BASE_ID_R 17
+#define TEGRA_PIN_BASE_ID_S 18
+#define TEGRA_PIN_BASE_ID_T 19
+#define TEGRA_PIN_BASE_ID_U 20
+#define TEGRA_PIN_BASE_ID_V 21
+#define TEGRA_PIN_BASE_ID_W 22
+#define TEGRA_PIN_BASE_ID_X 23
+#define TEGRA_PIN_BASE_ID_Y 24
+#define TEGRA_PIN_BASE_ID_Z 25
+#define TEGRA_PIN_BASE_ID_AA 26
+#define TEGRA_PIN_BASE_ID_BB 27
+#define TEGRA_PIN_BASE_ID_CC 28
+#define TEGRA_PIN_BASE_ID_DD 29
+#define TEGRA_PIN_BASE_ID_EE 30
+#define TEGRA_PIN_BASE_ID_FF 31
+
+#define TEGRA_PIN_BASE(port) (TEGRA_PIN_BASE_ID_##port * 8)
+
+#define TEGRA_MAIN_GPIO_RANGE(st, end) \
+	((TEGRA_MAIN_GPIO_PORT_##end - TEGRA_MAIN_GPIO_PORT_##st + 1) * 8)
+#define TEGRA_MAIN_GPIO_BASE(port) (TEGRA_MAIN_GPIO_PORT_##port * 8)
+
+#define TEGRA_AON_GPIO_RANGE(st, end) \
+	((TEGRA_AON_GPIO_PORT_##end - TEGRA_AON_GPIO_PORT_##st + 1) * 8)
+#define TEGRA_AON_GPIO_BASE(port) (TEGRA_AON_GPIO_PORT_##port * 8)
 
 #endif

@@ -28,6 +28,7 @@
 #include <linux/export.h>
 #include <linux/math64.h>
 #include <linux/slab.h>
+#include <linux/nospec.h>
 #include <asm/processor.h>
 #include <asm/msr.h>
 #include <asm/page.h>
@@ -57,7 +58,7 @@
 #define APIC_BUS_CYCLE_NS 1
 
 /* #define apic_debug(fmt,arg...) printk(KERN_WARNING fmt,##arg) */
-#define apic_debug(fmt, arg...)
+#define apic_debug(fmt, arg...) do {} while (0)
 
 /* 14 is the version for Xeon and Pentium 8.4.8*/
 #define APIC_VERSION			(0x14UL | ((KVM_APIC_LVT_NUM - 1) << 16))
@@ -246,9 +247,14 @@ static inline void kvm_apic_set_ldr(struct kvm_lapic *apic, u32 id)
 	recalculate_apic_map(apic->vcpu->kvm);
 }
 
+static inline u32 kvm_apic_calc_x2apic_ldr(u32 id)
+{
+	return ((id >> 4) << 16) | (1 << (id & 0xf));
+}
+
 static inline void kvm_apic_set_x2apic_id(struct kvm_lapic *apic, u32 id)
 {
-	u32 ldr = ((id >> 4) << 16) | (1 << (id & 0xf));
+	u32 ldr = kvm_apic_calc_x2apic_ldr(id);
 
 	kvm_lapic_set_reg(apic, APIC_ID, id);
 	kvm_lapic_set_reg(apic, APIC_LDR, ldr);
@@ -294,8 +300,16 @@ void kvm_apic_set_version(struct kvm_vcpu *vcpu)
 	if (!lapic_in_kernel(vcpu))
 		return;
 
+	/*
+	 * KVM emulates 82093AA datasheet (with in-kernel IOAPIC implementation)
+	 * which doesn't have EOI register; Some buggy OSes (e.g. Windows with
+	 * Hyper-V role) disable EOI broadcast in lapic not checking for IOAPIC
+	 * version first and level-triggered interrupts never get EOIed in
+	 * IOAPIC.
+	 */
 	feat = kvm_find_cpuid_entry(apic->vcpu, 0x1, 0);
-	if (feat && (feat->ecx & (1 << (X86_FEATURE_X2APIC & 31))))
+	if (feat && (feat->ecx & (1 << (X86_FEATURE_X2APIC & 31))) &&
+	    !ioapic_in_kernel(vcpu->kvm))
 		v |= APIC_LVR_DIRECTED_EOI;
 	kvm_lapic_set_reg(apic, APIC_LVR, v);
 }
@@ -518,9 +532,11 @@ static inline bool pv_eoi_enabled(struct kvm_vcpu *vcpu)
 static bool pv_eoi_get_pending(struct kvm_vcpu *vcpu)
 {
 	u8 val;
-	if (pv_eoi_get_user(vcpu, &val) < 0)
+	if (pv_eoi_get_user(vcpu, &val) < 0) {
 		apic_debug("Can't read EOI MSR value: 0x%llx\n",
 			   (unsigned long long)vcpu->arch.pv_eoi.msr_val);
+		return false;
+	}
 	return val & 0x1;
 }
 
@@ -1207,9 +1223,8 @@ EXPORT_SYMBOL_GPL(kvm_lapic_reg_read);
 
 static int apic_mmio_in_range(struct kvm_lapic *apic, gpa_t addr)
 {
-	return kvm_apic_hw_enabled(apic) &&
-	    addr >= apic->base_address &&
-	    addr < apic->base_address + LAPIC_MMIO_LENGTH;
+	return addr >= apic->base_address &&
+		addr < apic->base_address + LAPIC_MMIO_LENGTH;
 }
 
 static int apic_mmio_read(struct kvm_vcpu *vcpu, struct kvm_io_device *this,
@@ -1220,6 +1235,15 @@ static int apic_mmio_read(struct kvm_vcpu *vcpu, struct kvm_io_device *this,
 
 	if (!apic_mmio_in_range(apic, address))
 		return -EOPNOTSUPP;
+
+	if (!kvm_apic_hw_enabled(apic) || apic_x2apic_mode(apic)) {
+		if (!kvm_check_has_quirk(vcpu->kvm,
+					 KVM_X86_QUIRK_LAPIC_MMIO_HOLE))
+			return -EOPNOTSUPP;
+
+		memset(data, 0xff, len);
+		return 0;
+	}
 
 	kvm_lapic_reg_read(apic, offset, len, data);
 
@@ -1358,8 +1382,10 @@ EXPORT_SYMBOL_GPL(kvm_lapic_hv_timer_in_use);
 
 static void cancel_hv_tscdeadline(struct kvm_lapic *apic)
 {
+	preempt_disable();
 	kvm_x86_ops->cancel_hv_timer(apic->vcpu);
 	apic->lapic_timer.hv_timer_in_use = false;
+	preempt_enable();
 }
 
 void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu)
@@ -1564,15 +1590,20 @@ int kvm_lapic_reg_write(struct kvm_lapic *apic, u32 reg, u32 val)
 	case APIC_LVTTHMR:
 	case APIC_LVTPC:
 	case APIC_LVT1:
-	case APIC_LVTERR:
+	case APIC_LVTERR: {
 		/* TODO: Check vector */
+		size_t size;
+		u32 index;
+
 		if (!kvm_apic_sw_enabled(apic))
 			val |= APIC_LVT_MASKED;
-
-		val &= apic_lvt_mask[(reg - APIC_LVTT) >> 4];
+		size = ARRAY_SIZE(apic_lvt_mask);
+		index = array_index_nospec(
+				(reg - APIC_LVTT) >> 4, size);
+		val &= apic_lvt_mask[index];
 		kvm_lapic_set_reg(apic, reg, val);
-
 		break;
+	}
 
 	case APIC_LVTT:
 		if (!kvm_apic_sw_enabled(apic))
@@ -1630,6 +1661,14 @@ static int apic_mmio_write(struct kvm_vcpu *vcpu, struct kvm_io_device *this,
 
 	if (!apic_mmio_in_range(apic, address))
 		return -EOPNOTSUPP;
+
+	if (!kvm_apic_hw_enabled(apic) || apic_x2apic_mode(apic)) {
+		if (!kvm_check_has_quirk(vcpu->kvm,
+					 KVM_X86_QUIRK_LAPIC_MMIO_HOLE))
+			return -EOPNOTSUPP;
+
+		return 0;
+	}
 
 	/*
 	 * APIC register must be aligned on 128-bits boundary.
@@ -1717,7 +1756,7 @@ void kvm_set_lapic_tscdeadline_msr(struct kvm_vcpu *vcpu, u64 data)
 {
 	struct kvm_lapic *apic = vcpu->arch.apic;
 
-	if (!lapic_in_kernel(vcpu) || apic_lvtt_oneshot(apic) ||
+	if (!kvm_apic_present(vcpu) || apic_lvtt_oneshot(apic) ||
 			apic_lvtt_period(apic))
 		return;
 
@@ -1961,7 +2000,7 @@ int kvm_apic_has_interrupt(struct kvm_vcpu *vcpu)
 	struct kvm_lapic *apic = vcpu->arch.apic;
 	int highest_irr;
 
-	if (!apic_enabled(apic))
+	if (!kvm_apic_hw_enabled(apic))
 		return -1;
 
 	apic_update_ppr(apic);
@@ -2029,6 +2068,7 @@ static int kvm_apic_state_fixup(struct kvm_vcpu *vcpu,
 {
 	if (apic_x2apic_mode(vcpu->arch.apic)) {
 		u32 *id = (u32 *)(s->regs + APIC_ID);
+		u32 *ldr = (u32 *)(s->regs + APIC_LDR);
 
 		if (vcpu->kvm->arch.x2apic_format) {
 			if (*id != vcpu->vcpu_id)
@@ -2039,6 +2079,10 @@ static int kvm_apic_state_fixup(struct kvm_vcpu *vcpu,
 			else
 				*id <<= 24;
 		}
+
+		/* In x2APIC mode, the LDR is fixed and based on the id */
+		if (set)
+			*ldr = kvm_apic_calc_x2apic_ldr(*id);
 	}
 
 	return 0;
@@ -2359,4 +2403,10 @@ void kvm_lapic_init(void)
 	/* do not patch jump label more than once per second */
 	jump_label_rate_limit(&apic_hw_disabled, HZ);
 	jump_label_rate_limit(&apic_sw_disabled, HZ);
+}
+
+void kvm_lapic_exit(void)
+{
+	static_key_deferred_flush(&apic_hw_disabled);
+	static_key_deferred_flush(&apic_sw_disabled);
 }

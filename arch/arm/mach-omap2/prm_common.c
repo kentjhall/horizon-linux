@@ -533,8 +533,10 @@ void omap_prm_reset_system(void)
 
 	prm_ll_data->reset_system();
 
-	while (1)
+	while (1) {
 		cpu_relax();
+		wfe();
+	}
 }
 
 /**
@@ -713,7 +715,7 @@ static struct omap_prcm_init_data scrm_data __initdata = {
 };
 #endif
 
-static const struct of_device_id const omap_prcm_dt_match_table[] __initconst = {
+static const struct of_device_id omap_prcm_dt_match_table[] __initconst = {
 #ifdef CONFIG_SOC_AM33XX
 	{ .compatible = "ti,am3-prcm", .data = &am3_prm_data },
 #endif

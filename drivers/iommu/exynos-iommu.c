@@ -542,7 +542,13 @@ static void sysmmu_tlb_invalidate_flpdcache(struct sysmmu_drvdata *data,
 	spin_lock_irqsave(&data->lock, flags);
 	if (is_sysmmu_active(data) && data->version >= MAKE_MMU_VER(3, 3)) {
 		clk_enable(data->clk_master);
-		__sysmmu_tlb_invalidate_entry(data, iova, 1);
+		if (sysmmu_block(data)) {
+			if (data->version >= MAKE_MMU_VER(5, 0))
+				__sysmmu_tlb_invalidate(data);
+			else
+				__sysmmu_tlb_invalidate_entry(data, iova, 1);
+			sysmmu_unblock(data);
+		}
 		clk_disable(data->clk_master);
 	}
 	spin_unlock_irqrestore(&data->lock, flags);
@@ -1259,13 +1265,17 @@ static int exynos_iommu_of_xlate(struct device *dev,
 		return -ENODEV;
 
 	data = platform_get_drvdata(sysmmu);
-	if (!data)
+	if (!data) {
+		put_device(&sysmmu->dev);
 		return -ENODEV;
+	}
 
 	if (!owner) {
 		owner = kzalloc(sizeof(*owner), GFP_KERNEL);
-		if (!owner)
+		if (!owner) {
+			put_device(&sysmmu->dev);
 			return -ENOMEM;
+		}
 
 		INIT_LIST_HEAD(&owner->controllers);
 		dev->archdata.iommu = owner;

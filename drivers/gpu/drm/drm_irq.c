@@ -952,8 +952,10 @@ static u32 drm_vblank_count_and_time(struct drm_device *dev, unsigned int pipe,
 	u32 vblank_count;
 	unsigned int seq;
 
-	if (WARN_ON(pipe >= dev->num_crtcs))
+	if (WARN_ON(pipe >= dev->num_crtcs)) {
+		*vblanktime = (struct timeval) { 0 };
 		return 0;
+	}
 
 	do {
 		seq = read_seqbegin(&vblank->seqlock);
@@ -1200,9 +1202,9 @@ static void drm_vblank_put(struct drm_device *dev, unsigned int pipe)
 	if (atomic_dec_and_test(&vblank->refcount)) {
 		if (drm_vblank_offdelay == 0)
 			return;
-		else if (dev->vblank_disable_immediate || drm_vblank_offdelay < 0)
+		else if (drm_vblank_offdelay < 0)
 			vblank_disable_fn((unsigned long)vblank);
-		else
+		else if (!dev->vblank_disable_immediate)
 			mod_timer(&vblank->disable_timer,
 				  jiffies + ((drm_vblank_offdelay * HZ)/1000));
 	}
@@ -1816,6 +1818,16 @@ bool drm_handle_vblank(struct drm_device *dev, unsigned int pipe)
 
 	wake_up(&vblank->queue);
 	drm_handle_vblank_events(dev, pipe);
+
+	/* With instant-off, we defer disabling the interrupt until after
+	 * we finish processing the following vblank. The disable has to
+	 * be last (after drm_handle_vblank_events) so that the timestamp
+	 * is always accurate.
+	 */
+	if (dev->vblank_disable_immediate &&
+	    drm_vblank_offdelay > 0 &&
+	    !atomic_read(&vblank->refcount))
+		vblank_disable_fn((unsigned long)vblank);
 
 	spin_unlock_irqrestore(&dev->event_lock, irqflags);
 

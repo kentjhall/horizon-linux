@@ -22,6 +22,7 @@
 #include <linux/filter.h>
 #include <linux/compat.h>
 #include <linux/security.h>
+#include <linux/audit.h>
 #include <linux/export.h>
 
 #include <net/scm.h>
@@ -283,6 +284,7 @@ void scm_detach_fds_compat(struct msghdr *kmsg, struct scm_cookie *scm)
 			break;
 		}
 		/* Bump the usage count and install the file. */
+		__receive_sock(fp[i]);
 		fd_install(new_fd, get_file(fp[i]));
 	}
 
@@ -371,7 +373,8 @@ static int compat_sock_setsockopt(struct socket *sock, int level, int optname,
 	    optname == SO_ATTACH_REUSEPORT_CBPF)
 		return do_set_attach_filter(sock, level, optname,
 					    optval, optlen);
-	if (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO)
+	if (!COMPAT_USE_64BIT_TIME &&
+	    (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO))
 		return do_set_sock_timeout(sock, level, optname, optval, optlen);
 
 	return sock_setsockopt(sock, level, optname, optval, optlen);
@@ -436,7 +439,8 @@ static int do_get_sock_timeout(struct socket *sock, int level, int optname,
 static int compat_sock_getsockopt(struct socket *sock, int level, int optname,
 				char __user *optval, int __user *optlen)
 {
-	if (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO)
+	if (!COMPAT_USE_64BIT_TIME &&
+	    (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO))
 		return do_get_sock_timeout(sock, level, optname, optval, optlen);
 	return sock_getsockopt(sock, level, optname, optval, optlen);
 }
@@ -454,12 +458,14 @@ int compat_sock_get_timestamp(struct sock *sk, struct timeval __user *userstamp)
 	err = -ENOENT;
 	if (!sock_flag(sk, SOCK_TIMESTAMP))
 		sock_enable_timestamp(sk, SOCK_TIMESTAMP);
-	tv = ktime_to_timeval(sk->sk_stamp);
+	tv = ktime_to_timeval(sock_read_timestamp(sk));
+
 	if (tv.tv_sec == -1)
 		return err;
 	if (tv.tv_sec == 0) {
-		sk->sk_stamp = ktime_get_real();
-		tv = ktime_to_timeval(sk->sk_stamp);
+		ktime_t kt = ktime_get_real();
+		sock_write_timestamp(sk, kt);
+		tv = ktime_to_timeval(kt);
 	}
 	err = 0;
 	if (put_user(tv.tv_sec, &ctv->tv_sec) ||
@@ -482,12 +488,13 @@ int compat_sock_get_timestampns(struct sock *sk, struct timespec __user *usersta
 	err = -ENOENT;
 	if (!sock_flag(sk, SOCK_TIMESTAMP))
 		sock_enable_timestamp(sk, SOCK_TIMESTAMP);
-	ts = ktime_to_timespec(sk->sk_stamp);
+	ts = ktime_to_timespec(sock_read_timestamp(sk));
 	if (ts.tv_sec == -1)
 		return err;
 	if (ts.tv_sec == 0) {
-		sk->sk_stamp = ktime_get_real();
-		ts = ktime_to_timespec(sk->sk_stamp);
+		ktime_t kt = ktime_get_real();
+		sock_write_timestamp(sk, kt);
+		ts = ktime_to_timespec(kt);
 	}
 	err = 0;
 	if (put_user(ts.tv_sec, &ctv->tv_sec) ||
@@ -781,14 +788,24 @@ COMPAT_SYSCALL_DEFINE5(recvmmsg, int, fd, struct compat_mmsghdr __user *, mmsg,
 
 COMPAT_SYSCALL_DEFINE2(socketcall, int, call, u32 __user *, args)
 {
-	int ret;
-	u32 a[6];
+	u32 a[AUDITSC_ARGS];
+	unsigned int len;
 	u32 a0, a1;
+	int ret;
 
 	if (call < SYS_SOCKET || call > SYS_SENDMMSG)
 		return -EINVAL;
-	if (copy_from_user(a, args, nas[call]))
+	len = nas[call];
+	if (len > sizeof(a))
+		return -EINVAL;
+
+	if (copy_from_user(a, args, len))
 		return -EFAULT;
+
+	ret = audit_socketcall_compat(len / sizeof(a[0]), a);
+	if (ret)
+		return ret;
+
 	a0 = a[0];
 	a1 = a[1];
 

@@ -160,6 +160,7 @@ struct compat_video_event {
 		unsigned int frame_rate;
 	} u;
 };
+#define VIDEO_GET_EVENT32 _IOR('o', 28, struct compat_video_event)
 
 static int do_video_get_event(struct file *file,
 		unsigned int cmd, struct compat_video_event __user *up)
@@ -171,7 +172,7 @@ static int do_video_get_event(struct file *file,
 	if (kevent == NULL)
 		return -EFAULT;
 
-	err = do_ioctl(file, cmd, (unsigned long)kevent);
+	err = do_ioctl(file, VIDEO_GET_EVENT, (unsigned long)kevent);
 	if (!err) {
 		err  = convert_in_user(&kevent->type, &up->type);
 		err |= convert_in_user(&kevent->timestamp, &up->timestamp);
@@ -190,6 +191,7 @@ struct compat_video_still_picture {
         compat_uptr_t iFrame;
         int32_t size;
 };
+#define VIDEO_STILLPICTURE32 _IOW('o', 30, struct compat_video_still_picture)
 
 static int do_video_stillpicture(struct file *file,
 		unsigned int cmd, struct compat_video_still_picture __user *up)
@@ -212,7 +214,7 @@ static int do_video_stillpicture(struct file *file,
 	if (err)
 		return -EFAULT;
 
-	err = do_ioctl(file, cmd, (unsigned long) up_native);
+	err = do_ioctl(file, VIDEO_STILLPICTURE, (unsigned long) up_native);
 
 	return err;
 }
@@ -833,7 +835,7 @@ static int compat_ioctl_preallocate(struct file *file,
  */
 #define XFORM(i) (((i) ^ ((i) << 27) ^ ((i) << 17)) & 0xffffffff)
 
-#define COMPATIBLE_IOCTL(cmd) XFORM(cmd),
+#define COMPATIBLE_IOCTL(cmd) XFORM((u32)cmd),
 /* ioctl should not be warned about even if it's not implemented.
    Valid reasons to use this:
    - It is implemented with ->compat_ioctl on some device, but programs
@@ -1038,9 +1040,6 @@ COMPATIBLE_IOCTL(PPPIOCDISCONN)
 COMPATIBLE_IOCTL(PPPIOCATTCHAN)
 COMPATIBLE_IOCTL(PPPIOCGCHAN)
 COMPATIBLE_IOCTL(PPPIOCGL2TPSTATS)
-/* PPPOX */
-COMPATIBLE_IOCTL(PPPOEIOCSFWD)
-COMPATIBLE_IOCTL(PPPOEIOCDFWD)
 /* Big A */
 /* sparc only */
 /* Big Q for sound/OSS */
@@ -1341,23 +1340,6 @@ COMPATIBLE_IOCTL(DMX_GET_PES_PIDS)
 COMPATIBLE_IOCTL(DMX_GET_CAPS)
 COMPATIBLE_IOCTL(DMX_SET_SOURCE)
 COMPATIBLE_IOCTL(DMX_GET_STC)
-COMPATIBLE_IOCTL(FE_GET_INFO)
-COMPATIBLE_IOCTL(FE_DISEQC_RESET_OVERLOAD)
-COMPATIBLE_IOCTL(FE_DISEQC_SEND_MASTER_CMD)
-COMPATIBLE_IOCTL(FE_DISEQC_RECV_SLAVE_REPLY)
-COMPATIBLE_IOCTL(FE_DISEQC_SEND_BURST)
-COMPATIBLE_IOCTL(FE_SET_TONE)
-COMPATIBLE_IOCTL(FE_SET_VOLTAGE)
-COMPATIBLE_IOCTL(FE_ENABLE_HIGH_LNB_VOLTAGE)
-COMPATIBLE_IOCTL(FE_READ_STATUS)
-COMPATIBLE_IOCTL(FE_READ_BER)
-COMPATIBLE_IOCTL(FE_READ_SIGNAL_STRENGTH)
-COMPATIBLE_IOCTL(FE_READ_SNR)
-COMPATIBLE_IOCTL(FE_READ_UNCORRECTED_BLOCKS)
-COMPATIBLE_IOCTL(FE_SET_FRONTEND)
-COMPATIBLE_IOCTL(FE_GET_FRONTEND)
-COMPATIBLE_IOCTL(FE_GET_EVENT)
-COMPATIBLE_IOCTL(FE_DISHNETWORK_SEND_LEGACY_CMD)
 COMPATIBLE_IOCTL(VIDEO_STOP)
 COMPATIBLE_IOCTL(VIDEO_PLAY)
 COMPATIBLE_IOCTL(VIDEO_FREEZE)
@@ -1487,9 +1469,9 @@ static long do_ioctl_trans(unsigned int cmd,
 		return rtc_ioctl(file, cmd, argp);
 
 	/* dvb */
-	case VIDEO_GET_EVENT:
+	case VIDEO_GET_EVENT32:
 		return do_video_get_event(file, cmd, argp);
-	case VIDEO_STILLPICTURE:
+	case VIDEO_STILLPICTURE32:
 		return do_video_stillpicture(file, cmd, argp);
 	case VIDEO_SET_SPU_PALETTE:
 		return do_video_set_spu_palette(file, cmd, argp);
@@ -1586,9 +1568,10 @@ COMPAT_SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd,
 #endif
 
 	case FICLONE:
+		goto do_ioctl;
 	case FICLONERANGE:
 	case FIDEDUPERANGE:
-		goto do_ioctl;
+		goto found_handler;
 
 	case FIBMAP:
 	case FIGETBSZ:

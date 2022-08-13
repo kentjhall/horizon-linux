@@ -573,8 +573,7 @@ sba_io_pdir_entry(u64 *pdir_ptr, space_t sid, unsigned long vba,
 	pa = virt_to_phys(vba);
 	pa &= IOVP_MASK;
 
-	mtsp(sid,1);
-	asm("lci 0(%%sr1, %1), %0" : "=r" (ci) : "r" (vba));
+	asm("lci 0(%1), %0" : "=r" (ci) : "r" (vba));
 	pa |= (ci >> PAGE_SHIFT) & 0xff;  /* move CI (8 bits) into lowest byte */
 
 	pa |= SBA_PDIR_VALID_BIT;	/* set "valid" bit */
@@ -691,6 +690,8 @@ static int sba_dma_supported( struct device *dev, u64 mask)
 		return 0;
 
 	ioc = GET_IOC(dev);
+	if (!ioc)
+		return 0;
 
 	/*
 	 * check if mask is >= than the current max IO Virt Address
@@ -722,6 +723,8 @@ sba_map_single(struct device *dev, void *addr, size_t size,
 	int pide;
 
 	ioc = GET_IOC(dev);
+	if (!ioc)
+		return DMA_ERROR_CODE;
 
 	/* save offset bits */
 	offset = ((dma_addr_t) (long) addr) & ~IOVP_MASK;
@@ -813,6 +816,10 @@ sba_unmap_page(struct device *dev, dma_addr_t iova, size_t size,
 	DBG_RUN("%s() iovp 0x%lx/%x\n", __func__, (long) iova, size);
 
 	ioc = GET_IOC(dev);
+	if (!ioc) {
+		WARN_ON(!ioc);
+		return;
+	}
 	offset = iova & ~IOVP_MASK;
 	iova ^= offset;        /* clear offset bits */
 	size += offset;
@@ -952,6 +959,8 @@ sba_map_sg(struct device *dev, struct scatterlist *sglist, int nents,
 	DBG_RUN_SG("%s() START %d entries\n", __func__, nents);
 
 	ioc = GET_IOC(dev);
+	if (!ioc)
+		return 0;
 
 	/* Fast path single entry scatterlists. */
 	if (nents == 1) {
@@ -1037,6 +1046,10 @@ sba_unmap_sg(struct device *dev, struct scatterlist *sglist, int nents,
 		__func__, nents, sg_virt(sglist), sglist->length);
 
 	ioc = GET_IOC(dev);
+	if (!ioc) {
+		WARN_ON(!ioc);
+		return;
+	}
 
 #ifdef SBA_COLLECT_STATS
 	ioc->usg_calls++;
@@ -1270,7 +1283,7 @@ sba_ioc_init_pluto(struct parisc_device *sba, struct ioc *ioc, int ioc_num)
 	** (one that doesn't overlap memory or LMMIO space) in the
 	** IBASE and IMASK registers.
 	*/
-	ioc->ibase = READ_REG(ioc->ioc_hpa + IOC_IBASE);
+	ioc->ibase = READ_REG(ioc->ioc_hpa + IOC_IBASE) & ~0x1fffffULL;
 	iova_space_size = ~(READ_REG(ioc->ioc_hpa + IOC_IMASK) & 0xFFFFFFFFUL) + 1;
 
 	if ((ioc->ibase < 0xfed00000UL) && ((ioc->ibase + iova_space_size) > 0xfee00000UL)) {

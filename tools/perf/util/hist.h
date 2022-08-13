@@ -102,7 +102,6 @@ struct hist_entry_iter {
 	int curr;
 
 	bool hide_unresolved;
-	int max_stack;
 
 	struct perf_evsel *evsel;
 	struct perf_sample *sample;
@@ -282,6 +281,8 @@ void perf_hpp_list__column_register(struct perf_hpp_list *list,
 				    struct perf_hpp_fmt *format);
 void perf_hpp_list__register_sort_field(struct perf_hpp_list *list,
 					struct perf_hpp_fmt *format);
+void perf_hpp_list__prepend_sort_field(struct perf_hpp_list *list,
+				       struct perf_hpp_fmt *format);
 
 static inline void perf_hpp__column_register(struct perf_hpp_fmt *format)
 {
@@ -291,6 +292,11 @@ static inline void perf_hpp__column_register(struct perf_hpp_fmt *format)
 static inline void perf_hpp__register_sort_field(struct perf_hpp_fmt *format)
 {
 	perf_hpp_list__register_sort_field(&perf_hpp_list, format);
+}
+
+static inline void perf_hpp__prepend_sort_field(struct perf_hpp_fmt *format)
+{
+	perf_hpp_list__prepend_sort_field(&perf_hpp_list, format);
 }
 
 #define perf_hpp_list__for_each_format(_list, format) \
@@ -306,10 +312,10 @@ static inline void perf_hpp__register_sort_field(struct perf_hpp_fmt *format)
 	list_for_each_entry_safe(format, tmp, &(_list)->sorts, sort_list)
 
 #define hists__for_each_format(hists, format) \
-	perf_hpp_list__for_each_format((hists)->hpp_list, fmt)
+	perf_hpp_list__for_each_format((hists)->hpp_list, format)
 
 #define hists__for_each_sort_list(hists, format) \
-	perf_hpp_list__for_each_sort_list((hists)->hpp_list, fmt)
+	perf_hpp_list__for_each_sort_list((hists)->hpp_list, format)
 
 extern struct perf_hpp_fmt perf_hpp__format[];
 

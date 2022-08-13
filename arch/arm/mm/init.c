@@ -192,6 +192,11 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max_low,
 #ifdef CONFIG_HAVE_ARCH_PFN_VALID
 int pfn_valid(unsigned long pfn)
 {
+	phys_addr_t addr = __pfn_to_phys(pfn);
+
+	if (__phys_to_pfn(addr) != pfn)
+		return 0;
+
 	return memblock_is_map_memory(__pfn_to_phys(pfn));
 }
 EXPORT_SYMBOL(pfn_valid);
@@ -619,8 +624,8 @@ static struct section_perm ro_perms[] = {
 		.start  = (unsigned long)_stext,
 		.end    = (unsigned long)__init_begin,
 #ifdef CONFIG_ARM_LPAE
-		.mask   = ~L_PMD_SECT_RDONLY,
-		.prot   = L_PMD_SECT_RDONLY,
+		.mask   = ~(L_PMD_SECT_RDONLY | PMD_SECT_AP2),
+		.prot   = L_PMD_SECT_RDONLY | PMD_SECT_AP2,
 #else
 		.mask   = ~(PMD_SECT_APX | PMD_SECT_AP_WRITE),
 		.prot   = PMD_SECT_APX | PMD_SECT_AP_WRITE,
@@ -698,7 +703,8 @@ static void update_sections_early(struct section_perm perms[], int n)
 		if (t->flags & PF_KTHREAD)
 			continue;
 		for_each_thread(t, s)
-			set_section_perms(perms, n, true, s->mm);
+			if (s->mm)
+				set_section_perms(perms, n, true, s->mm);
 	}
 	read_unlock(&tasklist_lock);
 	set_section_perms(perms, n, true, current->active_mm);
@@ -722,19 +728,28 @@ int __mark_rodata_ro(void *unused)
 	return 0;
 }
 
+static int kernel_set_to_readonly __read_mostly;
+
 void mark_rodata_ro(void)
 {
+	kernel_set_to_readonly = 1;
 	stop_machine(__mark_rodata_ro, NULL, NULL);
 }
 
 void set_kernel_text_rw(void)
 {
+	if (!kernel_set_to_readonly)
+		return;
+
 	set_section_perms(ro_perms, ARRAY_SIZE(ro_perms), false,
 				current->active_mm);
 }
 
 void set_kernel_text_ro(void)
 {
+	if (!kernel_set_to_readonly)
+		return;
+
 	set_section_perms(ro_perms, ARRAY_SIZE(ro_perms), true,
 				current->active_mm);
 }

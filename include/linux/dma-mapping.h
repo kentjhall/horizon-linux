@@ -10,6 +10,13 @@
 #include <linux/scatterlist.h>
 #include <linux/kmemcheck.h>
 #include <linux/bug.h>
+#include <linux/dma-attrs.h>
+
+#ifdef CONFIG_IOMMU_DMA
+#define ENABLE_IOMMU_DMA_OPS 0
+#else
+#define ENABLE_IOMMU_DMA_OPS 0
+#endif
 
 /**
  * List of possible attributes associated with a DMA mapping. The semantics
@@ -61,6 +68,28 @@
  * allocation failure reports (similarly to __GFP_NOWARN).
  */
 #define DMA_ATTR_NO_WARN	(1UL << 8)
+/*
+ * DMA_ATTR_SKIP_IOVA_GAP: This tells the DMA-mapping subsystem to skip gap pages
+ */
+#define DMA_ATTR_SKIP_IOVA_GAP	(1UL << 9)
+/*
+ * DMA_ATTR_ALLOC_EXACT_SIZE: This tells the DMA-mapping subsystem to allocate
+ * the exact number of pages
+ */
+#define DMA_ATTR_ALLOC_EXACT_SIZE	(1UL << 10)
+/*
+ * DMA_ATTR_SKIP_FREE_IOVA: This tells the DMA-mapping subsystem to skip freeing
+ * IOVA allocated at unmap
+ */
+#define DMA_ATTR_SKIP_FREE_IOVA	(1UL << 11)
+/*
+ * DMA_ATTR_READ_ONLY: This tells the DMA-mapping subsystem to map as read-only
+ */
+#define DMA_ATTR_READ_ONLY	(1UL << 12)
+/*
+ * DMA_ATTR_WRITE_ONLY: This tells the DMA-mapping subsystem to map as write-only
+ */
+#define DMA_ATTR_WRITE_ONLY	(1UL << 13)
 
 /*
  * A dma_addr_t can hold any valid DMA or bus address for the platform.
@@ -86,6 +115,12 @@ struct dma_map_ops {
 			       unsigned long offset, size_t size,
 			       enum dma_data_direction dir,
 			       unsigned long attrs);
+
+	dma_addr_t (*map_at)(struct device *dev, dma_addr_t dma_handle,
+			     phys_addr_t phys, size_t size,
+			     enum dma_data_direction dir,
+			     unsigned long attrs);
+
 	void (*unmap_page)(struct device *dev, dma_addr_t dma_handle,
 			   size_t size, enum dma_data_direction dir,
 			   unsigned long attrs);
@@ -135,6 +170,7 @@ extern struct dma_map_ops dma_noop_ops;
 
 static inline int valid_dma_direction(int dma_direction)
 {
+	dma_direction &= DMA_NONE;
 	return ((dma_direction == DMA_BIDIRECTIONAL) ||
 		(dma_direction == DMA_TO_DEVICE) ||
 		(dma_direction == DMA_FROM_DEVICE));
@@ -156,10 +192,18 @@ int dma_release_from_coherent(struct device *dev, int order, void *vaddr);
 
 int dma_mmap_from_coherent(struct device *dev, struct vm_area_struct *vma,
 			    void *cpu_addr, size_t size, int *ret);
+
+int dma_alloc_from_coherent_attr(struct device *dev, ssize_t size,
+				       dma_addr_t *dma_handle, void **ret,
+				       unsigned long attrs);
+int dma_release_from_coherent_attr(struct device *dev, size_t size, void *vaddr,
+				unsigned long attrs, dma_addr_t dma_handle);
 #else
 #define dma_alloc_from_coherent(dev, size, handle, ret) (0)
 #define dma_release_from_coherent(dev, order, vaddr) (0)
 #define dma_mmap_from_coherent(dev, vma, vaddr, order, ret) (0)
+#define dma_alloc_from_coherent_attr(dev, size, dandle, ret, attrs) (0)
+#define dma_release_from_coherent_attr(dev, size, vaddr, attrs, handle) (0)
 #endif /* CONFIG_HAVE_GENERIC_DMA_COHERENT */
 
 #ifdef CONFIG_HAS_DMA
@@ -453,10 +497,15 @@ static inline void *dma_alloc_attrs(struct device *dev, size_t size,
 {
 	struct dma_map_ops *ops = get_dma_ops(dev);
 	void *cpu_addr;
-
+#ifdef DMA_ERROR_CODE
+	*dma_handle = DMA_ERROR_CODE;
+#else
+	*dma_handle = 0;
+#endif
 	BUG_ON(!ops);
 
-	if (dma_alloc_from_coherent(dev, size, dma_handle, &cpu_addr))
+	if (dma_alloc_from_coherent_attr(dev, size, dma_handle,
+					 &cpu_addr, attrs))
 		return cpu_addr;
 
 	if (!arch_dma_alloc_attrs(&dev, &flag))
@@ -478,7 +527,8 @@ static inline void dma_free_attrs(struct device *dev, size_t size,
 	BUG_ON(!ops);
 	WARN_ON(irqs_disabled());
 
-	if (dma_release_from_coherent(dev, get_order(size), cpu_addr))
+	if (dma_release_from_coherent_attr(dev, size, cpu_addr,
+					   attrs, dma_handle))
 		return;
 
 	if (!ops->free || !cpu_addr)
@@ -618,8 +668,7 @@ static inline unsigned int dma_get_max_seg_size(struct device *dev)
 	return SZ_64K;
 }
 
-static inline unsigned int dma_set_max_seg_size(struct device *dev,
-						unsigned int size)
+static inline int dma_set_max_seg_size(struct device *dev, unsigned int size)
 {
 	if (dev->dma_parms) {
 		dev->dma_parms->max_segment_size = size;
@@ -659,7 +708,6 @@ static inline void *dma_zalloc_coherent(struct device *dev, size_t size,
 	return ret;
 }
 
-#ifdef CONFIG_HAS_DMA
 static inline int dma_get_cache_alignment(void)
 {
 #ifdef ARCH_DMA_MINALIGN
@@ -667,20 +715,50 @@ static inline int dma_get_cache_alignment(void)
 #endif
 	return 1;
 }
-#endif
 
 /* flags for the coherent memory api */
 #define	DMA_MEMORY_MAP			0x01
 #define DMA_MEMORY_IO			0x02
 #define DMA_MEMORY_INCLUDES_CHILDREN	0x04
 #define DMA_MEMORY_EXCLUSIVE		0x08
+#define DMA_MEMORY_NOMAP		0x10
 
 #ifdef CONFIG_HAVE_GENERIC_DMA_COHERENT
 int dma_declare_coherent_memory(struct device *dev, phys_addr_t phys_addr,
 				dma_addr_t device_addr, size_t size, int flags);
 void dma_release_declared_memory(struct device *dev);
 void *dma_mark_declared_memory_occupied(struct device *dev,
-					dma_addr_t device_addr, size_t size);
+					dma_addr_t device_addr, size_t size,
+					unsigned long attrs);
+
+void dma_mark_declared_memory_unoccupied(struct device *dev,
+		                        dma_addr_t device_addr, size_t size,
+					unsigned long attrs);
+
+struct dma_resize_notifier_ops {
+	int (*resize)(phys_addr_t, size_t);
+};
+
+struct dma_resize_notifier {
+	struct dma_resize_notifier_ops *ops;
+};
+
+struct dma_declare_info {
+	const char *name;
+	bool resize;
+	phys_addr_t base;
+	size_t size;
+	struct device *cma_dev;
+	struct dma_resize_notifier notifier;
+};
+
+struct dma_coherent_stats {
+	phys_addr_t base;
+	size_t size;
+	size_t used;
+	size_t max;
+};
+
 #else
 static inline int
 dma_declare_coherent_memory(struct device *dev, phys_addr_t phys_addr,
@@ -696,10 +774,14 @@ dma_release_declared_memory(struct device *dev)
 
 static inline void *
 dma_mark_declared_memory_occupied(struct device *dev,
-				  dma_addr_t device_addr, size_t size)
+				  dma_addr_t device_addr, size_t size,
+				  unsigned long attrs)
 {
 	return ERR_PTR(-EBUSY);
 }
+
+#define dma_mark_declared_memory_unoccupied(dev, addr, size, attrs) (0)
+
 #endif /* CONFIG_HAVE_GENERIC_DMA_COHERENT */
 
 /*
@@ -735,8 +817,10 @@ static inline void dmam_release_declared_memory(struct device *dev)
 static inline void *dma_alloc_wc(struct device *dev, size_t size,
 				 dma_addr_t *dma_addr, gfp_t gfp)
 {
-	return dma_alloc_attrs(dev, size, dma_addr, gfp,
-			       DMA_ATTR_WRITE_COMBINE);
+	pr_info("dma_alloc_writecombine forces non-cached memory irrespective"
+	"HW module IO coherency.\n");
+	WARN_ON(1);
+	return NULL;
 }
 #ifndef dma_alloc_writecombine
 #define dma_alloc_writecombine dma_alloc_wc

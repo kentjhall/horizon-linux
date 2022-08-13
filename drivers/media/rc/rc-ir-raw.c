@@ -1,6 +1,7 @@
 /* rc-ir-raw.c - handle IR pulse/space events
  *
  * Copyright (C) 2010 by Mauro Carvalho Chehab
+ * Copyright (c) 2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -109,15 +110,17 @@ int ir_raw_event_store_edge(struct rc_dev *dev, enum raw_event_type type)
 	ktime_t			now;
 	s64			delta; /* ns */
 	DEFINE_IR_RAW_EVENT(ev);
+	DEFINE_IR_RAW_EVENT(drop_ev);
 	int			rc = 0;
 	int			delay;
+	bool flag = false;
 
 	if (!dev->raw)
 		return -EINVAL;
 
 	now = ktime_get();
 	delta = ktime_to_ns(ktime_sub(now, dev->raw->last_event));
-	delay = MS_TO_NS(dev->input_dev->rep[REP_DELAY]);
+	delay = MS_TO_NS(max((u32) dev->input_dev->rep[REP_DELAY], dev->min_delay));
 
 	/* Check for a long duration since last event or if we're
 	 * being called for the first time, note that delta can't
@@ -125,8 +128,26 @@ int ir_raw_event_store_edge(struct rc_dev *dev, enum raw_event_type type)
 	 */
 	if (delta > delay || !dev->raw->last_type)
 		type |= IR_START_EVENT;
-	else
+	else {
 		ev.duration = delta;
+
+		if (dev->allowed_protocols & RC_BIT_NEC) {
+			if (type == dev->raw->last_type) {
+				drop_ev.duration = 0;
+				if (type == IR_PULSE) {
+					flag = true;
+					drop_ev.pulse = false;
+					drop_ev.duration = 562500;
+				} else if (type == IR_SPACE) {
+					flag = true;
+					drop_ev.pulse = true;
+					drop_ev.duration = 562500;
+				}
+
+			ev.duration = ev.duration - drop_ev.duration;
+			}
+		}
+	}
 
 	if (type & IR_START_EVENT)
 		ir_raw_event_reset(dev);
@@ -138,6 +159,9 @@ int ir_raw_event_store_edge(struct rc_dev *dev, enum raw_event_type type)
 		rc = ir_raw_event_store(dev, &ev);
 	} else
 		return 0;
+
+	if (flag)
+		rc = ir_raw_event_store(dev, &drop_ev);
 
 	dev->raw->last_event = now;
 	dev->raw->last_type = type;

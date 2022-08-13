@@ -1,7 +1,7 @@
 /*
  * DMA driver for Nvidia's Tegra20 APB DMA controller.
  *
- * Copyright (c) 2012-2013, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -288,7 +288,7 @@ static struct tegra_dma_desc *tegra_dma_desc_get(
 
 	/* Do not allocate if desc are waiting for ack */
 	list_for_each_entry(dma_desc, &tdc->free_dma_desc, node) {
-		if (async_tx_test_ack(&dma_desc->txd)) {
+		if (async_tx_test_ack(&dma_desc->txd) && !dma_desc->cb_count) {
 			list_del(&dma_desc->node);
 			spin_unlock_irqrestore(&tdc->lock, flags);
 			dma_desc->txd.flags = 0;
@@ -635,7 +635,10 @@ static void handle_cont_sngl_cycle_dma_done(struct tegra_dma_channel *tdc,
 
 	sgreq = list_first_entry(&tdc->pending_sg_req, typeof(*sgreq), node);
 	dma_desc = sgreq->dma_desc;
-	dma_desc->bytes_transferred += sgreq->req_len;
+	/* if we dma for long enough the transfer count will wrap */
+	dma_desc->bytes_transferred =
+		(dma_desc->bytes_transferred + sgreq->req_len) %
+		dma_desc->bytes_requested;
 
 	/* Callback need to be call */
 	if (!dma_desc->cb_count)
@@ -752,10 +755,6 @@ static int tegra_dma_terminate_all(struct dma_chan *dc)
 	bool was_busy;
 
 	spin_lock_irqsave(&tdc->lock, flags);
-	if (list_empty(&tdc->pending_sg_req)) {
-		spin_unlock_irqrestore(&tdc->lock, flags);
-		return 0;
-	}
 
 	if (!tdc->busy)
 		goto skip_dma_stop;
@@ -1209,8 +1208,7 @@ static void tegra_dma_free_chan_resources(struct dma_chan *dc)
 
 	dev_dbg(tdc2dev(tdc), "Freeing channel %d\n", tdc->id);
 
-	if (tdc->busy)
-		tegra_dma_terminate_all(dc);
+	tegra_dma_terminate_all(dc);
 
 	spin_lock_irqsave(&tdc->lock, flags);
 	list_splice_init(&tdc->pending_sg_req, &sg_req_list);
@@ -1324,7 +1322,7 @@ static int tegra_dma_probe(struct platform_device *pdev)
 	if (IS_ERR(tdma->base_addr))
 		return PTR_ERR(tdma->base_addr);
 
-	tdma->dma_clk = devm_clk_get(&pdev->dev, NULL);
+	tdma->dma_clk = devm_clk_get(&pdev->dev, "dma");
 	if (IS_ERR(tdma->dma_clk)) {
 		dev_err(&pdev->dev, "Error: Missing controller clock\n");
 		return PTR_ERR(tdma->dma_clk);
@@ -1494,35 +1492,7 @@ static int tegra_dma_remove(struct platform_device *pdev)
 static int tegra_dma_runtime_suspend(struct device *dev)
 {
 	struct tegra_dma *tdma = dev_get_drvdata(dev);
-
-	clk_disable_unprepare(tdma->dma_clk);
-	return 0;
-}
-
-static int tegra_dma_runtime_resume(struct device *dev)
-{
-	struct tegra_dma *tdma = dev_get_drvdata(dev);
-	int ret;
-
-	ret = clk_prepare_enable(tdma->dma_clk);
-	if (ret < 0) {
-		dev_err(dev, "clk_enable failed: %d\n", ret);
-		return ret;
-	}
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int tegra_dma_pm_suspend(struct device *dev)
-{
-	struct tegra_dma *tdma = dev_get_drvdata(dev);
 	int i;
-	int ret;
-
-	/* Enable clock before accessing register */
-	ret = pm_runtime_get_sync(dev);
-	if (ret < 0)
-		return ret;
 
 	tdma->reg_gen = tdma_read(tdma, TEGRA_APBDMA_GENERAL);
 	for (i = 0; i < tdma->chip_data->nr_channels; i++) {
@@ -1543,21 +1513,21 @@ static int tegra_dma_pm_suspend(struct device *dev)
 						  TEGRA_APBDMA_CHAN_WCOUNT);
 	}
 
-	/* Disable clock */
-	pm_runtime_put(dev);
+	clk_disable_unprepare(tdma->dma_clk);
+
 	return 0;
 }
 
-static int tegra_dma_pm_resume(struct device *dev)
+static int tegra_dma_runtime_resume(struct device *dev)
 {
 	struct tegra_dma *tdma = dev_get_drvdata(dev);
-	int i;
-	int ret;
+	int i, ret;
 
-	/* Enable clock before accessing register */
-	ret = pm_runtime_get_sync(dev);
-	if (ret < 0)
+	ret = clk_prepare_enable(tdma->dma_clk);
+	if (ret < 0) {
+		dev_err(dev, "clk_enable failed: %d\n", ret);
 		return ret;
+	}
 
 	tdma_write(tdma, TEGRA_APBDMA_GENERAL, tdma->reg_gen);
 	tdma_write(tdma, TEGRA_APBDMA_CONTROL, 0);
@@ -1582,16 +1552,14 @@ static int tegra_dma_pm_resume(struct device *dev)
 			(ch_reg->csr & ~TEGRA_APBDMA_CSR_ENB));
 	}
 
-	/* Disable clock */
-	pm_runtime_put(dev);
 	return 0;
 }
-#endif
 
 static const struct dev_pm_ops tegra_dma_dev_pm_ops = {
 	SET_RUNTIME_PM_OPS(tegra_dma_runtime_suspend, tegra_dma_runtime_resume,
 			   NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(tegra_dma_pm_suspend, tegra_dma_pm_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+				pm_runtime_force_resume)
 };
 
 static const struct of_device_id tegra_dma_of_match[] = {

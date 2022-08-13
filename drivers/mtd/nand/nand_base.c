@@ -64,8 +64,14 @@ static int nand_ooblayout_ecc_sp(struct mtd_info *mtd, int section,
 
 	if (!section) {
 		oobregion->offset = 0;
-		oobregion->length = 4;
+		if (mtd->oobsize == 16)
+			oobregion->length = 4;
+		else
+			oobregion->length = 3;
 	} else {
+		if (mtd->oobsize == 8)
+			return -ERANGE;
+
 		oobregion->offset = 6;
 		oobregion->length = ecc->total - 4;
 	}
@@ -137,6 +143,74 @@ const struct mtd_ooblayout_ops nand_ooblayout_lp_ops = {
 	.free = nand_ooblayout_free_lp,
 };
 EXPORT_SYMBOL_GPL(nand_ooblayout_lp_ops);
+
+/*
+ * Support the old "large page" layout used for 1-bit Hamming ECC where ECC
+ * are placed at a fixed offset.
+ */
+static int nand_ooblayout_ecc_lp_hamming(struct mtd_info *mtd, int section,
+					 struct mtd_oob_region *oobregion)
+{
+	struct nand_chip *chip = mtd_to_nand(mtd);
+	struct nand_ecc_ctrl *ecc = &chip->ecc;
+
+	if (section)
+		return -ERANGE;
+
+	switch (mtd->oobsize) {
+	case 64:
+		oobregion->offset = 40;
+		break;
+	case 128:
+		oobregion->offset = 80;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	oobregion->length = ecc->total;
+	if (oobregion->offset + oobregion->length > mtd->oobsize)
+		return -ERANGE;
+
+	return 0;
+}
+
+static int nand_ooblayout_free_lp_hamming(struct mtd_info *mtd, int section,
+					  struct mtd_oob_region *oobregion)
+{
+	struct nand_chip *chip = mtd_to_nand(mtd);
+	struct nand_ecc_ctrl *ecc = &chip->ecc;
+	int ecc_offset = 0;
+
+	if (section < 0 || section > 1)
+		return -ERANGE;
+
+	switch (mtd->oobsize) {
+	case 64:
+		ecc_offset = 40;
+		break;
+	case 128:
+		ecc_offset = 80;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (section == 0) {
+		oobregion->offset = 2;
+		oobregion->length = ecc_offset - 2;
+	} else {
+		oobregion->offset = ecc_offset + ecc->total;
+		oobregion->length = mtd->oobsize - oobregion->offset;
+	}
+
+	return 0;
+}
+
+const struct mtd_ooblayout_ops nand_ooblayout_lp_hamming_ops = {
+	.ecc = nand_ooblayout_ecc_lp_hamming,
+	.free = nand_ooblayout_free_lp_hamming,
+};
 
 static int check_offs_len(struct mtd_info *mtd,
 					loff_t ofs, uint64_t len)
@@ -641,7 +715,8 @@ static void nand_command(struct mtd_info *mtd, unsigned int command,
 		chip->cmd_ctrl(mtd, readcmd, ctrl);
 		ctrl &= ~NAND_CTRL_CHANGE;
 	}
-	chip->cmd_ctrl(mtd, command, ctrl);
+	if (command != NAND_CMD_NONE)
+		chip->cmd_ctrl(mtd, command, ctrl);
 
 	/* Address cycle, when necessary */
 	ctrl = NAND_CTRL_ALE | NAND_CTRL_CHANGE;
@@ -670,6 +745,7 @@ static void nand_command(struct mtd_info *mtd, unsigned int command,
 	 */
 	switch (command) {
 
+	case NAND_CMD_NONE:
 	case NAND_CMD_PAGEPROG:
 	case NAND_CMD_ERASE1:
 	case NAND_CMD_ERASE2:
@@ -732,7 +808,9 @@ static void nand_command_lp(struct mtd_info *mtd, unsigned int command,
 	}
 
 	/* Command latch cycle */
-	chip->cmd_ctrl(mtd, command, NAND_NCE | NAND_CLE | NAND_CTRL_CHANGE);
+	if (command != NAND_CMD_NONE)
+		chip->cmd_ctrl(mtd, command,
+			       NAND_NCE | NAND_CLE | NAND_CTRL_CHANGE);
 
 	if (column != -1 || page_addr != -1) {
 		int ctrl = NAND_CTRL_CHANGE | NAND_NCE | NAND_ALE;
@@ -768,6 +846,7 @@ static void nand_command_lp(struct mtd_info *mtd, unsigned int command,
 	 */
 	switch (command) {
 
+	case NAND_CMD_NONE:
 	case NAND_CMD_CACHEDPROG:
 	case NAND_CMD_PAGEPROG:
 	case NAND_CMD_ERASE1:
@@ -1013,7 +1092,9 @@ static int nand_setup_data_interface(struct nand_chip *chip)
 	 * Ensure the timing mode has been changed on the chip side
 	 * before changing timings on the controller side.
 	 */
-	if (chip->onfi_version) {
+	if (chip->onfi_version &&
+	    (le16_to_cpu(chip->onfi_params.opt_cmd) &
+	     ONFI_OPT_CMD_SET_GET_FEATURES)) {
 		u8 tmode_param[ONFI_SUBFEATURE_PARAM_LEN] = {
 			chip->onfi_timing_mode_default,
 		};
@@ -2244,6 +2325,7 @@ EXPORT_SYMBOL(nand_write_oob_syndrome);
 static int nand_do_read_oob(struct mtd_info *mtd, loff_t from,
 			    struct mtd_oob_ops *ops)
 {
+	unsigned int max_bitflips = 0;
 	int page, realpage, chipnr;
 	struct nand_chip *chip = mtd_to_nand(mtd);
 	struct mtd_ecc_stats stats;
@@ -2301,6 +2383,8 @@ static int nand_do_read_oob(struct mtd_info *mtd, loff_t from,
 				nand_wait_ready(mtd);
 		}
 
+		max_bitflips = max_t(unsigned int, max_bitflips, ret);
+
 		readlen -= len;
 		if (!readlen)
 			break;
@@ -2326,7 +2410,7 @@ static int nand_do_read_oob(struct mtd_info *mtd, loff_t from,
 	if (mtd->ecc_stats.failed - stats.failed)
 		return -EBADMSG;
 
-	return  mtd->ecc_stats.corrected - stats.corrected ? -EUCLEAN : 0;
+	return max_bitflips;
 }
 
 /**
@@ -2859,14 +2943,17 @@ static int panic_nand_write(struct mtd_info *mtd, loff_t to, size_t len,
 			    size_t *retlen, const uint8_t *buf)
 {
 	struct nand_chip *chip = mtd_to_nand(mtd);
+	int chipnr = (int)(to >> chip->chip_shift);
 	struct mtd_oob_ops ops;
 	int ret;
 
-	/* Wait for the device to get ready */
-	panic_nand_wait(mtd, chip, 400);
-
 	/* Grab the device */
 	panic_nand_get_device(chip, mtd, FL_WRITING);
+
+	chip->select_chip(mtd, chipnr);
+
+	/* Wait for the device to get ready */
+	panic_nand_wait(mtd, chip, 400);
 
 	memset(&ops, 0, sizeof(ops));
 	ops.len = len;
@@ -4565,7 +4652,7 @@ int nand_scan_tail(struct mtd_info *mtd)
 			break;
 		case 64:
 		case 128:
-			mtd_set_ooblayout(mtd, &nand_ooblayout_lp_ops);
+			mtd_set_ooblayout(mtd, &nand_ooblayout_lp_hamming_ops);
 			break;
 		default:
 			WARN(1, "No oob scheme defined for oobsize %d\n",
@@ -4698,6 +4785,11 @@ int nand_scan_tail(struct mtd_info *mtd)
 		goto err_free;
 	}
 	ecc->total = ecc->steps * ecc->bytes;
+	if (ecc->total > mtd->oobsize) {
+		WARN(1, "Total number of ECC bytes exceeded oobsize\n");
+		ret = -EINVAL;
+		goto err_free;
+	}
 
 	/*
 	 * The number of bytes available for a client to place data into
@@ -4849,12 +4941,12 @@ EXPORT_SYMBOL_GPL(nand_cleanup);
 /**
  * nand_release - [NAND Interface] Unregister the MTD device and free resources
  *		  held by the NAND device
- * @mtd: MTD device structure
+ * @chip: NAND chip object
  */
-void nand_release(struct mtd_info *mtd)
+void nand_release(struct nand_chip *chip)
 {
-	mtd_device_unregister(mtd);
-	nand_cleanup(mtd_to_nand(mtd));
+	mtd_device_unregister(nand_to_mtd(chip));
+	nand_cleanup(chip);
 }
 EXPORT_SYMBOL_GPL(nand_release);
 

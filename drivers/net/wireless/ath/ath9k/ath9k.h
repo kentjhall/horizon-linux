@@ -267,7 +267,7 @@ struct ath_node {
 #endif
 	u8 key_idx[4];
 
-	u32 ackto;
+	int ackto;
 	struct list_head list;
 };
 
@@ -959,6 +959,7 @@ struct ath_softc {
 	struct survey_info *cur_survey;
 	struct survey_info survey[ATH9K_NUM_CHANNELS];
 
+	spinlock_t intr_lock;
 	struct tasklet_struct intr_tq;
 	struct tasklet_struct bcon_tasklet;
 	struct ath_hw *sc_ah;

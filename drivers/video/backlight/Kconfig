@@ -403,6 +403,22 @@ config BACKLIGHT_LP8788
 	help
 	  This supports TI LP8788 backlight driver.
 
+config BACKLIGHT_LP88XX_I2C
+	tristate "Backlight driver for TI LP88XX I2C driver"
+	depends on BACKLIGHT_CLASS_DEVICE && I2C
+	select LP88XX_CORE
+	help
+	  This supports TI LP8580, LP8863 and LP8880 backlight driver.
+	  Register access through the I2C.
+
+config BACKLIGHT_LP88XX_SPI
+	tristate "Backlight driver for TI LP88XX SPI driver"
+	depends on BACKLIGHT_CLASS_DEVICE && SPI
+	select LP88XX_CORE
+	help
+	  This supports TI lp8580, LP8863 and LP8880 backlight driver.
+	  Register access through the SPI.
+
 config BACKLIGHT_OT200
 	tristate "Backlight driver for ot200 visualisation device"
 	depends on BACKLIGHT_CLASS_DEVICE && CS5535_MFGPT && GPIO_CS5535

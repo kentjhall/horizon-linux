@@ -223,10 +223,11 @@ nfsd4_alloc_layout_stateid(struct nfsd4_compound_state *cstate,
 	struct nfs4_layout_stateid *ls;
 	struct nfs4_stid *stp;
 
-	stp = nfs4_alloc_stid(cstate->clp, nfs4_layout_stateid_cache);
+	stp = nfs4_alloc_stid(cstate->clp, nfs4_layout_stateid_cache,
+					nfsd4_free_layout_stateid);
 	if (!stp)
 		return NULL;
-	stp->sc_free = nfsd4_free_layout_stateid;
+
 	get_nfs4_file(fp);
 	stp->sc_file = fp;
 
@@ -679,7 +680,7 @@ nfsd4_cb_layout_done(struct nfsd4_callback *cb, struct rpc_task *task)
 
 		/* Client gets 2 lease periods to return it */
 		cutoff = ktime_add_ns(task->tk_start,
-					 nn->nfsd4_lease * NSEC_PER_SEC * 2);
+					 (u64)nn->nfsd4_lease * NSEC_PER_SEC * 2);
 
 		if (ktime_before(now, cutoff)) {
 			rpc_delay(task, HZ/100); /* 10 mili-seconds */

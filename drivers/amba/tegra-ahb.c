@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2017, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (C) 2011 Google, Inc.
  *
  * Author:
@@ -28,6 +28,8 @@
 #include <linux/of.h>
 
 #include <soc/tegra/ahb.h>
+
+#include <dt-bindings/soc/tegra-ahb.h>
 
 #define DRV_NAME "tegra-ahb"
 
@@ -93,6 +95,7 @@
 #define INCORRECT_BASE_ADDR_LOW_BYTE		0x4
 
 static struct platform_driver tegra_ahb_driver;
+static struct tegra_ahb *_ahb;
 
 static const u32 tegra_ahb_gizmo[] = {
 	AHB_ARBITRATION_DISABLE,
@@ -169,6 +172,36 @@ int tegra_ahb_enable_smmu(struct device_node *dn)
 }
 EXPORT_SYMBOL(tegra_ahb_enable_smmu);
 #endif
+
+int tegra_ahb_get_master_id(struct device *dev)
+{
+	struct device_node *np = dev->of_node;
+	u32 val = 0;
+	int err;
+
+	err = of_property_read_u32(np, "nvidia,ahb-master-id", &val);
+	if (err)
+		return err;
+
+	if (val > TEGRA_AHB_MASTER_ID_MAX)
+		return -EINVAL;
+
+	return val;
+}
+EXPORT_SYMBOL(tegra_ahb_get_master_id);
+
+bool tegra_ahb_is_mem_wrque_busy(u32 mst_id)
+{
+	struct tegra_ahb *ahb = _ahb;
+	u32 val;
+
+	val = gizmo_readl(ahb, AHB_ARBITRATION_AHB_MEM_WRQUE_MST_ID);
+	if (val & (1 << mst_id))
+		return true;
+
+	return false;
+}
+EXPORT_SYMBOL(tegra_ahb_is_mem_wrque_busy);
 
 #ifdef CONFIG_PM
 static int tegra_ahb_suspend(struct device *dev)
@@ -282,6 +315,7 @@ static int tegra_ahb_probe(struct platform_device *pdev)
 		return PTR_ERR(ahb->regs);
 
 	ahb->dev = &pdev->dev;
+	_ahb = ahb;
 	platform_set_drvdata(pdev, ahb);
 	tegra_ahb_gizmo_init(ahb);
 	return 0;

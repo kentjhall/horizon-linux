@@ -492,20 +492,24 @@ static int get_epic_descriptor(struct edgeport_serial *ep)
 	int result;
 	struct usb_serial *serial = ep->serial;
 	struct edgeport_product_info *product_info = &ep->product_info;
-	struct edge_compatibility_descriptor *epic = &ep->epic_descriptor;
+	struct edge_compatibility_descriptor *epic;
 	struct edge_compatibility_bits *bits;
 	struct device *dev = &serial->dev->dev;
 
 	ep->is_epic = 0;
+
+	epic = kmalloc(sizeof(*epic), GFP_KERNEL);
+	if (!epic)
+		return -ENOMEM;
+
 	result = usb_control_msg(serial->dev, usb_rcvctrlpipe(serial->dev, 0),
 				 USB_REQUEST_ION_GET_EPIC_DESC,
 				 0xC0, 0x00, 0x00,
-				 &ep->epic_descriptor,
-				 sizeof(struct edge_compatibility_descriptor),
+				 epic, sizeof(*epic),
 				 300);
-
-	if (result > 0) {
+	if (result == sizeof(*epic)) {
 		ep->is_epic = 1;
+		memcpy(&ep->epic_descriptor, epic, sizeof(*epic));
 		memset(product_info, 0, sizeof(struct edgeport_product_info));
 
 		product_info->NumPorts = epic->NumPorts;
@@ -534,7 +538,15 @@ static int get_epic_descriptor(struct edgeport_serial *ep)
 		dev_dbg(dev, "  IOSPWriteLCR     : %s\n", bits->IOSPWriteLCR	? "TRUE": "FALSE");
 		dev_dbg(dev, "  IOSPSetBaudRate  : %s\n", bits->IOSPSetBaudRate	? "TRUE": "FALSE");
 		dev_dbg(dev, "  TrueEdgeport     : %s\n", bits->TrueEdgeport	? "TRUE": "FALSE");
+
+		result = 0;
+	} else if (result >= 0) {
+		dev_warn(&serial->interface->dev, "short epic descriptor received: %d\n",
+			 result);
+		result = -EIO;
 	}
+
+	kfree(epic);
 
 	return result;
 }
@@ -560,6 +572,7 @@ static void edge_interrupt_callback(struct urb *urb)
 	struct usb_serial_port *port;
 	unsigned char *data = urb->transfer_buffer;
 	int length = urb->actual_length;
+	unsigned long flags;
 	int bytes_avail;
 	int position;
 	int txCredits;
@@ -591,7 +604,7 @@ static void edge_interrupt_callback(struct urb *urb)
 		if (length > 1) {
 			bytes_avail = data[0] | (data[1] << 8);
 			if (bytes_avail) {
-				spin_lock(&edge_serial->es_lock);
+				spin_lock_irqsave(&edge_serial->es_lock, flags);
 				edge_serial->rxBytesAvail += bytes_avail;
 				dev_dbg(dev,
 					"%s - bytes_avail=%d, rxBytesAvail=%d, read_in_progress=%d\n",
@@ -614,22 +627,25 @@ static void edge_interrupt_callback(struct urb *urb)
 						edge_serial->read_in_progress = false;
 					}
 				}
-				spin_unlock(&edge_serial->es_lock);
+				spin_unlock_irqrestore(&edge_serial->es_lock,
+						       flags);
 			}
 		}
 		/* grab the txcredits for the ports if available */
 		position = 2;
 		portNumber = 0;
-		while ((position < length) &&
+		while ((position < length - 1) &&
 				(portNumber < edge_serial->serial->num_ports)) {
 			txCredits = data[position] | (data[position+1] << 8);
 			if (txCredits) {
 				port = edge_serial->serial->port[portNumber];
 				edge_port = usb_get_serial_port_data(port);
-				if (edge_port->open) {
-					spin_lock(&edge_port->ep_lock);
+				if (edge_port && edge_port->open) {
+					spin_lock_irqsave(&edge_port->ep_lock,
+							  flags);
 					edge_port->txCredits += txCredits;
-					spin_unlock(&edge_port->ep_lock);
+					spin_unlock_irqrestore(&edge_port->ep_lock,
+							       flags);
 					dev_dbg(dev, "%s - txcredits for port%d = %d\n",
 						__func__, portNumber,
 						edge_port->txCredits);
@@ -670,6 +686,7 @@ static void edge_bulk_in_callback(struct urb *urb)
 	int			retval;
 	__u16			raw_data_length;
 	int status = urb->status;
+	unsigned long flags;
 
 	if (status) {
 		dev_dbg(&urb->dev->dev, "%s - nonzero read bulk status received: %d\n",
@@ -689,7 +706,7 @@ static void edge_bulk_in_callback(struct urb *urb)
 
 	usb_serial_debug_data(dev, __func__, raw_data_length, data);
 
-	spin_lock(&edge_serial->es_lock);
+	spin_lock_irqsave(&edge_serial->es_lock, flags);
 
 	/* decrement our rxBytes available by the number that we just got */
 	edge_serial->rxBytesAvail -= raw_data_length;
@@ -713,7 +730,7 @@ static void edge_bulk_in_callback(struct urb *urb)
 		edge_serial->read_in_progress = false;
 	}
 
-	spin_unlock(&edge_serial->es_lock);
+	spin_unlock_irqrestore(&edge_serial->es_lock, flags);
 }
 
 
@@ -1650,7 +1667,8 @@ static void edge_break(struct tty_struct *tty, int break_state)
 static void process_rcvd_data(struct edgeport_serial *edge_serial,
 				unsigned char *buffer, __u16 bufferLength)
 {
-	struct device *dev = &edge_serial->serial->dev->dev;
+	struct usb_serial *serial = edge_serial->serial;
+	struct device *dev = &serial->dev->dev;
 	struct usb_serial_port *port;
 	struct edgeport_port *edge_port;
 	__u16 lastBufferLength;
@@ -1755,11 +1773,10 @@ static void process_rcvd_data(struct edgeport_serial *edge_serial,
 
 			/* spit this data back into the tty driver if this
 			   port is open */
-			if (rxLen) {
-				port = edge_serial->serial->port[
-							edge_serial->rxPort];
+			if (rxLen && edge_serial->rxPort < serial->num_ports) {
+				port = serial->port[edge_serial->rxPort];
 				edge_port = usb_get_serial_port_data(port);
-				if (edge_port->open) {
+				if (edge_port && edge_port->open) {
 					dev_dbg(dev, "%s - Sending %d bytes to TTY for port %d\n",
 						__func__, rxLen,
 						edge_serial->rxPort);
@@ -1767,8 +1784,8 @@ static void process_rcvd_data(struct edgeport_serial *edge_serial,
 							rxLen);
 					edge_port->port->icount.rx += rxLen;
 				}
-				buffer += rxLen;
 			}
+			buffer += rxLen;
 			break;
 
 		case EXPECT_HDR3:	/* Expect 3rd byte of status header */
@@ -1803,6 +1820,8 @@ static void process_rcvd_status(struct edgeport_serial *edge_serial,
 	__u8 code = edge_serial->rxStatusCode;
 
 	/* switch the port pointer to the one being currently talked about */
+	if (edge_serial->rxPort >= edge_serial->serial->num_ports)
+		return;
 	port = edge_serial->serial->port[edge_serial->rxPort];
 	edge_port = usb_get_serial_port_data(port);
 	if (edge_port == NULL) {
@@ -2093,8 +2112,7 @@ static int rom_write(struct usb_serial *serial, __u16 extAddr, __u16 addr,
  * rom_read
  *	reads a number of bytes from the Edgeport device starting at the given
  *	address.
- *	If successful returns the number of bytes read, otherwise it returns
- *	a negative error number of the problem.
+ *	Returns zero on success or a negative error number.
  ****************************************************************************/
 static int rom_read(struct usb_serial *serial, __u16 extAddr,
 					__u16 addr, __u16 length, __u8 *data)
@@ -2119,12 +2137,17 @@ static int rom_read(struct usb_serial *serial, __u16 extAddr,
 					USB_REQUEST_ION_READ_ROM,
 					0xC0, addr, extAddr, transfer_buffer,
 					current_length, 300);
-		if (result < 0)
+		if (result < current_length) {
+			if (result >= 0)
+				result = -EIO;
 			break;
+		}
 		memcpy(data, transfer_buffer, current_length);
 		length -= current_length;
 		addr += current_length;
 		data += current_length;
+
+		result = 0;
 	}
 
 	kfree(transfer_buffer);
@@ -2199,7 +2222,6 @@ static int write_cmd_usb(struct edgeport_port *edge_port,
 		/* something went wrong */
 		dev_err(dev, "%s - usb_submit_urb(write command) failed, status = %d\n",
 			__func__, status);
-		usb_kill_urb(urb);
 		usb_free_urb(urb);
 		atomic_dec(&CmdUrbs);
 		return status;
@@ -2578,9 +2600,10 @@ static void get_manufacturing_desc(struct edgeport_serial *edge_serial)
 				EDGE_MANUF_DESC_LEN,
 				(__u8 *)(&edge_serial->manuf_descriptor));
 
-	if (response < 1)
-		dev_err(dev, "error in getting manufacturer descriptor\n");
-	else {
+	if (response < 0) {
+		dev_err(dev, "error in getting manufacturer descriptor: %d\n",
+				response);
+	} else {
 		char string[30];
 		dev_dbg(dev, "**Manufacturer Descriptor\n");
 		dev_dbg(dev, "  RomSize:        %dK\n",
@@ -2637,9 +2660,10 @@ static void get_boot_desc(struct edgeport_serial *edge_serial)
 				EDGE_BOOT_DESC_LEN,
 				(__u8 *)(&edge_serial->boot_descriptor));
 
-	if (response < 1)
-		dev_err(dev, "error in getting boot descriptor\n");
-	else {
+	if (response < 0) {
+		dev_err(dev, "error in getting boot descriptor: %d\n",
+				response);
+	} else {
 		dev_dbg(dev, "**Boot Descriptor:\n");
 		dev_dbg(dev, "  BootCodeLength: %d\n",
 			le16_to_cpu(edge_serial->boot_descriptor.BootCodeLength));
@@ -2754,6 +2778,11 @@ static int edge_startup(struct usb_serial *serial)
 					EDGE_COMPATIBILITY_MASK1,
 					EDGE_COMPATIBILITY_MASK2 };
 
+	if (serial->num_bulk_in < 1 || serial->num_interrupt_in < 1) {
+		dev_err(&serial->interface->dev, "missing endpoints\n");
+		return -ENODEV;
+	}
+
 	dev = serial->dev;
 
 	/* create our private serial structure */
@@ -2777,7 +2806,7 @@ static int edge_startup(struct usb_serial *serial)
 	dev_info(&serial->dev->dev, "%s detected\n", edge_serial->name);
 
 	/* Read the epic descriptor */
-	if (get_epic_descriptor(edge_serial) <= 0) {
+	if (get_epic_descriptor(edge_serial) < 0) {
 		/* memcpy descriptor to Supports structures */
 		memcpy(&edge_serial->epic_descriptor.Supports, descriptor,
 		       sizeof(struct edge_compatibility_bits));
@@ -2830,16 +2859,18 @@ static int edge_startup(struct usb_serial *serial)
 	response = 0;
 
 	if (edge_serial->is_epic) {
+		struct usb_host_interface *alt;
+
+		alt = serial->interface->cur_altsetting;
+
 		/* EPIC thing, set up our interrupt polling now and our read
 		 * urb, so that the device knows it really is connected. */
 		interrupt_in_found = bulk_in_found = bulk_out_found = false;
-		for (i = 0; i < serial->interface->altsetting[0]
-						.desc.bNumEndpoints; ++i) {
+		for (i = 0; i < alt->desc.bNumEndpoints; ++i) {
 			struct usb_endpoint_descriptor *endpoint;
 			int buffer_size;
 
-			endpoint = &serial->interface->altsetting[0].
-							endpoint[i].desc;
+			endpoint = &alt->endpoint[i].desc;
 			buffer_size = usb_endpoint_maxp(endpoint);
 			if (!interrupt_in_found &&
 			    (usb_endpoint_is_int_in(endpoint))) {

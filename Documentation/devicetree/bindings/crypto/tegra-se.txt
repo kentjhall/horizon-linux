@@ -1,0 +1,22 @@
+CONFIG_CRYPTO_DEV_TEGRA_SE Crypto Module
+
+Required properties:
+- compatible : Should contain entries for this and backward compatible
+  - "nvidia,tegra124-se" or "nvidia,tegra210-se" or "nvidia,tegra210b01-se"
+  - This supports all AES/RNG/SHA/RSA features
+- reg : Offset and length of the register set for the module
+- clock-names: clocks required for Tegra SE to function
+- interrupts: Interrupt numbers
+
+Optional properties:
+- nvidia,ahb-master-id: To specify AHB master id.
+
+Example:
+	tegra_se: se@70012000 {
+		compatible = "nvidia,tegra210-se";
+		reg = <0x0 0x70012000 0x0 0x2000>;
+		clocks = <&tegra_car TEGRA210_CLK_SE_CBUS>,
+		       <&tegra_car_TEGRA210_CLK_ENTROPY>;
+		clock-names = "se", "entropy";
+		interrupts = <0 58 0x04>;
+	};

@@ -448,7 +448,7 @@ static int skl_tplg_set_module_init_data(struct snd_soc_dapm_widget *w)
 			if (bc->set_params != SKL_PARAM_INIT)
 				continue;
 
-			mconfig->formats_config.caps = (u32 *)&bc->params;
+			mconfig->formats_config.caps = (u32 *)bc->params;
 			mconfig->formats_config.caps_size = bc->size;
 
 			break;
@@ -1780,6 +1780,7 @@ static int skl_tplg_get_token(struct device *dev,
 
 	case SKL_TKN_U8_CORE_ID:
 		mconfig->core_id = tkn_elem->value;
+		break;
 
 	case SKL_TKN_U8_MOD_TYPE:
 		mconfig->m_type = tkn_elem->value;
@@ -2325,7 +2326,7 @@ static int skl_tplg_get_manifest_tkn(struct device *dev,
 
 			if (ret < 0)
 				return ret;
-			tkn_count += ret;
+			tkn_count = ret;
 
 			tuple_size += tkn_count *
 				sizeof(struct snd_soc_tplg_vendor_string_elem);

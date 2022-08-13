@@ -5,9 +5,11 @@
 comma   := ,
 quote   := "
 squote  := '
+double_dot := ..
 empty   :=
 space   := $(empty) $(empty)
 space_escape := _-_SPACE_-_
+pound := \#
 
 ###
 # Name of target with a '.' as filename prefix. foo/bar.o => foo/.bar.o
@@ -17,6 +19,11 @@ dot-target = $(dir $@).$(notdir $@)
 # The temporary file to save gcc -MD generated dependencies must not
 # contain a comma
 depfile = $(subst $(comma),_,$(dot-target).d)
+
+###
+# The conversion of .. to the _ddot_ to avoid any relative path to be
+# outside of out folder.
+replace_ddot = $(subst $(double_dot),_ddot_,$(1))
 
 ###
 # filename of target with directory and extension stripped
@@ -81,20 +88,21 @@ cc-cross-prefix =  \
 		fi)))
 
 # output directory for tests below
-TMPOUT := $(if $(KBUILD_EXTMOD),$(firstword $(KBUILD_EXTMOD))/)
+TMPOUT = $(if $(KBUILD_EXTMOD),$(firstword $(KBUILD_EXTMOD))/).tmp_$$$$
 
 # try-run
 # Usage: option = $(call try-run, $(CC)...-o "$$TMP",option-ok,otherwise)
 # Exit code chooses option. "$$TMP" is can be used as temporary file and
 # is automatically cleaned up.
 try-run = $(shell set -e;		\
-	TMP="$(TMPOUT).$$$$.tmp";	\
-	TMPO="$(TMPOUT).$$$$.o";	\
+	TMP=$(TMPOUT)/tmp;		\
+	TMPO=$(TMPOUT)/tmp.o;		\
+	mkdir -p $(TMPOUT);		\
+	trap "rm -rf $(TMPOUT)" EXIT;	\
 	if ($(1)) >/dev/null 2>&1;	\
 	then echo "$(2)";		\
 	else echo "$(3)";		\
-	fi;				\
-	rm -f "$$TMP" "$$TMPO")
+	fi)
 
 # as-option
 # Usage: cflags-y += $(call as-option,-Wa$(comma)-isa=foo,)
@@ -108,6 +116,11 @@ as-option = $(call try-run,\
 as-instr = $(call try-run,\
 	printf "%b\n" "$(1)" | $(CC) $(KBUILD_AFLAGS) -c -x assembler -o "$$TMP" -,$(2),$(3))
 
+# __cc-option
+# Usage: MY_CFLAGS += $(call __cc-option,$(CC),$(MY_CFLAGS),-march=winchip-c6,-march=i586)
+__cc-option = $(call try-run,\
+	$(1) -Werror $(2) $(3) -c -x c /dev/null -o "$$TMP",$(3),$(4))
+
 # Do not attempt to build with gcc plugins during cc-option tests.
 # (And this uses delayed resolution so the flags will be up to date.)
 CC_OPTION_CFLAGS = $(filter-out $(GCC_PLUGINS_CFLAGS),$(KBUILD_CFLAGS))
@@ -115,13 +128,18 @@ CC_OPTION_CFLAGS = $(filter-out $(GCC_PLUGINS_CFLAGS),$(KBUILD_CFLAGS))
 # cc-option
 # Usage: cflags-y += $(call cc-option,-march=winchip-c6,-march=i586)
 
-cc-option = $(call try-run,\
-	$(CC) $(KBUILD_CPPFLAGS) $(CC_OPTION_CFLAGS) $(1) -c -x c /dev/null -o "$$TMP",$(1),$(2))
+cc-option = $(call __cc-option, $(CC),\
+	$(KBUILD_CPPFLAGS) $(CC_OPTION_CFLAGS),$(1),$(2))
+
+# hostcc-option
+# Usage: cflags-y += $(call hostcc-option,-march=winchip-c6,-march=i586)
+hostcc-option = $(call __cc-option, $(HOSTCC),\
+	$(HOSTCFLAGS) $(HOST_EXTRACFLAGS),$(1),$(2))
 
 # cc-option-yn
 # Usage: flag := $(call cc-option-yn,-march=winchip-c6)
 cc-option-yn = $(call try-run,\
-	$(CC) $(KBUILD_CPPFLAGS) $(CC_OPTION_CFLAGS) $(1) -c -x c /dev/null -o "$$TMP",y,n)
+	$(CC) -Werror $(KBUILD_CPPFLAGS) $(CC_OPTION_CFLAGS) $(1) -c -x c /dev/null -o "$$TMP",y,n)
 
 # cc-option-align
 # Prefix align with either -falign or -malign
@@ -131,11 +149,42 @@ cc-option-align = $(subst -functions=0,,\
 # cc-disable-warning
 # Usage: cflags-y += $(call cc-disable-warning,unused-but-set-variable)
 cc-disable-warning = $(call try-run,\
-	$(CC) $(KBUILD_CPPFLAGS) $(CC_OPTION_CFLAGS) -W$(strip $(1)) -c -x c /dev/null -o "$$TMP",-Wno-$(strip $(1)))
+	$(CC) -Werror $(KBUILD_CPPFLAGS) $(CC_OPTION_CFLAGS) -W$(strip $(1)) -c -x c /dev/null -o "$$TMP",-Wno-$(strip $(1)))
 
 # cc-name
 # Expands to either gcc or clang
 cc-name = $(shell $(CC) -v 2>&1 | grep -q "clang version" && echo clang || echo gcc)
+
+# __cc-version
+# Returns compiler version
+__cc-version = $(shell $(CONFIG_SHELL) $(srctree)/scripts/$(cc-name)-version.sh $(CC))
+
+# __cc-fullversion
+# Returns full compiler version
+__cc-fullversion = $(shell $(CONFIG_SHELL) \
+	$(srctree)/scripts/$(cc-name)-version.sh -p $(CC))
+
+# __cc-ifversion
+# Matches compiler name and version
+# Usage:  EXTRA_CFLAGS += $(call cc-if-name-version, gcc, -lt, 0402, -O1)
+__cc-ifversion = $(shell [ $(cc-name) = $(1) ] && [ $(__cc-version) $(2) $(3) ] && echo $(4) || echo $(5))
+
+# __cc-if-fullversion
+# Matches compiler name and full version
+# Usage:  EXTRA_CFLAGS += $(call cc-if-name-fullversion, gcc, -lt, 040502, -O1)
+__cc-if-fullversion = $(shell [ $(cc-name) = $(1) ] && [ $(__cc-fullversion) $(2) $(3) ] && echo $(4) || echo $(5))
+
+# gcc-ifversion
+gcc-ifversion = $(call __cc-ifversion, gcc, $(1), $(2), $(3), $(4))
+
+# gcc-if-fullversion
+gcc-if-fullversion = (call __cc-if-fullversion, gcc, $(1), $(2), $(3), $(4))
+
+# clang-ifversion
+clang-ifversion =  $(call __cc-ifversion, clang, $(1), $(2), $(3), $(4))
+
+# clang-if-fullversion
+clang-if-fullversion = (call __cc-if-fullversion, clang, $(1), $(2), $(3), $(4))
 
 # cc-version
 cc-version = $(shell $(CONFIG_SHELL) $(srctree)/scripts/gcc-version.sh $(CC))
@@ -144,24 +193,27 @@ cc-version = $(shell $(CONFIG_SHELL) $(srctree)/scripts/gcc-version.sh $(CC))
 cc-fullversion = $(shell $(CONFIG_SHELL) \
 	$(srctree)/scripts/gcc-version.sh -p $(CC))
 
-# cc-ifversion
-# Usage:  EXTRA_CFLAGS += $(call cc-ifversion, -lt, 0402, -O1)
-cc-ifversion = $(shell [ $(cc-version) $(1) $(2) ] && echo $(3) || echo $(4))
+# backward compatibility
+cc-ifversion = $(gcc-ifversion)
+cc-if-fullversion = $(gcc-if-fullversion)
 
 # cc-ldoption
 # Usage: ldflags += $(call cc-ldoption, -Wl$(comma)--hash-style=both)
 cc-ldoption = $(call try-run,\
-	$(CC) $(1) -nostdlib -x c /dev/null -o "$$TMP",$(1),$(2))
+	$(CC) $(1) $(KBUILD_CPPFLAGS) $(CC_OPTION_CFLAGS) -nostdlib -x c /dev/null -o "$$TMP",$(1),$(2))
 
 # ld-option
 # Usage: LDFLAGS += $(call ld-option, -X)
-ld-option = $(call try-run,\
-	$(CC) -x c /dev/null -c -o "$$TMPO" ; $(LD) $(1) "$$TMPO" -o "$$TMP",$(1),$(2))
+ld-option = $(call try-run, $(LD) $(LDFLAGS) $(1) -v,$(1),$(2))
 
 # ar-option
 # Usage: KBUILD_ARFLAGS := $(call ar-option,D)
 # Important: no spaces around options
 ar-option = $(call try-run, $(AR) rc$(1) "$$TMP",$(1),$(2))
+
+# ld-name
+# Expands to either bfd or gold
+ld-name = $(shell $(LD) -v 2>&1 | grep -q "GNU gold" && echo gold || echo bfd)
 
 # ld-version
 # Note this is mainly for HJ Lu's 3 number binutil versions
@@ -170,6 +222,18 @@ ld-version = $(shell $(LD) --version | $(srctree)/scripts/ld-version.sh)
 # ld-ifversion
 # Usage:  $(call ld-ifversion, -ge, 22252, y)
 ld-ifversion = $(shell [ $(ld-version) $(1) $(2) ] && echo $(3) || echo $(4))
+
+# __ld-ifversion
+# Usage:  $(call __ld-ifversion, gold, -ge, 112000000, y)
+__ld-ifversion = $(shell [ $(ld-name) = $(1) ] && [ $(ld-version) $(2) $(3) ] && echo $(4) || echo $(5))
+
+# bfd-ifversion
+# Usage:  $(call bfd-ifversion, -ge, 227000000, y)
+bfd-ifversion = $(call __ld-ifversion, bfd, $(1), $(2), $(3), $(4))
+
+# gold-ifversion
+# Usage:  $(call gold-ifversion, -ge, 112000000, y)
+gold-ifversion = $(call __ld-ifversion, gold, $(1), $(2), $(3), $(4))
 
 ######
 
@@ -241,11 +305,11 @@ endif
 
 # Replace >$< with >$$< to preserve $ when reloading the .cmd file
 # (needed for make)
-# Replace >#< with >\#< to avoid starting a comment in the .cmd file
+# Replace >#< with >$(pound)< to avoid starting a comment in the .cmd file
 # (needed for make)
 # Replace >'< with >'\''< to be able to enclose the whole string in '...'
 # (needed for the shell)
-make-cmd = $(call escsq,$(subst \#,\\\#,$(subst $$,$$$$,$(cmd_$(1)))))
+make-cmd = $(call escsq,$(subst $(pound),$$(pound),$(subst $$,$$$$,$(cmd_$(1)))))
 
 # Find any prerequisites that is newer than target or that does not exist.
 # PHONY targets skipped in both cases.
@@ -393,3 +457,34 @@ endif
 endef
 #
 ###############################################################################
+
+# It's a common trick to declare makefile variable that contains space
+# we'll need it to convert the path string to list (string delimited by spaces)
+# and vice versa
+the-space :=
+the-space += 
+# TEGRA_ROOT_PATH is the relative path to the directory one level upper than $srctree
+_TEGRA_ROOT_PATH = $(subst ^$(realpath $(srctree)/..)/,,^$(realpath $(kbuild-dir)))
+# _TEGRA_REL_PATH is path like "../../../" that points to directory one level
+# upper that $(srctree)
+_TEGRA_REL_PATH = $(subst $(the-space),/,$(patsubst %,..,$(subst /, ,$(_TEGRA_ROOT_PATH))))
+# _KERNEL_LAST is the last directory name in $(srctree)
+_KERNEL_LAST = $(lastword $(subst /, ,$(realpath $(srctree))))
+# obj-y += $(call tegra-path,nv-hidden-repo,drivers/foo/bar.o)
+# will evaluate to either:
+# obj-y += ../../../nv-hidden-repo/drivers/foo/bar.o
+# or:
+# obj-y += bar.o
+tegra-base-kernel-path = $(call _TEGRA_REL_PATH)/$(call _KERNEL_LAST)
+tegra-path = $(if  $(wildcard $(srctree)/../$(1)),$(call _TEGRA_REL_PATH)/$(1)/$(2),$(call tegra-base-kernel-path)/$(2))
+
+ifneq ($(NV_BUILD_KERNEL_DTS_ROOT),)
+tegra-dtstree = $(NV_BUILD_KERNEL_DTS_ROOT)
+else
+tegra-dtstree = $(srctree)/../../hardware/nvidia
+endif
+
+tegra-root-dtstree = $(subst ^$(realpath $(tegra-dtstree)/../..)/,,^$(realpath $(srctree)/arch/arm64/boot/dts))
+tegra-rel-dtstree = $(subst $(the-space),/,$(patsubst %,..,$(subst /, ,$(tegra-root-dtstree))))
+# delete partially updated (i.e. corrupted) files on error
+.DELETE_ON_ERROR:

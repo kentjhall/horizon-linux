@@ -1089,6 +1089,7 @@ struct bnxt {
 #define BNXT_RESET_TASK_SILENT_SP_EVENT	11
 #define BNXT_GENEVE_ADD_PORT_SP_EVENT	12
 #define BNXT_GENEVE_DEL_PORT_SP_EVENT	13
+#define BNXT_LINK_SPEED_CHNG_SP_EVENT	14
 
 	struct bnxt_pf_info	pf;
 #ifdef CONFIG_BNXT_SRIOV
@@ -1108,6 +1109,10 @@ struct bnxt {
 	unsigned long		*ntp_fltr_bmap;
 	int			ntp_fltr_count;
 
+	/* To protect link related settings during link changes and
+	 * ethtool settings changes.
+	 */
+	struct mutex		link_lock;
 	struct bnxt_link_info	link_info;
 	struct ethtool_eee	eee;
 	u32			lpi_tmr_lo;

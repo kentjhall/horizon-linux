@@ -1,0 +1,29 @@
+Tegra194 CPU frequency scaling driver bindings
+----------------------------------------------
+
+Required properties :
+- compatible : Must be one of the following
+        "nvidia,tegra194-cpufreq"
+
+Optional properties:
+- status : standard DT availability property.
+
+- cpu_emc_map : specifies list of pairs cpufreq and emcfreq (unit in KHz) scaling
+  table datas in decrease order for EMC clock floor rate request based on CPU clock
+  frequency.
+
+- debug_fs_only : used to limit the cpufreq driver functionality
+  For linux in guest environment there is no need for full fledged cpufreq
+  driver in the guest. Only requirement is to support sysfs to read cpu frequency.
+
+For example,
+
+	cpufreq@d080000 {
+		compatible = "nvidia,tegra194-cpufreq";
+		status = "okay";
+		cpu_emc_map = <1500000 800000>,
+				<900000  675000>,
+				<550000  408000>,
+				<340000  204000>,
+				<000000  102000>;
+	};

@@ -3580,10 +3580,7 @@ qla2x00_set_idma_speed(scsi_qla_host_t *vha, uint16_t loop_id,
 	mcp->mb[0] = MBC_PORT_PARAMS;
 	mcp->mb[1] = loop_id;
 	mcp->mb[2] = BIT_0;
-	if (IS_CNA_CAPABLE(vha->hw))
-		mcp->mb[3] = port_speed & (BIT_5|BIT_4|BIT_3|BIT_2|BIT_1|BIT_0);
-	else
-		mcp->mb[3] = port_speed & (BIT_2|BIT_1|BIT_0);
+	mcp->mb[3] = port_speed & (BIT_5|BIT_4|BIT_3|BIT_2|BIT_1|BIT_0);
 	mcp->mb[9] = vha->vp_idx;
 	mcp->out_mb = MBX_9|MBX_3|MBX_2|MBX_1|MBX_0;
 	mcp->in_mb = MBX_3|MBX_1|MBX_0;
@@ -4783,9 +4780,9 @@ qla2x00_echo_test(scsi_qla_host_t *vha, struct msg_echo_lb *mreq,
 
 	memset(mcp->mb, 0 , sizeof(mcp->mb));
 	mcp->mb[0] = MBC_DIAGNOSTIC_ECHO;
-	mcp->mb[1] = mreq->options | BIT_6;	/* BIT_6 specifies 64bit address */
+	/* BIT_6 specifies 64bit address */
+	mcp->mb[1] = mreq->options | BIT_15 | BIT_6;
 	if (IS_CNA_CAPABLE(ha)) {
-		mcp->mb[1] |= BIT_15;
 		mcp->mb[2] = vha->fcoe_fcf_idx;
 	}
 	mcp->mb[16] = LSW(mreq->rcv_dma);
@@ -5726,9 +5723,8 @@ qla2x00_dump_mctp_data(scsi_qla_host_t *vha, dma_addr_t req_dma, uint32_t addr,
 	mcp->mb[7] = LSW(MSD(req_dma));
 	mcp->mb[8] = MSW(addr);
 	/* Setting RAM ID to valid */
-	mcp->mb[10] |= BIT_7;
 	/* For MCTP RAM ID is 0x40 */
-	mcp->mb[10] |= 0x40;
+	mcp->mb[10] = BIT_7 | 0x40;
 
 	mcp->out_mb |= MBX_10|MBX_8|MBX_7|MBX_6|MBX_5|MBX_4|MBX_3|MBX_2|MBX_1|
 	    MBX_0;

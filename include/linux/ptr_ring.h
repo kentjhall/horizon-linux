@@ -99,11 +99,17 @@ static inline bool ptr_ring_full_bh(struct ptr_ring *r)
 
 /* Note: callers invoking this in a loop must use a compiler barrier,
  * for example cpu_relax(). Callers must hold producer_lock.
+ * Callers are responsible for making sure pointer that is being queued
+ * points to a valid data.
  */
 static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
 {
 	if (unlikely(!r->size) || r->queue[r->producer])
 		return -ENOSPC;
+
+	/* Make sure the pointer we are storing points to a valid data. */
+	/* Pairs with smp_read_barrier_depends in __ptr_ring_consume. */
+	smp_wmb();
 
 	r->queue[r->producer++] = ptr;
 	if (unlikely(r->producer >= r->size))
@@ -111,6 +117,11 @@ static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
 	return 0;
 }
 
+/*
+ * Note: resize (below) nests producer lock within consumer lock, so if you
+ * consume in interrupt or BH context, you must disable interrupts/BH when
+ * calling this.
+ */
 static inline int ptr_ring_produce(struct ptr_ring *r, void *ptr)
 {
 	int ret;
@@ -239,9 +250,17 @@ static inline void *__ptr_ring_consume(struct ptr_ring *r)
 	if (ptr)
 		__ptr_ring_discard_one(r);
 
+	/* Make sure anyone accessing data through the pointer is up to date. */
+	/* Pairs with smp_wmb in __ptr_ring_produce. */
+	smp_read_barrier_depends();
 	return ptr;
 }
 
+/*
+ * Note: resize (below) nests producer lock within consumer lock, so if you
+ * call this in interrupt or BH context, you must disable interrupts/BH when
+ * producing.
+ */
 static inline void *ptr_ring_consume(struct ptr_ring *r)
 {
 	void *ptr;
@@ -330,9 +349,11 @@ static inline void *ptr_ring_consume_bh(struct ptr_ring *r)
 	__PTR_RING_PEEK_CALL_v; \
 })
 
-static inline void **__ptr_ring_init_queue_alloc(int size, gfp_t gfp)
+static inline void **__ptr_ring_init_queue_alloc(unsigned int size, gfp_t gfp)
 {
-	return kzalloc(ALIGN(size * sizeof(void *), SMP_CACHE_BYTES), gfp);
+	if (size > KMALLOC_MAX_SIZE / sizeof(void *))
+		return NULL;
+	return kcalloc(size, sizeof(void *), gfp);
 }
 
 static inline int ptr_ring_init(struct ptr_ring *r, int size, gfp_t gfp)
@@ -357,12 +378,14 @@ static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
 	void **old;
 	void *ptr;
 
-	while ((ptr = ptr_ring_consume(r)))
+	while ((ptr = __ptr_ring_consume(r)))
 		if (producer < size)
 			queue[producer++] = ptr;
 		else if (destroy)
 			destroy(ptr);
 
+	if (producer >= size)
+		producer = 0;
 	r->size = size;
 	r->producer = producer;
 	r->consumer = 0;
@@ -372,6 +395,12 @@ static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
 	return old;
 }
 
+/*
+ * Note: producer lock is nested within consumer lock, so if you
+ * resize you must make sure all uses nest correctly.
+ * In particular if you consume ring in interrupt or BH context, you must
+ * disable interrupts/BH when doing so.
+ */
 static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
 				  void (*destroy)(void *))
 {
@@ -382,18 +411,27 @@ static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
 	if (!queue)
 		return -ENOMEM;
 
-	spin_lock_irqsave(&(r)->producer_lock, flags);
+	spin_lock_irqsave(&(r)->consumer_lock, flags);
+	spin_lock(&(r)->producer_lock);
 
 	old = __ptr_ring_swap_queue(r, queue, size, gfp, destroy);
 
-	spin_unlock_irqrestore(&(r)->producer_lock, flags);
+	spin_unlock(&(r)->producer_lock);
+	spin_unlock_irqrestore(&(r)->consumer_lock, flags);
 
 	kfree(old);
 
 	return 0;
 }
 
-static inline int ptr_ring_resize_multiple(struct ptr_ring **rings, int nrings,
+/*
+ * Note: producer lock is nested within consumer lock, so if you
+ * resize you must make sure all uses nest correctly.
+ * In particular if you consume ring in interrupt or BH context, you must
+ * disable interrupts/BH when doing so.
+ */
+static inline int ptr_ring_resize_multiple(struct ptr_ring **rings,
+					   unsigned int nrings,
 					   int size,
 					   gfp_t gfp, void (*destroy)(void *))
 {
@@ -401,7 +439,7 @@ static inline int ptr_ring_resize_multiple(struct ptr_ring **rings, int nrings,
 	void ***queues;
 	int i;
 
-	queues = kmalloc(nrings * sizeof *queues, gfp);
+	queues = kmalloc_array(nrings, sizeof(*queues), gfp);
 	if (!queues)
 		goto noqueues;
 
@@ -412,10 +450,12 @@ static inline int ptr_ring_resize_multiple(struct ptr_ring **rings, int nrings,
 	}
 
 	for (i = 0; i < nrings; ++i) {
-		spin_lock_irqsave(&(rings[i])->producer_lock, flags);
+		spin_lock_irqsave(&(rings[i])->consumer_lock, flags);
+		spin_lock(&(rings[i])->producer_lock);
 		queues[i] = __ptr_ring_swap_queue(rings[i], queues[i],
 						  size, gfp, destroy);
-		spin_unlock_irqrestore(&(rings[i])->producer_lock, flags);
+		spin_unlock(&(rings[i])->producer_lock);
+		spin_unlock_irqrestore(&(rings[i])->consumer_lock, flags);
 	}
 
 	for (i = 0; i < nrings; ++i)

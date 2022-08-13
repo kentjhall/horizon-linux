@@ -141,6 +141,7 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 	if (!atomic_read(&head->ht.nelems))
 		return -1;
 
+	flow_dissector_init_keys(&skb_key.control, &skb_key.basic);
 	fl_clear_masked_range(&skb_key, &head->mask);
 
 	info = skb_tunnel_info(skb);
@@ -149,10 +150,14 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 
 		switch (ip_tunnel_info_af(info)) {
 		case AF_INET:
+			skb_key.enc_control.addr_type =
+				FLOW_DISSECTOR_KEY_IPV4_ADDRS;
 			skb_key.enc_ipv4.src = key->u.ipv4.src;
 			skb_key.enc_ipv4.dst = key->u.ipv4.dst;
 			break;
 		case AF_INET6:
+			skb_key.enc_control.addr_type =
+				FLOW_DISSECTOR_KEY_IPV6_ADDRS;
 			skb_key.enc_ipv6.src = key->u.ipv6.src;
 			skb_key.enc_ipv6.dst = key->u.ipv6.dst;
 			break;
@@ -360,6 +365,7 @@ static const struct nla_policy fl_policy[TCA_FLOWER_MAX + 1] = {
 	[TCA_FLOWER_KEY_TCP_DST_MASK]	= { .type = NLA_U16 },
 	[TCA_FLOWER_KEY_UDP_SRC_MASK]	= { .type = NLA_U16 },
 	[TCA_FLOWER_KEY_UDP_DST_MASK]	= { .type = NLA_U16 },
+	[TCA_FLOWER_FLAGS]		= { .type = NLA_U32 },
 };
 
 static void fl_set_key_val(struct nlattr **tb,

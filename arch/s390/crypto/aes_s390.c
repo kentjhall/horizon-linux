@@ -28,6 +28,7 @@
 #include <linux/cpufeature.h>
 #include <linux/init.h>
 #include <linux/spinlock.h>
+#include <linux/fips.h>
 #include <crypto/xts.h>
 #include <asm/cpacf.h>
 
@@ -501,6 +502,12 @@ static int xts_aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
 	if (err)
 		return err;
 
+	/* In fips mode only 128 bit or 256 bit keys are valid */
+	if (fips_enabled && key_len != 32 && key_len != 64) {
+		tfm->crt_flags |= CRYPTO_TFM_RES_BAD_KEY_LEN;
+		return -EINVAL;
+	}
+
 	/* Pick the correct function code based on the key length */
 	fc = (key_len == 32) ? CPACF_KM_XTS_128 :
 	     (key_len == 64) ? CPACF_KM_XTS_256 : 0;
@@ -565,6 +572,9 @@ static int xts_aes_encrypt(struct blkcipher_desc *desc,
 	struct s390_xts_ctx *xts_ctx = crypto_blkcipher_ctx(desc->tfm);
 	struct blkcipher_walk walk;
 
+	if (!nbytes)
+		return -EINVAL;
+
 	if (unlikely(!xts_ctx->fc))
 		return xts_fallback_encrypt(desc, dst, src, nbytes);
 
@@ -578,6 +588,9 @@ static int xts_aes_decrypt(struct blkcipher_desc *desc,
 {
 	struct s390_xts_ctx *xts_ctx = crypto_blkcipher_ctx(desc->tfm);
 	struct blkcipher_walk walk;
+
+	if (!nbytes)
+		return -EINVAL;
 
 	if (unlikely(!xts_ctx->fc))
 		return xts_fallback_decrypt(desc, dst, src, nbytes);

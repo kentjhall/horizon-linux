@@ -1,0 +1,547 @@
+Device tree binding for NVIDIA Tegra XUSB pad controller
+========================================================
+
+The Tegra XUSB pad controller manages a set of I/O lanes (with differential
+signals) which connect directly to pins/pads on the SoC package. Each lane
+is controlled by a HW block referred to as a "pad" in the Tegra hardware
+documentation. Each such "pad" may control either one or multiple lanes,
+and thus contains any logic common to all its lanes. Each lane can be
+separately configured and powered up.
+
+Some of the lanes are high-speed lanes, which can be used for PCIe, SATA or
+super-speed USB. Other lanes are for various types of low-speed, full-speed
+or high-speed USB (such as UTMI, ULPI and HSIC). The XUSB pad controller
+contains a software-configurable mux that sits between the I/O controller
+ports (e.g. PCIe) and the lanes.
+
+In addition to per-lane configuration, USB 3.0 ports may require additional
+settings on a per-board basis.
+
+Pads will be represented as children of the top-level XUSB pad controller
+device tree node. Each lane exposed by the pad will be represented by its
+own subnode and can be referenced by users of the lane using the standard
+PHY bindings, as described by the phy-bindings.txt file in this directory.
+
+The Tegra hardware documentation refers to the connection between the XUSB
+pad controller and the XUSB controller as "ports". This is confusing since
+"port" is typically used to denote the physical USB receptacle. The device
+tree binding in this document uses the term "port" to refer to the logical
+abstraction of the signals that are routed to a USB receptacle (i.e. a PHY
+for the USB signal, the VBUS power supply, the USB 2.0 companion port for
+USB 3.0 receptacles, ...).
+
+Required properties:
+--------------------
+ - compatible: For Tegra124, must be "nvidia,tegra124-xusb-padctl".
+               For Tegra186, must be "nvidia,tegra18x-xusb-padctl".
+               For Tegra194, must be "nvidia,tegra19x-xusb-padctl".
+               For Tegra210, must be "nvidia,tegra210-xusb-padctl".
+               For Tegra210b01, must be "nvidia,tegra210b01-xusb-padctl".
+ - reg: Must contain the base and length of physical base address and length
+   for each entry in reg-names.
+ - reg-names: an array of strings describing the "reg" entries.
+   Must include the following entries:
+   For Tegra124, Tegra210 and Tegra210b01:
+   -padctl
+   For Tegra186 and Tegra194:
+   -padctl
+   -ao
+ - resets: Must contain an entry for each entry in reset-names.
+   See ../reset/reset.txt for details.
+ - reset-names: Must include the following entries:
+   - padctl
+
+For Tegra186:
+ - avdd_usb-supply: USB 2.0 pads power supply. Must supply 3.3 V.
+ - vclamp_usb-supply: USB controller power supply. Must supply 1.8 V.
+ - avdd_pll_erefeut-supply: PLLE reference PLL power supply. Must supply 1.8 V.
+
+For Tegra194:
+ - pex_dvdd-supply: PCIe/USB3 digital logic power supply. Must supply 1.05 V.
+ - pex_hvdd-supply: PCIe/USB3 high-voltage power supply. Must supply 1.8 V.
+ - pex_pll_hvdd-supply: PCIe/USB3 high-voltage PLL power supply. Must supply 1.8 V.
+ - vclamp_usb-supply: USB controller power supply. Must supply 1.8 V.
+ - avdd_usb-supply: USB 2.0 pads power supply. Must supply 3.3 V.
+ - avdd_pll_nvhs_eutmip-supply: PLLE/USB 2.0 pad PLL power supply. Must supply 1.8 V.
+
+For Tegra210:
+ - avdd_pll_uerefe-supply: PLLE reference PLL power supply. Must supply 1.05 V.
+ - hvdd_pex_pll_e-supply: PCIe/USB3 PLLE power supply. Must supply 1.8 V.
+ - dvdd_pex_pll-supply: PCIe/USB3 digital logic power supply. Must supply 1.05 V.
+ - hvddio_pex-supply: PCIe/USB3 high-voltage power supply. Must supply 1.8 V.
+ - dvddio_pex-supply: PCIe/USB3 digital logic power supply. Must supply 1.05 V.
+ - hvdd_sata-supply: Sata controller power supply. Must supply 1.8 V.
+ - dvdd_sata_pll-supply: Sata PLL power supply. Must supply 1.05 V.
+ - hvddio_sata-supply: Sata pads power supply. Must supply 1.8 V.
+ - dvddio_sata-supply: Sata digital logic power supply. Must apply 1.05 V.
+
+For Tegra210b01:
+ - avdd_pll_uerefe-supply: PLLE reference PLL power supply. Must supply 1.05 V.
+ - hvdd_pex_pll_e-supply: PCIe/USB3 PLLE power supply. Must supply 1.8 V.
+ - dvdd_pex_pll-supply: PCIe/USB3 digital logic power supply. Must supply 1.05 V.
+ - hvddio_pex-supply: PCIe/USB3 high-voltage power supply. Must supply 1.8 V.
+ - dvddio_pex-supply: PCIe/USB3 digital logic power supply. Must supply 1.05 V.
+
+Optional properties:
+-------------------
+ - vddio-hsic-supply: VDDIO regulator for the HSIC pads.
+ - pinctrl-{1,}: For over-current support, we have to specify 3 different
+   pinctrl states for each VBUS_EN pin in sequence of "sfio tristate state",
+   "sfio passthrough state" and "default state", for setting over-current support
+   with VBUS_EN as tristate and passthrough states,and to restore to its default
+   state. For example, if there are 2 VBUS_EN pins, we should set pinctrl-1 to
+   pinctrl-6 as:
+   1:pin 0 sfio tristate state,
+   2:pin 1 sfio tristate state,
+   3:pin 0 sfio passthrough state,
+   4:pin 1 sfio passthrough state,
+   5:pin 0 default state,
+   6:pin 1 default state.
+ - pinctrl-names: should be set to vbus_en0_sfio, vbus_en0_default,
+   vbus_en1_sfio, vbus_en1_default, ... up to the highest supported pin number.
+   The first pinctrl-names item should be "default" since pinctrl-0 is used for
+   XUSB ports, not for VBUS_ENx pins.
+
+Lane muxing:
+===========
+
+Child nodes contain the pad and port configurations following the conventions from
+the pinctrl-bindings.txt document. Typically a single, static configuration is
+given and applied at boot time.
+
+Each subnode describes groups of lanes and ports along with parameters and pads that
+they should be assigned to. The name of these subnodes should follow the rules. Subnodes
+should be named with their lanes accordingly.
+
+Each subnode only applies the parameters that are explicitly listed. In other
+words, if a subnode that lists a function but no pin configuration parameters
+implies no information about any pin configuration parameters. Similarly, a
+subnode that describes only a parameter implies no information about what
+function the pins are assigned to.
+
+Pad group:
+=========
+
+A required child node named "pads" contains a list of subnodes, one for each
+of the pads exposed by the XUSB pad controller. Each pad may need additional
+resources that can be referenced in its pad node.
+
+The "status" property is used to enable or disable the use of a pad. If set
+to "disabled", the pad will not be used on the given board. In order to use
+the pad and any of its lanes, this property must be set to "okay".
+
+For Tegra124, the following pads exist: usb2, ulpi, hsic, pcie
+and sata. No extra resources are required for operation of these pads.
+
+For Tegra186, the following pads exist: usb2, hsic, usb3.
+
+For Tegra194, the following pads exist: usb2 and usb3.
+
+For Tegra210, the following pads exist: usb2, hsic, pcie and sata.
+
+For Tegra210b01, the following pads exit: usb2 and pcie
+
+Below is a description of the properties of each pad.
+
+usb2 pad:
+========
+
+Required properties:
+-------------------
+ - clocks: Must contain an entry for each entry in clock-names.
+ - clock-names: Must contain the following entries:
+   - "trk": phandle and specifier referring to the USB2 tracking clock
+
+HSIC pad:
+========
+
+Required properties:
+-------------------
+ - clocks: Must contain an entry for each entry in clock-names.
+ - clock-names: Must contain the following entries:
+   - "trk": phandle and specifier referring to the HSIC tracking clock
+
+PCIe pad:
+========
+
+Required properties:
+-------------------
+ - clocks: Must contain an entry for each entry in clock-names.
+ - clock-names: Must contain the following entries:
+   For Tegra124, Tegra186, Tegra194 and Tegra210:
+   - "pll": phandle and specifier referring to the PLLE
+   For Tegra210b01:
+   - "pll": phandle and specifier referring to the PLLE
+   - "uphy_mgmt": phandle and specifier referring to the PCIe/USB3
+     management clock
+ - resets: Must contain an entry for each entry in reset-names.
+ - reset-names: Must contain the following entries:
+   - "phy": reset for the PCIe UPHY block
+
+SATA pad:
+========
+
+Required properties:
+-------------------
+ - clocks: Must contain an entry for each entry in clock-names.
+ - clock-names: Must contain the following entries:
+   - "pll": phandle and specifier referring to the PLLE
+ - resets: Must contain an entry for each entry in reset-names.
+ - reset-names: Must contain the following entries:
+   - "phy": reset for the SATA UPHY block
+
+PHY nodes:
+==========
+
+Each pad node has a child named "lanes" that contains one or more children of
+its own, each representing one of the lanes controlled by the pad.
+
+The name of each parameter description of subnode in lanes must
+be in the form <pads>-<port_number>, where <pads> is "usb2", "ulpi", "hsic",
+"pcie", "sata" or "usb3" and <port_number> is the associated port number.
+
+Required properties:
+--------------------
+ - status: Defines the operation status of the PHY. Valid values are:
+   - "disabled": the PHY is disabled
+   - "okay": the PHY is enabled
+ - #phy-cells: Should be 0. Since each lane represents a single PHY, there is
+   no need for an additional specifier.
+ - nvidia,function: The output function of the PHY. See below for a list of
+   valid functions per SoC generation.
+
+For Tegra124, the list of valid PHY nodes is given below:
+ - usb2: usb2-0, usb2-1, usb2-2
+   - functions: "snps", "xusb", "uart"
+ - ulpi: ulpi-0
+   - functions: "snps", "xusb"
+ - hsic: hsic-0, hsic-1
+   - functions: "snps", "xusb"
+ - pcie: pcie-0, pcie-1, pcie-2, pcie-3, pcie-4
+   - functions: "pcie", "usb3-ss". "sata"
+ - sata: sata-0
+   - functions: N/A, we do not need to set the function for sata.
+
+For Tegra186, the list of valid PHY nodes is given below:
+ - usb2: usb2-0, usb2-1, usb2-2
+   - functions: "xusb"
+ - hsic: hsic-0
+   - functions: "xusb"
+ - usb3: usb3-0, usb3-1, usb3-2
+   - functions: "xusb"
+
+For Tegra194, the list of valid PHY nodes is given below:
+ - usb2: usb2-0, usb2-1, usb2-2, usb2-3
+   - functions: "xusb"
+ - usb3: usb3-0, usb3-1, usb3-2, usb3-3
+   - functions: "xusb"
+
+For Tegra210, the list of valid PHY nodes is given below:
+ - usb2: usb2-0, usb2-1, usb2-2, usb2-3
+   - functions: "snps", "xusb", "uart"
+ - hsic: hsic-0
+   - functions: "snps", "xusb"
+ - pcie: pcie-0, pcie-1, pcie-2, pcie-3, pcie-4, pcie-5, pcie-6
+   - functions: "pcie-x1", "xusb", "sata", "pcie-x4"
+ - sata: sata-0
+   - functions: N/A, we do not need to set the function for sata.
+
+For Tegra210b01, the list of valid PHY nodes is given below:
+ - usb2: usb2-0, usb2-1, usb2-2, usb2-3
+   - functions: "snps", "xusb", "uart"
+ - pcie: pcie-0, pcie-1, pcie-2, pcie-3, pcie-4, pcie-5
+   - functions: "pcie-x1", "xusb", "sata", "pcie-x4"
+
+Port group:
+==========
+
+A required child node named "ports" contains a list of all the ports exposed
+by the XUSB pad controller. Per-port configuration is only required for USB.
+
+The name of each parameter description of subnode in ports must
+be in the form <pads>-<port_number>, where <pads> is "usb2", "ulpi", "hsic",
+or "usb3" and <port_number> is the associated port number.
+
+ULPI ports:
+==========
+
+Optional properties:
+-------------------
+ - status: Defines the operation status of the port. Valid values are:
+   - "disabled": the port is disabled
+   - "okay": the port is enabled
+ - nvidia,internal: A boolean property whose presence determines that a port
+   is internal. In the absence of this property the port is considered to be
+   external.
+ - vbus-supply: phandle to a regulator supplying the VBUS voltage.
+
+HSIC ports:
+==========
+
+Required properties:
+-------------------
+ - status: Defines the operation status of the port. Valid values are:
+   - "disabled": the port is disabled
+   - "okay": the port is enabled
+
+Optional properties:
+-------------------
+ - vbus-supply: phandle to a regulator supplying the VBUS voltage.
+
+USB2 ports:
+==========
+
+Required properties:
+-------------------
+ - status: Defines the operation status of the port. Valid values are:
+   - "disabled": the port is disabled
+   - "okay": the port is enabled
+ - mode: A string describes USB port capability. A port for USB2 MUST have this property.
+   Should be one of the following value
+   - host
+   - device
+   - otg
+ - vbus-supply: VBUS regulator for the corresponding UTMI pad. Set "&battery_reg" for
+   dummy regulator. A port for USB2 MUST have this property.
+
+Optional properties:
+-------------------
+ - nvidia,oc-pin: the overcurrent VBUS pin (should be >=0) the lane is using.
+   When this property is specified, the corresponding OC pin will be monitored
+   and if overcurrent event happens, the pad associated with this lane will be
+   reported, Overcurrent support is default disabled if this property is absent.
+
+For Tegra210 and Tegra210b01
+ - nvidia,usb3-port-fake: Faked USB3 port (0/1/2/3) to which USB2 port is mapped.
+   Any usb port work on USB2 function only MUST have this property.
+
+USB3 ports:
+==========
+
+Required properties:
+-------------------
+ - status: Defines the operation status of the port. Valid values are:
+   - "disabled": the port is disabled
+   - "okay": the port is enabled
+ - nvidia,usb2-companion: A single cell that specifies the physical port number
+   to map this super-speed USB port to. The range of valid port numbers varies
+   with the SoC generation:
+   - 0-2: for Tegra124 and Tegra186
+   - 0-3: for Tegra194, Tegra210 and Tegra210b01
+
+Optional properties:
+-------------------
+ - nvidia,internal: A boolean property whose presence determines that a port
+   is internal. In the absence of this property the port is considered to be
+   external.
+
+For Tegra194:
+ - nvidia,usb3-gen1-only: Restrict USB3 port to gen1 capability
+
+Prod Support:
+============
+The recommended configuration for SoC/platform from HW/characterisation of
+SoC is provided as prod data. The POR value of controller registers may be
+different than this configurations. It is required to configure the
+controller registers with recommended setting before doing any data transfer.
+
+The prod setting from the SoC characterisation is provided under the
+sub-node "prod-settings". The prod data is provided under the sub node
+of "prod-settings" with different name (default and conditional) and
+it is used to configure controller register before starting transfer.
+
+The name of each parameter description of subnode in prod-settings must
+be in the form prod_c_<phys><port_number>, where <phys> is "utmi", "ss", or
+"hsic" and <port_number> is the associated port number. A special case is
+"prod_c_bias" for utmi bias pad prod settings.
+
+The supported names of DT sub nodes for prod data are:
+
+For Tegra186:
+ - utmi: "prod_c_utmi0", "prod_c_utmi1", "prod_c_utmi2"
+ - hsic: "prod_c_hsic0"
+ - bias: "prod_c_bias"
+
+For Tegra194:
+ - utmi: "prod_c_utmi0", "prod_c_utmi1", "prod_c_utmi2", "prod_c_utmi3"
+ - bias: "prod_c_bias"
+
+For Tegra210"
+ - utmi: "prod_c_utmi0", "prod_c_utmi1", "prod_c_utmi2", "prod_c_utmi3"
+ - ss: "prod_c_ss0", "prod_c_ss1", "prod_c_ss2", "prod_c_ss3"
+ - hsic: "prod_c_hsic0"
+ - bias: "prod_c_bias"
+
+For Tegra210b01:
+ - utmi: "prod_c_utmi0", "prod_c_utmi1", "prod_c_utmi2", "prod_c_utmi3"
+
+Required properties:
+-------------------
+ - #phy-cells: Should be 4. Prod settings is set of tuples used to program
+   the registers through prod setting API.The fields of each tuple are
+   [index, offset, bitmask, value]
+ - prod: Default DT node for prod setting which need to be configure before
+   starting of any transfer.
+
+Example:
+========
+
+SoC file extract:
+-----------------
+
+	xusb_padctl@3520000 {
+		compatible = "nvidia,tegra19x-xusb-padctl";
+		reg = <0x0 0x03520000 0x0 0x1000>,
+			<0x0 0x03540000 0x0 0x1000>;
+		reg-names = "padctl", "ao";
+		resets = <&bpmp_resets TEGRA194_RESET_XUSB_PADCTL>;
+		reset-names = "padctl";
+
+	};
+
+
+Board file extract:
+-------------------
+
+	# XUSB host mode takes UTMI pad#0,1,2,3 and SuperSpeed pad#0,1,2,3 for a USB 3.0 host
+	tegra_xhci: xhci@3610000 {
+		...
+		phys = <&{/xusb_padctl@3520000/pads/usb2/lanes/usb2-0}>,
+			<&{/xusb_padctl@3520000/pads/usb2/lanes/usb2-1}>,
+			<&{/xusb_padctl@3520000/pads/usb2/lanes/usb2-3}>,
+			<&{/xusb_padctl@3520000/pads/usb2/lanes/usb2-2}>,
+			<&{/xusb_padctl@3520000/pads/usb3/lanes/usb3-2}>,
+			<&{/xusb_padctl@3520000/pads/usb3/lanes/usb3-0}>,
+			<&{/xusb_padctl@3520000/pads/usb3/lanes/usb3-1}>,
+			<&{/xusb_padctl@3520000/pads/usb3/lanes/usb3-3}>;
+		phy-names = "usb2-0", "usb2-1", "usb2-3", "usb2-2",
+			"usb3-2", "usb3-0", "usb3-1", "usb3-3";
+		nvidia,xusb-padctl = <&xusb_padctl>;
+		...
+	};
+
+	# XUSB device mode takes UTMI pad#0 and SuperSpeed pad#2 for a USB3.0 device port
+	tegra_xudc: xudc@3550000 {
+		...
+		phys = <&{/xusb_padctl@3520000/pads/usb2/lanes/usb2-0}>,
+			   <&{/xusb_padctl@3520000/pads/usb3/lanes/usb3-2}>;
+		phy-names = "usb2", "usb3";
+		nvidia,xusb-padctl = <&xusb_padctl>;
+		...
+	};
+
+	xusb_padctl: xusb_padctl@3520000 {
+		pex_dvdd-supply = <&e3360_spmic_sd0>;
+		pex_hvdd-supply = <&e3360_spmic_sd1>;
+		pex_pll_hvdd-supply = <&e3360_spmic_sd1>;
+		vclamp_usb-supply = <&e3360_spmic_sd3>;
+		avdd_usb-supply = <&e3360_spmic_ldo5>;
+		avdd_pll_nvhs_eutmip-supply = <&e3360_spmic_sd1>;
+		pinctrl-0 = <&vbus_en0_default_state>;
+		pinctrl-1 = <&vbus_en1_default_state>;
+		pinctrl-2 = <&vbus_en0_sfio_tristate_state>;
+		pinctrl-3 = <&vbus_en1_sfio_tristate_state>;
+		pinctrl-4 = <&vbus_en0_sfio_passthrough_state>;
+		pinctrl-5 = <&vbus_en1_sfio_passthrough_state>;
+		pinctrl-names = "vbus_en0_default", "vbus_en1_default",
+			"vbus_en0_sfio_tristate", "vbus_en1_sfio_tristate",
+			"vbus_en0_sfio_passthrough", "vbus_en1_sfio_passthrough";
+
+		pads {
+			usb2 {
+				clocks = <&bpmp_clks TEGRA194_CLK_USB2_TRK>;
+				clock-names = "trk";
+				lanes {
+					usb2-0 {
+						nvidia,function = "xusb";
+						status = "okay";
+					};
+					usb2-1 {
+						nvidia,function = "xusb";
+						status = "okay";
+					};
+					usb2-2 {
+						nvidia,function = "xusb";
+						status = "okay";
+					};
+					usb2-3 {
+						nvidia,function = "xusb";
+						status = "okay";
+					};
+				};
+			};
+			usb3 {
+				lanes {
+					usb3-0 {
+						nvidia,function = "xusb";
+						status = "okay";
+					};
+					usb3-1 {
+						nvidia,function = "xusb";
+						status = "okay";
+					};
+					usb3-2 {
+						nvidia,function = "xusb";
+						status = "okay";
+					};
+					usb3-3 {
+						nvidia,function = "xusb";
+						status = "okay";
+					};
+				};
+			};
+		};
+
+		ports {
+			usb2-0 {
+				mode = "otg";
+				status = "okay";
+				nvidia,oc-pin = <0>;
+				vbus-supply = <&e3365_vdd_usb32_5v0>;
+			};
+			usb2-1 {
+				mode = "host";
+				status = "okay";
+				nvidia,oc-pin = <1>;
+				vbus-supply = <&e3365_vdd_usb33_5v0>;
+			};
+			usb2-2 {
+				mode = "host";
+				status = "okay";
+				vbus-supply = <&e3365_vdd_usb30_5v0>;
+			};
+			usb2-3 {
+				mode = "host";
+				status = "okay";
+				vbus-supply = <&e3365_vdd_usb31_5v0>;
+			};
+			usb3-0 {
+				nvidia,usb2-companion = <2>;
+				status = "okay";
+			};
+			usb3-2 {
+				nvidia,usb2-companion = <0>;
+				status = "okay";
+				nvidia,oc-pin = <0>;
+			};
+			usb3-1 {
+				nvidia,usb2-companion = <3>;
+				status = "okay";
+			};
+			usb3-3 {
+				nvidia,usb2-companion = <1>;
+				status = "okay";
+				nvidia,oc-pin = <1>;
+			};
+		};
+
+		prod-settings {
+			#prod-cells = <4>;
+			prod_c_bias {
+				prod = <0 0x284 0x00000038 0x38>;	//XUSB_PADCTL_USB2_BIAS_PAD_CTL_0[HS_DISCON_LEVEL]=7
+			};
+			prod {
+				prod = <0 0x00000024 0x00000fff 0x00000000>;   //XUSB_PADCTL_ELPG_PROGRAM_1_0
+			};
+		};
+	};

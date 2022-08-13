@@ -241,8 +241,9 @@ struct perf_evsel *perf_evsel__new_idx(struct perf_event_attr *attr, int idx)
 {
 	struct perf_evsel *evsel = zalloc(perf_evsel__object.size);
 
-	if (evsel != NULL)
-		perf_evsel__init(evsel, attr, idx);
+	if (!evsel)
+		return NULL;
+	perf_evsel__init(evsel, attr, idx);
 
 	if (perf_evsel__is_bpf_output(evsel)) {
 		evsel->attr.sample_type |= (PERF_SAMPLE_RAW | PERF_SAMPLE_TIME |
@@ -262,8 +263,20 @@ struct perf_evsel *perf_evsel__new_cycles(void)
 	struct perf_evsel *evsel;
 
 	event_attr_init(&attr);
+	/*
+	 * Unnamed union member, not supported as struct member named
+	 * initializer in older compilers such as gcc 4.4.7
+	 *
+	 * Just for probing the precise_ip:
+	 */
+	attr.sample_period = 1;
 
 	perf_event_attr__set_max_precise_ip(&attr);
+	/*
+	 * Now let the usual logic to set up the perf_event_attr defaults
+	 * to kick in when we return and before perf_evsel__open() is called.
+	 */
+	attr.sample_period = 0;
 
 	evsel = perf_evsel__new(&attr);
 	if (evsel == NULL)
@@ -545,6 +558,9 @@ const char *perf_evsel__name(struct perf_evsel *evsel)
 {
 	char bf[128];
 
+	if (!evsel)
+		goto out_unknown;
+
 	if (evsel->name)
 		return evsel->name;
 
@@ -581,7 +597,10 @@ const char *perf_evsel__name(struct perf_evsel *evsel)
 
 	evsel->name = strdup(bf);
 
-	return evsel->name ?: "unknown";
+	if (evsel->name)
+		return evsel->name;
+out_unknown:
+	return "unknown";
 }
 
 const char *perf_evsel__group_name(struct perf_evsel *evsel)
@@ -681,13 +700,13 @@ static void apply_config_terms(struct perf_evsel *evsel,
 	struct perf_evsel_config_term *term;
 	struct list_head *config_terms = &evsel->config_terms;
 	struct perf_event_attr *attr = &evsel->attr;
-	struct callchain_param param;
+	/* callgraph default */
+	struct callchain_param param = {
+		.record_mode = callchain_param.record_mode,
+	};
 	u32 dump_size = 0;
 	int max_stack = 0;
 	const char *callgraph_buf = NULL;
-
-	/* callgraph default */
-	param.record_mode = callchain_param.record_mode;
 
 	list_for_each_entry(term, config_terms, list) {
 		switch (term->type) {
@@ -1154,6 +1173,7 @@ void perf_evsel__exit(struct perf_evsel *evsel)
 {
 	assert(list_empty(&evsel->node));
 	assert(evsel->evlist == NULL);
+	perf_evsel__free_counts(evsel);
 	perf_evsel__free_fd(evsel);
 	perf_evsel__free_id(evsel);
 	perf_evsel__free_config_terms(evsel);
@@ -1221,7 +1241,7 @@ int perf_evsel__read(struct perf_evsel *evsel, int cpu, int thread,
 	if (FD(evsel, cpu, thread) < 0)
 		return -EINVAL;
 
-	if (readn(FD(evsel, cpu, thread), count, sizeof(*count)) < 0)
+	if (readn(FD(evsel, cpu, thread), count, sizeof(*count)) <= 0)
 		return -errno;
 
 	return 0;
@@ -1239,7 +1259,7 @@ int __perf_evsel__read_on_cpu(struct perf_evsel *evsel,
 	if (evsel->counts == NULL && perf_evsel__alloc_counts(evsel, cpu + 1, thread + 1) < 0)
 		return -ENOMEM;
 
-	if (readn(FD(evsel, cpu, thread), &count, nv * sizeof(u64)) < 0)
+	if (readn(FD(evsel, cpu, thread), &count, nv * sizeof(u64)) <= 0)
 		return -errno;
 
 	perf_evsel__compute_deltas(evsel, cpu, thread, &count);
@@ -2400,11 +2420,17 @@ int perf_evsel__open_strerror(struct perf_evsel *evsel, struct target *target,
 			      int err, char *msg, size_t size)
 {
 	char sbuf[STRERR_BUFSIZE];
+	int printed = 0;
 
 	switch (err) {
 	case EPERM:
 	case EACCES:
-		return scnprintf(msg, size,
+		if (err == EPERM)
+			printed = scnprintf(msg, size,
+				"No permission to enable %s event.\n\n",
+				perf_evsel__name(evsel));
+
+		return scnprintf(msg + printed, size - printed,
 		 "You may not have permission to collect %sstats.\n\n"
 		 "Consider tweaking /proc/sys/kernel/perf_event_paranoid,\n"
 		 "which controls use of the performance events system by\n"

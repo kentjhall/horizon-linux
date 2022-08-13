@@ -546,6 +546,13 @@ struct ldlm_lock *__ldlm_handle2lock(const struct lustre_handle *handle,
 	if (!lock)
 		return NULL;
 
+	if (lock->l_export && lock->l_export->exp_failed) {
+		CDEBUG(D_INFO, "lock export failed: lock %p, exp %p\n",
+		       lock, lock->l_export);
+		LDLM_LOCK_PUT(lock);
+		return NULL;
+	}
+
 	/* It's unlikely but possible that someone marked the lock as
 	 * destroyed after we did handle2object on it
 	 */
@@ -1482,8 +1489,10 @@ struct ldlm_lock *ldlm_lock_create(struct ldlm_namespace *ns,
 		return ERR_CAST(res);
 
 	lock = ldlm_lock_new(res);
-	if (!lock)
+	if (!lock) {
+		ldlm_resource_putref(res);
 		return ERR_PTR(-ENOMEM);
+	}
 
 	lock->l_req_mode = mode;
 	lock->l_ast_data = data;
@@ -1525,6 +1534,8 @@ out:
 	LDLM_LOCK_RELEASE(lock);
 	return ERR_PTR(rc);
 }
+
+
 
 /**
  * Enqueue (request) a lock.

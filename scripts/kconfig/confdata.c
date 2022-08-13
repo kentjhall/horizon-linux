@@ -258,12 +258,12 @@ int conf_read_simple(const char *name, int def)
 	int i, def_flags;
 
 	if (name) {
-		in = zconf_fopen(name);
+		in = zconf_fopen(name, 0, NULL, NULL);
 	} else {
 		struct property *prop;
 
 		name = conf_get_configname();
-		in = zconf_fopen(name);
+		in = zconf_fopen(name, 0, NULL, NULL);
 		if (in)
 			goto load;
 		sym_add_change_count(1);
@@ -275,7 +275,7 @@ int conf_read_simple(const char *name, int def)
 			    prop->expr->type != E_SYMBOL)
 				continue;
 			name = conf_expand_value(prop->expr->left.sym->name);
-			in = zconf_fopen(name);
+			in = zconf_fopen(name, 0, NULL, NULL);
 			if (in) {
 				conf_message(_("using defaults found in %s"),
 					 name);
@@ -745,7 +745,7 @@ int conf_write(const char *name)
 	struct menu *menu;
 	const char *basename;
 	const char *str;
-	char dirname[PATH_MAX+1], tmpname[PATH_MAX+1], newname[PATH_MAX+1];
+	char dirname[PATH_MAX+1], tmpname[PATH_MAX+22], newname[PATH_MAX+8];
 	char *env;
 
 	dirname[0] = 0;
@@ -1238,7 +1238,7 @@ bool conf_set_all_new_symbols(enum conf_def_mode mode)
 
 		sym_calc_value(csym);
 		if (mode == def_random)
-			has_changed = randomize_choice_values(csym);
+			has_changed |= randomize_choice_values(csym);
 		else {
 			set_all_choice_values(csym);
 			has_changed = true;

@@ -2,6 +2,7 @@
  *
  * Copyright (c) 2016, Intel Corporation
  * Authors: Salvator Benedetto <salvatore.benedetto@intel.com>
+ * Copyright (c) 2017, NVIDIA Corporation. All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public Licence
@@ -14,7 +15,8 @@
 #include <crypto/kpp.h>
 #include <crypto/ecdh.h>
 #include <linux/scatterlist.h>
-#include "ecc.h"
+
+#include "ecc_ecdh.h"
 
 struct ecdh_ctx {
 	unsigned int curve_id;

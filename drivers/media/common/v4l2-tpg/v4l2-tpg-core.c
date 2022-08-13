@@ -102,7 +102,7 @@ void tpg_init(struct tpg_data *tpg, unsigned w, unsigned h)
 {
 	memset(tpg, 0, sizeof(*tpg));
 	tpg->scaled_width = tpg->src_width = w;
-	tpg->src_height = tpg->buf_height = h;
+	tpg->src_height = tpg->buf_height[0] = h;
 	tpg->crop.width = tpg->compose.width = w;
 	tpg->crop.height = tpg->compose.height = h;
 	tpg->recalc_colors = true;
@@ -114,7 +114,7 @@ void tpg_init(struct tpg_data *tpg, unsigned w, unsigned h)
 	tpg->mv_hor_mode = TPG_MOVE_NONE;
 	tpg->mv_vert_mode = TPG_MOVE_NONE;
 	tpg->field = V4L2_FIELD_NONE;
-	tpg_s_fourcc(tpg, V4L2_PIX_FMT_RGB24);
+	tpg_s_fourcc(tpg, V4L2_PIX_FMT_RGB24, 0);
 	tpg->colorspace = V4L2_COLORSPACE_SRGB;
 	tpg->perc_fill = 100;
 }
@@ -182,7 +182,7 @@ void tpg_free(struct tpg_data *tpg)
 }
 EXPORT_SYMBOL_GPL(tpg_free);
 
-bool tpg_s_fourcc(struct tpg_data *tpg, u32 fourcc)
+bool tpg_s_fourcc(struct tpg_data *tpg, u32 fourcc, u32 metadata_height)
 {
 	tpg->fourcc = fourcc;
 	tpg->planes = 1;
@@ -191,19 +191,43 @@ bool tpg_s_fourcc(struct tpg_data *tpg, u32 fourcc)
 	tpg->interleaved = false;
 	tpg->vdownsampling[0] = 1;
 	tpg->hdownsampling[0] = 1;
+	tpg->packedpixels[0] = 1;
+	tpg->packedpixels[1] = 1;
+	tpg->packedpixels[2] = 1;
 	tpg->hmask[0] = ~0;
 	tpg->hmask[1] = ~0;
 	tpg->hmask[2] = ~0;
 
 	switch (fourcc) {
-	case V4L2_PIX_FMT_SBGGR8:
-	case V4L2_PIX_FMT_SGBRG8:
-	case V4L2_PIX_FMT_SGRBG8:
-	case V4L2_PIX_FMT_SRGGB8:
+	case V4L2_PIX_FMT_XBGGR10P:
+	case V4L2_PIX_FMT_XGBRG10P:
+	case V4L2_PIX_FMT_XGRBG10P:
+	case V4L2_PIX_FMT_XRGGB10P:
+		tpg->packedpixels[0] = 3;
+		tpg->is_yuv = false;
+		if (metadata_height) {
+			tpg->buffers = 2;
+			tpg->planes = 2;
+		}
+		tpg->vdownsampling[1] = 1;
+		tpg->hdownsampling[1] = 1;
+		break;
 	case V4L2_PIX_FMT_SBGGR10:
 	case V4L2_PIX_FMT_SGBRG10:
 	case V4L2_PIX_FMT_SGRBG10:
 	case V4L2_PIX_FMT_SRGGB10:
+		if (metadata_height) {
+			tpg->buffers = 2;
+			tpg->planes = 2;
+		}
+		tpg->is_yuv = false;
+		tpg->vdownsampling[1] = 1;
+		tpg->hdownsampling[1] = 1;
+		break;
+	case V4L2_PIX_FMT_SBGGR8:
+	case V4L2_PIX_FMT_SGBRG8:
+	case V4L2_PIX_FMT_SGRBG8:
+	case V4L2_PIX_FMT_SRGGB8:
 	case V4L2_PIX_FMT_SBGGR12:
 	case V4L2_PIX_FMT_SGBRG12:
 	case V4L2_PIX_FMT_SGRBG12:
@@ -389,6 +413,13 @@ bool tpg_s_fourcc(struct tpg_data *tpg, u32 fourcc)
 		tpg->twopixelsize[0] = 4;
 		tpg->twopixelsize[1] = 4;
 		break;
+	case V4L2_PIX_FMT_XBGGR10P:
+	case V4L2_PIX_FMT_XGBRG10P:
+	case V4L2_PIX_FMT_XGRBG10P:
+	case V4L2_PIX_FMT_XRGGB10P:
+		tpg->twopixelsize[0] = 2 * 4;
+		tpg->twopixelsize[1] = 2 * 4;
+		break;
 	case V4L2_PIX_FMT_YUV444M:
 	case V4L2_PIX_FMT_YVU444M:
 	case V4L2_PIX_FMT_YUV422M:
@@ -436,19 +467,20 @@ void tpg_reset_source(struct tpg_data *tpg, unsigned width, unsigned height,
 	tpg->src_width = width;
 	tpg->src_height = height;
 	tpg->field = field;
-	tpg->buf_height = height;
+	tpg->buf_height[0] = height;
 	if (V4L2_FIELD_HAS_T_OR_B(field))
-		tpg->buf_height /= 2;
+		tpg->buf_height[0] /= 2;
 	tpg->scaled_width = width;
 	tpg->crop.top = tpg->crop.left = 0;
 	tpg->crop.width = width;
 	tpg->crop.height = height;
 	tpg->compose.top = tpg->compose.left = 0;
 	tpg->compose.width = width;
-	tpg->compose.height = tpg->buf_height;
-	for (p = 0; p < tpg->planes; p++)
+	tpg->compose.height = tpg->buf_height[0];
+	for (p = 0; p < tpg->planes; p++) {
 		tpg->bytesperline[p] = (width * tpg->twopixelsize[p]) /
-				       (2 * tpg->hdownsampling[p]);
+			(2 * tpg->hdownsampling[p] * tpg->packedpixels[p]);
+	}
 	tpg->recalc_square_border = true;
 }
 EXPORT_SYMBOL_GPL(tpg_reset_source);
@@ -1618,7 +1650,7 @@ typedef struct { u16 __; u8 _; } __packed x24;
 		unsigned s;	\
 	\
 		for (s = 0; s < len; s++) {	\
-			u8 chr = font8x16[text[s] * 16 + line];	\
+			u8 chr = font8x16[(u8)text[s] * 16 + line];	\
 	\
 			if (hdiv == 2 && tpg->hflip) { \
 				pos[3] = (chr & (0x01 << 6) ? fg : bg);	\
@@ -1650,7 +1682,7 @@ typedef struct { u16 __; u8 _; } __packed x24;
 				pos[7] = (chr & (0x01 << 0) ? fg : bg);	\
 			} \
 	\
-			pos += (tpg->hflip ? -8 : 8) / hdiv;	\
+			pos += (tpg->hflip ? -8 : 8) / (int)hdiv;	\
 		}	\
 	}	\
 } while (0)
@@ -1810,12 +1842,12 @@ static unsigned tpg_calc_buffer_line(const struct tpg_data *tpg, unsigned y,
 	switch (field) {
 	case V4L2_FIELD_SEQ_TB:
 		if (y & 1)
-			return tpg->buf_height / 2 + y / 2;
+			return tpg->buf_height[0] / 2 + y / 2;
 		return y / 2;
 	case V4L2_FIELD_SEQ_BT:
 		if (y & 1)
 			return y / 2;
-		return tpg->buf_height / 2 + y / 2;
+		return tpg->buf_height[0] / 2 + y / 2;
 	default:
 		return y;
 	}
@@ -1859,7 +1891,7 @@ void tpg_calc_text_basep(struct tpg_data *tpg,
 		u8 *basep[TPG_MAX_PLANES][2], unsigned p, u8 *vbuf)
 {
 	unsigned stride = tpg->bytesperline[p];
-	unsigned h = tpg->buf_height;
+	unsigned h = tpg->buf_height[p];
 
 	tpg_recalc(tpg);
 

@@ -445,6 +445,9 @@ static int fnic_queuecommand_lck(struct scsi_cmnd *sc, void (*done)(struct scsi_
 	if (unlikely(fnic_chk_state_flags_locked(fnic, FNIC_FLAGS_IO_BLOCKED)))
 		return SCSI_MLQUEUE_HOST_BUSY;
 
+	if (unlikely(fnic_chk_state_flags_locked(fnic, FNIC_FLAGS_FWRESET)))
+		return SCSI_MLQUEUE_HOST_BUSY;
+
 	rport = starget_to_rport(scsi_target(sc->device));
 	ret = fc_remote_port_chkready(rport);
 	if (ret) {
@@ -1127,12 +1130,6 @@ static void fnic_fcpio_itmf_cmpl_handler(struct fnic *fnic,
 		else
 			CMD_ABTS_STATUS(sc) = hdr_status;
 
-		atomic64_dec(&fnic_stats->io_stats.active_ios);
-		if (atomic64_read(&fnic->io_cmpl_skip))
-			atomic64_dec(&fnic->io_cmpl_skip);
-		else
-			atomic64_inc(&fnic_stats->io_stats.io_completions);
-
 		if (!(CMD_FLAGS(sc) & (FNIC_IO_ABORTED | FNIC_IO_DONE)))
 			atomic64_inc(&misc_stats->no_icmnd_itmf_cmpls);
 
@@ -1173,6 +1170,11 @@ static void fnic_fcpio_itmf_cmpl_handler(struct fnic *fnic,
 					(((u64)CMD_FLAGS(sc) << 32) |
 					CMD_STATE(sc)));
 				sc->scsi_done(sc);
+				atomic64_dec(&fnic_stats->io_stats.active_ios);
+				if (atomic64_read(&fnic->io_cmpl_skip))
+					atomic64_dec(&fnic->io_cmpl_skip);
+				else
+					atomic64_inc(&fnic_stats->io_stats.io_completions);
 			}
 		}
 
@@ -1962,6 +1964,11 @@ int fnic_abort_cmd(struct scsi_cmnd *sc)
 	/* Call SCSI completion function to complete the IO */
 		sc->result = (DID_ABORT << 16);
 		sc->scsi_done(sc);
+		atomic64_dec(&fnic_stats->io_stats.active_ios);
+		if (atomic64_read(&fnic->io_cmpl_skip))
+			atomic64_dec(&fnic->io_cmpl_skip);
+		else
+			atomic64_inc(&fnic_stats->io_stats.io_completions);
 	}
 
 fnic_abort_cmd_end:
@@ -2573,6 +2580,19 @@ int fnic_host_reset(struct scsi_cmnd *sc)
 	unsigned long wait_host_tmo;
 	struct Scsi_Host *shost = sc->device->host;
 	struct fc_lport *lp = shost_priv(shost);
+	struct fnic *fnic = lport_priv(lp);
+	unsigned long flags;
+
+	spin_lock_irqsave(&fnic->fnic_lock, flags);
+	if (fnic->internal_reset_inprogress == 0) {
+		fnic->internal_reset_inprogress = 1;
+	} else {
+		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+			"host reset in progress skipping another host reset\n");
+		return SUCCESS;
+	}
+	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
 
 	/*
 	 * If fnic_reset is successful, wait for fabric login to complete
@@ -2593,6 +2613,9 @@ int fnic_host_reset(struct scsi_cmnd *sc)
 		}
 	}
 
+	spin_lock_irqsave(&fnic->fnic_lock, flags);
+	fnic->internal_reset_inprogress = 0;
+	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
 	return ret;
 }
 

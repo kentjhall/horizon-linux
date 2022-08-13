@@ -49,11 +49,6 @@ static inline bool pciehp_no_msi(void) { return false; }
 #ifdef CONFIG_PCIE_PME
 extern bool pcie_pme_msi_disabled;
 
-static inline void pcie_pme_disable_msi(void)
-{
-	pcie_pme_msi_disabled = true;
-}
-
 static inline bool pcie_pme_no_msi(void)
 {
 	return pcie_pme_msi_disabled;
@@ -61,7 +56,6 @@ static inline bool pcie_pme_no_msi(void)
 
 void pcie_pme_interrupt_enable(struct pci_dev *dev, bool enable);
 #else /* !CONFIG_PCIE_PME */
-static inline void pcie_pme_disable_msi(void) {}
 static inline bool pcie_pme_no_msi(void) { return false; }
 static inline void pcie_pme_interrupt_enable(struct pci_dev *dev, bool en) {}
 #endif /* !CONFIG_PCIE_PME */

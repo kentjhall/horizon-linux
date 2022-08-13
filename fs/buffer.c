@@ -207,6 +207,7 @@ __find_get_block_slow(struct block_device *bdev, sector_t block)
 	struct buffer_head *head;
 	struct page *page;
 	int all_mapped = 1;
+	static DEFINE_RATELIMIT_STATE(last_warned, HZ, 1);
 
 	index = block >> (PAGE_SHIFT - bd_inode->i_blkbits);
 	page = find_get_page_flags(bd_mapping, index, FGP_ACCESSED);
@@ -234,15 +235,15 @@ __find_get_block_slow(struct block_device *bdev, sector_t block)
 	 * file io on the block device and getblk.  It gets dealt with
 	 * elsewhere, don't buffer_error if we had some unmapped buffers
 	 */
-	if (all_mapped) {
-		printk("__find_get_block_slow() failed. "
-			"block=%llu, b_blocknr=%llu\n",
-			(unsigned long long)block,
-			(unsigned long long)bh->b_blocknr);
-		printk("b_state=0x%08lx, b_size=%zu\n",
-			bh->b_state, bh->b_size);
-		printk("device %pg blocksize: %d\n", bdev,
-			1 << bd_inode->i_blkbits);
+	ratelimit_set_flags(&last_warned, RATELIMIT_MSG_ON_RELEASE);
+	if (all_mapped && __ratelimit(&last_warned)) {
+		printk("__find_get_block_slow() failed. block=%llu, "
+		       "b_blocknr=%llu, b_state=0x%08lx, b_size=%zu, "
+		       "device %pg blocksize: %d\n",
+		       (unsigned long long)block,
+		       (unsigned long long)bh->b_blocknr,
+		       bh->b_state, bh->b_size, bdev,
+		       1 << bd_inode->i_blkbits);
 	}
 out_unlock:
 	spin_unlock(&bd_mapping->private_lock);
@@ -2353,7 +2354,7 @@ static int cont_expand_zero(struct file *file, struct address_space *mapping,
 			    loff_t pos, loff_t *bytes)
 {
 	struct inode *inode = mapping->host;
-	unsigned blocksize = 1 << inode->i_blkbits;
+	unsigned int blocksize = i_blocksize(inode);
 	struct page *page;
 	void *fsdata;
 	pgoff_t index, curidx;
@@ -2433,8 +2434,8 @@ int cont_write_begin(struct file *file, struct address_space *mapping,
 			get_block_t *get_block, loff_t *bytes)
 {
 	struct inode *inode = mapping->host;
-	unsigned blocksize = 1 << inode->i_blkbits;
-	unsigned zerofrom;
+	unsigned int blocksize = i_blocksize(inode);
+	unsigned int zerofrom;
 	int err;
 
 	err = cont_expand_zero(file, mapping, pos, bytes);
@@ -2752,16 +2753,6 @@ int nobh_writepage(struct page *page, get_block_t *get_block,
 	/* Is the page fully outside i_size? (truncate in progress) */
 	offset = i_size & (PAGE_SIZE-1);
 	if (page->index >= end_index+1 || !offset) {
-		/*
-		 * The page may have dirty, unmapped buffers.  For example,
-		 * they may have been added in ext3_writepage().  Make them
-		 * freeable here, so the page does not leak.
-		 */
-#if 0
-		/* Not really sure about this  - do we need this ? */
-		if (page->mapping->a_ops->invalidatepage)
-			page->mapping->a_ops->invalidatepage(page, offset);
-#endif
 		unlock_page(page);
 		return 0; /* don't care */
 	}
@@ -2796,7 +2787,7 @@ int nobh_truncate_page(struct address_space *mapping,
 	struct buffer_head map_bh;
 	int err;
 
-	blocksize = 1 << inode->i_blkbits;
+	blocksize = i_blocksize(inode);
 	length = offset & (blocksize - 1);
 
 	/* Block boundary? Nothing to do */
@@ -2874,7 +2865,7 @@ int block_truncate_page(struct address_space *mapping,
 	struct buffer_head *bh;
 	int err;
 
-	blocksize = 1 << inode->i_blkbits;
+	blocksize = i_blocksize(inode);
 	length = offset & (blocksize - 1);
 
 	/* Block boundary? Nothing to do */
@@ -2956,12 +2947,6 @@ int block_write_full_page(struct page *page, get_block_t *get_block,
 	/* Is the page fully outside i_size? (truncate in progress) */
 	offset = i_size & (PAGE_SIZE-1);
 	if (page->index >= end_index+1 || !offset) {
-		/*
-		 * The page may have dirty, unmapped buffers.  For example,
-		 * they may have been added in ext3_writepage().  Make them
-		 * freeable here, so the page does not leak.
-		 */
-		do_invalidatepage(page, 0, PAGE_SIZE);
 		unlock_page(page);
 		return 0; /* don't care */
 	}
@@ -2986,7 +2971,7 @@ sector_t generic_block_bmap(struct address_space *mapping, sector_t block,
 	struct inode *inode = mapping->host;
 	tmp.b_state = 0;
 	tmp.b_blocknr = 0;
-	tmp.b_size = 1 << inode->i_blkbits;
+	tmp.b_size = i_blocksize(inode);
 	get_block(inode, block, &tmp, 0);
 	return tmp.b_blocknr;
 }
@@ -3039,6 +3024,13 @@ void guard_bio_eod(int op, struct bio *bio)
 
 	/* Uhhuh. We've got a bio that straddles the device size! */
 	truncated_bytes = bio->bi_iter.bi_size - (maxsector << 9);
+
+	/*
+	 * The bio contains more than one segment which spans EOD, just return
+	 * and let IO layer turn it into an EIO
+	 */
+	if (truncated_bytes > bvec->bv_len)
+		return;
 
 	/* Truncate the bio.. */
 	bio->bi_iter.bi_size -= truncated_bytes;
@@ -3195,6 +3187,15 @@ int __sync_dirty_buffer(struct buffer_head *bh, int op_flags)
 	WARN_ON(atomic_read(&bh->b_count) < 1);
 	lock_buffer(bh);
 	if (test_clear_buffer_dirty(bh)) {
+		/*
+		 * The bh should be mapped, but it might not be if the
+		 * device was hot-removed. Not much we can do but fail the I/O.
+		 */
+		if (!buffer_mapped(bh)) {
+			unlock_buffer(bh);
+			return -EIO;
+		}
+
 		get_bh(bh);
 		bh->b_end_io = end_buffer_write_sync;
 		ret = submit_bh(REQ_OP_WRITE, op_flags, bh);

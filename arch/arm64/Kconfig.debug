@@ -62,6 +62,15 @@ config DEBUG_ALIGN_RODATA
 
 	  If in doubt, say N.
 
+config DEBUG_VERBOSE_OOPS
+        bool "Output more data during an OOPS"
+	default n
+	help
+	  This option dumps out a lot more information during an OOPS. It
+	  will dump out memory regions in hex from registers that appear
+	  to contain pointers.
+	  If in doubt, say "N".
+
 source "drivers/hwtracing/coresight/Kconfig"
 
 endmenu

@@ -601,7 +601,9 @@ config ARCH_S3C24XX
 	select HAVE_S3C_RTC if RTC_CLASS
 	select MULTI_IRQ_HANDLER
 	select NEED_MACH_IO_H
+	select S3C2410_WATCHDOG
 	select SAMSUNG_ATAGS
+	select WATCHDOG
 	help
 	  Samsung S3C2410, S3C2412, S3C2413, S3C2416, S3C2440, S3C2442, S3C2443
 	  and S3C2450 SoCs based systems, such as the Simtec Electronics BAST
@@ -1457,6 +1459,7 @@ config NR_CPUS
 config HOTPLUG_CPU
 	bool "Support for hot-pluggable CPUs"
 	depends on SMP
+	select GENERIC_IRQ_MIGRATION
 	help
 	  Say Y here to experiment with turning CPUs off and on.  CPUs
 	  can be controlled through /sys/devices/system/cpu.
@@ -1836,6 +1839,15 @@ config XEN
 	help
 	  Say Y if you want to run Linux in a Virtual Machine on Xen on ARM.
 
+config ARM_FLUSH_CONSOLE_ON_RESTART
+	bool "Force flush the console on restart"
+	help
+	  If the console is locked while the system is rebooted, the messages
+	  in the temporary logbuffer would not have propogated to all the
+	  console drivers. This option forces the console lock to be
+	  released if it failed to be acquired, which will cause all the
+	  pending messages to be flushed.
+
 endmenu
 
 menu "Boot options"
@@ -1863,6 +1875,21 @@ config DEPRECATED_PARAM_STRUCT
 	help
 	  This was deprecated in 2001 and announced to live on for 5 years.
 	  Some old boot loaders still use this way.
+
+config BUILD_ARM_APPENDED_DTB_IMAGE
+	bool "Build a concatenated zImage/dtb by default"
+	depends on OF
+	help
+	  Enabling this option will cause a concatenated zImage and list of
+	  DTBs to be built by default (instead of a standalone zImage.)
+	  The image will built in arch/arm/boot/zImage-dtb
+
+config BUILD_ARM_APPENDED_DTB_IMAGE_NAMES
+	string "Default dtb names"
+	depends on BUILD_ARM_APPENDED_DTB_IMAGE
+	help
+	  Space separated list of names of dtbs to append when
+	  building a concatenated zImage-dtb.
 
 # Compressed boot loader in ROM.  Yes, we really want to ask about
 # TEXT and BSS so we preserve their values in the config files.
@@ -2019,7 +2046,7 @@ config XIP_PHYS_ADDR
 config KEXEC
 	bool "Kexec system call (EXPERIMENTAL)"
 	depends on (!SMP || PM_SLEEP_SMP)
-	depends on !CPU_V7M
+	depends on MMU
 	select KEXEC_CORE
 	help
 	  kexec is a system call that implements the ability to shutdown your

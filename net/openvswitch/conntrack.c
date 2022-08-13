@@ -23,6 +23,7 @@
 #include <net/netfilter/nf_conntrack_seqadj.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/ipv6/nf_defrag_ipv6.h>
+#include <net/ipv6_frag.h>
 
 #ifdef CONFIG_NF_NAT_NEEDED
 #include <linux/netfilter/nf_nat.h>
@@ -367,7 +368,6 @@ static int handle_fragments(struct net *net, struct sw_flow_key *key,
 	} else if (key->eth.type == htons(ETH_P_IPV6)) {
 		enum ip6_defrag_users user = IP6_DEFRAG_CONNTRACK_IN + zone;
 
-		skb_orphan(skb);
 		memset(IP6CB(skb), 0, sizeof(struct inet6_skb_parm));
 		err = nf_ct_frag6_gather(net, skb, user);
 		if (err) {
@@ -397,10 +397,38 @@ ovs_ct_expect_find(struct net *net, const struct nf_conntrack_zone *zone,
 		   u16 proto, const struct sk_buff *skb)
 {
 	struct nf_conntrack_tuple tuple;
+	struct nf_conntrack_expect *exp;
 
 	if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb), proto, net, &tuple))
 		return NULL;
-	return __nf_ct_expect_find(net, zone, &tuple);
+
+	exp = __nf_ct_expect_find(net, zone, &tuple);
+	if (exp) {
+		struct nf_conntrack_tuple_hash *h;
+
+		/* Delete existing conntrack entry, if it clashes with the
+		 * expectation.  This can happen since conntrack ALGs do not
+		 * check for clashes between (new) expectations and existing
+		 * conntrack entries.  nf_conntrack_in() will check the
+		 * expectations only if a conntrack entry can not be found,
+		 * which can lead to OVS finding the expectation (here) in the
+		 * init direction, but which will not be removed by the
+		 * nf_conntrack_in() call, if a matching conntrack entry is
+		 * found instead.  In this case all init direction packets
+		 * would be reported as new related packets, while reply
+		 * direction packets would be reported as un-related
+		 * established packets.
+		 */
+		h = nf_conntrack_find_get(net, zone, &tuple);
+		if (h) {
+			struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(h);
+
+			nf_ct_delete(ct, 0, 0);
+			nf_conntrack_put(&ct->ct_general);
+		}
+	}
+
+	return exp;
 }
 
 /* This replicates logic from nf_conntrack_core.c that is not exported. */
@@ -514,7 +542,7 @@ static int ovs_ct_nat_execute(struct sk_buff *skb, struct nf_conn *ct,
 	int hooknum, nh_off, err = NF_ACCEPT;
 
 	nh_off = skb_network_offset(skb);
-	skb_pull(skb, nh_off);
+	skb_pull_rcsum(skb, nh_off);
 
 	/* See HOOK2MANIP(). */
 	if (maniptype == NF_NAT_MANIP_SRC)
@@ -579,6 +607,7 @@ static int ovs_ct_nat_execute(struct sk_buff *skb, struct nf_conn *ct,
 	err = nf_nat_packet(ct, ctinfo, hooknum, skb);
 push:
 	skb_push(skb, nh_off);
+	skb_postpush_rcsum(skb, skb->data, nh_off);
 
 	return err;
 }
@@ -679,6 +708,21 @@ static int ovs_ct_nat(struct net *net, struct sw_flow_key *key,
 		return NF_ACCEPT; /* Connection is not NATed. */
 	}
 	err = ovs_ct_nat_execute(skb, ct, ctinfo, &info->range, maniptype);
+
+	if (err == NF_ACCEPT && ct->status & IPS_DST_NAT) {
+		if (ct->status & IPS_SRC_NAT) {
+			if (maniptype == NF_NAT_MANIP_SRC)
+				maniptype = NF_NAT_MANIP_DST;
+			else
+				maniptype = NF_NAT_MANIP_SRC;
+
+			err = ovs_ct_nat_execute(skb, ct, ctinfo, &info->range,
+						 maniptype);
+		} else if (CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL) {
+			err = ovs_ct_nat_execute(skb, ct, ctinfo, NULL,
+						 NF_NAT_MANIP_SRC);
+		}
+	}
 
 	/* Mark NAT done if successful and update the flow key. */
 	if (err == NF_ACCEPT)
@@ -878,6 +922,36 @@ static int ovs_ct_commit(struct net *net, struct sw_flow_key *key,
 	return 0;
 }
 
+/* Trim the skb to the length specified by the IP/IPv6 header,
+ * removing any trailing lower-layer padding. This prepares the skb
+ * for higher-layer processing that assumes skb->len excludes padding
+ * (such as nf_ip_checksum). The caller needs to pull the skb to the
+ * network header, and ensure ip_hdr/ipv6_hdr points to valid data.
+ */
+static int ovs_skb_network_trim(struct sk_buff *skb)
+{
+	unsigned int len;
+	int err;
+
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+		len = ntohs(ip_hdr(skb)->tot_len);
+		break;
+	case htons(ETH_P_IPV6):
+		len = sizeof(struct ipv6hdr)
+			+ ntohs(ipv6_hdr(skb)->payload_len);
+		break;
+	default:
+		len = skb->len;
+	}
+
+	err = pskb_trim_rcsum(skb, len);
+	if (err)
+		kfree_skb(skb);
+
+	return err;
+}
+
 /* Returns 0 on success, -EINPROGRESS if 'skb' is stolen, or other nonzero
  * value if 'skb' is freed.
  */
@@ -890,7 +964,11 @@ int ovs_ct_execute(struct net *net, struct sk_buff *skb,
 
 	/* The conntrack module expects to be working at L3. */
 	nh_ofs = skb_network_offset(skb);
-	skb_pull(skb, nh_ofs);
+	skb_pull_rcsum(skb, nh_ofs);
+
+	err = ovs_skb_network_trim(skb);
+	if (err)
+		return err;
 
 	if (key->ip.frag != OVS_FRAG_TYPE_NONE) {
 		err = handle_fragments(net, key, info->zone.id, skb);
@@ -904,6 +982,7 @@ int ovs_ct_execute(struct net *net, struct sk_buff *skb,
 		err = ovs_ct_lookup(net, key, info, skb);
 
 	skb_push(skb, nh_ofs);
+	skb_postpush_rcsum(skb, skb->data, nh_ofs);
 	if (err)
 		kfree_skb(skb);
 	return err;
@@ -1087,8 +1166,8 @@ static int parse_ct(const struct nlattr *attr, struct ovs_conntrack_info *info,
 
 	nla_for_each_nested(a, attr, rem) {
 		int type = nla_type(a);
-		int maxlen = ovs_ct_attr_lens[type].maxlen;
-		int minlen = ovs_ct_attr_lens[type].minlen;
+		int maxlen;
+		int minlen;
 
 		if (type > OVS_CT_ATTR_MAX) {
 			OVS_NLERR(log,
@@ -1096,6 +1175,9 @@ static int parse_ct(const struct nlattr *attr, struct ovs_conntrack_info *info,
 				  type, OVS_CT_ATTR_MAX);
 			return -EINVAL;
 		}
+
+		maxlen = ovs_ct_attr_lens[type].maxlen;
+		minlen = ovs_ct_attr_lens[type].minlen;
 		if (nla_len(a) < minlen || nla_len(a) > maxlen) {
 			OVS_NLERR(log,
 				  "Conntrack attr type has unexpected length (type=%d, length=%d, expected=%d)",

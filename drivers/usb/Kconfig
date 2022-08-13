@@ -19,6 +19,14 @@ config USB_EHCI_BIG_ENDIAN_MMIO
 config USB_EHCI_BIG_ENDIAN_DESC
 	bool
 
+config USB_UHCI_BIG_ENDIAN_MMIO
+	bool
+	default y if SPARC_LEON
+
+config USB_UHCI_BIG_ENDIAN_DESC
+	bool
+	default y if SPARC_LEON
+
 menuconfig USB_SUPPORT
 	bool "USB support"
 	depends on HAS_IOMEM
@@ -149,6 +157,8 @@ endif # USB
 source "drivers/usb/phy/Kconfig"
 
 source "drivers/usb/gadget/Kconfig"
+
+source "drivers/usb/typec/Kconfig"
 
 config USB_LED_TRIG
 	bool "USB LED Triggers"

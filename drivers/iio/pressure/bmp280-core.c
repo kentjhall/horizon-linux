@@ -175,11 +175,14 @@ static u32 bmp280_compensate_humidity(struct bmp280_data *data,
 	}
 	H6 = sign_extend32(tmp, 7);
 
-	var = ((s32)data->t_fine) - 76800;
-	var = ((((adc_humidity << 14) - (H4 << 20) - (H5 * var)) + 16384) >> 15)
-		* (((((((var * H6) >> 10) * (((var * H3) >> 11) + 32768)) >> 10)
-		+ 2097152) * H2 + 8192) >> 14);
-	var -= ((((var >> 15) * (var >> 15)) >> 7) * H1) >> 4;
+	var = ((s32)data->t_fine) - (s32)76800;
+	var = ((((adc_humidity << 14) - (H4 << 20) - (H5 * var))
+		+ (s32)16384) >> 15) * (((((((var * H6) >> 10)
+		* (((var * (s32)H3) >> 11) + (s32)32768)) >> 10)
+		+ (s32)2097152) * H2 + 8192) >> 14);
+	var -= ((((var >> 15) * (var >> 15)) >> 7) * (s32)H1) >> 4;
+
+	var = clamp_val(var, 0, 419430400);
 
 	return var >> 12;
 };
@@ -346,10 +349,9 @@ static int bmp280_read_humid(struct bmp280_data *data, int *val, int *val2)
 	adc_humidity = be16_to_cpu(tmp);
 	comp_humidity = bmp280_compensate_humidity(data, adc_humidity);
 
-	*val = comp_humidity;
-	*val2 = 1024;
+	*val = comp_humidity * 1000 / 1024;
 
-	return IIO_VAL_FRACTIONAL;
+	return IIO_VAL_INT;
 }
 
 static int bmp280_read_raw(struct iio_dev *indio_dev,
@@ -557,7 +559,7 @@ static int bmp280_chip_config(struct bmp280_data *data)
 	u8 osrs = BMP280_OSRS_TEMP_X(data->oversampling_temp + 1) |
 		  BMP280_OSRS_PRESS_X(data->oversampling_press + 1);
 
-	ret = regmap_update_bits(data->regmap, BMP280_REG_CTRL_MEAS,
+	ret = regmap_write_bits(data->regmap, BMP280_REG_CTRL_MEAS,
 				 BMP280_OSRS_TEMP_MASK |
 				 BMP280_OSRS_PRESS_MASK |
 				 BMP280_MODE_MASK,
@@ -630,7 +632,7 @@ static int bmp180_measure(struct bmp280_data *data, u8 ctrl_meas)
 	unsigned int ctrl;
 
 	if (data->use_eoc)
-		init_completion(&data->done);
+		reinit_completion(&data->done);
 
 	ret = regmap_write(data->regmap, BMP280_REG_CTRL_MEAS, ctrl_meas);
 	if (ret)
@@ -886,6 +888,9 @@ static int bmp085_fetch_eoc_irq(struct device *dev,
 			"trying to enforce it\n");
 		irq_trig = IRQF_TRIGGER_RISING;
 	}
+
+	init_completion(&data->done);
+
 	ret = devm_request_threaded_irq(dev,
 			irq,
 			bmp085_eoc_irq,

@@ -249,6 +249,7 @@ struct orangefs_sb_info_s {
 	char devname[ORANGEFS_MAX_SERVER_ADDR_LEN];
 	struct super_block *sb;
 	int mount_pending;
+	int no_list;
 	struct list_head list;
 };
 
@@ -568,17 +569,6 @@ do {									\
 	sys_attr.ctime = 0;						\
 	sys_attr.mask = ORANGEFS_ATTR_SYS_ALL_SETABLE;			\
 } while (0)
-
-static inline void orangefs_i_size_write(struct inode *inode, loff_t i_size)
-{
-#if BITS_PER_LONG == 32 && defined(CONFIG_SMP)
-	inode_lock(inode);
-#endif
-	i_size_write(inode, i_size);
-#if BITS_PER_LONG == 32 && defined(CONFIG_SMP)
-	inode_unlock(inode);
-#endif
-}
 
 static inline void orangefs_set_timeout(struct dentry *dentry)
 {

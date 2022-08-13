@@ -1,7 +1,7 @@
 /*
  * OF helpers for IOMMU
  *
- * Copyright (c) 2012, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -27,6 +27,80 @@
 
 static const struct of_device_id __iommu_of_table_sentinel
 	__used __section(__iommu_of_table_end);
+
+static void parse_dm_regions(struct device_node *resv_node,
+					struct device *dev,
+					char *prop_name)
+{
+	int total_values, i, ret;
+	u64 *prop_values;
+	DEFINE_DMA_ATTRS(attrs);
+
+	dma_set_attr(DMA_ATTR_SKIP_IOVA_GAP, attrs);
+	dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, attrs);
+
+	total_values = of_property_count_elems_of_size(resv_node,
+			prop_name,
+			sizeof(u64));
+
+	if (total_values % 2 != 0) {
+		pr_warn("iommu-region props must be pairs of <start size>\n");
+		return;
+	}
+	if (total_values < 0)
+		return;
+
+
+	prop_values = devm_kzalloc(dev, sizeof(u64) *total_values, GFP_KERNEL);
+	if (!prop_values)
+		return;
+
+	ret = of_property_read_variable_u64_array(resv_node, prop_name,
+			prop_values, total_values, total_values);
+	if (ret != total_values) {
+		pr_warn("iommu region values reading failed\n");
+		kfree(prop_values);
+		return;
+	}
+
+	for (i = 0; i < total_values; i += 2) {
+		u64 size, start;
+
+		start = prop_values[i];
+		size  = prop_values[i + 1];
+
+		if (size == 0) {
+			continue;
+		}
+
+		/* If there is overflow, replace size with max possible size */
+		if (start + size < start) {
+			size = (~0x0) - start;
+		}
+
+		dev_info(dev, "OF IOVA linear map 0x%llx size (0x%llx)\n",
+				start, size);
+		dma_map_linear_attrs(dev, start, size, 0, attrs);
+	}
+
+	devm_kfree(dev, prop_values);
+}
+
+void of_map_iommu_direct_regions(struct device *dev)
+{
+	struct device_node *dn = dev->of_node;
+	struct device_node *dm_node;
+	int phandle_index = 0;
+
+	dm_node = of_parse_phandle(dn, "iommu-direct-regions", phandle_index++);
+	while (dm_node != NULL) {
+		parse_dm_regions(dm_node, dev, "reg");
+		dm_node = of_parse_phandle(dn, "iommu-direct-regions",
+							phandle_index++);
+	}
+
+	return;
+}
 
 /**
  * of_get_dma_window - Parse *dma-window property and returns 0 if found.

@@ -739,7 +739,7 @@ static int __qcom_smd_send(struct qcom_smd_channel *channel, const void *data,
 
 	while (qcom_smd_get_tx_avail(channel) < tlen) {
 		if (!wait) {
-			ret = -ENOMEM;
+			ret = -EAGAIN;
 			goto out;
 		}
 
@@ -1006,14 +1006,16 @@ static struct qcom_smd_channel *qcom_smd_create_channel(struct qcom_smd_edge *ed
 	void *info;
 	int ret;
 
-	channel = devm_kzalloc(&edge->dev, sizeof(*channel), GFP_KERNEL);
+	channel = kzalloc(sizeof(*channel), GFP_KERNEL);
 	if (!channel)
 		return ERR_PTR(-ENOMEM);
 
 	channel->edge = edge;
-	channel->name = devm_kstrdup(&edge->dev, name, GFP_KERNEL);
-	if (!channel->name)
-		return ERR_PTR(-ENOMEM);
+	channel->name = kstrdup(name, GFP_KERNEL);
+	if (!channel->name) {
+		ret = -ENOMEM;
+		goto free_channel;
+	}
 
 	mutex_init(&channel->tx_lock);
 	spin_lock_init(&channel->recv_lock);
@@ -1061,8 +1063,9 @@ static struct qcom_smd_channel *qcom_smd_create_channel(struct qcom_smd_edge *ed
 	return channel;
 
 free_name_and_channel:
-	devm_kfree(&edge->dev, channel->name);
-	devm_kfree(&edge->dev, channel);
+	kfree(channel->name);
+free_channel:
+	kfree(channel);
 
 	return ERR_PTR(ret);
 }
@@ -1279,13 +1282,13 @@ static int qcom_smd_parse_edge(struct device *dev,
  */
 static void qcom_smd_edge_release(struct device *dev)
 {
-	struct qcom_smd_channel *channel;
+	struct qcom_smd_channel *channel, *tmp;
 	struct qcom_smd_edge *edge = to_smd_edge(dev);
 
-	list_for_each_entry(channel, &edge->channels, list) {
-		SET_RX_CHANNEL_INFO(channel, state, SMD_CHANNEL_CLOSED);
-		SET_RX_CHANNEL_INFO(channel, head, 0);
-		SET_RX_CHANNEL_INFO(channel, tail, 0);
+	list_for_each_entry_safe(channel, tmp, &edge->channels, list) {
+		list_del(&channel->list);
+		kfree(channel->name);
+		kfree(channel);
 	}
 
 	kfree(edge);

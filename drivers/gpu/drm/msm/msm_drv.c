@@ -396,6 +396,14 @@ static int msm_drm_init(struct device *dev, struct drm_driver *drv)
 	if (ret)
 		goto fail;
 
+	if (!dev->dma_parms) {
+		dev->dma_parms = devm_kzalloc(dev, sizeof(*dev->dma_parms),
+					      GFP_KERNEL);
+		if (!dev->dma_parms)
+			return -ENOMEM;
+	}
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+
 	msm_gem_shrinker_init(ddev);
 
 	switch (get_mdp_ver(pdev)) {
@@ -801,6 +809,7 @@ static struct drm_driver msm_driver = {
 	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
 	.gem_prime_export   = drm_gem_prime_export,
 	.gem_prime_import   = drm_gem_prime_import,
+	.gem_prime_res_obj  = msm_gem_prime_res_obj,
 	.gem_prime_pin      = msm_gem_prime_pin,
 	.gem_prime_unpin    = msm_gem_prime_unpin,
 	.gem_prime_get_sg_table = msm_gem_prime_get_sg_table,

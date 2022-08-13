@@ -191,7 +191,10 @@ sched_clock_register(u64 (*read)(void), int bits, unsigned long rate)
 	rd = cd.read_data[0];
 
 	/* Update epoch for new counter and update 'epoch_ns' from old counter*/
-	new_epoch = read();
+	if (IS_ENABLED(CONFIG_SCHED_POR_TIME))
+		new_epoch = 0;
+	else
+		new_epoch = read();
 	cyc = cd.actual_read_sched_clock();
 	ns = rd.epoch_ns + cyc_to_ns((cyc - rd.epoch_cyc) & rd.sched_clock_mask, rd.mult, rd.shift);
 	cd.actual_read_sched_clock = read;
@@ -204,6 +207,11 @@ sched_clock_register(u64 (*read)(void), int bits, unsigned long rate)
 	rd.epoch_ns		= ns;
 
 	update_clock_read_data(&rd);
+
+	if (sched_clock_timer.function != NULL) {
+		/* update timeout for clock wrap */
+		hrtimer_start(&sched_clock_timer, cd.wrap_kt, HRTIMER_MODE_REL);
+	}
 
 	r = rate;
 	if (r >= 4000000) {

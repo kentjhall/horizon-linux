@@ -298,6 +298,7 @@ struct sdma_engine;
  * @event_id1		for channels that use 2 events
  * @word_size		peripheral access size
  * @buf_tail		ID of the buffer that was processed
+ * @buf_ptail		ID of the previous buffer that was processed
  * @num_bd		max NUM_BD. number of descriptors currently handling
  */
 struct sdma_channel {
@@ -309,6 +310,7 @@ struct sdma_channel {
 	unsigned int			event_id1;
 	enum dma_slave_buswidth		word_size;
 	unsigned int			buf_tail;
+	unsigned int			buf_ptail;
 	unsigned int			num_bd;
 	unsigned int			period_len;
 	struct sdma_buffer_descriptor	*bd;
@@ -630,7 +632,7 @@ static int sdma_load_script(struct sdma_engine *sdma, void *buf, int size,
 	spin_lock_irqsave(&sdma->channel_0_lock, flags);
 
 	bd0->mode.command = C0_SETPM;
-	bd0->mode.status = BD_DONE | BD_INTR | BD_WRAP | BD_EXTD;
+	bd0->mode.status = BD_DONE | BD_WRAP | BD_EXTD;
 	bd0->mode.count = size / 2;
 	bd0->buffer_addr = buf_phys;
 	bd0->ext_buffer_addr = address;
@@ -700,6 +702,8 @@ static void sdma_update_channel_loop(struct sdma_channel *sdmac)
 		sdmac->chn_real_count = bd->mode.count;
 		bd->mode.status |= BD_DONE;
 		bd->mode.count = sdmac->period_len;
+		sdmac->buf_ptail = sdmac->buf_tail;
+		sdmac->buf_tail = (sdmac->buf_tail + 1) % sdmac->num_bd;
 
 		/*
 		 * The callback is called from the interrupt context in order
@@ -709,9 +713,6 @@ static void sdma_update_channel_loop(struct sdma_channel *sdmac)
 		 */
 
 		dmaengine_desc_get_callback_invoke(&sdmac->desc, NULL);
-
-		sdmac->buf_tail++;
-		sdmac->buf_tail %= sdmac->num_bd;
 
 		if (error)
 			sdmac->status = old_status;
@@ -908,7 +909,7 @@ static int sdma_load_context(struct sdma_channel *sdmac)
 	context->gReg[7] = sdmac->watermark_level;
 
 	bd0->mode.command = C0_SETDM;
-	bd0->mode.status = BD_DONE | BD_INTR | BD_WRAP | BD_EXTD;
+	bd0->mode.status = BD_DONE | BD_WRAP | BD_EXTD;
 	bd0->mode.count = sizeof(*context) / 4;
 	bd0->buffer_addr = sdma->context_phys;
 	bd0->ext_buffer_addr = 2048 + (sizeof(*context) / 4) * channel;
@@ -932,6 +933,21 @@ static int sdma_disable_channel(struct dma_chan *chan)
 
 	writel_relaxed(BIT(channel), sdma->regs + SDMA_H_STATSTOP);
 	sdmac->status = DMA_ERROR;
+
+	return 0;
+}
+
+static int sdma_disable_channel_with_delay(struct dma_chan *chan)
+{
+	sdma_disable_channel(chan);
+
+	/*
+	 * According to NXP R&D team a delay of one BD SDMA cost time
+	 * (maximum is 1ms) should be added after disable of the channel
+	 * bit, to ensure SDMA core has really been stopped after SDMA
+	 * clients call .device_terminate_all.
+	 */
+	mdelay(1);
 
 	return 0;
 }
@@ -1186,6 +1202,8 @@ static struct dma_async_tx_descriptor *sdma_prep_slave_sg(
 	sdmac->flags = 0;
 
 	sdmac->buf_tail = 0;
+	sdmac->buf_ptail = 0;
+	sdmac->chn_real_count = 0;
 
 	dev_dbg(sdma->dev, "setting up %d entries for channel %d.\n",
 			sg_len, channel);
@@ -1288,6 +1306,8 @@ static struct dma_async_tx_descriptor *sdma_prep_dma_cyclic(
 	sdmac->status = DMA_IN_PROGRESS;
 
 	sdmac->buf_tail = 0;
+	sdmac->buf_ptail = 0;
+	sdmac->chn_real_count = 0;
 	sdmac->period_len = period_len;
 
 	sdmac->flags |= IMX_DMA_SG_LOOP;
@@ -1385,7 +1405,7 @@ static enum dma_status sdma_tx_status(struct dma_chan *chan,
 	u32 residue;
 
 	if (sdmac->flags & IMX_DMA_SG_LOOP)
-		residue = (sdmac->num_bd - sdmac->buf_tail) *
+		residue = (sdmac->num_bd - sdmac->buf_ptail) *
 			   sdmac->period_len - sdmac->chn_real_count;
 	else
 		residue = sdmac->chn_count - sdmac->chn_real_count;
@@ -1420,6 +1440,14 @@ static void sdma_add_scripts(struct sdma_engine *sdma,
 	/* use the default firmware in ROM if missing external firmware */
 	if (!sdma->script_number)
 		sdma->script_number = SDMA_SCRIPT_ADDRS_ARRAY_SIZE_V1;
+
+	if (sdma->script_number > sizeof(struct sdma_script_start_addrs)
+				  / sizeof(s32)) {
+		dev_err(sdma->dev,
+			"SDMA script number %d not match with firmware.\n",
+			sdma->script_number);
+		return;
+	}
 
 	for (i = 0; i < sdma->script_number; i++)
 		if (addr_arr[i] > 0)
@@ -1735,19 +1763,26 @@ static int sdma_probe(struct platform_device *pdev)
 	if (IS_ERR(sdma->clk_ahb))
 		return PTR_ERR(sdma->clk_ahb);
 
-	clk_prepare(sdma->clk_ipg);
-	clk_prepare(sdma->clk_ahb);
+	ret = clk_prepare(sdma->clk_ipg);
+	if (ret)
+		return ret;
+
+	ret = clk_prepare(sdma->clk_ahb);
+	if (ret)
+		goto err_clk;
 
 	ret = devm_request_irq(&pdev->dev, irq, sdma_int_handler, 0, "sdma",
 			       sdma);
 	if (ret)
-		return ret;
+		goto err_irq;
 
 	sdma->irq = irq;
 
 	sdma->script_addrs = kzalloc(sizeof(*sdma->script_addrs), GFP_KERNEL);
-	if (!sdma->script_addrs)
-		return -ENOMEM;
+	if (!sdma->script_addrs) {
+		ret = -ENOMEM;
+		goto err_irq;
+	}
 
 	/* initially no scripts available */
 	saddr_arr = (s32 *)sdma->script_addrs;
@@ -1794,27 +1829,6 @@ static int sdma_probe(struct platform_device *pdev)
 	if (pdata && pdata->script_addrs)
 		sdma_add_scripts(sdma, pdata->script_addrs);
 
-	if (pdata) {
-		ret = sdma_get_firmware(sdma, pdata->fw_name);
-		if (ret)
-			dev_warn(&pdev->dev, "failed to get firmware from platform data\n");
-	} else {
-		/*
-		 * Because that device tree does not encode ROM script address,
-		 * the RAM script in firmware is mandatory for device tree
-		 * probe, otherwise it fails.
-		 */
-		ret = of_property_read_string(np, "fsl,sdma-ram-script-name",
-					      &fw_name);
-		if (ret)
-			dev_warn(&pdev->dev, "failed to get firmware name\n");
-		else {
-			ret = sdma_get_firmware(sdma, fw_name);
-			if (ret)
-				dev_warn(&pdev->dev, "failed to get firmware from device tree\n");
-		}
-	}
-
 	sdma->dma_device.dev = &pdev->dev;
 
 	sdma->dma_device.device_alloc_chan_resources = sdma_alloc_chan_resources;
@@ -1823,7 +1837,7 @@ static int sdma_probe(struct platform_device *pdev)
 	sdma->dma_device.device_prep_slave_sg = sdma_prep_slave_sg;
 	sdma->dma_device.device_prep_dma_cyclic = sdma_prep_dma_cyclic;
 	sdma->dma_device.device_config = sdma_config;
-	sdma->dma_device.device_terminate_all = sdma_disable_channel;
+	sdma->dma_device.device_terminate_all = sdma_disable_channel_with_delay;
 	sdma->dma_device.src_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
 	sdma->dma_device.dst_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
 	sdma->dma_device.directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
@@ -1856,12 +1870,43 @@ static int sdma_probe(struct platform_device *pdev)
 		of_node_put(spba_bus);
 	}
 
+	/*
+	 * Kick off firmware loading as the very last step:
+	 * attempt to load firmware only if we're not on the error path, because
+	 * the firmware callback requires a fully functional and allocated sdma
+	 * instance.
+	 */
+	if (pdata) {
+		ret = sdma_get_firmware(sdma, pdata->fw_name);
+		if (ret)
+			dev_warn(&pdev->dev, "failed to get firmware from platform data\n");
+	} else {
+		/*
+		 * Because that device tree does not encode ROM script address,
+		 * the RAM script in firmware is mandatory for device tree
+		 * probe, otherwise it fails.
+		 */
+		ret = of_property_read_string(np, "fsl,sdma-ram-script-name",
+					      &fw_name);
+		if (ret) {
+			dev_warn(&pdev->dev, "failed to get firmware name\n");
+		} else {
+			ret = sdma_get_firmware(sdma, fw_name);
+			if (ret)
+				dev_warn(&pdev->dev, "failed to get firmware from device tree\n");
+		}
+	}
+
 	return 0;
 
 err_register:
 	dma_async_device_unregister(&sdma->dma_device);
 err_init:
 	kfree(sdma->script_addrs);
+err_irq:
+	clk_unprepare(sdma->clk_ahb);
+err_clk:
+	clk_unprepare(sdma->clk_ipg);
 	return ret;
 }
 
@@ -1873,6 +1918,8 @@ static int sdma_remove(struct platform_device *pdev)
 	devm_free_irq(&pdev->dev, sdma->irq, sdma);
 	dma_async_device_unregister(&sdma->dma_device);
 	kfree(sdma->script_addrs);
+	clk_unprepare(sdma->clk_ahb);
+	clk_unprepare(sdma->clk_ipg);
 	/* Kill the tasklet */
 	for (i = 0; i < MAX_DMA_CHANNELS; i++) {
 		struct sdma_channel *sdmac = &sdma->channel[i];

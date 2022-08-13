@@ -89,6 +89,12 @@ void mmc_init_context_info(struct mmc_host *host);
 int mmc_execute_tuning(struct mmc_card *card);
 int mmc_hs200_to_hs400(struct mmc_card *card);
 int mmc_hs400_to_hs200(struct mmc_card *card);
+int mmc_hs400_to_ddr(struct mmc_card *card);
+int mmc_ddr_to_hs400(struct mmc_card *card);
+int mmc_hs200_to_ddr(struct mmc_card *card);
+int mmc_ddr_to_hs200(struct mmc_card *card);
+
+int mmc_cmdq_initiate_halt(struct mmc_host *host, bool halt);
 
 #ifdef CONFIG_PM_SLEEP
 void mmc_register_pm_notifier(struct mmc_host *host);

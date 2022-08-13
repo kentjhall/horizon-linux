@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2010 Google, Inc.
- * Copyright (c) 2013, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2013-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * Author:
  *	Colin Cross <ccross@android.com>
@@ -26,6 +26,7 @@ struct tegra_fuse;
 
 struct tegra_fuse_info {
 	u32 (*read)(struct tegra_fuse *fuse, unsigned int offset);
+	int (*write)(struct tegra_fuse *fuse, u32 value, unsigned int offset);
 	unsigned int size;
 	unsigned int spare;
 };
@@ -46,6 +47,10 @@ struct tegra_fuse {
 
 	u32 (*read_early)(struct tegra_fuse *fuse, unsigned int offset);
 	u32 (*read)(struct tegra_fuse *fuse, unsigned int offset);
+	int (*write)(struct tegra_fuse *fuse, u32 value, unsigned int offset);
+	u32 (*control_read)(struct tegra_fuse *fuse, unsigned int offset);
+	int (*control_write)(struct tegra_fuse *fuse, u32 value,
+			unsigned int offset);
 	const struct tegra_fuse_soc *soc;
 
 	/* APBDMA on Tegra20 */
@@ -62,47 +67,23 @@ struct tegra_fuse {
 void tegra_init_revision(void);
 void tegra_init_apbmisc(void);
 
-bool __init tegra_fuse_read_spare(unsigned int spare);
-u32 __init tegra_fuse_read_early(unsigned int offset);
+bool tegra_fuse_read_spare(unsigned int spare);
+u32 tegra_fuse_read_early(unsigned int offset);
+int tegra_fuse_control_read(unsigned long offset, u32 *value);
+void tegra_fuse_control_write(u32 value, unsigned long offset);
 
-#ifdef CONFIG_ARCH_TEGRA_2x_SOC
 void tegra20_init_speedo_data(struct tegra_sku_info *sku_info);
-#endif
-
-#ifdef CONFIG_ARCH_TEGRA_3x_SOC
 void tegra30_init_speedo_data(struct tegra_sku_info *sku_info);
-#endif
-
-#ifdef CONFIG_ARCH_TEGRA_114_SOC
 void tegra114_init_speedo_data(struct tegra_sku_info *sku_info);
-#endif
-
-#if defined(CONFIG_ARCH_TEGRA_124_SOC) || defined(CONFIG_ARCH_TEGRA_132_SOC)
 void tegra124_init_speedo_data(struct tegra_sku_info *sku_info);
-#endif
-
-#ifdef CONFIG_ARCH_TEGRA_210_SOC
 void tegra210_init_speedo_data(struct tegra_sku_info *sku_info);
-#endif
 
-#ifdef CONFIG_ARCH_TEGRA_2x_SOC
 extern const struct tegra_fuse_soc tegra20_fuse_soc;
-#endif
-
-#ifdef CONFIG_ARCH_TEGRA_3x_SOC
 extern const struct tegra_fuse_soc tegra30_fuse_soc;
-#endif
-
-#ifdef CONFIG_ARCH_TEGRA_114_SOC
 extern const struct tegra_fuse_soc tegra114_fuse_soc;
-#endif
-
-#if defined(CONFIG_ARCH_TEGRA_124_SOC) || defined(CONFIG_ARCH_TEGRA_132_SOC)
 extern const struct tegra_fuse_soc tegra124_fuse_soc;
-#endif
-
-#ifdef CONFIG_ARCH_TEGRA_210_SOC
 extern const struct tegra_fuse_soc tegra210_fuse_soc;
-#endif
+extern const struct tegra_fuse_soc tegra186_fuse_soc;
+extern const struct tegra_fuse_soc tegra194_fuse_soc;
 
 #endif

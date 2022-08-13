@@ -1,5 +1,5 @@
 /*
- * Copyright(c) 2015, 2016 Intel Corporation.
+ * Copyright(c) 2015 - 2017 Intel Corporation.
  *
  * This file is provided under a dual BSD/GPLv2 license.  When using or
  * redistributing this file, you may do so under either license.
@@ -1088,6 +1088,8 @@ int hfi1_verbs_send_pio(struct rvt_qp *qp, struct hfi1_pkt_state *ps,
 
 				if (slen > len)
 					slen = len;
+				if (slen > ss->sge.sge_length)
+					slen = ss->sge.sge_length;
 				update_sge(ss, slen);
 				seg_pio_copy_mid(pbuf, addr, slen);
 				len -= slen;
@@ -1342,8 +1344,6 @@ static void hfi1_fill_device_attr(struct hfi1_devdata *dd)
 	rdi->dparms.props.max_cq = hfi1_max_cqs;
 	rdi->dparms.props.max_ah = hfi1_max_ahs;
 	rdi->dparms.props.max_cqe = hfi1_max_cqes;
-	rdi->dparms.props.max_mr = rdi->lkey_table.max;
-	rdi->dparms.props.max_fmr = rdi->lkey_table.max;
 	rdi->dparms.props.max_map_per_fmr = 32767;
 	rdi->dparms.props.max_pd = hfi1_max_pds;
 	rdi->dparms.props.max_qp_rd_atom = HFI1_MAX_RDMA_ATOMIC;
@@ -1511,12 +1511,18 @@ static int hfi1_check_ah(struct ib_device *ibdev, struct ib_ah_attr *ah_attr)
 	struct hfi1_pportdata *ppd;
 	struct hfi1_devdata *dd;
 	u8 sc5;
+	u8 sl;
 
 	/* test the mapping for validity */
 	ibp = to_iport(ibdev, ah_attr->port_num);
 	ppd = ppd_from_ibp(ibp);
-	sc5 = ibp->sl_to_sc[ah_attr->sl];
 	dd = dd_from_ppd(ppd);
+
+	sl = ah_attr->sl;
+	if (sl >= ARRAY_SIZE(ibp->sl_to_sc))
+		return -EINVAL;
+
+	sc5 = ibp->sl_to_sc[sl];
 	if (sc_to_vlt(dd, sc5) > num_vls && sc_to_vlt(dd, sc5) != 0xf)
 		return -EINVAL;
 	return 0;
@@ -1697,7 +1703,7 @@ int hfi1_register_ib_device(struct hfi1_devdata *dd)
 	dd->verbs_dev.rdi.driver_f.qp_priv_free = qp_priv_free;
 	dd->verbs_dev.rdi.driver_f.free_all_qps = free_all_qps;
 	dd->verbs_dev.rdi.driver_f.notify_qp_reset = notify_qp_reset;
-	dd->verbs_dev.rdi.driver_f.do_send = hfi1_do_send;
+	dd->verbs_dev.rdi.driver_f.do_send = hfi1_do_send_from_rvt;
 	dd->verbs_dev.rdi.driver_f.schedule_send = hfi1_schedule_send;
 	dd->verbs_dev.rdi.driver_f.schedule_send_no_lock = _hfi1_schedule_send;
 	dd->verbs_dev.rdi.driver_f.get_pmtu_from_attr = get_pmtu_from_attr;

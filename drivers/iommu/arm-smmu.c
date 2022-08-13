@@ -15,6 +15,7 @@
  * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
  * Copyright (C) 2013 ARM Limited
+ * Copyright (c) 2015-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * Author: Will Deacon <will.deacon@arm.com>
  *
@@ -23,316 +24,110 @@
  *	- Stream-matching and stream-indexing
  *	- v7/v8 long-descriptor format
  *	- Non-secure access to the SMMU
+ *	- 4k and 64k pages, with contiguous pte hints.
+ *	- Up to 48-bit addressing (dependent on VA_BITS)
  *	- Context fault reporting
  */
 
 #define pr_fmt(fmt) "arm-smmu: " fmt
 
-#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/dma-iommu.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
-#include <linux/io-64-nonatomic-hi-lo.h>
 #include <linux/iommu.h>
-#include <linux/iopoll.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
 #include <linux/of_iommu.h>
+#include <linux/of_platform.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/debugfs.h>
+#include <linux/uaccess.h>
+#include <soc/tegra/chip-id.h>
+#include <linux/ktime.h>
+#include <linux/string.h>
 
 #include <linux/amba/bus.h>
 
-#include "io-pgtable.h"
+#include <linux/arm-smmu-suspend.h>
+
+#include <asm/pgalloc.h>
+#include <asm/dma-iommu.h>
+#include <asm/pgtable.h>
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/arm_smmu.h>
+
+#include "of_tegra-smmu.h" /* FIXME: to parse implicitly */
+#include "arm-smmu-regs.h"
+
+#include <dt-bindings/memory/tegra-swgroup.h>
+#include <linux/platform/tegra/tegra-mc-sid.h>
+
+#ifndef ENABLE_IOMMU_DMA_OPS
+#define ENABLE_IOMMU_DMA_OPS 0
+#endif
+
+#define MAX_SMMUS			1
+
+/* Maximum number of stream IDs assigned to a single device */
+#define MAX_MASTER_STREAMIDS		MAX_PHANDLE_ARGS
 
 /* Maximum number of context banks per SMMU */
 #define ARM_SMMU_MAX_CBS		128
 
-/* SMMU global address space */
-#define ARM_SMMU_GR0(smmu)		((smmu)->base)
-#define ARM_SMMU_GR1(smmu)		((smmu)->base + (1 << (smmu)->pgshift))
+/* Maximum number of mapping groups per SMMU */
+#define ARM_SMMU_MAX_SMRS		128
 
-/*
- * SMMU global address space with conditional offset to access secure
- * aliases of non-secure registers (e.g. nsCR0: 0x400, nsGFSR: 0x448,
- * nsGFSYNR0: 0x450)
- */
-#define ARM_SMMU_GR0_NS(smmu)						\
-	((smmu)->base +							\
-		((smmu->options & ARM_SMMU_OPT_SECURE_CFG_ACCESS)	\
-			? 0x400 : 0))
-
-/*
- * Some 64-bit registers only make sense to write atomically, but in such
- * cases all the data relevant to AArch32 formats lies within the lower word,
- * therefore this actually makes more sense than it might first appear.
- */
-#ifdef CONFIG_64BIT
-#define smmu_write_atomic_lq		writeq_relaxed
-#else
-#define smmu_write_atomic_lq		writel_relaxed
-#endif
-
-/* Configuration registers */
-#define ARM_SMMU_GR0_sCR0		0x0
-#define sCR0_CLIENTPD			(1 << 0)
-#define sCR0_GFRE			(1 << 1)
-#define sCR0_GFIE			(1 << 2)
-#define sCR0_GCFGFRE			(1 << 4)
-#define sCR0_GCFGFIE			(1 << 5)
-#define sCR0_USFCFG			(1 << 10)
-#define sCR0_VMIDPNE			(1 << 11)
-#define sCR0_PTM			(1 << 12)
-#define sCR0_FB				(1 << 13)
-#define sCR0_VMID16EN			(1 << 31)
-#define sCR0_BSU_SHIFT			14
-#define sCR0_BSU_MASK			0x3
-
-/* Auxiliary Configuration register */
-#define ARM_SMMU_GR0_sACR		0x10
-
-/* Identification registers */
-#define ARM_SMMU_GR0_ID0		0x20
-#define ARM_SMMU_GR0_ID1		0x24
-#define ARM_SMMU_GR0_ID2		0x28
-#define ARM_SMMU_GR0_ID3		0x2c
-#define ARM_SMMU_GR0_ID4		0x30
-#define ARM_SMMU_GR0_ID5		0x34
-#define ARM_SMMU_GR0_ID6		0x38
-#define ARM_SMMU_GR0_ID7		0x3c
-#define ARM_SMMU_GR0_sGFSR		0x48
-#define ARM_SMMU_GR0_sGFSYNR0		0x50
-#define ARM_SMMU_GR0_sGFSYNR1		0x54
-#define ARM_SMMU_GR0_sGFSYNR2		0x58
-
-#define ID0_S1TS			(1 << 30)
-#define ID0_S2TS			(1 << 29)
-#define ID0_NTS				(1 << 28)
-#define ID0_SMS				(1 << 27)
-#define ID0_ATOSNS			(1 << 26)
-#define ID0_PTFS_NO_AARCH32		(1 << 25)
-#define ID0_PTFS_NO_AARCH32S		(1 << 24)
-#define ID0_CTTW			(1 << 14)
-#define ID0_NUMIRPT_SHIFT		16
-#define ID0_NUMIRPT_MASK		0xff
-#define ID0_NUMSIDB_SHIFT		9
-#define ID0_NUMSIDB_MASK		0xf
-#define ID0_NUMSMRG_SHIFT		0
-#define ID0_NUMSMRG_MASK		0xff
-
-#define ID1_PAGESIZE			(1 << 31)
-#define ID1_NUMPAGENDXB_SHIFT		28
-#define ID1_NUMPAGENDXB_MASK		7
-#define ID1_NUMS2CB_SHIFT		16
-#define ID1_NUMS2CB_MASK		0xff
-#define ID1_NUMCB_SHIFT			0
-#define ID1_NUMCB_MASK			0xff
-
-#define ID2_OAS_SHIFT			4
-#define ID2_OAS_MASK			0xf
-#define ID2_IAS_SHIFT			0
-#define ID2_IAS_MASK			0xf
-#define ID2_UBS_SHIFT			8
-#define ID2_UBS_MASK			0xf
-#define ID2_PTFS_4K			(1 << 12)
-#define ID2_PTFS_16K			(1 << 13)
-#define ID2_PTFS_64K			(1 << 14)
-#define ID2_VMID16			(1 << 15)
-
-#define ID7_MAJOR_SHIFT			4
-#define ID7_MAJOR_MASK			0xf
-
-/* Global TLB invalidation */
-#define ARM_SMMU_GR0_TLBIVMID		0x64
-#define ARM_SMMU_GR0_TLBIALLNSNH	0x68
-#define ARM_SMMU_GR0_TLBIALLH		0x6c
-#define ARM_SMMU_GR0_sTLBGSYNC		0x70
-#define ARM_SMMU_GR0_sTLBGSTATUS	0x74
-#define sTLBGSTATUS_GSACTIVE		(1 << 0)
-#define TLB_LOOP_TIMEOUT		1000000	/* 1s! */
-
-/* Stream mapping registers */
-#define ARM_SMMU_GR0_SMR(n)		(0x800 + ((n) << 2))
-#define SMR_VALID			(1 << 31)
-#define SMR_MASK_SHIFT			16
-#define SMR_ID_SHIFT			0
-
-#define ARM_SMMU_GR0_S2CR(n)		(0xc00 + ((n) << 2))
-#define S2CR_CBNDX_SHIFT		0
-#define S2CR_CBNDX_MASK			0xff
-#define S2CR_TYPE_SHIFT			16
-#define S2CR_TYPE_MASK			0x3
-enum arm_smmu_s2cr_type {
-	S2CR_TYPE_TRANS,
-	S2CR_TYPE_BYPASS,
-	S2CR_TYPE_FAULT,
-};
-
-#define S2CR_PRIVCFG_SHIFT		24
-#define S2CR_PRIVCFG_MASK		0x3
-enum arm_smmu_s2cr_privcfg {
-	S2CR_PRIVCFG_DEFAULT,
-	S2CR_PRIVCFG_DIPAN,
-	S2CR_PRIVCFG_UNPRIV,
-	S2CR_PRIVCFG_PRIV,
-};
-
-/* Context bank attribute registers */
-#define ARM_SMMU_GR1_CBAR(n)		(0x0 + ((n) << 2))
-#define CBAR_VMID_SHIFT			0
-#define CBAR_VMID_MASK			0xff
-#define CBAR_S1_BPSHCFG_SHIFT		8
-#define CBAR_S1_BPSHCFG_MASK		3
-#define CBAR_S1_BPSHCFG_NSH		3
-#define CBAR_S1_MEMATTR_SHIFT		12
-#define CBAR_S1_MEMATTR_MASK		0xf
-#define CBAR_S1_MEMATTR_WB		0xf
-#define CBAR_TYPE_SHIFT			16
-#define CBAR_TYPE_MASK			0x3
-#define CBAR_TYPE_S2_TRANS		(0 << CBAR_TYPE_SHIFT)
-#define CBAR_TYPE_S1_TRANS_S2_BYPASS	(1 << CBAR_TYPE_SHIFT)
-#define CBAR_TYPE_S1_TRANS_S2_FAULT	(2 << CBAR_TYPE_SHIFT)
-#define CBAR_TYPE_S1_TRANS_S2_TRANS	(3 << CBAR_TYPE_SHIFT)
-#define CBAR_IRPTNDX_SHIFT		24
-#define CBAR_IRPTNDX_MASK		0xff
-
-#define ARM_SMMU_GR1_CBA2R(n)		(0x800 + ((n) << 2))
-#define CBA2R_RW64_32BIT		(0 << 0)
-#define CBA2R_RW64_64BIT		(1 << 0)
-#define CBA2R_VMID_SHIFT		16
-#define CBA2R_VMID_MASK			0xffff
-
-/* Translation context bank */
-#define ARM_SMMU_CB_BASE(smmu)		((smmu)->base + ((smmu)->size >> 1))
-#define ARM_SMMU_CB(smmu, n)		((n) * (1 << (smmu)->pgshift))
-
-#define ARM_SMMU_CB_SCTLR		0x0
-#define ARM_SMMU_CB_ACTLR		0x4
-#define ARM_SMMU_CB_RESUME		0x8
-#define ARM_SMMU_CB_TTBCR2		0x10
-#define ARM_SMMU_CB_TTBR0		0x20
-#define ARM_SMMU_CB_TTBR1		0x28
-#define ARM_SMMU_CB_TTBCR		0x30
-#define ARM_SMMU_CB_CONTEXTIDR		0x34
-#define ARM_SMMU_CB_S1_MAIR0		0x38
-#define ARM_SMMU_CB_S1_MAIR1		0x3c
-#define ARM_SMMU_CB_PAR			0x50
-#define ARM_SMMU_CB_FSR			0x58
-#define ARM_SMMU_CB_FAR			0x60
-#define ARM_SMMU_CB_FSYNR0		0x68
-#define ARM_SMMU_CB_S1_TLBIVA		0x600
-#define ARM_SMMU_CB_S1_TLBIASID		0x610
-#define ARM_SMMU_CB_S1_TLBIVAL		0x620
-#define ARM_SMMU_CB_S2_TLBIIPAS2	0x630
-#define ARM_SMMU_CB_S2_TLBIIPAS2L	0x638
-#define ARM_SMMU_CB_ATS1PR		0x800
-#define ARM_SMMU_CB_ATSR		0x8f0
-
-#define SCTLR_S1_ASIDPNE		(1 << 12)
-#define SCTLR_CFCFG			(1 << 7)
-#define SCTLR_CFIE			(1 << 6)
-#define SCTLR_CFRE			(1 << 5)
-#define SCTLR_E				(1 << 4)
-#define SCTLR_AFE			(1 << 2)
-#define SCTLR_TRE			(1 << 1)
-#define SCTLR_M				(1 << 0)
-
-#define ARM_MMU500_ACTLR_CPRE		(1 << 1)
-
-#define ARM_MMU500_ACR_CACHE_LOCK	(1 << 26)
-
-#define CB_PAR_F			(1 << 0)
-
-#define ATSR_ACTIVE			(1 << 0)
-
-#define RESUME_RETRY			(0 << 0)
-#define RESUME_TERMINATE		(1 << 0)
-
-#define TTBCR2_SEP_SHIFT		15
-#define TTBCR2_SEP_UPSTREAM		(0x7 << TTBCR2_SEP_SHIFT)
-
-#define TTBRn_ASID_SHIFT		48
-
-#define FSR_MULTI			(1 << 31)
-#define FSR_SS				(1 << 30)
-#define FSR_UUT				(1 << 8)
-#define FSR_ASF				(1 << 7)
-#define FSR_TLBLKF			(1 << 6)
-#define FSR_TLBMCF			(1 << 5)
-#define FSR_EF				(1 << 4)
-#define FSR_PF				(1 << 3)
-#define FSR_AFF				(1 << 2)
-#define FSR_TF				(1 << 1)
-
-#define FSR_IGN				(FSR_AFF | FSR_ASF | \
-					 FSR_TLBMCF | FSR_TLBLKF)
-#define FSR_FAULT			(FSR_MULTI | FSR_SS | FSR_UUT | \
-					 FSR_EF | FSR_PF | FSR_TF | FSR_IGN)
-
-#define FSYNR0_WNR			(1 << 4)
+#define NUM_SID				64
 
 static int force_stage;
 module_param(force_stage, int, S_IRUGO);
 MODULE_PARM_DESC(force_stage,
 	"Force SMMU mappings to be installed at a particular stage of translation. A value of '1' or '2' forces the corresponding stage. All other values are ignored (i.e. no stage is forced). Note that selecting a specific stage will disable support for nested translation.");
-static bool disable_bypass;
+static bool disable_bypass = 1;
 module_param(disable_bypass, bool, S_IRUGO);
 MODULE_PARM_DESC(disable_bypass,
 	"Disable bypass streams such that incoming transactions from devices that are not attached to an iommu domain will report an abort back to the device and will not be allowed to pass through the SMMU.");
 
 enum arm_smmu_arch_version {
-	ARM_SMMU_V1,
-	ARM_SMMU_V1_64K,
+	ARM_SMMU_V1 = 1,
 	ARM_SMMU_V2,
 };
 
-enum arm_smmu_implementation {
-	GENERIC_SMMU,
-	ARM_MMU500,
-	CAVIUM_SMMUV2,
-};
-
-struct arm_smmu_s2cr {
-	struct iommu_group		*group;
-	int				count;
-	enum arm_smmu_s2cr_type		type;
-	enum arm_smmu_s2cr_privcfg	privcfg;
-	u8				cbndx;
-};
-
-#define s2cr_init_val (struct arm_smmu_s2cr){				\
-	.type = disable_bypass ? S2CR_TYPE_FAULT : S2CR_TYPE_BYPASS,	\
-}
-
 struct arm_smmu_smr {
+	u8				idx;
 	u16				mask;
 	u16				id;
-	bool				valid;
 };
 
 struct arm_smmu_master_cfg {
-	struct arm_smmu_device		*smmu;
-	s16				smendx[];
+	int				num_streamids;
+	u16				streamids[MAX_MASTER_STREAMIDS];
+	struct arm_smmu_smr		*smrs;
 };
-#define INVALID_SMENDX			-1
-#define __fwspec_cfg(fw) ((struct arm_smmu_master_cfg *)fw->iommu_priv)
-#define fwspec_smmu(fw)  (__fwspec_cfg(fw)->smmu)
-#define fwspec_smendx(fw, i) \
-	(i >= fw->num_ids ? INVALID_SMENDX : __fwspec_cfg(fw)->smendx[i])
-#define for_each_cfg_sme(fw, i, idx) \
-	for (i = 0; idx = fwspec_smendx(fw, i), i < fw->num_ids; ++i)
+
+struct arm_smmu_master {
+	struct device_node		*of_node;
+	struct rb_node			node;
+	struct arm_smmu_master_cfg	*cfg;
+	struct dentry			*debugfs_root;
+};
 
 struct arm_smmu_device {
 	struct device			*dev;
 
 	void __iomem			*base;
+#ifdef CONFIG_ARM_SMMU_SUSPEND
+	void __iomem			*bases[MAX_SMMUS];
+#endif
+	u32				base_pa;
 	unsigned long			size;
 	unsigned long			pgshift;
 
@@ -341,19 +136,11 @@ struct arm_smmu_device {
 #define ARM_SMMU_FEAT_TRANS_S1		(1 << 2)
 #define ARM_SMMU_FEAT_TRANS_S2		(1 << 3)
 #define ARM_SMMU_FEAT_TRANS_NESTED	(1 << 4)
-#define ARM_SMMU_FEAT_TRANS_OPS		(1 << 5)
-#define ARM_SMMU_FEAT_VMID16		(1 << 6)
-#define ARM_SMMU_FEAT_FMT_AARCH64_4K	(1 << 7)
-#define ARM_SMMU_FEAT_FMT_AARCH64_16K	(1 << 8)
-#define ARM_SMMU_FEAT_FMT_AARCH64_64K	(1 << 9)
-#define ARM_SMMU_FEAT_FMT_AARCH32_L	(1 << 10)
-#define ARM_SMMU_FEAT_FMT_AARCH32_S	(1 << 11)
 	u32				features;
 
 #define ARM_SMMU_OPT_SECURE_CFG_ACCESS (1 << 0)
 	u32				options;
 	enum arm_smmu_arch_version	version;
-	enum arm_smmu_implementation	model;
 
 	u32				num_context_banks;
 	u32				num_s2_context_banks;
@@ -361,69 +148,79 @@ struct arm_smmu_device {
 	atomic_t			irptndx;
 
 	u32				num_mapping_groups;
-	u16				streamid_mask;
-	u16				smr_mask_mask;
-	struct arm_smmu_smr		*smrs;
-	struct arm_smmu_s2cr		*s2crs;
-	struct mutex			stream_map_mutex;
+	DECLARE_BITMAP(smr_map, ARM_SMMU_MAX_SMRS);
 
-	unsigned long			va_size;
-	unsigned long			ipa_size;
-	unsigned long			pa_size;
-	unsigned long			pgsize_bitmap;
+	unsigned long			s1_input_size;
+	unsigned long			s1_output_size;
+	unsigned long			s2_input_size;
+	unsigned long			s2_output_size;
 
 	u32				num_global_irqs;
 	u32				num_context_irqs;
 	unsigned int			*irqs;
 
-	u32				cavium_id_base; /* Specific to Cavium */
-};
+	struct list_head		list;
+	struct rb_root			masters;
+	struct dentry			*masters_root;
 
-enum arm_smmu_context_fmt {
-	ARM_SMMU_CTX_FMT_NONE,
-	ARM_SMMU_CTX_FMT_AARCH64,
-	ARM_SMMU_CTX_FMT_AARCH32_L,
-	ARM_SMMU_CTX_FMT_AARCH32_S,
+	struct dentry			*debugfs_root;
+	struct debugfs_regset32		*regset;
+	struct debugfs_regset32         *perf_regset;
+	DECLARE_BITMAP(context_filter, ARM_SMMU_MAX_CBS);
 };
 
 struct arm_smmu_cfg {
 	u8				cbndx;
 	u8				irptndx;
 	u32				cbar;
-	enum arm_smmu_context_fmt	fmt;
+	pgd_t				*pgd;
 };
 #define INVALID_IRPTNDX			0xff
 
-#define ARM_SMMU_CB_ASID(smmu, cfg) ((u16)(smmu)->cavium_id_base + (cfg)->cbndx)
-#define ARM_SMMU_CB_VMID(smmu, cfg) ((u16)(smmu)->cavium_id_base + (cfg)->cbndx + 1)
-
-enum arm_smmu_domain_stage {
-	ARM_SMMU_DOMAIN_S1 = 0,
-	ARM_SMMU_DOMAIN_S2,
-	ARM_SMMU_DOMAIN_NESTED,
-};
+#define ARM_SMMU_CB_ASID(cfg)		((cfg)->cbndx)
+#define ARM_SMMU_CB_VMID(cfg)		((cfg)->cbndx + 1)
 
 struct arm_smmu_domain {
 	struct arm_smmu_device		*smmu;
-	struct io_pgtable_ops		*pgtbl_ops;
-	spinlock_t			pgtbl_lock;
 	struct arm_smmu_cfg		cfg;
-	enum arm_smmu_domain_stage	stage;
-	struct mutex			init_mutex; /* Protects smmu pointer */
-	struct iommu_domain		domain;
+	spinlock_t			lock;
+
+	dma_addr_t			inquired_iova;
+	phys_addr_t			inquired_phys;
+
+	struct iommu_domain             domain;
+	bool				sodev_map;
 };
+
+static struct iommu_domain *iommu_domains[NUM_SID]; /* To keep all allocated domains */
+
+static DEFINE_SPINLOCK(arm_smmu_devices_lock);
+static LIST_HEAD(arm_smmu_devices);
+
+static struct arm_smmu_device *smmu_handle; /* assmu only one smmu device */
+static bool arm_smmu_skip_mapping; /* For debug */
+static bool arm_smmu_gr0_tlbiallnsnh; /* Insert TLBIALLNSNH at all */
+static bool arm_smmu_tlb_inv_by_addr = 1; /* debugfs: tlb inv context by default */
+static bool arm_smmu_tlb_inv_at_map;	/* debugfs: tlb inv at map additionally */
+
+static void get_pte_info(struct arm_smmu_cfg *cfg, ulong iova,
+	pgdval_t *pgdval, pudval_t *pudval, pmdval_t *pmdval, pteval_t *pteval);
+
+void __weak platform_override_streamid(int streamid)
+{
+}
+
+static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
+					dma_addr_t iova);
 
 struct arm_smmu_option_prop {
 	u32 opt;
 	const char *prop;
 };
 
-static atomic_t cavium_smmu_context_count = ATOMIC_INIT(0);
-
-static bool using_legacy_binding, using_generic_binding;
-
 static struct arm_smmu_option_prop arm_smmu_options[] = {
 	{ ARM_SMMU_OPT_SECURE_CFG_ACCESS, "calxeda,smmu-secure-config-access" },
+	{ ARM_SMMU_OPT_SECURE_CFG_ACCESS, "-calxeda,smmu-secure-config-access" },
 	{ 0, NULL},
 };
 
@@ -439,11 +236,18 @@ static void parse_driver_options(struct arm_smmu_device *smmu)
 	do {
 		if (of_property_read_bool(smmu->dev->of_node,
 						arm_smmu_options[i].prop)) {
-			smmu->options |= arm_smmu_options[i].opt;
+			if (arm_smmu_options[i].prop[0] == '-')
+				smmu->options &= ~arm_smmu_options[i].opt;
+			else
+				smmu->options |= arm_smmu_options[i].opt;
 			dev_notice(smmu->dev, "option %s\n",
 				arm_smmu_options[i].prop);
 		}
 	} while (arm_smmu_options[++i].opt);
+
+	/* FIXME: remove if linsim is fixed */
+	if (tegra_platform_is_sim())
+		smmu->options |= ARM_SMMU_OPT_SECURE_CFG_ACCESS;
 }
 
 static struct device_node *dev_get_dev_node(struct device *dev)
@@ -453,86 +257,202 @@ static struct device_node *dev_get_dev_node(struct device *dev)
 
 		while (!pci_is_root_bus(bus))
 			bus = bus->parent;
-		return of_node_get(bus->bridge->parent->of_node);
+		return bus->bridge->parent->of_node;
 	}
 
-	return of_node_get(dev->of_node);
+	return dev->of_node;
 }
 
-static int __arm_smmu_get_pci_sid(struct pci_dev *pdev, u16 alias, void *data)
+static struct arm_smmu_master *find_smmu_master(struct arm_smmu_device *smmu,
+						struct device_node *dev_node)
 {
-	*((__be32 *)data) = cpu_to_be32(alias);
-	return 0; /* Continue walking */
+	struct rb_node *node = smmu->masters.rb_node;
+
+	while (node) {
+		struct arm_smmu_master *master;
+
+		master = container_of(node, struct arm_smmu_master, node);
+
+		if (dev_node < master->of_node)
+			node = node->rb_left;
+		else if (dev_node > master->of_node)
+			node = node->rb_right;
+		else
+			return master;
+	}
+
+	return NULL;
 }
 
-static int __find_legacy_master_phandle(struct device *dev, void *data)
+static struct arm_smmu_master_cfg *
+find_smmu_master_cfg(struct device *dev)
 {
-	struct of_phandle_iterator *it = *(void **)data;
-	struct device_node *np = it->node;
-	int err;
+	struct arm_smmu_master_cfg *cfg = NULL;
+	struct iommu_group *group = iommu_group_get(dev);
 
-	of_for_each_phandle(it, err, dev->of_node, "mmu-masters",
-			    "#stream-id-cells", 0)
-		if (it->node == np) {
-			*(void **)data = dev;
-			return 1;
+	if (group) {
+		cfg = iommu_group_get_iommudata(group);
+		iommu_group_put(group);
+	}
+
+	return cfg;
+}
+
+static int insert_smmu_master(struct arm_smmu_device *smmu,
+			      struct arm_smmu_master *master)
+{
+	struct rb_node **new, *parent;
+
+	new = &smmu->masters.rb_node;
+	parent = NULL;
+	while (*new) {
+		struct arm_smmu_master *this
+			= container_of(*new, struct arm_smmu_master, node);
+
+		parent = *new;
+		if (master->of_node < this->of_node)
+			new = &((*new)->rb_left);
+		else if (master->of_node > this->of_node)
+			new = &((*new)->rb_right);
+		else
+			return -EEXIST;
+	}
+
+	rb_link_node(&master->node, parent, new);
+	rb_insert_color(&master->node, &smmu->masters);
+	return 0;
+}
+
+/*
+ * Look for a master_cfg which is identical to the masterspec passed. This
+ * allows us to support multiple devices all sharing the same master_cfg.
+ * Ultimately that allows multiple devices to share the same set of stream
+ * IDs.
+ */
+static struct arm_smmu_master_cfg *
+find_identical_smmu_master_cfg(struct arm_smmu_device *smmu,
+			       struct of_phandle_args *masterspec)
+{
+	struct rb_node *node;
+	struct arm_smmu_master *master;
+	int i;
+
+	for (node = rb_first(&smmu->masters); node; node = rb_next(node)) {
+		int sids_match = 1;
+
+		master = container_of(node, struct arm_smmu_master, node);
+
+		/* If we don't have the same number of StreamIDs then we are
+		 * certainly not identical.
+		 */
+		if (master->cfg->num_streamids != masterspec->args_count)
+			continue;
+
+		/* And now check the StreamIDs themselves. */
+		for (i = 0; i < masterspec->args_count; i++) {
+			if (masterspec->args[i] != master->cfg->streamids[i]) {
+				sids_match = 0;
+				break;
+			}
 		}
-	it->node = np;
-	return err == -ENOENT ? 0 : err;
+
+		if (!sids_match)
+			continue;
+
+		/* Found an identical master cfg! */
+		return master->cfg;
+	}
+
+	return NULL;
 }
 
-static struct platform_driver arm_smmu_driver;
-static struct iommu_ops arm_smmu_ops;
-
-static int arm_smmu_register_legacy_master(struct device *dev,
-					   struct arm_smmu_device **smmu)
+static int register_smmu_master(struct arm_smmu_device *smmu,
+				struct device *dev,
+				struct of_phandle_args *masterspec)
 {
-	struct device *smmu_dev;
-	struct device_node *np;
-	struct of_phandle_iterator it;
-	void *data = &it;
-	u32 *sids;
-	__be32 pci_sid;
-	int err;
+	int i;
+	struct arm_smmu_master *master;
+	struct arm_smmu_master_cfg *master_cfg;
 
-	np = dev_get_dev_node(dev);
-	if (!np || !of_find_property(np, "#stream-id-cells", NULL)) {
-		of_node_put(np);
-		return -ENODEV;
+	master = find_smmu_master(smmu, masterspec->np);
+	if (master) {
+		/* Silently ignore if the master is attempted to
+		 * register with same propoerties as before.
+		 */
+		if (master->cfg->num_streamids == masterspec->args_count) {
+			for (i = 0; i < master->cfg->num_streamids; ++i) {
+				if (master->cfg->streamids[i] == masterspec->args[i])
+					continue;
+				break;
+			}
+			if (i == master->cfg->num_streamids)
+				return 0;
+		}
+		dev_err(dev,
+			"rejecting multiple registrations for master device %s\n",
+			masterspec->np->name);
+		return -EBUSY;
 	}
 
-	it.node = np;
-	err = driver_for_each_device(&arm_smmu_driver.driver, NULL, &data,
-				     __find_legacy_master_phandle);
-	smmu_dev = data;
-	of_node_put(np);
-	if (err == 0)
-		return -ENODEV;
-	if (err < 0)
-		return err;
-
-	if (dev_is_pci(dev)) {
-		/* "mmu-masters" assumes Stream ID == Requester ID */
-		pci_for_each_dma_alias(to_pci_dev(dev), __arm_smmu_get_pci_sid,
-				       &pci_sid);
-		it.cur = &pci_sid;
-		it.cur_count = 1;
+	if (masterspec->args_count > MAX_MASTER_STREAMIDS) {
+		dev_err(dev,
+			"reached maximum number (%d) of stream IDs for master device %s\n",
+			MAX_MASTER_STREAMIDS, masterspec->np->name);
+		return -ENOSPC;
 	}
 
-	err = iommu_fwspec_init(dev, &smmu_dev->of_node->fwnode,
-				&arm_smmu_ops);
-	if (err)
-		return err;
-
-	sids = kcalloc(it.cur_count, sizeof(*sids), GFP_KERNEL);
-	if (!sids)
+	master = devm_kzalloc(smmu->dev, sizeof(*master), GFP_KERNEL);
+	if (!master)
 		return -ENOMEM;
 
-	*smmu = dev_get_drvdata(smmu_dev);
-	of_phandle_iterator_args(&it, sids, it.cur_count);
-	err = iommu_fwspec_add_ids(dev, sids, it.cur_count);
-	kfree(sids);
-	return err;
+	master->of_node = masterspec->np;
+
+	master_cfg = find_identical_smmu_master_cfg(smmu, masterspec);
+	if (master_cfg) {
+		master->cfg = master_cfg;
+		return insert_smmu_master(smmu, master);
+	}
+
+	/* Make a new master_cfg */
+	master_cfg = devm_kzalloc(smmu->dev, sizeof(*master_cfg), GFP_KERNEL);
+	if (!master_cfg) {
+		kfree(master);
+		return -ENOMEM;
+	}
+
+	master->cfg = master_cfg;
+	master->cfg->num_streamids = masterspec->args_count;
+	for (i = 0; i < master->cfg->num_streamids; ++i) {
+		u16 streamid = masterspec->args[i];
+
+		if (!(smmu->features & ARM_SMMU_FEAT_STREAM_MATCH) &&
+		     (streamid >= smmu->num_mapping_groups)) {
+			dev_err(dev,
+				"stream ID for master device %s greater than maximum allowed (%d)\n",
+				masterspec->np->name, smmu->num_mapping_groups);
+			return -ERANGE;
+		}
+		master->cfg->streamids[i] = streamid;
+	}
+
+	return insert_smmu_master(smmu, master);
+}
+
+static struct arm_smmu_device *find_smmu_for_device(struct device *dev)
+{
+	struct arm_smmu_device *smmu;
+	struct arm_smmu_master *master = NULL;
+	struct device_node *dev_node = dev_get_dev_node(dev);
+
+	spin_lock(&arm_smmu_devices_lock);
+	list_for_each_entry(smmu, &arm_smmu_devices, list) {
+		master = find_smmu_master(smmu, dev_node);
+		if (master)
+			break;
+	}
+	spin_unlock(&arm_smmu_devices_lock);
+
+	return master ? smmu : NULL;
 }
 
 static int __arm_smmu_alloc_bitmap(unsigned long *map, int start, int end)
@@ -554,14 +474,13 @@ static void __arm_smmu_free_bitmap(unsigned long *map, int idx)
 }
 
 /* Wait for any pending TLB invalidations to complete */
-static void __arm_smmu_tlb_sync(struct arm_smmu_device *smmu)
+static void arm_smmu_tlb_sync_wait_for_complete(struct arm_smmu_device *smmu,
+		void __iomem *base)
 {
 	int count = 0;
-	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
 
-	writel_relaxed(0, gr0_base + ARM_SMMU_GR0_sTLBGSYNC);
-	while (readl_relaxed(gr0_base + ARM_SMMU_GR0_sTLBGSTATUS)
-	       & sTLBGSTATUS_GSACTIVE) {
+	while (readl_relaxed(base + ARM_SMMU_GR0_sTLBGSTATUS)
+			& sTLBGSTATUS_GSACTIVE) {
 		cpu_relax();
 		if (++count == TLB_LOOP_TIMEOUT) {
 			dev_err_ratelimited(smmu->dev,
@@ -572,37 +491,88 @@ static void __arm_smmu_tlb_sync(struct arm_smmu_device *smmu)
 	}
 }
 
-static void arm_smmu_tlb_sync(void *cookie)
+static void arm_smmu_cb_tlb_sync_wait_for_complete(struct arm_smmu_device *smmu,
+		void __iomem *base)
 {
-	struct arm_smmu_domain *smmu_domain = cookie;
-	__arm_smmu_tlb_sync(smmu_domain->smmu);
+	int count = 0;
+
+	while (readl_relaxed(base + ARM_SMMU_CB_TLBSTATUS)
+			& sTLBGSTATUS_GSACTIVE) {
+		cpu_relax();
+		if (++count == TLB_LOOP_TIMEOUT) {
+			dev_err_ratelimited(smmu->dev,
+			"TLB sync timed out -- SMMU may be deadlocked\n");
+			return;
+		}
+		udelay(1);
+	}
 }
 
-static void arm_smmu_tlb_inv_context(void *cookie)
+static void arm_smmu_cb_tlb_sync(struct arm_smmu_domain *smmu_domain)
 {
-	struct arm_smmu_domain *smmu_domain = cookie;
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
-	bool stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
 	void __iomem *base;
+
+	base = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, cfg->cbndx);
+
+	writel_relaxed(0, base + ARM_SMMU_CB_TLBSYNC);
+
+	arm_smmu_cb_tlb_sync_wait_for_complete(smmu, base);
+}
+
+static void arm_smmu_tlb_sync(struct arm_smmu_device *smmu)
+{
+	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
+
+	if (tegra_platform_is_sim() || arm_smmu_gr0_tlbiallnsnh)
+		writel_relaxed(0, gr0_base + ARM_SMMU_GR0_TLBIALLNSNH);
+
+	writel_relaxed(0, gr0_base + ARM_SMMU_GR0_sTLBGSYNC);
+
+	arm_smmu_tlb_sync_wait_for_complete(smmu, gr0_base);
+}
+
+static void arm_smmu_tlb_inv_context(struct arm_smmu_domain *smmu_domain)
+{
+	u64 time_before = 0;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	void __iomem *base = ARM_SMMU_GR0(smmu);
+	bool stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
+	bool do_cb_inval_sync = false;
+
+#ifdef CONFIG_TRACEPOINTS
+	if (static_key_false(&__tracepoint_arm_smmu_tlb_inv_context.key)
+		&& test_bit(cfg->cbndx, smmu->context_filter))
+		time_before = local_clock();
+#endif
 
 	if (stage1) {
 		base = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, cfg->cbndx);
-		writel_relaxed(ARM_SMMU_CB_ASID(smmu, cfg),
+		writel_relaxed(ARM_SMMU_CB_ASID(cfg),
 			       base + ARM_SMMU_CB_S1_TLBIASID);
+		if (!tegra_platform_is_sim())
+			do_cb_inval_sync = true;
 	} else {
 		base = ARM_SMMU_GR0(smmu);
-		writel_relaxed(ARM_SMMU_CB_VMID(smmu, cfg),
+		writel_relaxed(ARM_SMMU_CB_VMID(cfg),
 			       base + ARM_SMMU_GR0_TLBIVMID);
 	}
 
-	__arm_smmu_tlb_sync(smmu);
+	if (do_cb_inval_sync) {
+		arm_smmu_cb_tlb_sync(smmu_domain);
+	} else {
+		arm_smmu_tlb_sync(smmu);
+	}
+
+	if (time_before)
+		trace_arm_smmu_tlb_inv_context(time_before, cfg->cbndx);
 }
 
-static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
-					  size_t granule, bool leaf, void *cookie)
+static void __arm_smmu_tlb_inv_range(struct arm_smmu_domain *smmu_domain,
+				     unsigned long iova)
 {
-	struct arm_smmu_domain *smmu_domain = cookie;
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
 	bool stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
@@ -610,47 +580,57 @@ static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
 
 	if (stage1) {
 		reg = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, cfg->cbndx);
-		reg += leaf ? ARM_SMMU_CB_S1_TLBIVAL : ARM_SMMU_CB_S1_TLBIVA;
-
-		if (cfg->fmt != ARM_SMMU_CTX_FMT_AARCH64) {
-			iova &= ~12UL;
-			iova |= ARM_SMMU_CB_ASID(smmu, cfg);
-			do {
-				writel_relaxed(iova, reg);
-				iova += granule;
-			} while (size -= granule);
-		} else {
-			iova >>= 12;
-			iova |= (u64)ARM_SMMU_CB_ASID(smmu, cfg) << 48;
-			do {
-				writeq_relaxed(iova, reg);
-				iova += granule >> 12;
-			} while (size -= granule);
-		}
+		reg += ARM_SMMU_CB_S1_TLBIVA;
+		iova >>= 12;
+		iova |= (u64)ARM_SMMU_CB_ASID(cfg) << 48;
+		writeq_relaxed(iova, reg);
 	} else if (smmu->version == ARM_SMMU_V2) {
 		reg = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, cfg->cbndx);
-		reg += leaf ? ARM_SMMU_CB_S2_TLBIIPAS2L :
-			      ARM_SMMU_CB_S2_TLBIIPAS2;
-		iova >>= 12;
-		do {
-			smmu_write_atomic_lq(iova, reg);
-			iova += granule >> 12;
-		} while (size -= granule);
+		reg += ARM_SMMU_CB_S2_TLBIIPAS2;
+		writeq_relaxed(iova >> 12, reg);
 	} else {
 		reg = ARM_SMMU_GR0(smmu) + ARM_SMMU_GR0_TLBIVMID;
-		writel_relaxed(ARM_SMMU_CB_VMID(smmu, cfg), reg);
+		writel_relaxed(ARM_SMMU_CB_VMID(cfg), reg);
 	}
 }
 
-static struct iommu_gather_ops arm_smmu_gather_ops = {
-	.tlb_flush_all	= arm_smmu_tlb_inv_context,
-	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
-	.tlb_sync	= arm_smmu_tlb_sync,
-};
-
-static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
+static void arm_smmu_tlb_inv_range(struct arm_smmu_domain *smmu_domain,
+				   unsigned long iova, size_t size)
 {
-	u32 fsr, fsynr;
+	int i;
+	u64 time_before = 0;
+	unsigned long iova_orig = iova;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	bool stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
+
+#ifdef CONFIG_TRACEPOINTS
+	if (static_key_false(&__tracepoint_arm_smmu_tlb_inv_range.key)
+		&& test_bit(cfg->cbndx, smmu->context_filter))
+		time_before = local_clock();
+#endif
+
+	for (i = 0; i < size / PAGE_SIZE; i++) {
+		__arm_smmu_tlb_inv_range(smmu_domain, iova);
+		iova += PAGE_SIZE;
+	}
+
+	if (!tegra_platform_is_sim() &&
+	    (stage1 || smmu->version == ARM_SMMU_V2)) {
+		arm_smmu_cb_tlb_sync(smmu_domain);
+	} else {
+		arm_smmu_tlb_sync(smmu);
+	}
+
+	if (time_before)
+		trace_arm_smmu_tlb_inv_range(time_before, cfg->cbndx,
+			iova_orig, size);
+}
+
+static irqreturn_t __arm_smmu_context_fault(int irq, void *dev)
+{
+	int flags, ret, sid;
+	u32 fsr, far, fsynr, fsynra, resume;
 	unsigned long iova;
 	struct iommu_domain *domain = dev;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
@@ -664,15 +644,80 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 	if (!(fsr & FSR_FAULT))
 		return IRQ_NONE;
 
+	if (fsr & FSR_IGN)
+		dev_err_ratelimited(smmu->dev,
+				    "Unexpected context fault (fsr 0x%x)\n",
+				    fsr);
+
 	fsynr = readl_relaxed(cb_base + ARM_SMMU_CB_FSYNR0);
-	iova = readq_relaxed(cb_base + ARM_SMMU_CB_FAR);
+	fsynra = readl_relaxed(ARM_SMMU_GR1(smmu) +
+			       ARM_SMMU_GR1_FRSYNRA(cfg->cbndx));
+	flags = fsynr & FSYNR0_WNR ? IOMMU_FAULT_WRITE : IOMMU_FAULT_READ;
 
-	dev_err_ratelimited(smmu->dev,
-	"Unhandled context fault: fsr=0x%x, iova=0x%08lx, fsynr=0x%x, cb=%d\n",
-			    fsr, iova, fsynr, cfg->cbndx);
+	far = readl_relaxed(cb_base + ARM_SMMU_CB_FAR_LO);
+	iova = far;
+#ifdef CONFIG_64BIT
+	far = readl_relaxed(cb_base + ARM_SMMU_CB_FAR_HI);
+	iova |= ((unsigned long)far << 32);
+#endif
+	sid = (fsynra & FRSYNRA_STREAMID_MASK) >> FRSYNRA_STREAMID_SHIFT;
+	sid &= 0xff; /* Tegra hack. Why are the top 8bits not RAZ? */
 
+	if (!report_iommu_fault(domain, smmu->dev, iova, flags)) {
+		ret = IRQ_HANDLED;
+		resume = RESUME_RETRY;
+	} else {
+		pgdval_t pgd;
+		pudval_t pud;
+		pmdval_t pmd;
+		pteval_t pte;
+
+		get_pte_info(cfg, iova, &pgd, &pud, &pmd, &pte);
+
+		dev_err_ratelimited(smmu->dev,
+			"Unhandled context fault: iova=0x%08lx, fsynr=0x%x, "
+			"cb=%d, sid=%d(0x%x - %s), pgd=%llx, pud=%llx, "
+			"pmd=%llx, pte=%llx\n", iova, fsynr, cfg->cbndx,
+			sid, sid, tegra_mc_get_sid_name(sid), pgd,
+			pud, pmd, pte);
+		ret = IRQ_NONE;
+		resume = RESUME_TERMINATE;
+	}
+
+	/* Clear the faulting FSR */
 	writel(fsr, cb_base + ARM_SMMU_CB_FSR);
-	return IRQ_HANDLED;
+
+	/* Retry or terminate any stalled transactions */
+	if (fsr & FSR_SS)
+		writel_relaxed(resume, cb_base + ARM_SMMU_CB_RESUME);
+
+	return ret;
+}
+
+static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
+{
+	int i;
+	struct arm_smmu_device *smmu = dev;
+
+	for (i = 0; i < smmu->num_context_banks; i++) {
+		void __iomem *cb_base;
+		struct iommu_domain *domain;
+		u32 fsr;
+
+		cb_base = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, i);
+		fsr = readl_relaxed(cb_base + ARM_SMMU_CB_FSR);
+		if (fsr & FSR_FAULT) {
+			domain = iommu_domains[i];
+			if (!domain) {
+				pr_err("%s: domain(%d) doesn't exist\n",
+				       __func__, i);
+				continue;
+			}
+			__arm_smmu_context_fault(irq, domain);
+			return IRQ_HANDLED;
+		}
+	}
+	return IRQ_NONE;
 }
 
 static irqreturn_t arm_smmu_global_fault(int irq, void *dev)
@@ -686,11 +731,16 @@ static irqreturn_t arm_smmu_global_fault(int irq, void *dev)
 	gfsynr1 = readl_relaxed(gr0_base + ARM_SMMU_GR0_sGFSYNR1);
 	gfsynr2 = readl_relaxed(gr0_base + ARM_SMMU_GR0_sGFSYNR2);
 
-	if (!gfsr)
-		return IRQ_NONE;
+	if (!gfsr) {
+		int ret;
+
+		ret = arm_smmu_context_fault(irq, dev);
+		if (ret == IRQ_HANDLED)
+			return ret;
+	}
 
 	dev_err_ratelimited(smmu->dev,
-		"Unexpected global fault, this could be serious\n");
+		"Unexpected {global,context} fault, this could be serious\n");
 	dev_err_ratelimited(smmu->dev,
 		"\tGFSR 0x%08x, GFSYNR0 0x%08x, GFSYNR1 0x%08x, GFSYNR2 0x%08x\n",
 		gfsr, gfsynr0, gfsynr1, gfsynr2);
@@ -699,35 +749,44 @@ static irqreturn_t arm_smmu_global_fault(int irq, void *dev)
 	return IRQ_HANDLED;
 }
 
-static void arm_smmu_init_context_bank(struct arm_smmu_domain *smmu_domain,
-				       struct io_pgtable_cfg *pgtbl_cfg)
+static void arm_smmu_flush_pgtable(struct arm_smmu_device *smmu, void *addr,
+				   size_t size)
 {
-	u32 reg, reg2;
-	u64 reg64;
+	unsigned long offset = (unsigned long)addr & ~PAGE_MASK;
+
+
+	/* Ensure new page tables are visible to the hardware walker */
+	if (smmu->features & ARM_SMMU_FEAT_COHERENT_WALK) {
+		dsb(ishst);
+	} else {
+		/*
+		 * If the SMMU can't walk tables in the CPU caches, treat them
+		 * like non-coherent DMA since we need to flush the new entries
+		 * all the way out to memory. There's no possibility of
+		 * recursion here as the SMMU table walker will not be wired
+		 * through another SMMU.
+		 */
+		dma_map_page(smmu->dev, virt_to_page(addr), offset, size,
+				DMA_TO_DEVICE);
+	}
+}
+
+static void arm_smmu_init_context_bank(struct arm_smmu_domain *smmu_domain)
+{
+	u32 reg;
 	bool stage1;
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
-	void __iomem *cb_base, *gr1_base;
+	void __iomem *cb_base, *gr0_base, *gr1_base;
 
+	gr0_base = ARM_SMMU_GR0(smmu);
 	gr1_base = ARM_SMMU_GR1(smmu);
 	stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
 	cb_base = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, cfg->cbndx);
 
-	if (smmu->version > ARM_SMMU_V1) {
-		if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64)
-			reg = CBA2R_RW64_64BIT;
-		else
-			reg = CBA2R_RW64_32BIT;
-		/* 16-bit VMIDs live in CBA2R */
-		if (smmu->features & ARM_SMMU_FEAT_VMID16)
-			reg |= ARM_SMMU_CB_VMID(smmu, cfg) << CBA2R_VMID_SHIFT;
-
-		writel_relaxed(reg, gr1_base + ARM_SMMU_GR1_CBA2R(cfg->cbndx));
-	}
-
 	/* CBAR */
 	reg = cfg->cbar;
-	if (smmu->version < ARM_SMMU_V2)
+	if (smmu->version == ARM_SMMU_V1)
 		reg |= cfg->irptndx << CBAR_IRPTNDX_SHIFT;
 
 	/*
@@ -737,67 +796,140 @@ static void arm_smmu_init_context_bank(struct arm_smmu_domain *smmu_domain,
 	if (stage1) {
 		reg |= (CBAR_S1_BPSHCFG_NSH << CBAR_S1_BPSHCFG_SHIFT) |
 			(CBAR_S1_MEMATTR_WB << CBAR_S1_MEMATTR_SHIFT);
-	} else if (!(smmu->features & ARM_SMMU_FEAT_VMID16)) {
-		/* 8-bit VMIDs live in CBAR */
-		reg |= ARM_SMMU_CB_VMID(smmu, cfg) << CBAR_VMID_SHIFT;
+	} else {
+		reg |= ARM_SMMU_CB_VMID(cfg) << CBAR_VMID_SHIFT;
 	}
 	writel_relaxed(reg, gr1_base + ARM_SMMU_GR1_CBAR(cfg->cbndx));
 
-	/* TTBRs */
-	if (stage1) {
-		u16 asid = ARM_SMMU_CB_ASID(smmu, cfg);
+	if (smmu->version > ARM_SMMU_V1) {
+		/* CBA2R */
+#ifdef CONFIG_64BIT
+		reg = CBA2R_RW64_64BIT;
+#else
+		reg = CBA2R_RW64_32BIT;
+#endif
+		writel_relaxed(reg,
+			       gr1_base + ARM_SMMU_GR1_CBA2R(cfg->cbndx));
 
-		if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH32_S) {
-			reg = pgtbl_cfg->arm_v7s_cfg.ttbr[0];
-			writel_relaxed(reg, cb_base + ARM_SMMU_CB_TTBR0);
-			reg = pgtbl_cfg->arm_v7s_cfg.ttbr[1];
-			writel_relaxed(reg, cb_base + ARM_SMMU_CB_TTBR1);
-			writel_relaxed(asid, cb_base + ARM_SMMU_CB_CONTEXTIDR);
-		} else {
-			reg64 = pgtbl_cfg->arm_lpae_s1_cfg.ttbr[0];
-			reg64 |= (u64)asid << TTBRn_ASID_SHIFT;
-			writeq_relaxed(reg64, cb_base + ARM_SMMU_CB_TTBR0);
-			reg64 = pgtbl_cfg->arm_lpae_s1_cfg.ttbr[1];
-			reg64 |= (u64)asid << TTBRn_ASID_SHIFT;
-			writeq_relaxed(reg64, cb_base + ARM_SMMU_CB_TTBR1);
+		/* TTBCR2 */
+		switch (smmu->s1_input_size) {
+		case 32:
+			reg = (TTBCR2_ADDR_32 << TTBCR2_SEP_SHIFT);
+			break;
+		case 36:
+			reg = (TTBCR2_ADDR_36 << TTBCR2_SEP_SHIFT);
+			break;
+		case 39:
+		case 40:
+			reg = (TTBCR2_ADDR_40 << TTBCR2_SEP_SHIFT);
+			break;
+		case 42:
+			reg = (TTBCR2_ADDR_42 << TTBCR2_SEP_SHIFT);
+			break;
+		case 44:
+			reg = (TTBCR2_ADDR_44 << TTBCR2_SEP_SHIFT);
+			break;
+		case 48:
+			reg = (TTBCR2_ADDR_48 << TTBCR2_SEP_SHIFT);
+			break;
 		}
-	} else {
-		reg64 = pgtbl_cfg->arm_lpae_s2_cfg.vttbr;
-		writeq_relaxed(reg64, cb_base + ARM_SMMU_CB_TTBR0);
+
+		switch (smmu->s1_output_size) {
+		case 32:
+			reg |= (TTBCR2_ADDR_32 << TTBCR2_PASIZE_SHIFT);
+			break;
+		case 36:
+			reg |= (TTBCR2_ADDR_36 << TTBCR2_PASIZE_SHIFT);
+			break;
+		case 39:
+		case 40:
+			reg |= (TTBCR2_ADDR_40 << TTBCR2_PASIZE_SHIFT);
+			break;
+		case 42:
+			reg |= (TTBCR2_ADDR_42 << TTBCR2_PASIZE_SHIFT);
+			break;
+		case 44:
+			reg |= (TTBCR2_ADDR_44 << TTBCR2_PASIZE_SHIFT);
+			break;
+		case 48:
+			reg |= (TTBCR2_ADDR_48 << TTBCR2_PASIZE_SHIFT);
+			break;
+		}
+
+		if (stage1)
+			writel_relaxed(reg, cb_base + ARM_SMMU_CB_TTBCR2);
 	}
 
-	/* TTBCR */
-	if (stage1) {
-		if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH32_S) {
-			reg = pgtbl_cfg->arm_v7s_cfg.tcr;
-			reg2 = 0;
+	/* TTBR0 */
+	arm_smmu_flush_pgtable(smmu, cfg->pgd,
+			       PTRS_PER_PGD * sizeof(pgd_t));
+	reg = __pa(cfg->pgd);
+	writel_relaxed(reg, cb_base + ARM_SMMU_CB_TTBR0_LO);
+	reg = (phys_addr_t)__pa(cfg->pgd) >> 32;
+	if (stage1)
+		reg |= ARM_SMMU_CB_ASID(cfg) << TTBRn_HI_ASID_SHIFT;
+	writel_relaxed(reg, cb_base + ARM_SMMU_CB_TTBR0_HI);
+
+	/*
+	 * TTBCR
+	 * We use long descriptor, with inner-shareable WBWA tables in TTBR0.
+	 */
+	if (smmu->version > ARM_SMMU_V1) {
+		if (PAGE_SIZE == SZ_4K)
+			reg = TTBCR_TG0_4K;
+		else
+			reg = TTBCR_TG0_64K;
+
+		if (!stage1) {
+			reg |= (64 - smmu->s2_input_size) << TTBCR_T0SZ_SHIFT;
+
+			switch (smmu->s2_output_size) {
+			case 32:
+				reg |= (TTBCR2_ADDR_32 << TTBCR_PASIZE_SHIFT);
+				break;
+			case 36:
+				reg |= (TTBCR2_ADDR_36 << TTBCR_PASIZE_SHIFT);
+				break;
+			case 40:
+				reg |= (TTBCR2_ADDR_40 << TTBCR_PASIZE_SHIFT);
+				break;
+			case 42:
+				reg |= (TTBCR2_ADDR_42 << TTBCR_PASIZE_SHIFT);
+				break;
+			case 44:
+				reg |= (TTBCR2_ADDR_44 << TTBCR_PASIZE_SHIFT);
+				break;
+			case 48:
+				reg |= (TTBCR2_ADDR_48 << TTBCR_PASIZE_SHIFT);
+				break;
+			}
 		} else {
-			reg = pgtbl_cfg->arm_lpae_s1_cfg.tcr;
-			reg2 = pgtbl_cfg->arm_lpae_s1_cfg.tcr >> 32;
-			reg2 |= TTBCR2_SEP_UPSTREAM;
+			reg |= (64 - smmu->s1_input_size) << TTBCR_T0SZ_SHIFT;
 		}
-		if (smmu->version > ARM_SMMU_V1)
-			writel_relaxed(reg2, cb_base + ARM_SMMU_CB_TTBCR2);
 	} else {
-		reg = pgtbl_cfg->arm_lpae_s2_cfg.vtcr;
+		reg = 0;
 	}
+
+	reg |= TTBCR_EAE |
+	      (TTBCR_SH_IS << TTBCR_SH0_SHIFT) |
+	      (TTBCR_RGN_WBWA << TTBCR_ORGN0_SHIFT) |
+	      (TTBCR_RGN_WBWA << TTBCR_IRGN0_SHIFT);
+
+	if (!stage1)
+		reg |= (TTBCR_SL0_LVL_1 << TTBCR_SL0_SHIFT);
+
 	writel_relaxed(reg, cb_base + ARM_SMMU_CB_TTBCR);
 
-	/* MAIRs (stage-1 only) */
+	/* MAIR0 (stage-1 only) */
 	if (stage1) {
-		if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH32_S) {
-			reg = pgtbl_cfg->arm_v7s_cfg.prrr;
-			reg2 = pgtbl_cfg->arm_v7s_cfg.nmrr;
-		} else {
-			reg = pgtbl_cfg->arm_lpae_s1_cfg.mair[0];
-			reg2 = pgtbl_cfg->arm_lpae_s1_cfg.mair[1];
-		}
+		reg = (MAIR_ATTR_NC << MAIR_ATTR_SHIFT(MAIR_ATTR_IDX_NC)) |
+		    (MAIR_ATTR_WBRWA << MAIR_ATTR_SHIFT(MAIR_ATTR_IDX_CACHE)) |
+		    (MAIR_ATTR_DEVICE << MAIR_ATTR_SHIFT(MAIR_ATTR_IDX_DEV));
 		writel_relaxed(reg, cb_base + ARM_SMMU_CB_S1_MAIR0);
-		writel_relaxed(reg2, cb_base + ARM_SMMU_CB_S1_MAIR1);
 	}
 
 	/* SCTLR */
-	reg = SCTLR_CFIE | SCTLR_CFRE | SCTLR_AFE | SCTLR_TRE | SCTLR_M;
+	reg = SCTLR_CFIE | SCTLR_CFRE | SCTLR_M | SCTLR_EAE_SBOP | SCTLR_HUPCF;
 	if (stage1)
 		reg |= SCTLR_S1_ASIDPNE;
 #ifdef __BIG_ENDIAN
@@ -810,105 +942,27 @@ static int arm_smmu_init_domain_context(struct iommu_domain *domain,
 					struct arm_smmu_device *smmu)
 {
 	int irq, start, ret = 0;
-	unsigned long ias, oas;
-	struct io_pgtable_ops *pgtbl_ops;
-	struct io_pgtable_cfg pgtbl_cfg;
-	enum io_pgtable_fmt fmt;
+	unsigned long flags;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 
-	mutex_lock(&smmu_domain->init_mutex);
+	spin_lock_irqsave(&smmu_domain->lock, flags);
 	if (smmu_domain->smmu)
 		goto out_unlock;
 
-	/*
-	 * Mapping the requested stage onto what we support is surprisingly
-	 * complicated, mainly because the spec allows S1+S2 SMMUs without
-	 * support for nested translation. That means we end up with the
-	 * following table:
-	 *
-	 * Requested        Supported        Actual
-	 *     S1               N              S1
-	 *     S1             S1+S2            S1
-	 *     S1               S2             S2
-	 *     S1               S1             S1
-	 *     N                N              N
-	 *     N              S1+S2            S2
-	 *     N                S2             S2
-	 *     N                S1             S1
-	 *
-	 * Note that you can't actually request stage-2 mappings.
-	 */
-	if (!(smmu->features & ARM_SMMU_FEAT_TRANS_S1))
-		smmu_domain->stage = ARM_SMMU_DOMAIN_S2;
-	if (!(smmu->features & ARM_SMMU_FEAT_TRANS_S2))
-		smmu_domain->stage = ARM_SMMU_DOMAIN_S1;
-
-	/*
-	 * Choosing a suitable context format is even more fiddly. Until we
-	 * grow some way for the caller to express a preference, and/or move
-	 * the decision into the io-pgtable code where it arguably belongs,
-	 * just aim for the closest thing to the rest of the system, and hope
-	 * that the hardware isn't esoteric enough that we can't assume AArch64
-	 * support to be a superset of AArch32 support...
-	 */
-	if (smmu->features & ARM_SMMU_FEAT_FMT_AARCH32_L)
-		cfg->fmt = ARM_SMMU_CTX_FMT_AARCH32_L;
-	if (IS_ENABLED(CONFIG_IOMMU_IO_PGTABLE_ARMV7S) &&
-	    !IS_ENABLED(CONFIG_64BIT) && !IS_ENABLED(CONFIG_ARM_LPAE) &&
-	    (smmu->features & ARM_SMMU_FEAT_FMT_AARCH32_S) &&
-	    (smmu_domain->stage == ARM_SMMU_DOMAIN_S1))
-		cfg->fmt = ARM_SMMU_CTX_FMT_AARCH32_S;
-	if ((IS_ENABLED(CONFIG_64BIT) || cfg->fmt == ARM_SMMU_CTX_FMT_NONE) &&
-	    (smmu->features & (ARM_SMMU_FEAT_FMT_AARCH64_64K |
-			       ARM_SMMU_FEAT_FMT_AARCH64_16K |
-			       ARM_SMMU_FEAT_FMT_AARCH64_4K)))
-		cfg->fmt = ARM_SMMU_CTX_FMT_AARCH64;
-
-	if (cfg->fmt == ARM_SMMU_CTX_FMT_NONE) {
-		ret = -EINVAL;
-		goto out_unlock;
-	}
-
-	switch (smmu_domain->stage) {
-	case ARM_SMMU_DOMAIN_S1:
-		cfg->cbar = CBAR_TYPE_S1_TRANS_S2_BYPASS;
-		start = smmu->num_s2_context_banks;
-		ias = smmu->va_size;
-		oas = smmu->ipa_size;
-		if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64) {
-			fmt = ARM_64_LPAE_S1;
-		} else if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH32_L) {
-			fmt = ARM_32_LPAE_S1;
-			ias = min(ias, 32UL);
-			oas = min(oas, 40UL);
-		} else {
-			fmt = ARM_V7S;
-			ias = min(ias, 32UL);
-			oas = min(oas, 32UL);
-		}
-		break;
-	case ARM_SMMU_DOMAIN_NESTED:
+	if (smmu->features & ARM_SMMU_FEAT_TRANS_NESTED) {
 		/*
 		 * We will likely want to change this if/when KVM gets
 		 * involved.
 		 */
-	case ARM_SMMU_DOMAIN_S2:
+		cfg->cbar = CBAR_TYPE_S1_TRANS_S2_BYPASS;
+		start = smmu->num_s2_context_banks;
+	} else if (smmu->features & ARM_SMMU_FEAT_TRANS_S1) {
+		cfg->cbar = CBAR_TYPE_S1_TRANS_S2_BYPASS;
+		start = smmu->num_s2_context_banks;
+	} else {
 		cfg->cbar = CBAR_TYPE_S2_TRANS;
 		start = 0;
-		ias = smmu->ipa_size;
-		oas = smmu->pa_size;
-		if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64) {
-			fmt = ARM_64_LPAE_S2;
-		} else {
-			fmt = ARM_32_LPAE_S2;
-			ias = min(ias, 40UL);
-			oas = min(oas, 40UL);
-		}
-		break;
-	default:
-		ret = -EINVAL;
-		goto out_unlock;
 	}
 
 	ret = __arm_smmu_alloc_bitmap(smmu->context_map, start,
@@ -917,59 +971,38 @@ static int arm_smmu_init_domain_context(struct iommu_domain *domain,
 		goto out_unlock;
 
 	cfg->cbndx = ret;
-	if (smmu->version < ARM_SMMU_V2) {
+	if (smmu->version == ARM_SMMU_V1) {
 		cfg->irptndx = atomic_inc_return(&smmu->irptndx);
 		cfg->irptndx %= smmu->num_context_irqs;
-	} else {
+	} else if (smmu->num_context_banks == smmu->num_context_irqs) {
 		cfg->irptndx = cfg->cbndx;
+	} else {
+		cfg->irptndx = 0;
 	}
 
-	pgtbl_cfg = (struct io_pgtable_cfg) {
-		.pgsize_bitmap	= smmu->pgsize_bitmap,
-		.ias		= ias,
-		.oas		= oas,
-		.tlb		= &arm_smmu_gather_ops,
-		.iommu_dev	= smmu->dev,
-	};
+	ACCESS_ONCE(smmu_domain->smmu) = smmu;
+	arm_smmu_init_context_bank(smmu_domain);
+	spin_unlock_irqrestore(&smmu_domain->lock, flags);
 
-	smmu_domain->smmu = smmu;
-	pgtbl_ops = alloc_io_pgtable_ops(fmt, &pgtbl_cfg, smmu_domain);
-	if (!pgtbl_ops) {
-		ret = -ENOMEM;
-		goto out_clear_smmu;
+	if (smmu->num_context_irqs) {
+
+		irq = smmu->irqs[smmu->num_global_irqs + cfg->irptndx];
+		ret = request_irq(irq, arm_smmu_context_fault, IRQF_SHARED,
+			  "arm-smmu-context-fault", domain);
+		if (ret < 0) {
+			dev_err(smmu->dev,
+				"failed to request context IRQ %d (%u)\n",
+				cfg->irptndx, irq);
+			cfg->irptndx = INVALID_IRPTNDX;
+		}
 	}
 
-	/* Update the domain's page sizes to reflect the page table format */
-	domain->pgsize_bitmap = pgtbl_cfg.pgsize_bitmap;
-	domain->geometry.aperture_end = (1UL << ias) - 1;
-	domain->geometry.force_aperture = true;
-
-	/* Initialise the context bank with our page table cfg */
-	arm_smmu_init_context_bank(smmu_domain, &pgtbl_cfg);
-
-	/*
-	 * Request context fault interrupt. Do this last to avoid the
-	 * handler seeing a half-initialised domain state.
-	 */
-	irq = smmu->irqs[smmu->num_global_irqs + cfg->irptndx];
-	ret = devm_request_irq(smmu->dev, irq, arm_smmu_context_fault,
-			       IRQF_SHARED, "arm-smmu-context-fault", domain);
-	if (ret < 0) {
-		dev_err(smmu->dev, "failed to request context IRQ %d (%u)\n",
-			cfg->irptndx, irq);
-		cfg->irptndx = INVALID_IRPTNDX;
-	}
-
-	mutex_unlock(&smmu_domain->init_mutex);
-
-	/* Publish page table ops for map/unmap */
-	smmu_domain->pgtbl_ops = pgtbl_ops;
+	BUG_ON(iommu_domains[cfg->cbndx]);
+	iommu_domains[cfg->cbndx] = domain;
 	return 0;
 
-out_clear_smmu:
-	smmu_domain->smmu = NULL;
 out_unlock:
-	mutex_unlock(&smmu_domain->init_mutex);
+	spin_unlock_irqrestore(&smmu_domain->lock, flags);
 	return ret;
 }
 
@@ -984,28 +1017,42 @@ static void arm_smmu_destroy_domain_context(struct iommu_domain *domain)
 	if (!smmu)
 		return;
 
-	/*
-	 * Disable the context bank and free the page tables before freeing
-	 * it.
-	 */
+	/* Disable the context bank and nuke the TLB before freeing it. */
 	cb_base = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, cfg->cbndx);
 	writel_relaxed(0, cb_base + ARM_SMMU_CB_SCTLR);
+	arm_smmu_tlb_inv_context(smmu_domain);
 
-	if (cfg->irptndx != INVALID_IRPTNDX) {
+	if ((smmu->num_context_irqs) &&
+		(cfg->irptndx != INVALID_IRPTNDX)) {
 		irq = smmu->irqs[smmu->num_global_irqs + cfg->irptndx];
-		devm_free_irq(smmu->dev, irq, domain);
+		free_irq(irq, domain);
 	}
 
-	free_io_pgtable_ops(smmu_domain->pgtbl_ops);
 	__arm_smmu_free_bitmap(smmu->context_map, cfg->cbndx);
+	iommu_domains[cfg->cbndx] = NULL;
+}
+
+static int arm_smmu_get_hwid(struct iommu_domain *domain,
+			     struct device *dev, unsigned int id)
+{
+	struct arm_smmu_master_cfg *cfg;
+
+	cfg = find_smmu_master_cfg(dev);
+	if (!cfg)
+		return -EINVAL;
+
+	if (id >= cfg->num_streamids)
+		return -EINVAL;
+
+	return cfg->streamids[id];
 }
 
 static struct iommu_domain *arm_smmu_domain_alloc(unsigned type)
 {
 	struct arm_smmu_domain *smmu_domain;
+	pgd_t *pgd;
+	unsigned int order;
 
-	if (type != IOMMU_DOMAIN_UNMANAGED && type != IOMMU_DOMAIN_DMA)
-		return NULL;
 	/*
 	 * Allocate the domain and initialise some of its data structures.
 	 * We can't really do anything meaningful until we've added a
@@ -1015,242 +1062,492 @@ static struct iommu_domain *arm_smmu_domain_alloc(unsigned type)
 	if (!smmu_domain)
 		return NULL;
 
-	if (type == IOMMU_DOMAIN_DMA && (using_legacy_binding ||
-	    iommu_get_dma_cookie(&smmu_domain->domain))) {
-		kfree(smmu_domain);
-		return NULL;
-	}
+	order = get_order(PTRS_PER_PGD * sizeof(pgd_t));
+	pgd = (pgd_t *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, order);
+	if (!pgd)
+		goto out_free_domain;
 
-	mutex_init(&smmu_domain->init_mutex);
-	spin_lock_init(&smmu_domain->pgtbl_lock);
+	smmu_domain->cfg.pgd = pgd;
+
+	spin_lock_init(&smmu_domain->lock);
+
+	/*
+	 * Our arm-smmu driver can handle any size page by breaking
+	 * it up into 4Kb and 4Mb chunks. We would like the iommu
+	 * framework to pass us largest pages possible for performance
+	 * reasons, so set all pgsize_bitmap bits.
+	 */
+	smmu_domain->domain.pgsize_bitmap = (0UL - 1UL) & PAGE_MASK;
+
+	if (iommu_get_dma_cookie(&smmu_domain->domain))
+		goto out_free_domain;
 
 	return &smmu_domain->domain;
+
+out_free_domain:
+	kfree(smmu_domain);
+	return NULL;
+}
+
+static void arm_smmu_free_ptes(pmd_t *pmd)
+{
+	pgtable_t table = pmd_pgtable(*pmd);
+
+	__free_page(table);
+}
+
+static void arm_smmu_free_pmds(pud_t *pud)
+{
+	int i;
+	pmd_t *pmd, *pmd_base = pmd_offset(pud, 0);
+
+	pmd = pmd_base;
+	for (i = 0; i < PTRS_PER_PMD; ++i) {
+		if (pmd_none(*pmd))
+			continue;
+
+		arm_smmu_free_ptes(pmd);
+		pmd++;
+	}
+
+	pmd_free(NULL, pmd_base);
+}
+
+static void arm_smmu_free_puds(pgd_t *pgd)
+{
+	int i;
+	pud_t *pud, *pud_base = pud_offset(pgd, 0);
+
+	pud = pud_base;
+	for (i = 0; i < PTRS_PER_PUD; ++i) {
+		if (pud_none(*pud))
+			continue;
+
+		arm_smmu_free_pmds(pud);
+		pud++;
+	}
+
+	pud_free(NULL, pud_base);
+}
+
+static void arm_smmu_free_pgtables(struct arm_smmu_domain *smmu_domain)
+{
+	int i;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	pgd_t *pgd, *pgd_base = cfg->pgd;
+	unsigned long order;
+
+	/*
+	 * Recursively free the page tables for this domain. We don't
+	 * care about speculative TLB filling because the tables should
+	 * not be active in any context bank at this point (SCTLR.M is 0).
+	 */
+	pgd = pgd_base;
+	for (i = 0; i < PTRS_PER_PGD; ++i) {
+		if (pgd_none(*pgd))
+			continue;
+		arm_smmu_free_puds(pgd);
+		pgd++;
+	}
+
+	order = get_order(PTRS_PER_PGD * sizeof(pgd_t));
+	free_pages((unsigned long)pgd_base, order);
 }
 
 static void arm_smmu_domain_free(struct iommu_domain *domain)
 {
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 
+	iommu_put_dma_cookie(domain);
+
 	/*
 	 * Free the domain resources. We assume that all devices have
 	 * already been detached.
 	 */
-	iommu_put_dma_cookie(domain);
 	arm_smmu_destroy_domain_context(domain);
+	arm_smmu_free_pgtables(smmu_domain);
 	kfree(smmu_domain);
 }
 
-static void arm_smmu_write_smr(struct arm_smmu_device *smmu, int idx)
+static int arm_smmu_master_configure_smrs(struct arm_smmu_device *smmu,
+					  struct arm_smmu_master_cfg *cfg)
 {
-	struct arm_smmu_smr *smr = smmu->smrs + idx;
-	u32 reg = smr->id << SMR_ID_SHIFT | smr->mask << SMR_MASK_SHIFT;
+	int i;
+	struct arm_smmu_smr *smrs;
+	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
 
-	if (smr->valid)
-		reg |= SMR_VALID;
-	writel_relaxed(reg, ARM_SMMU_GR0(smmu) + ARM_SMMU_GR0_SMR(idx));
-}
+	if (!(smmu->features & ARM_SMMU_FEAT_STREAM_MATCH))
+		return 0;
 
-static void arm_smmu_write_s2cr(struct arm_smmu_device *smmu, int idx)
-{
-	struct arm_smmu_s2cr *s2cr = smmu->s2crs + idx;
-	u32 reg = (s2cr->type & S2CR_TYPE_MASK) << S2CR_TYPE_SHIFT |
-		  (s2cr->cbndx & S2CR_CBNDX_MASK) << S2CR_CBNDX_SHIFT |
-		  (s2cr->privcfg & S2CR_PRIVCFG_MASK) << S2CR_PRIVCFG_SHIFT;
+	if (cfg->smrs) {
+		pr_debug("%s() cfg->smrs=%p exists\n", __func__, cfg->smrs);
+		return -EEXIST;
+	}
 
-	writel_relaxed(reg, ARM_SMMU_GR0(smmu) + ARM_SMMU_GR0_S2CR(idx));
-}
-
-static void arm_smmu_write_sme(struct arm_smmu_device *smmu, int idx)
-{
-	arm_smmu_write_s2cr(smmu, idx);
-	if (smmu->smrs)
-		arm_smmu_write_smr(smmu, idx);
-}
-
-static int arm_smmu_find_sme(struct arm_smmu_device *smmu, u16 id, u16 mask)
-{
-	struct arm_smmu_smr *smrs = smmu->smrs;
-	int i, free_idx = -ENOSPC;
-
-	/* Stream indexing is blissfully easy */
+	smrs = kmalloc_array(cfg->num_streamids, sizeof(*smrs), GFP_KERNEL);
 	if (!smrs)
-		return id;
+		return -ENOMEM;
 
-	/* Validating SMRs is... less so */
-	for (i = 0; i < smmu->num_mapping_groups; ++i) {
-		if (!smrs[i].valid) {
-			/*
-			 * Note the first free entry we come across, which
-			 * we'll claim in the end if nothing else matches.
-			 */
-			if (free_idx < 0)
-				free_idx = i;
-			continue;
-		}
-		/*
-		 * If the new entry is _entirely_ matched by an existing entry,
-		 * then reuse that, with the guarantee that there also cannot
-		 * be any subsequent conflicting entries. In normal use we'd
-		 * expect simply identical entries for this case, but there's
-		 * no harm in accommodating the generalisation.
-		 */
-		if ((mask & smrs[i].mask) == mask &&
-		    !((id ^ smrs[i].id) & ~smrs[i].mask))
-			return i;
-		/*
-		 * If the new entry has any other overlap with an existing one,
-		 * though, then there always exists at least one stream ID
-		 * which would cause a conflict, and we can't allow that risk.
-		 */
-		if (!((id ^ smrs[i].id) & ~(smrs[i].mask | mask)))
-			return -EINVAL;
-	}
-
-	return free_idx;
-}
-
-static bool arm_smmu_free_sme(struct arm_smmu_device *smmu, int idx)
-{
-	if (--smmu->s2crs[idx].count)
-		return false;
-
-	smmu->s2crs[idx] = s2cr_init_val;
-	if (smmu->smrs)
-		smmu->smrs[idx].valid = false;
-
-	return true;
-}
-
-static int arm_smmu_master_alloc_smes(struct device *dev)
-{
-	struct iommu_fwspec *fwspec = dev->iommu_fwspec;
-	struct arm_smmu_master_cfg *cfg = fwspec->iommu_priv;
-	struct arm_smmu_device *smmu = cfg->smmu;
-	struct arm_smmu_smr *smrs = smmu->smrs;
-	struct iommu_group *group;
-	int i, idx, ret;
-
-	mutex_lock(&smmu->stream_map_mutex);
-	/* Figure out a viable stream map entry allocation */
-	for_each_cfg_sme(fwspec, i, idx) {
-		u16 sid = fwspec->ids[i];
-		u16 mask = fwspec->ids[i] >> SMR_MASK_SHIFT;
-
-		if (idx != INVALID_SMENDX) {
-			ret = -EEXIST;
-			goto out_err;
+	/* Allocate the SMRs on the SMMU */
+	for (i = 0; i < cfg->num_streamids; ++i) {
+		int idx = __arm_smmu_alloc_bitmap(smmu->smr_map, 0,
+						  smmu->num_mapping_groups);
+		if (idx < 0) {
+			dev_err(smmu->dev, "failed to allocate free SMR\n");
+			goto err_free_smrs;
 		}
 
-		ret = arm_smmu_find_sme(smmu, sid, mask);
-		if (ret < 0)
-			goto out_err;
-
-		idx = ret;
-		if (smrs && smmu->s2crs[idx].count == 0) {
-			smrs[idx].id = sid;
-			smrs[idx].mask = mask;
-			smrs[idx].valid = true;
-		}
-		smmu->s2crs[idx].count++;
-		cfg->smendx[i] = (s16)idx;
+		smrs[i] = (struct arm_smmu_smr) {
+			.idx	= idx,
+			.mask	= SMR_ID_MASK,
+			.id	= cfg->streamids[i],
+		};
 	}
-
-	group = iommu_group_get_for_dev(dev);
-	if (!group)
-		group = ERR_PTR(-ENOMEM);
-	if (IS_ERR(group)) {
-		ret = PTR_ERR(group);
-		goto out_err;
-	}
-	iommu_group_put(group);
 
 	/* It worked! Now, poke the actual hardware */
-	for_each_cfg_sme(fwspec, i, idx) {
-		arm_smmu_write_sme(smmu, idx);
-		smmu->s2crs[idx].group = group;
+	for (i = 0; i < cfg->num_streamids; ++i) {
+		u32 reg = SMR_VALID | smrs[i].id << SMR_ID_SHIFT |
+			  smrs[i].mask << SMR_MASK_SHIFT;
+		writel_relaxed(reg, gr0_base + ARM_SMMU_GR0_SMR(smrs[i].idx));
 	}
 
-	mutex_unlock(&smmu->stream_map_mutex);
+	cfg->smrs = smrs;
+	pr_debug("%s() set cfg->smrs=%p\n", __func__, cfg->smrs);
 	return 0;
 
-out_err:
-	while (i--) {
-		arm_smmu_free_sme(smmu, cfg->smendx[i]);
-		cfg->smendx[i] = INVALID_SMENDX;
-	}
-	mutex_unlock(&smmu->stream_map_mutex);
-	return ret;
+err_free_smrs:
+	while (--i >= 0)
+		__arm_smmu_free_bitmap(smmu->smr_map, smrs[i].idx);
+	kfree(smrs);
+	return -ENOSPC;
 }
 
-static void arm_smmu_master_free_smes(struct iommu_fwspec *fwspec)
+static void arm_smmu_master_free_smrs(struct arm_smmu_device *smmu,
+				      struct arm_smmu_master_cfg *cfg)
 {
-	struct arm_smmu_device *smmu = fwspec_smmu(fwspec);
-	struct arm_smmu_master_cfg *cfg = fwspec->iommu_priv;
-	int i, idx;
+	int i;
+	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
+	struct arm_smmu_smr *smrs = cfg->smrs;
 
-	mutex_lock(&smmu->stream_map_mutex);
-	for_each_cfg_sme(fwspec, i, idx) {
-		if (arm_smmu_free_sme(smmu, idx))
-			arm_smmu_write_sme(smmu, idx);
-		cfg->smendx[i] = INVALID_SMENDX;
+	if (!smrs)
+		return;
+
+	/* Invalidate the SMRs before freeing back to the allocator */
+	for (i = 0; i < cfg->num_streamids; ++i) {
+		u8 idx = smrs[i].idx;
+
+		writel_relaxed(~SMR_VALID, gr0_base + ARM_SMMU_GR0_SMR(idx));
+		__arm_smmu_free_bitmap(smmu->smr_map, idx);
 	}
-	mutex_unlock(&smmu->stream_map_mutex);
+
+	cfg->smrs = NULL;
+	kfree(smrs);
 }
 
 static int arm_smmu_domain_add_master(struct arm_smmu_domain *smmu_domain,
-				      struct iommu_fwspec *fwspec)
+				      struct arm_smmu_master_cfg *cfg)
 {
+	int i, ret;
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
-	struct arm_smmu_s2cr *s2cr = smmu->s2crs;
-	enum arm_smmu_s2cr_type type = S2CR_TYPE_TRANS;
-	u8 cbndx = smmu_domain->cfg.cbndx;
-	int i, idx;
+	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
 
-	for_each_cfg_sme(fwspec, i, idx) {
-		if (type == s2cr[idx].type && cbndx == s2cr[idx].cbndx)
-			continue;
+	/* Devices in an IOMMU group may already be configured */
+	ret = arm_smmu_master_configure_smrs(smmu, cfg);
+	if (ret)
+		return ret == -EEXIST ? 0 : ret;
 
-		s2cr[idx].type = type;
-		s2cr[idx].privcfg = S2CR_PRIVCFG_UNPRIV;
-		s2cr[idx].cbndx = cbndx;
-		arm_smmu_write_s2cr(smmu, idx);
+	for (i = 0; i < cfg->num_streamids; ++i) {
+		u32 idx, s2cr;
+
+		idx = cfg->smrs ? cfg->smrs[i].idx : cfg->streamids[i];
+		s2cr = S2CR_TYPE_TRANS |
+		       (smmu_domain->cfg.cbndx << S2CR_CBNDX_SHIFT);
+		writel_relaxed(s2cr, gr0_base + ARM_SMMU_GR0_S2CR(idx));
 	}
+
 	return 0;
+}
+
+static void arm_smmu_domain_remove_master(struct arm_smmu_domain *smmu_domain,
+					  struct arm_smmu_master_cfg *cfg)
+{
+	int i;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
+
+	/* An IOMMU group is torn down by the first device to be removed */
+	if ((smmu->features & ARM_SMMU_FEAT_STREAM_MATCH) && !cfg->smrs)
+		return;
+
+	/*
+	 * We *must* clear the S2CR first, because freeing the SMR means
+	 * that it can be re-allocated immediately.
+	 */
+	for (i = 0; i < cfg->num_streamids; ++i) {
+		u32 idx = cfg->smrs ? cfg->smrs[i].idx : cfg->streamids[i];
+		u32 reg = disable_bypass ? S2CR_TYPE_FAULT : S2CR_TYPE_BYPASS;
+
+		writel_relaxed(reg, gr0_base + ARM_SMMU_GR0_S2CR(idx));
+	}
+
+	arm_smmu_master_free_smrs(smmu, cfg);
+}
+
+static int smmu_ptdump_show(struct seq_file *s, void *unused)
+{
+	struct arm_smmu_domain *smmu_domain = s->private;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	int i, j, k, l;
+	unsigned long addr = 0;
+	unsigned long mapped = 0;
+
+	pgd = cfg->pgd;
+	for (i = 0; i < PTRS_PER_PGD;
+		++i, pgd++, addr += PGDIR_SIZE) {
+		if (pgd_none(*pgd))
+			continue;
+		pud = pud_offset(pgd, addr);
+		for (j = 0; j < PTRS_PER_PUD; ++j, pud++) {
+			if (pud_none(*pud)) {
+				if ((ulong)pgd != (ulong)pud)
+					addr += PUD_SIZE;
+				continue;
+			}
+			pmd = pmd_offset(pud, addr);
+			for (k = 0; k < PTRS_PER_PMD;
+				++k, pmd++, addr += PMD_SIZE) {
+				if (pmd_none(*pmd))
+					continue;
+				pte = pmd_page_vaddr(*pmd) + pte_index(addr);
+				for (l = 0; l < PTRS_PER_PTE;
+					++l, pte++, addr += PAGE_SIZE) {
+					phys_addr_t pa;
+
+					pa = __pfn_to_phys(pte_pfn(*pte));
+					if (!pa)
+						continue;
+					seq_printf(s,
+						   "va=0x%016lx pa=%pap *pte=%pad\n",
+						   addr, &pa, &(*pte));
+					mapped += PAGE_SIZE;
+				}
+			}
+			if ((ulong)pgd != (ulong)pud)
+				addr += PUD_SIZE;
+		}
+	}
+	seq_printf(s, "total mapped iova=%luKB\n", mapped / SZ_1K);
+	return 0;
+}
+
+static int smmu_ptdump_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, smmu_ptdump_show, inode->i_private);
+}
+
+static const struct file_operations smmu_ptdump_fops = {
+	.open           = smmu_ptdump_open,
+	.read           = seq_read,
+	.llseek         = seq_lseek,
+	.release        = single_release,
+};
+
+#define defreg_cb(_name)			\
+	{					\
+		.name = __stringify(_name),	\
+		.offset = ARM_SMMU_CB_ ## _name,\
+	}
+
+static const struct debugfs_reg32 arm_smmu_cb_regs[] = {
+	defreg_cb(SCTLR),
+	defreg_cb(TTBCR2),
+	defreg_cb(TTBR0_LO),
+	defreg_cb(TTBR0_HI),
+	defreg_cb(TTBCR),
+	defreg_cb(S1_MAIR0),
+	defreg_cb(FSR),
+	defreg_cb(FAR_LO),
+	defreg_cb(FAR_HI),
+	defreg_cb(FSYNR0),
+};
+
+static ssize_t smmu_debugfs_iova2phys_write(struct file *file,
+					    const char __user *buffer,
+					    size_t count, loff_t *pos)
+{
+	int ret;
+	struct iommu_domain *domain = file_inode(file)->i_private;
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	char str[] = "0x0123456789abcdef";
+	unsigned long flags;
+	dma_addr_t tmp;
+
+	count = min_t(size_t, strlen(str), count);
+	if (copy_from_user(str, buffer, count))
+		return -EINVAL;
+
+	ret = sscanf(str, "0x%16llx", &tmp);
+	if (ret != 1)
+		return -EINVAL;
+
+	spin_lock_irqsave(&smmu_domain->lock, flags);
+	smmu_domain->inquired_iova = tmp;
+	smmu_domain->inquired_phys =
+		arm_smmu_iova_to_phys(domain, smmu_domain->inquired_iova);
+	pr_info("iova=%pa pa=%pa\n",
+		&smmu_domain->inquired_iova, &smmu_domain->inquired_phys);
+	spin_unlock_irqrestore(&smmu_domain->lock, flags);
+	return count;
+}
+
+static int smmu_iova2phys_show(struct seq_file *m, void *v)
+{
+	struct iommu_domain *domain = m->private;
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	unsigned long flags;
+
+	spin_lock_irqsave(&smmu_domain->lock, flags);
+
+	seq_printf(m, "iova=%pa pa=%pa\n",
+		   &smmu_domain->inquired_iova,
+		   &smmu_domain->inquired_phys);
+
+	spin_unlock_irqrestore(&smmu_domain->lock, flags);
+	return 0;
+}
+
+static int smmu_iova2phys_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, smmu_iova2phys_show, inode->i_private);
+}
+
+static const struct file_operations smmu_iova2phys_fops = {
+	.open		= smmu_iova2phys_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= smmu_debugfs_iova2phys_write,
+};
+
+static void debugfs_create_smmu_cb(struct iommu_domain *domain,
+				   struct device *dev)
+{
+	struct dentry *dent;
+	char name[] = "cb000";
+	struct debugfs_regset32	*cb;
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	u8 cbndx = smmu_domain->cfg.cbndx;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+
+	sprintf(name, "cb%03d", cbndx);
+	dent = debugfs_create_dir(name, smmu->debugfs_root);
+	if (!dent)
+		return;
+	cb = smmu->regset + 1 + cbndx;
+	cb->regs = arm_smmu_cb_regs;
+	cb->nregs = ARRAY_SIZE(arm_smmu_cb_regs);
+	cb->base = smmu->base + (smmu->size >> 1) +
+		cbndx * (1 << smmu->pgshift);
+	debugfs_create_regset32("regdump", S_IRUGO, dent, cb);
+	debugfs_create_file("ptdump", S_IRUGO, dent, smmu_domain,
+			    &smmu_ptdump_fops);
+	debugfs_create_file("iova_to_phys", S_IRUSR, dent, domain,
+			    &smmu_iova2phys_fops);
+}
+
+static int smmu_master_show(struct seq_file *s, void *unused)
+{
+	int i;
+	struct arm_smmu_master *master = s->private;
+
+	if (!master->cfg)
+		return 0;
+	for (i = 0; i < master->cfg->num_streamids; i++)
+		seq_printf(s, "streamids: % 3d ", master->cfg->streamids[i]);
+	seq_printf(s, "\n");
+
+	if (!master->cfg->smrs)
+		return 0;
+	for (i = 0; i < master->cfg->num_streamids; i++)
+		seq_printf(s, "smrs:      % 3d ",
+			(master->cfg->smrs ? master->cfg->smrs[i].idx : -1));
+	seq_printf(s, "\n");
+	return 0;
+}
+
+static int smmu_master_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, smmu_master_show, inode->i_private);
+}
+
+static const struct file_operations smmu_master_fops = {
+	.open           = smmu_master_open,
+	.read           = seq_read,
+	.llseek         = seq_lseek,
+	.release        = single_release,
+};
+
+static void add_smmu_master_debugfs(struct iommu_domain *domain,
+				    struct device *dev,
+				    struct arm_smmu_master *master)
+{
+	struct dentry *dent;
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	char name[] = "cb000";
+	char target[] = "../../cb000";
+	u8 cbndx = smmu_domain->cfg.cbndx;
+
+	dent = debugfs_create_dir(dev_name(dev), smmu->masters_root);
+	if (!dent)
+		return;
+
+	debugfs_create_file("streamids", 0444, dent, master, &smmu_master_fops);
+	debugfs_create_u8("cbndx", 0444, dent, &smmu_domain->cfg.cbndx);
+	debugfs_create_smmu_cb(domain, dev);
+	sprintf(name, "cb%03d", cbndx);
+	sprintf(target, "../../cb%03d", cbndx);
+	debugfs_create_symlink(name, dent, target);
+	master->debugfs_root = dent;
 }
 
 static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 {
-	int ret;
-	struct iommu_fwspec *fwspec = dev->iommu_fwspec;
-	struct arm_smmu_device *smmu;
+	int ret, i;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	struct arm_smmu_device *smmu, *dom_smmu;
+	struct arm_smmu_master_cfg *cfg;
 
-	if (!fwspec || fwspec->ops != &arm_smmu_ops) {
+	smmu = find_smmu_for_device(dev);
+	if (!smmu) {
 		dev_err(dev, "cannot attach to SMMU, is it on the same bus?\n");
 		return -ENXIO;
 	}
 
-	/*
-	 * FIXME: The arch/arm DMA API code tries to attach devices to its own
-	 * domains between of_xlate() and add_device() - we have no way to cope
-	 * with that, so until ARM gets converted to rely on groups and default
-	 * domains, just say no (but more politely than by dereferencing NULL).
-	 * This should be at least a WARN_ON once that's sorted.
-	 */
-	if (!fwspec->iommu_priv)
-		return -ENODEV;
-
-	smmu = fwspec_smmu(fwspec);
-	/* Ensure that the domain is finalised */
-	ret = arm_smmu_init_domain_context(domain, smmu);
-	if (ret < 0)
-		return ret;
+	if (dev->archdata.iommu) {
+		dev_err(dev, "already attached to IOMMU domain\n");
+		return -EEXIST;
+	}
 
 	/*
 	 * Sanity check the domain. We don't support domains across
 	 * different SMMUs.
 	 */
-	if (smmu_domain->smmu != smmu) {
+	dom_smmu = ACCESS_ONCE(smmu_domain->smmu);
+	if (!dom_smmu) {
+		/* Now that we have a master, we can finalise the domain */
+		ret = arm_smmu_init_domain_context(domain, smmu);
+		if (ret < 0)
+			return ret;
+
+		dom_smmu = smmu_domain->smmu;
+	}
+
+	if (dom_smmu != smmu) {
 		dev_err(dev,
 			"cannot attach to SMMU %s whilst already attached to domain on SMMU %s\n",
 			dev_name(smmu_domain->smmu->dev), dev_name(smmu->dev));
@@ -1258,105 +1555,449 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 	}
 
 	/* Looks ok, so add the device to the domain */
-	return arm_smmu_domain_add_master(smmu_domain, fwspec);
+	cfg = find_smmu_master_cfg(dev);
+	if (!cfg)
+		return -ENODEV;
+
+	smmu_domain->sodev_map = of_property_read_bool(dev_get_dev_node(dev),
+						       "iommu_sodev_map");
+	if (smmu_domain->sodev_map)
+		pr_info("forcing sodev map for %s\n", dev_name(dev));
+
+	ret = arm_smmu_domain_add_master(smmu_domain, cfg);
+	if (!ret) {
+		dev->archdata.iommu = domain;
+		add_smmu_master_debugfs(domain, dev,
+				find_smmu_master(smmu, dev_get_dev_node(dev)));
+	}
+
+	if (iommu_dma_init_domain(domain,
+				domain->geometry.aperture_start,
+				domain->geometry.aperture_end -
+				domain->geometry.aperture_start, dev))
+		pr_err("iommu_dma_init_domain failed, %s\n",
+				dev_name(dev));
+
+	of_map_iommu_direct_regions(dev);
+
+	/* Enable stream Id override, which enables SMMU translation for dev */
+	for (i = 0; i < cfg->num_streamids; i++)
+		platform_override_streamid(cfg->streamids[i]);
+	return ret;
+}
+
+static void arm_smmu_detach_dev(struct iommu_domain *domain, struct device *dev)
+{
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	struct arm_smmu_master_cfg *cfg;
+
+	cfg = find_smmu_master_cfg(dev);
+	if (!cfg)
+		return;
+
+	dev->archdata.iommu = NULL;
+	arm_smmu_domain_remove_master(smmu_domain, cfg);
+}
+
+static void *arm_smmu_alloc_pgtable_page(struct arm_smmu_domain *domain, int lvl,
+					void * entry, unsigned long addr)
+{
+	struct arm_smmu_device *smmu = domain->smmu;
+	void * ret = NULL;
+	unsigned long flags;
+
+	pr_debug("Alloc for address %lx level: %d\n", addr, lvl);
+
+	spin_lock_irqsave(&domain->lock, flags);
+
+	if (lvl == 0) {
+#ifndef __PAGETABLE_PUD_FOLDED
+		pgd_t *pgd = (pgd_t *) entry;
+		pud_t *pud;
+
+		if (!pgd_none(*pgd)) {
+			ret = pud_offset(pgd, adr);
+			goto unlock_ret;
+		}
+
+		pud = (pud_t *)get_zeroed_page(GFP_ATOMIC);
+		if (!pud)
+			goto unlock_ret;
+
+		arm_smmu_flush_pgtable(smmu, pud, PAGE_SIZE);
+		pgd_populate(NULL, pgd, pud);
+		arm_smmu_flush_pgtable(smmu, pgd, sizeof(*pgd));
+
+		ret = pud + pud_index(addr);
+		goto unlock_ret;
+#else
+		goto unlock_ret;
+#endif
+
+	} else if (lvl == 1) {
+#ifndef __PAGETABLE_PMD_FOLDED
+		pud_t *pud = (pud_t *) entry;
+		pmd_t *pmd;
+
+		if (!pud_none(*pud)) {
+			ret = pmd_offset(pud, addr);
+			goto unlock_ret;
+		}
+
+		pmd = (pmd_t *) get_zeroed_page(GFP_ATOMIC);
+		if (!pmd)
+			goto unlock_ret;
+
+		arm_smmu_flush_pgtable(smmu, pmd, PAGE_SIZE);
+		pud_populate(NULL, pud, pmd);
+		arm_smmu_flush_pgtable(smmu, pud, sizeof(*pud));
+
+		ret = pmd + pmd_index(addr);
+		goto unlock_ret;
+#else
+		goto unlock_ret;
+#endif
+	} else if (lvl == 2) {
+		pmd_t *pmd = (pmd_t *) entry;
+		pgtable_t table;
+
+		if (!pmd_none(*pmd)) {
+			ret = pmd_page_vaddr(*pmd) + pte_index(addr);
+			goto unlock_ret;
+		}
+
+		table = alloc_page(GFP_ATOMIC|__GFP_ZERO);
+		if (!table)
+			goto unlock_ret;
+
+		arm_smmu_flush_pgtable(smmu, page_address(table), PAGE_SIZE);
+		pmd_populate(NULL, pmd, table);
+		arm_smmu_flush_pgtable(smmu, pmd, sizeof(*pmd));
+
+		ret = table;
+		goto unlock_ret;
+	}
+
+unlock_ret:
+	spin_unlock_irqrestore(&domain->lock, flags);
+	return ret;
+}
+
+static int arm_smmu_alloc_init_pte(struct arm_smmu_domain *domain, pmd_t *pmd,
+				   unsigned long addr, unsigned long end,
+				   unsigned long pfn, int prot, int stage)
+{
+	pte_t *pte, *start;
+	struct arm_smmu_device *smmu = domain->smmu;
+	pteval_t pteval = ARM_SMMU_PTE_PAGE | ARM_SMMU_PTE_AF | ARM_SMMU_PTE_XN;
+
+	if (pmd_none(*pmd)) {
+		/* Allocate a new set of tables */
+		pgtable_t table = (pgtable_t) arm_smmu_alloc_pgtable_page(
+							domain, 2, pmd, addr);
+
+		if (!table)
+			return -ENOMEM;
+	}
+
+	if (stage == 1) {
+		pteval |= ARM_SMMU_PTE_AP_UNPRIV | ARM_SMMU_PTE_nG;
+		if (!(prot & IOMMU_WRITE) && (prot & IOMMU_READ))
+			pteval |= ARM_SMMU_PTE_AP_RDONLY;
+
+		if (prot & IOMMU_CACHE)
+			pteval |= (MAIR_ATTR_IDX_CACHE <<
+				   ARM_SMMU_PTE_ATTRINDX_SHIFT);
+		else if (domain->sodev_map)
+			pteval |= (MAIR_ATTR_IDX_DEV <<
+				   ARM_SMMU_PTE_ATTRINDX_SHIFT);
+		else
+			pteval |= (MAIR_ATTR_IDX_NC <<
+				   ARM_SMMU_PTE_ATTRINDX_SHIFT);
+	} else {
+		pteval |= ARM_SMMU_PTE_HAP_FAULT;
+		if (prot & IOMMU_READ)
+			pteval |= ARM_SMMU_PTE_HAP_READ;
+		if (prot & IOMMU_WRITE)
+			pteval |= ARM_SMMU_PTE_HAP_WRITE;
+		if (prot & IOMMU_CACHE)
+			pteval |= ARM_SMMU_PTE_MEMATTR_OIWB;
+		else if (domain->sodev_map)
+			pteval |= ARM_SMMU_PTE_MEMATTR_DEV;
+		else
+			pteval |= ARM_SMMU_PTE_MEMATTR_NC;
+	}
+
+	if (prot & IOMMU_NOEXEC)
+		pteval |= ARM_SMMU_PTE_XN;
+
+	/* If no access, create a faulting entry to avoid TLB fills */
+	if (!(prot & (IOMMU_READ | IOMMU_WRITE)))
+		pteval &= ~ARM_SMMU_PTE_PAGE;
+
+	pteval |= ARM_SMMU_PTE_SH_IS;
+	start = pmd_page_vaddr(*pmd) + pte_index(addr);
+	pte = start;
+
+	do {
+
+		if (!pfn) {
+			memset(pte, 0, sizeof(*pte));
+		} else {
+			*pte = pfn_pte(pfn, __pgprot(pteval));
+			pfn++;
+		}
+
+		pte++;
+		addr += PAGE_SIZE;
+	} while (addr != end);
+
+	arm_smmu_flush_pgtable(smmu, start, sizeof(*pte) * (pte - start));
+	return 0;
+}
+
+static int arm_smmu_alloc_init_pmd(struct arm_smmu_domain *domain, pud_t *pud,
+				   unsigned long addr, unsigned long end,
+				   phys_addr_t phys, int prot, int stage)
+{
+	int ret;
+	pmd_t *pmd = NULL;
+	unsigned long next, pfn = __phys_to_pfn(phys);
+
+#ifndef __PAGETABLE_PMD_FOLDED
+	if (pud_none(*pud)) {
+		pmd = (pmd_t *) arm_smmu_alloc_pgtable_page(domain, 1,
+								pud, addr);
+
+		if (!pmd)
+			return -ENOMEM;
+	}
+#endif
+	if (!pmd)
+		pmd = pmd_offset(pud, addr);
+
+	do {
+		next = pmd_addr_end(addr, end);
+		ret = arm_smmu_alloc_init_pte(domain, pmd, addr, next, pfn,
+					      prot, stage);
+		if (phys)
+			phys += next - addr;
+		pfn = __phys_to_pfn(phys);
+	} while (pmd++, addr = next, addr < end);
+
+	return ret;
+}
+
+static int arm_smmu_alloc_init_pud(struct arm_smmu_domain *domain, pgd_t *pgd,
+				   unsigned long addr, unsigned long end,
+				   phys_addr_t phys, int prot, int stage)
+{
+	int ret = 0;
+	pud_t *pud = NULL;
+	unsigned long next;
+#ifndef __PAGETABLE_PUD_FOLDED
+	if (pgd_none(*pgd)) {
+		pud = (pud_t *) arm_smmu_alloc_pgtable_page(domain, 0,
+								pgd, addr);
+		if (!pud)
+			return -ENOMEM;
+	}
+#endif
+	if (!pud)
+		pud = pud_offset(pgd, addr);
+
+	do {
+		next = pud_addr_end(addr, end);
+		ret = arm_smmu_alloc_init_pmd(domain, pud, addr, next, phys,
+					      prot, stage);
+		if (phys)
+			phys += next - addr;
+	} while (pud++, addr = next, addr < end);
+
+	return ret;
+}
+
+static void get_pte_info(struct arm_smmu_cfg *cfg, ulong iova,
+	pgdval_t *pgdval, pudval_t *pudval, pmdval_t *pmdval, pteval_t *pteval)
+{
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	*pgdval = *pudval = *pmdval = *pteval = 0;
+
+	pgd = cfg->pgd + pgd_index(iova);
+	*pgdval = pgd_val(*pgd);
+	if (pgd_none(*pgd))
+		return;
+
+	pud = pud_offset(pgd, iova);
+	*pudval = pud_val(*pud);
+	if (pud_none(*pud))
+		return;
+
+	pmd = pmd_offset(pud, iova);
+	*pmdval = pmd_val(*pmd);
+	if (pmd_none(*pmd))
+		return;
+
+	pte = pmd_page_vaddr(*pmd) + pte_index(iova);
+	*pteval = pte_val(*pte);
+}
+
+static int arm_smmu_handle_mapping(struct arm_smmu_domain *smmu_domain,
+				   unsigned long iova, phys_addr_t paddr,
+				   size_t size, unsigned long prot)
+{
+	int ret, stage;
+	unsigned long end, iova_orig = iova;
+	phys_addr_t input_mask, output_mask;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	pgd_t *pgd = cfg->pgd;
+
+	u64 time_before = 0;
+
+	if (cfg->cbar == CBAR_TYPE_S2_TRANS) {
+		stage = 2;
+		input_mask = (1ULL << smmu->s2_input_size) - 1;
+		output_mask = (1ULL << smmu->s2_output_size) - 1;
+	} else {
+		stage = 1;
+		input_mask = (1ULL << smmu->s1_input_size) - 1;
+		output_mask = (1ULL << smmu->s1_output_size) - 1;
+	}
+
+	if (!pgd)
+		return -EINVAL;
+
+	if (size & ~PAGE_MASK)
+		return -EINVAL;
+
+	if ((phys_addr_t)iova & ~input_mask)
+		return -ERANGE;
+
+	if (paddr & ~output_mask)
+		return -ERANGE;
+
+	if (test_bit(cfg->cbndx, smmu->context_filter)) {
+		pr_debug("cbndx=%d iova=%pad paddr=%pap size=%zx prot=%lx skip=%d\n",
+			 cfg->cbndx, &iova, &paddr, size, prot,
+			 arm_smmu_skip_mapping);
+	}
+
+	if (arm_smmu_skip_mapping)
+		return 0;
+
+#ifdef CONFIG_TRACEPOINTS
+	if (static_key_false(&__tracepoint_arm_smmu_handle_mapping.key)
+		&& test_bit(cfg->cbndx, smmu->context_filter))
+		time_before = local_clock();
+#endif
+
+	pgd += pgd_index(iova);
+	end = iova + size;
+	do {
+		unsigned long next = pgd_addr_end(iova, end);
+
+		ret = arm_smmu_alloc_init_pud(smmu_domain, pgd, iova, next, paddr,
+					      prot, stage);
+		if (ret)
+			goto out_unlock;
+
+		if (paddr)
+			paddr += next - iova;
+		iova = next;
+	} while (pgd++, iova != end);
+
+out_unlock:
+	if (arm_smmu_tlb_inv_at_map) {
+		if (arm_smmu_tlb_inv_by_addr)
+			arm_smmu_tlb_inv_range(smmu_domain,
+					       iova_orig, size);
+		else
+			arm_smmu_tlb_inv_context(smmu_domain);
+	}
+
+	if (time_before)
+		trace_arm_smmu_handle_mapping(time_before, cfg->cbndx,
+			iova_orig, paddr, size, prot);
+
+	return ret;
 }
 
 static int arm_smmu_map(struct iommu_domain *domain, unsigned long iova,
-			phys_addr_t paddr, size_t size, int prot)
+			phys_addr_t paddr, size_t size, unsigned long prot)
 {
-	int ret;
-	unsigned long flags;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
-	struct io_pgtable_ops *ops= smmu_domain->pgtbl_ops;
 
-	if (!ops)
+	if (!smmu_domain)
 		return -ENODEV;
 
-	spin_lock_irqsave(&smmu_domain->pgtbl_lock, flags);
-	ret = ops->map(ops, iova, paddr, size, prot);
-	spin_unlock_irqrestore(&smmu_domain->pgtbl_lock, flags);
-	return ret;
+	return arm_smmu_handle_mapping(smmu_domain, iova, paddr, size, prot);
 }
 
 static size_t arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova,
 			     size_t size)
 {
-	size_t ret;
-	unsigned long flags;
+	int ret;
+	u64 time_before = 0;
+
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
-	struct io_pgtable_ops *ops= smmu_domain->pgtbl_ops;
-
-	if (!ops)
-		return 0;
-
-	spin_lock_irqsave(&smmu_domain->pgtbl_lock, flags);
-	ret = ops->unmap(ops, iova, size);
-	spin_unlock_irqrestore(&smmu_domain->pgtbl_lock, flags);
-	return ret;
-}
-
-static phys_addr_t arm_smmu_iova_to_phys_hard(struct iommu_domain *domain,
-					      dma_addr_t iova)
-{
-	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+#ifdef CONFIG_TRACEPOINTS
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
-	struct io_pgtable_ops *ops= smmu_domain->pgtbl_ops;
-	struct device *dev = smmu->dev;
-	void __iomem *cb_base;
-	u32 tmp;
-	u64 phys;
-	unsigned long va;
 
-	cb_base = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, cfg->cbndx);
+	if (static_key_false(&__tracepoint_arm_smmu_unmap.key)
+		&& test_bit(cfg->cbndx, smmu->context_filter))
+		time_before = local_clock();
+#endif
 
-	/* ATS1 registers can only be written atomically */
-	va = iova & ~0xfffUL;
-	if (smmu->version == ARM_SMMU_V2)
-		smmu_write_atomic_lq(va, cb_base + ARM_SMMU_CB_ATS1PR);
-	else /* Register is only 32-bit in v1 */
-		writel_relaxed(va, cb_base + ARM_SMMU_CB_ATS1PR);
-
-	if (readl_poll_timeout_atomic(cb_base + ARM_SMMU_CB_ATSR, tmp,
-				      !(tmp & ATSR_ACTIVE), 5, 50)) {
-		dev_err(dev,
-			"iova to phys timed out on %pad. Falling back to software table walk.\n",
-			&iova);
-		return ops->iova_to_phys(ops, iova);
+	ret = arm_smmu_handle_mapping(smmu_domain, iova, 0, size, 0);
+	if (!arm_smmu_tlb_inv_at_map) {
+		if (arm_smmu_tlb_inv_by_addr)
+			arm_smmu_tlb_inv_range(smmu_domain, iova, size);
+		else
+			arm_smmu_tlb_inv_context(smmu_domain);
 	}
+	if (time_before)
+		trace_arm_smmu_unmap(time_before, iova, size);
 
-	phys = readq_relaxed(cb_base + ARM_SMMU_CB_PAR);
-	if (phys & CB_PAR_F) {
-		dev_err(dev, "translation fault!\n");
-		dev_err(dev, "PAR = 0x%llx\n", phys);
-		return 0;
-	}
-
-	return (phys & GENMASK_ULL(39, 12)) | (iova & 0xfff);
+	return ret ? 0 : size;
 }
 
 static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
-					dma_addr_t iova)
+					 dma_addr_t iova)
 {
-	phys_addr_t ret;
-	unsigned long flags;
+	pgd_t *pgdp, pgd;
+	pud_t pud;
+	pmd_t pmd;
+	pte_t pte;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
-	struct io_pgtable_ops *ops= smmu_domain->pgtbl_ops;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 
-	if (!ops)
+	pgdp = cfg->pgd;
+	if (!pgdp)
 		return 0;
 
-	spin_lock_irqsave(&smmu_domain->pgtbl_lock, flags);
-	if (smmu_domain->smmu->features & ARM_SMMU_FEAT_TRANS_OPS &&
-			smmu_domain->stage == ARM_SMMU_DOMAIN_S1) {
-		ret = arm_smmu_iova_to_phys_hard(domain, iova);
-	} else {
-		ret = ops->iova_to_phys(ops, iova);
-	}
+	pgd = *(pgdp + pgd_index(iova));
+	if (pgd_none(pgd))
+		return 0;
 
-	spin_unlock_irqrestore(&smmu_domain->pgtbl_lock, flags);
+	pud = *pud_offset(&pgd, iova);
+	if (pud_none(pud))
+		return 0;
 
-	return ret;
+	pmd = *pmd_offset(&pud, iova);
+	if (pmd_none(pmd))
+		return 0;
+
+	pte = *(pmd_page_vaddr(pmd) + pte_index(iova));
+	if (pte_none(pte))
+		return 0;
+
+	return __pfn_to_phys(pte_pfn(pte)) | (iova & ~PAGE_MASK);
 }
 
 static bool arm_smmu_capable(enum iommu_cap cap)
@@ -1370,228 +2011,155 @@ static bool arm_smmu_capable(enum iommu_cap cap)
 		return true;
 	case IOMMU_CAP_INTR_REMAP:
 		return true; /* MSIs are just memory writes */
-	case IOMMU_CAP_NOEXEC:
-		return true;
 	default:
 		return false;
 	}
 }
 
-static int arm_smmu_match_node(struct device *dev, void *data)
+/*
+ * On Tegra we set the same SID for all PCI devices. As such this function does
+ * not need to do anything.
+ */
+static int __arm_smmu_get_pci_sid(struct pci_dev *pdev, u16 alias, void *data)
 {
-	return dev->of_node == data;
-}
-
-static struct arm_smmu_device *arm_smmu_get_by_node(struct device_node *np)
-{
-	struct device *dev = driver_find_device(&arm_smmu_driver.driver, NULL,
-						np, arm_smmu_match_node);
-	put_device(dev);
-	return dev ? dev_get_drvdata(dev) : NULL;
+	return 0; /* Continue walking */
 }
 
 static int arm_smmu_add_device(struct device *dev)
 {
 	struct arm_smmu_device *smmu;
 	struct arm_smmu_master_cfg *cfg;
-	struct iommu_fwspec *fwspec = dev->iommu_fwspec;
-	int i, ret;
+	struct iommu_group *group;
+	struct arm_smmu_master *master;
+	struct dma_iommu_mapping *mapping;
+	int ret;
+	int i;
+	struct device_node *np = dev_get_dev_node(dev);
+	struct of_phandle_args args;
+	struct of_phandle_args master_spec = {0};
+	int iommus_idx = 0;
+	bool register_master = false;
 
-	if (using_legacy_binding) {
-		ret = arm_smmu_register_legacy_master(dev, &smmu);
-		fwspec = dev->iommu_fwspec;
-		if (ret)
-			goto out_free;
-	} else if (fwspec && fwspec->ops == &arm_smmu_ops) {
-		smmu = arm_smmu_get_by_node(to_of_node(fwspec->iommu_fwnode));
-	} else {
+	if (!smmu_handle)
 		return -ENODEV;
+	master_spec.args_count = 0;
+
+	while (!of_parse_phandle_with_args(np, "iommus", "#iommu-cells",
+					   iommus_idx++, &args)) {
+		if (args.np == smmu_handle->dev->of_node) {
+			master_spec.np = np;
+			for (i = 0; i < args.args_count; i++) {
+				if (master_spec.args_count >= MAX_MASTER_STREAMIDS) {
+					WARN(1, "> %d stream id's not supported, dev=%s",
+						MAX_MASTER_STREAMIDS, dev_name(dev));
+					of_node_put(args.np);
+					return -ENOSPC;
+				}
+				master_spec.args[master_spec.args_count++] = args.args[i];
+				pr_debug("sid=%d, dev_name=%s\n", args.args[i], dev_name(dev));
+				register_master = true;
+			}
+		}
+		of_node_put(args.np);
 	}
 
-	ret = -EINVAL;
-	for (i = 0; i < fwspec->num_ids; i++) {
-		u16 sid = fwspec->ids[i];
-		u16 mask = fwspec->ids[i] >> SMR_MASK_SHIFT;
+	if (register_master)
+		(void)register_smmu_master(smmu_handle, dev, &master_spec);
 
-		if (sid & ~smmu->streamid_mask) {
-			dev_err(dev, "stream ID 0x%x out of range for SMMU (0x%x)\n",
-				sid, smmu->streamid_mask);
-			goto out_free;
-		}
-		if (mask & ~smmu->smr_mask_mask) {
-			dev_err(dev, "SMR mask 0x%x out of range for SMMU (0x%x)\n",
-				sid, smmu->smr_mask_mask);
-			goto out_free;
-		}
+	smmu = find_smmu_for_device(dev);
+	if (!smmu)
+		return -ENODEV;
+
+	group = iommu_group_alloc();
+	if (IS_ERR(group)) {
+		dev_err(dev, "Failed to allocate IOMMU group\n");
+		return PTR_ERR(group);
 	}
 
-	ret = -ENOMEM;
-	cfg = kzalloc(offsetof(struct arm_smmu_master_cfg, smendx[i]),
-		      GFP_KERNEL);
-	if (!cfg)
-		goto out_free;
+	/*
+	 * Don't just use the dev here. That dev won't be a registered SMMU
+	 * master so instead we should use the PCIe root.
+	 */
+	master = find_smmu_master(smmu, dev_get_dev_node(dev));
+	if (!master) {
+		ret = -ENODEV;
+		goto out_put_group;
+	}
 
-	cfg->smmu = smmu;
-	fwspec->iommu_priv = cfg;
-	while (i--)
-		cfg->smendx[i] = INVALID_SMENDX;
+	cfg = master->cfg;
 
-	ret = arm_smmu_master_alloc_smes(dev);
+	if (dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+
+		pci_for_each_dma_alias(pdev, __arm_smmu_get_pci_sid,
+				       &cfg->streamids[0]);
+	}
+
+	iommu_group_set_iommudata(group, cfg, NULL);
+	ret = iommu_group_add_device(group, dev);
+	iommu_group_put(group);
 	if (ret)
-		goto out_free;
+		return ret;
 
+	mapping = tegra_smmu_of_get_master_map(dev, master->cfg->streamids,
+					       master->cfg->num_streamids);
+	if (IS_ERR_OR_NULL(mapping)) {
+		ret = PTR_ERR(mapping);
+		goto out_put_group;
+	}
+
+	ret = arm_iommu_attach_device(dev, mapping);
+	if (ret)
+		goto err_attach_dev;
+
+	pr_debug("Device added to SMMU: %s\n", dev_name(dev));
 	return 0;
 
-out_free:
-	if (fwspec)
-		kfree(fwspec->iommu_priv);
-	iommu_fwspec_free(dev);
+err_attach_dev:
+	arm_iommu_release_mapping(mapping);
+out_put_group:
+	iommu_group_put(group);
 	return ret;
 }
 
 static void arm_smmu_remove_device(struct device *dev)
 {
-	struct iommu_fwspec *fwspec = dev->iommu_fwspec;
-
-	if (!fwspec || fwspec->ops != &arm_smmu_ops)
-		return;
-
-	arm_smmu_master_free_smes(fwspec);
 	iommu_group_remove_device(dev);
-	kfree(fwspec->iommu_priv);
-	iommu_fwspec_free(dev);
 }
 
-static struct iommu_group *arm_smmu_device_group(struct device *dev)
-{
-	struct iommu_fwspec *fwspec = dev->iommu_fwspec;
-	struct arm_smmu_device *smmu = fwspec_smmu(fwspec);
-	struct iommu_group *group = NULL;
-	int i, idx;
-
-	for_each_cfg_sme(fwspec, i, idx) {
-		if (group && smmu->s2crs[idx].group &&
-		    group != smmu->s2crs[idx].group)
-			return ERR_PTR(-EINVAL);
-
-		group = smmu->s2crs[idx].group;
-	}
-
-	if (group)
-		return group;
-
-	if (dev_is_pci(dev))
-		group = pci_device_group(dev);
-	else
-		group = generic_device_group(dev);
-
-	return group;
-}
-
-static int arm_smmu_domain_get_attr(struct iommu_domain *domain,
-				    enum iommu_attr attr, void *data)
-{
-	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
-
-	switch (attr) {
-	case DOMAIN_ATTR_NESTING:
-		*(int *)data = (smmu_domain->stage == ARM_SMMU_DOMAIN_NESTED);
-		return 0;
-	default:
-		return -ENODEV;
-	}
-}
-
-static int arm_smmu_domain_set_attr(struct iommu_domain *domain,
-				    enum iommu_attr attr, void *data)
-{
-	int ret = 0;
-	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
-
-	mutex_lock(&smmu_domain->init_mutex);
-
-	switch (attr) {
-	case DOMAIN_ATTR_NESTING:
-		if (smmu_domain->smmu) {
-			ret = -EPERM;
-			goto out_unlock;
-		}
-
-		if (*(int *)data)
-			smmu_domain->stage = ARM_SMMU_DOMAIN_NESTED;
-		else
-			smmu_domain->stage = ARM_SMMU_DOMAIN_S1;
-
-		break;
-	default:
-		ret = -ENODEV;
-	}
-
-out_unlock:
-	mutex_unlock(&smmu_domain->init_mutex);
-	return ret;
-}
-
-static int arm_smmu_of_xlate(struct device *dev, struct of_phandle_args *args)
-{
-	u32 fwid = 0;
-
-	if (args->args_count > 0)
-		fwid |= (u16)args->args[0];
-
-	if (args->args_count > 1)
-		fwid |= (u16)args->args[1] << SMR_MASK_SHIFT;
-
-	return iommu_fwspec_add_ids(dev, &fwid, 1);
-}
-
-static struct iommu_ops arm_smmu_ops = {
-	.capable		= arm_smmu_capable,
-	.domain_alloc		= arm_smmu_domain_alloc,
-	.domain_free		= arm_smmu_domain_free,
-	.attach_dev		= arm_smmu_attach_dev,
-	.map			= arm_smmu_map,
-	.unmap			= arm_smmu_unmap,
-	.map_sg			= default_iommu_map_sg,
-	.iova_to_phys		= arm_smmu_iova_to_phys,
-	.add_device		= arm_smmu_add_device,
-	.remove_device		= arm_smmu_remove_device,
-	.device_group		= arm_smmu_device_group,
-	.domain_get_attr	= arm_smmu_domain_get_attr,
-	.domain_set_attr	= arm_smmu_domain_set_attr,
-	.of_xlate		= arm_smmu_of_xlate,
-	.pgsize_bitmap		= -1UL, /* Restricted during device attach */
+static const struct iommu_ops arm_smmu_ops = {
+	.capable	= arm_smmu_capable,
+	.domain_alloc	= arm_smmu_domain_alloc,
+	.domain_free	= arm_smmu_domain_free,
+	.attach_dev	= arm_smmu_attach_dev,
+	.detach_dev	= arm_smmu_detach_dev,
+	.get_hwid	= arm_smmu_get_hwid,
+	.map_sg         = default_iommu_map_sg,
+	.map		= arm_smmu_map,
+	.unmap		= arm_smmu_unmap,
+	.iova_to_phys	= arm_smmu_iova_to_phys,
+	.add_device	= arm_smmu_add_device,
+	.remove_device	= arm_smmu_remove_device,
+	.pgsize_bitmap	= (0UL - 1UL) & PAGE_MASK,
+	.ignore_align	= 1,
 };
 
 static void arm_smmu_device_reset(struct arm_smmu_device *smmu)
 {
 	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
 	void __iomem *cb_base;
-	int i;
-	u32 reg, major;
+	int i = 0;
+	u32 reg;
 
 	/* clear global FSR */
 	reg = readl_relaxed(ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sGFSR);
 	writel(reg, ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sGFSR);
 
-	/*
-	 * Reset stream mapping groups: Initial values mark all SMRn as
-	 * invalid and all S2CRn as bypass unless overridden.
-	 */
-	for (i = 0; i < smmu->num_mapping_groups; ++i)
-		arm_smmu_write_sme(smmu, i);
-
-	/*
-	 * Before clearing ARM_MMU500_ACTLR_CPRE, need to
-	 * clear CACHE_LOCK bit of ACR first. And, CACHE_LOCK
-	 * bit is only present in MMU-500r2 onwards.
-	 */
-	reg = readl_relaxed(gr0_base + ARM_SMMU_GR0_ID7);
-	major = (reg >> ID7_MAJOR_SHIFT) & ID7_MAJOR_MASK;
-	if ((smmu->model == ARM_MMU500) && (major >= 2)) {
-		reg = readl_relaxed(gr0_base + ARM_SMMU_GR0_sACR);
-		reg &= ~ARM_MMU500_ACR_CACHE_LOCK;
-		writel_relaxed(reg, gr0_base + ARM_SMMU_GR0_sACR);
+	/* Mark all SMRn as invalid and all S2CRn as bypass unless overridden */
+	reg = disable_bypass ? S2CR_TYPE_FAULT : S2CR_TYPE_BYPASS;
+	for (i = 0; i < smmu->num_mapping_groups; ++i) {
+		writel_relaxed(0, gr0_base + ARM_SMMU_GR0_SMR(i));
+		writel_relaxed(reg, gr0_base + ARM_SMMU_GR0_S2CR(i));
 	}
 
 	/* Make sure all context banks are disabled and clear CB_FSR  */
@@ -1599,25 +2167,18 @@ static void arm_smmu_device_reset(struct arm_smmu_device *smmu)
 		cb_base = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, i);
 		writel_relaxed(0, cb_base + ARM_SMMU_CB_SCTLR);
 		writel_relaxed(FSR_FAULT, cb_base + ARM_SMMU_CB_FSR);
-		/*
-		 * Disable MMU-500's not-particularly-beneficial next-page
-		 * prefetcher for the sake of errata #841119 and #826419.
-		 */
-		if (smmu->model == ARM_MMU500) {
-			reg = readl_relaxed(cb_base + ARM_SMMU_CB_ACTLR);
-			reg &= ~ARM_MMU500_ACTLR_CPRE;
-			writel_relaxed(reg, cb_base + ARM_SMMU_CB_ACTLR);
-		}
 	}
 
 	/* Invalidate the TLB, just in case */
+	writel_relaxed(0, gr0_base + ARM_SMMU_GR0_STLBIALL);
 	writel_relaxed(0, gr0_base + ARM_SMMU_GR0_TLBIALLH);
 	writel_relaxed(0, gr0_base + ARM_SMMU_GR0_TLBIALLNSNH);
 
 	reg = readl_relaxed(ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sCR0);
 
 	/* Enable fault reporting */
-	reg |= (sCR0_GFRE | sCR0_GFIE | sCR0_GCFGFRE | sCR0_GCFGFIE);
+	reg |= (sCR0_GFRE | sCR0_GFIE | sCR0_GCFGFRE | sCR0_GCFGFIE |
+		sCR0_USFCFG);
 
 	/* Disable TLB broadcasting. */
 	reg |= (sCR0_VMIDPNE | sCR0_PTM);
@@ -1635,11 +2196,8 @@ static void arm_smmu_device_reset(struct arm_smmu_device *smmu)
 	/* Don't upgrade barriers */
 	reg &= ~(sCR0_BSU_MASK << sCR0_BSU_SHIFT);
 
-	if (smmu->features & ARM_SMMU_FEAT_VMID16)
-		reg |= sCR0_VMID16EN;
-
 	/* Push the button */
-	__arm_smmu_tlb_sync(smmu);
+	arm_smmu_tlb_sync(smmu);
 	writel(reg, ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sCR0);
 }
 
@@ -1667,15 +2225,18 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
 	unsigned long size;
 	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
 	u32 id;
-	bool cttw_dt, cttw_reg;
-	int i;
 
 	dev_notice(smmu->dev, "probing hardware configuration...\n");
-	dev_notice(smmu->dev, "SMMUv%d with:\n",
-			smmu->version == ARM_SMMU_V2 ? 2 : 1);
+	dev_notice(smmu->dev, "SMMUv%d with:\n", smmu->version);
 
 	/* ID0 */
 	id = readl_relaxed(gr0_base + ARM_SMMU_GR0_ID0);
+#ifndef CONFIG_64BIT
+	if (((id >> ID0_PTFS_SHIFT) & ID0_PTFS_MASK) == ID0_PTFS_V8_ONLY) {
+		dev_err(smmu->dev, "\tno v7 descriptor support!\n");
+		return -ENODEV;
+	}
+#endif
 
 	/* Restrict available stages based on module parameter */
 	if (force_stage == 1)
@@ -1704,83 +2265,45 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
 		return -ENODEV;
 	}
 
-	if ((id & ID0_S1TS) &&
-		((smmu->version < ARM_SMMU_V2) || !(id & ID0_ATOSNS))) {
-		smmu->features |= ARM_SMMU_FEAT_TRANS_OPS;
-		dev_notice(smmu->dev, "\taddress translation ops\n");
+	if (id & ID0_CTTW) {
+		smmu->features |= ARM_SMMU_FEAT_COHERENT_WALK;
+		dev_notice(smmu->dev, "\tcoherent table walk\n");
 	}
 
-	/*
-	 * In order for DMA API calls to work properly, we must defer to what
-	 * the DT says about coherency, regardless of what the hardware claims.
-	 * Fortunately, this also opens up a workaround for systems where the
-	 * ID register value has ended up configured incorrectly.
-	 */
-	cttw_dt = of_dma_is_coherent(smmu->dev->of_node);
-	cttw_reg = !!(id & ID0_CTTW);
-	if (cttw_dt)
-		smmu->features |= ARM_SMMU_FEAT_COHERENT_WALK;
-	if (cttw_dt || cttw_reg)
-		dev_notice(smmu->dev, "\t%scoherent table walk\n",
-			   cttw_dt ? "" : "non-");
-	if (cttw_dt != cttw_reg)
-		dev_notice(smmu->dev,
-			   "\t(IDR0.CTTW overridden by dma-coherent property)\n");
+	smmu->num_mapping_groups = (id >> ID0_NUMSMRG_SHIFT) &
+		ID0_NUMSMRG_MASK;
 
-	/* Max. number of entries we have for stream matching/indexing */
-	size = 1 << ((id >> ID0_NUMSIDB_SHIFT) & ID0_NUMSIDB_MASK);
-	smmu->streamid_mask = size - 1;
 	if (id & ID0_SMS) {
-		u32 smr;
+		u32 smr, sid, mask;
 
 		smmu->features |= ARM_SMMU_FEAT_STREAM_MATCH;
-		size = (id >> ID0_NUMSMRG_SHIFT) & ID0_NUMSMRG_MASK;
-		if (size == 0) {
+		if (smmu->num_mapping_groups == 0) {
 			dev_err(smmu->dev,
 				"stream-matching supported, but no SMRs present!\n");
 			return -ENODEV;
 		}
 
-		/*
-		 * SMR.ID bits may not be preserved if the corresponding MASK
-		 * bits are set, so check each one separately. We can reject
-		 * masters later if they try to claim IDs outside these masks.
-		 */
-		smr = smmu->streamid_mask << SMR_ID_SHIFT;
+		smr = SMR_MASK_MASK << SMR_MASK_SHIFT;
+		smr |= (SMR_ID_MASK << SMR_ID_SHIFT);
 		writel_relaxed(smr, gr0_base + ARM_SMMU_GR0_SMR(0));
 		smr = readl_relaxed(gr0_base + ARM_SMMU_GR0_SMR(0));
-		smmu->streamid_mask = smr >> SMR_ID_SHIFT;
 
-		smr = smmu->streamid_mask << SMR_MASK_SHIFT;
-		writel_relaxed(smr, gr0_base + ARM_SMMU_GR0_SMR(0));
-		smr = readl_relaxed(gr0_base + ARM_SMMU_GR0_SMR(0));
-		smmu->smr_mask_mask = smr >> SMR_MASK_SHIFT;
-
-		/* Zero-initialised to mark as invalid */
-		smmu->smrs = devm_kcalloc(smmu->dev, size, sizeof(*smmu->smrs),
-					  GFP_KERNEL);
-		if (!smmu->smrs)
-			return -ENOMEM;
+		mask = (smr >> SMR_MASK_SHIFT) & SMR_MASK_MASK;
+		sid = (smr >> SMR_ID_SHIFT) & SMR_ID_MASK;
+		if ((mask & sid) != sid) {
+			dev_err(smmu->dev,
+				"SMR mask bits (0x%x) insufficient for ID field (0x%x)\n",
+				mask, sid);
+			return -ENODEV;
+		}
 
 		dev_notice(smmu->dev,
-			   "\tstream matching with %lu register groups, mask 0x%x",
-			   size, smmu->smr_mask_mask);
-	}
-	/* s2cr->type == 0 means translation, so initialise explicitly */
-	smmu->s2crs = devm_kmalloc_array(smmu->dev, size, sizeof(*smmu->s2crs),
-					 GFP_KERNEL);
-	if (!smmu->s2crs)
-		return -ENOMEM;
-	for (i = 0; i < size; i++)
-		smmu->s2crs[i] = s2cr_init_val;
-
-	smmu->num_mapping_groups = size;
-	mutex_init(&smmu->stream_map_mutex);
-
-	if (smmu->version < ARM_SMMU_V2 || !(id & ID0_PTFS_NO_AARCH32)) {
-		smmu->features |= ARM_SMMU_FEAT_FMT_AARCH32_L;
-		if (!(id & ID0_PTFS_NO_AARCH32S))
-			smmu->features |= ARM_SMMU_FEAT_FMT_AARCH32_S;
+			   "\tstream matching with %u register groups, mask 0x%x",
+			   smmu->num_mapping_groups, mask);
+	} else {
+		dev_notice(smmu->dev,
+			   "\tstream indexing with %u indices",
+			   smmu->num_mapping_groups);
 	}
 
 	/* ID1 */
@@ -1788,14 +2311,18 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
 	smmu->pgshift = (id & ID1_PAGESIZE) ? 16 : 12;
 
 	/* Check for size mismatch of SMMU address space from mapped region */
-	size = 1 << (((id >> ID1_NUMPAGENDXB_SHIFT) & ID1_NUMPAGENDXB_MASK) + 1);
+	size = 1 <<
+		(((id >> ID1_NUMPAGENDXB_SHIFT) & ID1_NUMPAGENDXB_MASK) + 1);
 	size *= 2 << smmu->pgshift;
-	if (smmu->size != size)
-		dev_warn(smmu->dev,
+	if (smmu->size != size) {
+		dev_info(smmu->dev,
 			"SMMU address space size (0x%lx) differs from mapped region size (0x%lx)!\n",
 			size, smmu->size);
+		smmu->size = size;
+	}
 
-	smmu->num_s2_context_banks = (id >> ID1_NUMS2CB_SHIFT) & ID1_NUMS2CB_MASK;
+	smmu->num_s2_context_banks = (id >> ID1_NUMS2CB_SHIFT) &
+				      ID1_NUMS2CB_MASK;
 	smmu->num_context_banks = (id >> ID1_NUMCB_SHIFT) & ID1_NUMCB_MASK;
 	if (smmu->num_s2_context_banks > smmu->num_context_banks) {
 		dev_err(smmu->dev, "impossible number of S2 context banks!\n");
@@ -1803,146 +2330,480 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
 	}
 	dev_notice(smmu->dev, "\t%u context banks (%u stage-2 only)\n",
 		   smmu->num_context_banks, smmu->num_s2_context_banks);
-	/*
-	 * Cavium CN88xx erratum #27704.
-	 * Ensure ASID and VMID allocation is unique across all SMMUs in
-	 * the system.
-	 */
-	if (smmu->model == CAVIUM_SMMUV2) {
-		smmu->cavium_id_base =
-			atomic_add_return(smmu->num_context_banks,
-					  &cavium_smmu_context_count);
-		smmu->cavium_id_base -= smmu->num_context_banks;
-	}
 
 	/* ID2 */
 	id = readl_relaxed(gr0_base + ARM_SMMU_GR0_ID2);
 	size = arm_smmu_id_size_to_bits((id >> ID2_IAS_SHIFT) & ID2_IAS_MASK);
-	smmu->ipa_size = size;
+	smmu->s1_output_size = min_t(unsigned long, PHYS_MASK_SHIFT, size);
 
-	/* The output mask is also applied for bypass */
+	/* Stage-2 input size limited due to pgd allocation (PTRS_PER_PGD) */
+#ifdef CONFIG_64BIT
+	smmu->s2_input_size = min_t(unsigned long, VA_BITS, size);
+#else
+	smmu->s2_input_size = min(32UL, size);
+#endif
+
+	/* The stage-2 output mask is also applied for bypass */
 	size = arm_smmu_id_size_to_bits((id >> ID2_OAS_SHIFT) & ID2_OAS_MASK);
-	smmu->pa_size = size;
+	smmu->s2_output_size = min_t(unsigned long, PHYS_MASK_SHIFT, size);
 
-	if (id & ID2_VMID16)
-		smmu->features |= ARM_SMMU_FEAT_VMID16;
-
-	/*
-	 * What the page table walker can address actually depends on which
-	 * descriptor format is in use, but since a) we don't know that yet,
-	 * and b) it can vary per context bank, this will have to do...
-	 */
-	if (dma_set_mask_and_coherent(smmu->dev, DMA_BIT_MASK(size)))
-		dev_warn(smmu->dev,
-			 "failed to set DMA mask for table walker\n");
-
-	if (smmu->version < ARM_SMMU_V2) {
-		smmu->va_size = smmu->ipa_size;
-		if (smmu->version == ARM_SMMU_V1_64K)
-			smmu->features |= ARM_SMMU_FEAT_FMT_AARCH64_64K;
+	if (smmu->version == ARM_SMMU_V1) {
+		smmu->s1_input_size = 32;
 	} else {
+#ifdef CONFIG_64BIT
 		size = (id >> ID2_UBS_SHIFT) & ID2_UBS_MASK;
-		smmu->va_size = arm_smmu_id_size_to_bits(size);
-		if (id & ID2_PTFS_4K)
-			smmu->features |= ARM_SMMU_FEAT_FMT_AARCH64_4K;
-		if (id & ID2_PTFS_16K)
-			smmu->features |= ARM_SMMU_FEAT_FMT_AARCH64_16K;
-		if (id & ID2_PTFS_64K)
-			smmu->features |= ARM_SMMU_FEAT_FMT_AARCH64_64K;
+		size = min(VA_BITS, arm_smmu_id_size_to_bits(size));
+#else
+		size = 32;
+#endif
+		smmu->s1_input_size = size;
+
+		if ((PAGE_SIZE == SZ_4K && !(id & ID2_PTFS_4K)) ||
+		    (PAGE_SIZE == SZ_64K && !(id & ID2_PTFS_64K)) ||
+		    (PAGE_SIZE != SZ_4K && PAGE_SIZE != SZ_64K)) {
+			dev_err(smmu->dev, "CPU page size 0x%lx unsupported\n",
+				PAGE_SIZE);
+			return -ENODEV;
+		}
 	}
-
-	/* Now we've corralled the various formats, what'll it do? */
-	if (smmu->features & ARM_SMMU_FEAT_FMT_AARCH32_S)
-		smmu->pgsize_bitmap |= SZ_4K | SZ_64K | SZ_1M | SZ_16M;
-	if (smmu->features &
-	    (ARM_SMMU_FEAT_FMT_AARCH32_L | ARM_SMMU_FEAT_FMT_AARCH64_4K))
-		smmu->pgsize_bitmap |= SZ_4K | SZ_2M | SZ_1G;
-	if (smmu->features & ARM_SMMU_FEAT_FMT_AARCH64_16K)
-		smmu->pgsize_bitmap |= SZ_16K | SZ_32M;
-	if (smmu->features & ARM_SMMU_FEAT_FMT_AARCH64_64K)
-		smmu->pgsize_bitmap |= SZ_64K | SZ_512M;
-
-	if (arm_smmu_ops.pgsize_bitmap == -1UL)
-		arm_smmu_ops.pgsize_bitmap = smmu->pgsize_bitmap;
-	else
-		arm_smmu_ops.pgsize_bitmap |= smmu->pgsize_bitmap;
-	dev_notice(smmu->dev, "\tSupported page sizes: 0x%08lx\n",
-		   smmu->pgsize_bitmap);
-
 
 	if (smmu->features & ARM_SMMU_FEAT_TRANS_S1)
 		dev_notice(smmu->dev, "\tStage-1: %lu-bit VA -> %lu-bit IPA\n",
-			   smmu->va_size, smmu->ipa_size);
+			   smmu->s1_input_size, smmu->s1_output_size);
 
 	if (smmu->features & ARM_SMMU_FEAT_TRANS_S2)
 		dev_notice(smmu->dev, "\tStage-2: %lu-bit IPA -> %lu-bit PA\n",
-			   smmu->ipa_size, smmu->pa_size);
+			   smmu->s2_input_size, smmu->s2_output_size);
 
 	return 0;
 }
 
-struct arm_smmu_match_data {
-	enum arm_smmu_arch_version version;
-	enum arm_smmu_implementation model;
+#define defreg(_name)				\
+	{					\
+		.name = __stringify(_name),	\
+		.offset = ARM_SMMU_ ## _name,	\
+	}
+#define defreg_gr0(_name) defreg(GR0_ ## _name)
+
+static const struct debugfs_reg32 arm_smmu_gr0_regs[] = {
+	defreg_gr0(sCR0),
+	defreg_gr0(ID0),
+	defreg_gr0(ID1),
+	defreg_gr0(ID2),
+	defreg_gr0(sGFSR),
+	defreg_gr0(sGFSYNR0),
+	defreg_gr0(sGFSYNR1),
+	defreg_gr0(sTLBGSTATUS),
+	defreg_gr0(nsCR0),
+	defreg_gr0(nsGFSR),
+	defreg_gr0(nsGFSYNR0),
+	defreg_gr0(nsGFSYNR1),
+	defreg_gr0(nsTLBGSTATUS),
+	defreg_gr0(PIDR2),
 };
 
-#define ARM_SMMU_MATCH_DATA(name, ver, imp)	\
-static struct arm_smmu_match_data name = { .version = ver, .model = imp }
+#define defreg_gnsr0(_name) defreg(GNSR0_ ## _name)
 
-ARM_SMMU_MATCH_DATA(smmu_generic_v1, ARM_SMMU_V1, GENERIC_SMMU);
-ARM_SMMU_MATCH_DATA(smmu_generic_v2, ARM_SMMU_V2, GENERIC_SMMU);
-ARM_SMMU_MATCH_DATA(arm_mmu401, ARM_SMMU_V1_64K, GENERIC_SMMU);
-ARM_SMMU_MATCH_DATA(arm_mmu500, ARM_SMMU_V2, ARM_MMU500);
-ARM_SMMU_MATCH_DATA(cavium_smmuv2, ARM_SMMU_V2, CAVIUM_SMMUV2);
+static const struct debugfs_reg32 arm_smmu_gnsr0_regs[] = {
+	defreg_gnsr0(PMCNTENSET_0),
+	defreg_gnsr0(PMCNTENCLR_0),
+	defreg_gnsr0(PMINTENSET_0),
+	defreg_gnsr0(PMINTENCLR_0),
+	defreg_gnsr0(PMOVSCLR_0),
+	defreg_gnsr0(PMOVSSET_0),
+	defreg_gnsr0(PMCFGR_0),
+	defreg_gnsr0(PMCR_0),
+	defreg_gnsr0(PMCEID0_0),
+	defreg_gnsr0(PMAUTHSTATUS_0),
+	defreg_gnsr0(PMDEVTYPE_0)
+};
+
+static ssize_t smmu_context_filter_write(struct file *file,
+					 const char __user *user_buf,
+					 size_t count, loff_t *ppos)
+{
+	s16 cbndx;
+	char *pbuf, *temp, *val;
+	bool first_times = 1;
+	ssize_t ret = count;
+	struct seq_file *seqf = file->private_data;
+	struct arm_smmu_device *smmu = seqf->private;
+	unsigned long *bitmap = smmu->context_filter;
+
+	/* Clear bitmap in case of user buf empty */
+	if (count == 1 && *user_buf == '\n') {
+		bitmap_zero(bitmap, smmu->num_context_banks);
+		return ret;
+	}
+
+	pbuf = vmalloc(count + 1);
+	if (!pbuf)
+		return -ENOMEM;
+
+	if (copy_from_user(pbuf, user_buf, count)) {
+		ret = -EFAULT;
+		goto end;
+	}
+
+	if (pbuf[count - 1] == '\n')
+		pbuf[count - 1] = '\0';
+	else
+		pbuf[count] = '\0';
+
+	temp = pbuf;
+
+	do {
+		val = strsep(&temp, ",");
+		if (*val) {
+			if (kstrtos16(val, 10, &cbndx))
+				continue;
+
+			/* Reset bitmap in case of negative index */
+			if (cbndx < 0) {
+				bitmap_fill(bitmap, smmu->num_context_banks);
+				goto end;
+			}
+
+			if (cbndx >= smmu->num_context_banks) {
+				dev_err(smmu->dev,
+					"context filter index out of range\n");
+				ret = -EINVAL;
+				goto end;
+			}
+
+			if (first_times) {
+				bitmap_zero(bitmap, smmu->num_context_banks);
+				first_times = 0;
+			}
+
+			set_bit(cbndx, bitmap);
+		}
+	} while (temp);
+
+end:
+	vfree(pbuf);
+	return ret;
+}
+
+static int smmu_context_filter_show(struct seq_file *s, void *unused)
+{
+	struct arm_smmu_device *smmu = s->private;
+	unsigned long *bitmap = smmu->context_filter;
+	int idx = 0;
+
+	while (1) {
+		idx = find_next_bit(bitmap, ARM_SMMU_MAX_CBS, idx);
+		if (idx >= smmu->num_context_banks)
+			break;
+		seq_printf(s, "%d,", idx);
+		idx++;
+	}
+	seq_putc(s, '\n');
+	return 0;
+}
+
+static int smmu_context_filter_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, smmu_context_filter_show, inode->i_private);
+}
+
+static const struct file_operations smmu_context_filter_fops = {
+	.open		= smmu_context_filter_open,
+	.read		= seq_read,
+	.write		= smmu_context_filter_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int smmu_reg32_debugfs_set(void *data, u64 val)
+{
+	struct debugfs_reg32 *regs = (struct debugfs_reg32 *)data;
+
+	writel(val, (smmu_handle->base + regs->offset));
+	return 0;
+}
+
+static int smmu_reg32_debugfs_get(void *data, u64 *val)
+{
+	struct debugfs_reg32 *regs = (struct debugfs_reg32 *)data;
+
+	*val = readl(smmu_handle->base + regs->offset);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(smmu_reg32_debugfs_fops,
+			smmu_reg32_debugfs_get,
+			smmu_reg32_debugfs_set, "%08llx\n");
+
+static int smmu_perf_regset_debugfs_set(void *data, u64 val)
+{
+	struct debugfs_reg32 *regs = (struct debugfs_reg32 *)data;
+
+	writel(val, (smmu_handle->perf_regset->base + regs->offset));
+	return 0;
+}
+
+static int smmu_perf_regset_debugfs_get(void *data, u64 *val)
+{
+	struct debugfs_reg32 *regs = (struct debugfs_reg32 *)data;
+
+	*val = readl(smmu_handle->perf_regset->base + regs->offset);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(smmu_perf_regset_debugfs_fops,
+			smmu_perf_regset_debugfs_get,
+			smmu_perf_regset_debugfs_set, "%08llx\n");
+
+static void arm_smmu_debugfs_delete(struct arm_smmu_device *smmu)
+{
+	int i;
+
+	if (smmu->regset) {
+		const struct debugfs_reg32 *regs = smmu->regset->regs;
+
+		regs += ARRAY_SIZE(arm_smmu_gr0_regs);
+		for (i = 0; i < 4 * smmu->num_context_banks; i++)
+			kfree(regs[i].name);
+
+		kfree(smmu->regset);
+	}
+
+	if (smmu->perf_regset) {
+		const struct debugfs_reg32 *regs = smmu->perf_regset->regs;
+
+		i = ARRAY_SIZE(arm_smmu_gnsr0_regs);
+		for (; i < smmu->perf_regset->nregs ; i++)
+			kfree(regs[i].name);
+
+		kfree(smmu->perf_regset);
+		smmu->perf_regset = NULL;
+	}
+
+	debugfs_remove_recursive(smmu->debugfs_root);
+}
+
+static void arm_smmu_debugfs_create(struct arm_smmu_device *smmu)
+{
+	int i;
+	struct debugfs_reg32 *regs;
+	size_t bytes;
+	struct dentry *dent_gr, *dent_gnsr;
+
+	smmu->debugfs_root = debugfs_create_dir(dev_name(smmu->dev), NULL);
+	if (!smmu->debugfs_root)
+		return;
+
+	dent_gr = debugfs_create_dir("gr", smmu->debugfs_root);
+	if (!dent_gr)
+		goto err_out;
+
+	if (!is_tegra_hypervisor_mode()) {
+		dent_gnsr = debugfs_create_dir("gnsr", smmu->debugfs_root);
+		if (!dent_gnsr)
+			goto err_out;
+	}
+
+	smmu->masters_root = debugfs_create_dir("masters", smmu->debugfs_root);
+	if (!smmu->masters_root)
+		goto err_out;
+
+	bytes = (smmu->num_context_banks + 1) * sizeof(*smmu->regset);
+	bytes += ARRAY_SIZE(arm_smmu_gr0_regs) * sizeof(*regs);
+	bytes += 4 * smmu->num_context_banks * sizeof(*regs);
+	smmu->regset = kzalloc(bytes, GFP_KERNEL);
+	if (!smmu->regset)
+		goto err_out;
+
+	smmu->regset->base = smmu->base;
+	smmu->regset->nregs = ARRAY_SIZE(arm_smmu_gr0_regs) +
+		4 * smmu->num_context_banks;
+	smmu->regset->regs = (struct debugfs_reg32 *)(smmu->regset +
+						smmu->num_context_banks + 1);
+	regs = (struct debugfs_reg32 *)smmu->regset->regs;
+	for (i = 0; i < ARRAY_SIZE(arm_smmu_gr0_regs); i++) {
+		regs->name = arm_smmu_gr0_regs[i].name;
+		regs->offset = arm_smmu_gr0_regs[i].offset;
+		regs++;
+	}
+
+	for (i = 0; i < smmu->num_context_banks; i++) {
+		regs->name = kasprintf(GFP_KERNEL, "GR0_SMR%03d", i);
+		if (!regs->name)
+			goto err_out;
+		regs->offset = ARM_SMMU_GR0_SMR(i);
+		regs++;
+
+		regs->name = kasprintf(GFP_KERNEL, "GR0_S2CR%03d", i);
+		if (!regs->name)
+			goto err_out;
+		regs->offset = ARM_SMMU_GR0_S2CR(i);
+		regs++;
+
+		regs->name = kasprintf(GFP_KERNEL, "GR1_CBAR%03d", i);
+		if (!regs->name)
+			goto err_out;
+		regs->offset = (1 << smmu->pgshift) + ARM_SMMU_GR1_CBAR(i);
+		regs++;
+
+		regs->name = kasprintf(GFP_KERNEL, "GR1_CBA2R%03d", i);
+		if (!regs->name)
+			goto err_out;
+		regs->offset = (1 << smmu->pgshift) + ARM_SMMU_GR1_CBA2R(i);
+		regs++;
+	}
+
+	regs = (struct debugfs_reg32 *)smmu->regset->regs;
+	for (i = 0; i < smmu->regset->nregs; i++) {
+		debugfs_create_file(regs->name, S_IRUGO | S_IWUSR,
+				dent_gr, regs, &smmu_reg32_debugfs_fops);
+		regs++;
+	}
+
+	debugfs_create_regset32("regdump", S_IRUGO, smmu->debugfs_root,
+				smmu->regset);
+
+	if (!is_tegra_hypervisor_mode()) {
+		bytes = sizeof(*smmu->perf_regset);
+		bytes += ARRAY_SIZE(arm_smmu_gnsr0_regs) * sizeof(*regs);
+		/*
+		 * Account the number of bytes for two sets of
+		 * counter group registers
+		 */
+		bytes += 2 * PMCG_SIZE * sizeof(*regs);
+		/*
+		 * Account the number of bytes for two sets of
+		 * event counter registers
+		 */
+		bytes += 2 * PMEV_SIZE * sizeof(*regs);
+
+		/* Allocate memory for Perf Monitor registers */
+		smmu->perf_regset =  kzalloc(bytes, GFP_KERNEL);
+		if (!smmu->perf_regset)
+			goto err_out;
+
+		/*
+		 * perf_regset base address is placed at offset
+		 * (3 * smmu_pagesize) from smmu->base address
+		 */
+		smmu->perf_regset->base = smmu->base + 3 * (1 << smmu->pgshift);
+		smmu->perf_regset->nregs = ARRAY_SIZE(arm_smmu_gnsr0_regs) +
+			2 * PMCG_SIZE + 2 * PMEV_SIZE;
+		smmu->perf_regset->regs =
+			(struct debugfs_reg32 *)(smmu->perf_regset + 1);
+
+		regs = (struct debugfs_reg32 *)smmu->perf_regset->regs;
+
+		for (i = 0; i < ARRAY_SIZE(arm_smmu_gnsr0_regs); i++) {
+			regs->name = arm_smmu_gnsr0_regs[i].name;
+			regs->offset = arm_smmu_gnsr0_regs[i].offset;
+			regs++;
+		}
+
+		for (i = 0; i < PMEV_SIZE; i++) {
+			regs->name = kasprintf(GFP_KERNEL,
+				"GNSR0_PMEVTYPER%d_0", i);
+			if (!regs->name)
+				goto err_out;
+			regs->offset = ARM_SMMU_GNSR0_PMEVTYPER(i);
+			regs++;
+
+			regs->name = kasprintf(GFP_KERNEL,
+				"GNSR0_PMEVCNTR%d_0", i);
+			if (!regs->name)
+				goto err_out;
+			regs->offset = ARM_SMMU_GNSR0_PMEVCNTR(i);
+			regs++;
+		}
+
+		for (i = 0; i < PMCG_SIZE; i++) {
+			regs->name = kasprintf(GFP_KERNEL,
+				"GNSR0_PMCGCR%d_0", i);
+			if (!regs->name)
+				goto err_out;
+			regs->offset = ARM_SMMU_GNSR0_PMCGCR(i);
+			regs++;
+
+			regs->name = kasprintf(GFP_KERNEL,
+				"GNSR0_PMCGSMR%d_0", i);
+			if (!regs->name)
+				goto err_out;
+			regs->offset = ARM_SMMU_GNSR0_PMCGSMR(i);
+			regs++;
+		}
+
+		regs = (struct debugfs_reg32 *)smmu->perf_regset->regs;
+		for (i = 0; i < smmu->perf_regset->nregs; i++) {
+			debugfs_create_file(regs->name, S_IRUGO | S_IWUSR,
+			dent_gnsr, regs, &smmu_perf_regset_debugfs_fops);
+			regs++;
+		}
+	}
+
+	debugfs_create_file("context_filter", S_IRUGO | S_IWUSR,
+			    smmu->debugfs_root, smmu,
+			    &smmu_context_filter_fops);
+	debugfs_create_bool("skip_mapping",  S_IRUGO | S_IWUSR,
+			    smmu->debugfs_root, &arm_smmu_skip_mapping);
+	debugfs_create_bool("gr0_tlbiallnsnh",  S_IRUGO | S_IWUSR,
+			smmu->debugfs_root, &arm_smmu_gr0_tlbiallnsnh);
+	debugfs_create_bool("tlb_inv_by_addr",  S_IRUGO | S_IWUSR,
+			smmu->debugfs_root, &arm_smmu_tlb_inv_by_addr);
+	debugfs_create_bool("tlb_inv_at_map",  S_IRUGO | S_IWUSR,
+			smmu->debugfs_root, &arm_smmu_tlb_inv_at_map);
+	return;
+
+err_out:
+	arm_smmu_debugfs_delete(smmu);
+}
 
 static const struct of_device_id arm_smmu_of_match[] = {
-	{ .compatible = "arm,smmu-v1", .data = &smmu_generic_v1 },
-	{ .compatible = "arm,smmu-v2", .data = &smmu_generic_v2 },
-	{ .compatible = "arm,mmu-400", .data = &smmu_generic_v1 },
-	{ .compatible = "arm,mmu-401", .data = &arm_mmu401 },
-	{ .compatible = "arm,mmu-500", .data = &arm_mmu500 },
-	{ .compatible = "cavium,smmu-v2", .data = &cavium_smmuv2 },
+	{ .compatible = "arm,smmu-v1", .data = (void *)ARM_SMMU_V1 },
+	{ .compatible = "arm,smmu-v2", .data = (void *)ARM_SMMU_V2 },
+	{ .compatible = "arm,mmu-400", .data = (void *)ARM_SMMU_V1 },
+	{ .compatible = "arm,mmu-401", .data = (void *)ARM_SMMU_V1 },
+	{ .compatible = "arm,mmu-500", .data = (void *)ARM_SMMU_V2 },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, arm_smmu_of_match);
 
 static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 {
-	const struct arm_smmu_match_data *data;
+	const struct of_device_id *of_id;
 	struct resource *res;
 	struct arm_smmu_device *smmu;
 	struct device *dev = &pdev->dev;
 	int num_irqs, i, err;
-	bool legacy_binding;
+#ifdef CONFIG_ARM_SMMU_SUSPEND
+	u32 suspend_save_reg;
+#endif
 
-	legacy_binding = of_find_property(dev->of_node, "mmu-masters", NULL);
-	if (legacy_binding && !using_generic_binding) {
-		if (!using_legacy_binding)
-			pr_notice("deprecated \"mmu-masters\" DT property in use; DMA API support unavailable\n");
-		using_legacy_binding = true;
-	} else if (!legacy_binding && !using_legacy_binding) {
-		using_generic_binding = true;
-	} else {
-		dev_err(dev, "not probing due to mismatched DT properties\n");
+	if (tegra_platform_is_unit_fpga())
 		return -ENODEV;
-	}
 
 	smmu = devm_kzalloc(dev, sizeof(*smmu), GFP_KERNEL);
 	if (!smmu) {
 		dev_err(dev, "failed to allocate arm_smmu_device\n");
 		return -ENOMEM;
 	}
+	smmu_handle = smmu;
 	smmu->dev = dev;
 
-	data = of_device_get_match_data(dev);
-	smmu->version = data->version;
-	smmu->model = data->model;
+	of_id = of_match_node(arm_smmu_of_match, dev->of_node);
+	smmu->version = (enum arm_smmu_arch_version)of_id->data;
+
+	err = tegra_smmu_of_parse_sids(smmu->dev);
+	if (err) {
+		pr_err("Unable to parse tegra SIDs!\n");
+		return -EINVAL;
+	}
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	smmu->base = devm_ioremap_resource(dev, res);
 	if (IS_ERR(smmu->base))
 		return PTR_ERR(smmu->base);
 	smmu->size = resource_size(res);
+	smmu->base_pa = res->start;
 
 	if (of_property_read_u32(dev->of_node, "#global-interrupts",
 				 &smmu->num_global_irqs)) {
@@ -1955,12 +2816,6 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 		num_irqs++;
 		if (num_irqs > smmu->num_global_irqs)
 			smmu->num_context_irqs++;
-	}
-
-	if (!smmu->num_context_irqs) {
-		dev_err(dev, "found %d interrupts but expected at least %d\n",
-			num_irqs, smmu->num_global_irqs + 1);
-		return -ENODEV;
 	}
 
 	smmu->irqs = devm_kzalloc(dev, sizeof(*smmu->irqs) * num_irqs,
@@ -1984,58 +2839,86 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 	if (err)
 		return err;
 
+	bitmap_fill(smmu->context_filter, smmu->num_context_banks);
+	smmu->masters = RB_ROOT;
 	parse_driver_options(smmu);
 
-	if (smmu->version == ARM_SMMU_V2 &&
-	    smmu->num_context_banks != smmu->num_context_irqs) {
-		dev_err(dev,
-			"found only %d context interrupt(s) but %d required\n",
-			smmu->num_context_irqs, smmu->num_context_banks);
-		return -ENODEV;
-	}
-
 	for (i = 0; i < smmu->num_global_irqs; ++i) {
-		err = devm_request_irq(smmu->dev, smmu->irqs[i],
-				       arm_smmu_global_fault,
-				       IRQF_SHARED,
-				       "arm-smmu global fault",
-				       smmu);
+		err = request_irq(smmu->irqs[i],
+				  arm_smmu_global_fault,
+				  IRQF_SHARED,
+				  "arm-smmu global fault",
+				  smmu);
 		if (err) {
 			dev_err(dev, "failed to request global IRQ %d (%u)\n",
 				i, smmu->irqs[i]);
-			return err;
+			goto out_free_irqs;
 		}
 	}
 
-	of_iommu_set_ops(dev->of_node, &arm_smmu_ops);
-	platform_set_drvdata(pdev, smmu);
-	arm_smmu_device_reset(smmu);
-
-	/* Oh, for a proper bus abstraction */
-	if (!iommu_present(&platform_bus_type))
-		bus_set_iommu(&platform_bus_type, &arm_smmu_ops);
-#ifdef CONFIG_ARM_AMBA
-	if (!iommu_present(&amba_bustype))
-		bus_set_iommu(&amba_bustype, &arm_smmu_ops);
-#endif
-#ifdef CONFIG_PCI
-	if (!iommu_present(&pci_bus_type)) {
-		pci_request_acs();
-		bus_set_iommu(&pci_bus_type, &arm_smmu_ops);
+#ifdef CONFIG_ARM_SMMU_SUSPEND
+	if (!of_property_read_u32(dev->of_node, "suspend-save-reg",
+			&suspend_save_reg)) {
+		smmu->bases[0] = smmu->base;
+		err = arm_smmu_suspend_init(smmu->bases, &smmu->base_pa, 1,
+					smmu->size, smmu->pgshift,
+					suspend_save_reg);
+		if (err) {
+			dev_err(dev, "failed to init arm_smu_suspend\n");
+			goto out_free_irqs;
+		}
 	}
 #endif
+
+	INIT_LIST_HEAD(&smmu->list);
+	spin_lock(&arm_smmu_devices_lock);
+	list_add(&smmu->list, &arm_smmu_devices);
+	spin_unlock(&arm_smmu_devices_lock);
+
+	arm_smmu_device_reset(smmu);
+	arm_smmu_debugfs_create(smmu);
 	return 0;
+
+out_free_irqs:
+	while (i--)
+		free_irq(smmu->irqs[i], smmu);
+
+	return err;
 }
 
 static int arm_smmu_device_remove(struct platform_device *pdev)
 {
-	struct arm_smmu_device *smmu = platform_get_drvdata(pdev);
+	int i;
+	struct device *dev = &pdev->dev;
+	struct arm_smmu_device *curr, *smmu = NULL;
+	struct rb_node *node;
+
+	spin_lock(&arm_smmu_devices_lock);
+	list_for_each_entry(curr, &arm_smmu_devices, list) {
+		if (curr->dev == dev) {
+			smmu = curr;
+			list_del(&smmu->list);
+			break;
+		}
+	}
+	spin_unlock(&arm_smmu_devices_lock);
 
 	if (!smmu)
 		return -ENODEV;
 
+	arm_smmu_debugfs_delete(smmu);
+
+	for (node = rb_first(&smmu->masters); node; node = rb_next(node)) {
+		struct arm_smmu_master *master
+			= container_of(node, struct arm_smmu_master, node);
+		of_node_put(master->of_node);
+	}
+
 	if (!bitmap_empty(smmu->context_map, ARM_SMMU_MAX_CBS))
-		dev_err(&pdev->dev, "removing device with active domains!\n");
+		dev_err(dev, "removing device with active domains!\n");
+
+	for (i = 0; i < smmu->num_global_irqs; ++i)
+		free_irq(smmu->irqs[i], smmu);
 
 	/* Turn the thing off */
 	writel(sCR0_CLIENTPD, ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sCR0);
@@ -2044,23 +2927,42 @@ static int arm_smmu_device_remove(struct platform_device *pdev)
 
 static struct platform_driver arm_smmu_driver = {
 	.driver	= {
+		.owner		= THIS_MODULE,
 		.name		= "arm-smmu",
 		.of_match_table	= of_match_ptr(arm_smmu_of_match),
+		.suppress_bind_attrs = true,
 	},
 	.probe	= arm_smmu_device_dt_probe,
 	.remove	= arm_smmu_device_remove,
 };
 
+static bool init_done;
+
 static int __init arm_smmu_init(void)
 {
-	static bool registered;
-	int ret = 0;
+	int ret;
 
-	if (!registered) {
-		ret = platform_driver_register(&arm_smmu_driver);
-		registered = !ret;
-	}
-	return ret;
+	ret = platform_driver_register(&arm_smmu_driver);
+	if (ret)
+		return ret;
+
+	/* Oh, for a proper bus abstraction */
+	if (!iommu_present(&platform_bus_type))
+		bus_set_iommu(&platform_bus_type, &arm_smmu_ops);
+
+#ifdef CONFIG_ARM_AMBA
+	if (!iommu_present(&amba_bustype))
+		bus_set_iommu(&amba_bustype, &arm_smmu_ops);
+#endif
+
+#ifdef CONFIG_PCI
+	if (!iommu_present(&pci_bus_type))
+		bus_set_iommu(&pci_bus_type, &arm_smmu_ops);
+#endif
+
+	init_done = true;
+
+	return 0;
 }
 
 static void __exit arm_smmu_exit(void)
@@ -2068,27 +2970,23 @@ static void __exit arm_smmu_exit(void)
 	return platform_driver_unregister(&arm_smmu_driver);
 }
 
-subsys_initcall(arm_smmu_init);
 module_exit(arm_smmu_exit);
 
-static int __init arm_smmu_of_init(struct device_node *np)
+static int __init arm_smmu_of_setup(struct device_node *np)
 {
-	int ret = arm_smmu_init();
+	struct platform_device *pdev;
 
-	if (ret)
-		return ret;
+	if (!init_done)
+		arm_smmu_init();
 
-	if (!of_platform_device_create(np, NULL, platform_bus_type.dev_root))
-		return -ENODEV;
+	pdev = of_platform_device_create(np, NULL, platform_bus_type.dev_root);
+	if (IS_ERR(pdev))
+		return PTR_ERR(pdev);
 
+	of_iommu_set_ops(np, (struct iommu_ops *)&arm_smmu_ops);
 	return 0;
 }
-IOMMU_OF_DECLARE(arm_smmuv1, "arm,smmu-v1", arm_smmu_of_init);
-IOMMU_OF_DECLARE(arm_smmuv2, "arm,smmu-v2", arm_smmu_of_init);
-IOMMU_OF_DECLARE(arm_mmu400, "arm,mmu-400", arm_smmu_of_init);
-IOMMU_OF_DECLARE(arm_mmu401, "arm,mmu-401", arm_smmu_of_init);
-IOMMU_OF_DECLARE(arm_mmu500, "arm,mmu-500", arm_smmu_of_init);
-IOMMU_OF_DECLARE(cavium_smmuv2, "cavium,smmu-v2", arm_smmu_of_init);
+IOMMU_OF_DECLARE(arm_smmu_of, "arm,mmu-500", arm_smmu_of_setup);
 
 MODULE_DESCRIPTION("IOMMU API for ARM architected SMMU implementations");
 MODULE_AUTHOR("Will Deacon <will.deacon@arm.com>");

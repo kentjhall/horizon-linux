@@ -145,7 +145,7 @@ config DEBUG_INFO_REDUCED
 
 config DEBUG_INFO_SPLIT
 	bool "Produce split debuginfo in .dwo files"
-	depends on DEBUG_INFO
+	depends on DEBUG_INFO && !FRV
 	help
 	  Generate debug info into separate .dwo files. This significantly
 	  reduces the build directory size for builds with DEBUG_INFO,
@@ -197,7 +197,6 @@ config ENABLE_MUST_CHECK
 config FRAME_WARN
 	int "Warn for stack frames larger than (needs gcc 4.4)"
 	range 0 8192
-	default 0 if KASAN
 	default 2048 if GCC_PLUGIN_LATENT_ENTROPY
 	default 1024 if !64BIT
 	default 2048 if 64BIT
@@ -536,7 +535,7 @@ config DEBUG_KMEMLEAK_EARLY_LOG_SIZE
 	int "Maximum kmemleak early log entries"
 	depends on DEBUG_KMEMLEAK
 	range 200 40000
-	default 400
+	default 16000
 	help
 	  Kmemleak must track all the memory allocations to avoid
 	  reporting false positives. Since memory may be allocated or
@@ -558,6 +557,14 @@ config DEBUG_KMEMLEAK_DEFAULT_OFF
 	help
 	  Say Y here to disable kmemleak by default. It can then be enabled
 	  on the command line via kmemleak=on.
+
+config DEBUG_KMEMLEAK_SCAN_ON
+	bool "Enable kmemleak auto scan thread on boot up"
+	default y
+	depends on DEBUG_KMEMLEAK
+	help
+	  Kmemleak scan is cpu intensive and can stall user tasks at times.
+	  Say N here to disable kmemleak auto scan thread at boot up.
 
 config DEBUG_STACK_USAGE
 	bool "Stack utilization instrumentation"
@@ -764,14 +771,26 @@ config LOCKUP_DETECTOR
 	  The overhead should be minimal.  A periodic hrtimer runs to
 	  generate interrupts and kick the watchdog task every 4 seconds.
 	  An NMI is generated every 10 seconds or so to check for hardlockups.
+	  If NMIs are not available on the platform, every 12 seconds the
+	  hrtimer interrupt on one cpu will be used to check for hardlockups
+	  on the next cpu.
 
 	  The frequency of hrtimer and NMI events and the soft and hard lockup
 	  thresholds can be controlled through the sysctl watchdog_thresh.
 
-config HARDLOCKUP_DETECTOR
+config HARDLOCKUP_DETECTOR_NMI
 	def_bool y
 	depends on LOCKUP_DETECTOR && !HAVE_NMI_WATCHDOG
 	depends on PERF_EVENTS && HAVE_PERF_EVENTS_NMI
+
+config HARDLOCKUP_DETECTOR_OTHER_CPU
+	def_bool y
+	depends on LOCKUP_DETECTOR && SMP
+	depends on !HARDLOCKUP_DETECTOR_NMI && !HAVE_NMI_WATCHDOG
+
+config HARDLOCKUP_DETECTOR
+	def_bool y
+	depends on HARDLOCKUP_DETECTOR_NMI || HARDLOCKUP_DETECTOR_OTHER_CPU
 
 config BOOTPARAM_HARDLOCKUP_PANIC
 	bool "Panic (Reboot) On Hard Lockups"
@@ -922,6 +941,15 @@ config SCHED_DEBUG
 config SCHED_INFO
 	bool
 	default n
+
+config PANIC_ON_RT_THROTTLING
+	bool "Panic on RT throttling"
+	help
+	  Say Y here to enable the kernel to panic when a realtime
+	  runqueue is throttled. This may be useful for detecting
+	  and debugging RT throttling issues.
+
+	  Say N if unsure.
 
 config SCHEDSTATS
 	bool "Collect scheduler statistics"
@@ -1823,9 +1851,9 @@ config TEST_HASH
 	tristate "Perform selftest on hash functions"
 	default n
 	help
-	  Enable this option to test the kernel's integer (<linux/hash,h>)
-	  and string (<linux/stringhash.h>) hash functions on boot
-	  (or module load).
+	  Enable this option to test the kernel's integer (<linux/hash.h>),
+	  string (<linux/stringhash.h>), and siphash (<linux/siphash.h>)
+	  hash functions on boot (or module load).
 
 	  This is intended to help people writing architecture-specific
 	  optimized versions.  If unsure, say N.

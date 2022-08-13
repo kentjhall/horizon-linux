@@ -26,6 +26,7 @@
 #include <linux/spinlock.h>
 #include <linux/freezer.h>
 #include <linux/major.h>
+#include <linux/of.h>
 #include "tpm.h"
 #include "tpm_eventlog.h"
 
@@ -130,6 +131,41 @@ static void tpm_dev_release(struct device *dev)
 	kfree(chip);
 }
 
+
+/**
+ * tpm_class_shutdown() - prepare the TPM device for loss of power.
+ * @dev: device to which the chip is associated.
+ *
+ * Issues a TPM2_Shutdown command prior to loss of power, as required by the
+ * TPM 2.0 spec.
+ * Then, calls bus- and device- specific shutdown code.
+ *
+ * XXX: This codepath relies on the fact that sysfs is not enabled for
+ * TPM2: sysfs uses an implicit lock on chip->ops, so this could race if TPM2
+ * has sysfs support enabled before TPM sysfs's implicit locking is fixed.
+ */
+static int tpm_class_shutdown(struct device *dev)
+{
+	struct tpm_chip *chip = container_of(dev, struct tpm_chip, dev);
+
+	if (chip->flags & TPM_CHIP_FLAG_TPM2) {
+		down_write(&chip->ops_sem);
+		tpm2_shutdown(chip, TPM2_SU_CLEAR);
+		chip->ops = NULL;
+		up_write(&chip->ops_sem);
+	}
+	/* Allow bus- and device-specific code to run. Note: since chip->ops
+	 * is NULL, more-specific shutdown code will not be able to issue TPM
+	 * commands.
+	 */
+	if (dev->bus && dev->bus->shutdown)
+		dev->bus->shutdown(dev);
+	else if (dev->driver && dev->driver->shutdown)
+		dev->driver->shutdown(dev);
+	return 0;
+}
+
+
 /**
  * tpm_chip_alloc() - allocate a new struct tpm_chip instance
  * @pdev: device to which the chip is associated
@@ -140,7 +176,7 @@ static void tpm_dev_release(struct device *dev)
  * Allocates a new struct tpm_chip instance and assigns a free
  * device number for it. Must be paired with put_device(&chip->dev).
  */
-struct tpm_chip *tpm_chip_alloc(struct device *dev,
+struct tpm_chip *tpm_chip_alloc(struct device *pdev,
 				const struct tpm_class_ops *ops)
 {
 	struct tpm_chip *chip;
@@ -159,7 +195,7 @@ struct tpm_chip *tpm_chip_alloc(struct device *dev,
 	rc = idr_alloc(&dev_nums_idr, NULL, 0, TPM_NUM_DEVICES, GFP_KERNEL);
 	mutex_unlock(&idr_lock);
 	if (rc < 0) {
-		dev_err(dev, "No available tpm device numbers\n");
+		dev_err(pdev, "No available tpm device numbers\n");
 		kfree(chip);
 		return ERR_PTR(rc);
 	}
@@ -168,8 +204,9 @@ struct tpm_chip *tpm_chip_alloc(struct device *dev,
 	device_initialize(&chip->dev);
 
 	chip->dev.class = tpm_class;
+	chip->dev.class->shutdown = tpm_class_shutdown;
 	chip->dev.release = tpm_dev_release;
-	chip->dev.parent = dev;
+	chip->dev.parent = pdev;
 	chip->dev.groups = chip->groups;
 
 	if (chip->dev_num == 0)
@@ -181,7 +218,7 @@ struct tpm_chip *tpm_chip_alloc(struct device *dev,
 	if (rc)
 		goto out;
 
-	if (!dev)
+	if (!pdev)
 		chip->flags |= TPM_CHIP_FLAG_VIRTUAL;
 
 	cdev_init(&chip->cdev, &tpm_fops);
@@ -352,7 +389,19 @@ static int tpm_add_legacy_sysfs(struct tpm_chip *chip)
  */
 int tpm_chip_register(struct tpm_chip *chip)
 {
+#ifdef CONFIG_OF
+	struct device_node *np;
+#endif
 	int rc;
+
+#ifdef CONFIG_OF
+	np = of_find_node_by_name(NULL, "vtpm");
+	if (np) {
+		if (of_property_read_bool(np, "powered-while-suspended"))
+			chip->flags |= TPM_CHIP_FLAG_ALWAYS_POWERED;
+	}
+	of_node_put(np);
+#endif
 
 	if (chip->ops->flags & TPM_OPS_AUTO_STARTUP) {
 		if (chip->flags & TPM_CHIP_FLAG_TPM2)

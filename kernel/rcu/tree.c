@@ -127,13 +127,16 @@ int rcu_num_nodes __read_mostly = NUM_RCU_NODES; /* Total # rcu_nodes in use. */
 int sysctl_panic_on_rcu_stall __read_mostly;
 
 /*
- * The rcu_scheduler_active variable transitions from zero to one just
- * before the first task is spawned.  So when this variable is zero, RCU
- * can assume that there is but one task, allowing RCU to (for example)
+ * The rcu_scheduler_active variable is initialized to the value
+ * RCU_SCHEDULER_INACTIVE and transitions RCU_SCHEDULER_INIT just before the
+ * first task is spawned.  So when this variable is RCU_SCHEDULER_INACTIVE,
+ * RCU can assume that there is but one task, allowing RCU to (for example)
  * optimize synchronize_rcu() to a simple barrier().  When this variable
- * is one, RCU must actually do all the hard work required to detect real
- * grace periods.  This variable is also used to suppress boot-time false
- * positives from lockdep-RCU error checking.
+ * is RCU_SCHEDULER_INIT, RCU must actually do all the hard work required
+ * to detect real grace periods.  This variable is also used to suppress
+ * boot-time false positives from lockdep-RCU error checking.  Finally, it
+ * transitions from RCU_SCHEDULER_INIT to RCU_SCHEDULER_RUNNING after RCU
+ * is fully initialized, including all of its kthreads having been spawned.
  */
 int rcu_scheduler_active __read_mostly;
 EXPORT_SYMBOL_GPL(rcu_scheduler_active);
@@ -789,8 +792,13 @@ void rcu_irq_exit(void)
 	long long oldval;
 	struct rcu_dynticks *rdtp;
 
-	RCU_LOCKDEP_WARN(!irqs_disabled(), "rcu_irq_exit() invoked with irqs enabled!!!");
 	rdtp = this_cpu_ptr(&rcu_dynticks);
+
+	/* Page faults can happen in NMI handlers, so check... */
+	if (READ_ONCE(rdtp->dynticks_nmi_nesting))
+		return;
+
+	RCU_LOCKDEP_WARN(!irqs_disabled(), "rcu_irq_exit() invoked with irqs enabled!!!");
 	oldval = rdtp->dynticks_nesting;
 	rdtp->dynticks_nesting--;
 	WARN_ON_ONCE(IS_ENABLED(CONFIG_RCU_EQS_DEBUG) &&
@@ -927,8 +935,13 @@ void rcu_irq_enter(void)
 	struct rcu_dynticks *rdtp;
 	long long oldval;
 
-	RCU_LOCKDEP_WARN(!irqs_disabled(), "rcu_irq_enter() invoked with irqs enabled!!!");
 	rdtp = this_cpu_ptr(&rcu_dynticks);
+
+	/* Page faults can happen in NMI handlers, so check... */
+	if (READ_ONCE(rdtp->dynticks_nmi_nesting))
+		return;
+
+	RCU_LOCKDEP_WARN(!irqs_disabled(), "rcu_irq_enter() invoked with irqs enabled!!!");
 	oldval = rdtp->dynticks_nesting;
 	rdtp->dynticks_nesting++;
 	WARN_ON_ONCE(IS_ENABLED(CONFIG_RCU_EQS_DEBUG) &&
@@ -1705,15 +1718,23 @@ static int rcu_future_gp_cleanup(struct rcu_state *rsp, struct rcu_node *rnp)
 }
 
 /*
- * Awaken the grace-period kthread for the specified flavor of RCU.
- * Don't do a self-awaken, and don't bother awakening when there is
- * nothing for the grace-period kthread to do (as in several CPUs
- * raced to awaken, and we lost), and finally don't try to awaken
- * a kthread that has not yet been created.
+ * Awaken the grace-period kthread.  Don't do a self-awaken (unless in
+ * an interrupt or softirq handler), and don't bother awakening when there
+ * is nothing for the grace-period kthread to do (as in several CPUs raced
+ * to awaken, and we lost), and finally don't try to awaken a kthread that
+ * has not yet been created.  If all those checks are passed, track some
+ * debug information and awaken.
+ *
+ * So why do the self-wakeup when in an interrupt or softirq handler
+ * in the grace-period kthread's context?  Because the kthread might have
+ * been interrupted just as it was going to sleep, and just after the final
+ * pre-sleep check of the awaken condition.  In this case, a wakeup really
+ * is required, and is therefore supplied.
  */
 static void rcu_gp_kthread_wake(struct rcu_state *rsp)
 {
-	if (current == rsp->gp_kthread ||
+	if ((current == rsp->gp_kthread &&
+	     !in_interrupt() && !in_serving_softirq()) ||
 	    !READ_ONCE(rsp->gp_flags) ||
 	    !rsp->gp_kthread)
 		return;
@@ -3985,18 +4006,22 @@ static int __init rcu_spawn_gp_kthread(void)
 early_initcall(rcu_spawn_gp_kthread);
 
 /*
- * This function is invoked towards the end of the scheduler's initialization
- * process.  Before this is called, the idle task might contain
- * RCU read-side critical sections (during which time, this idle
- * task is booting the system).  After this function is called, the
- * idle tasks are prohibited from containing RCU read-side critical
- * sections.  This function also enables RCU lockdep checking.
+ * This function is invoked towards the end of the scheduler's
+ * initialization process.  Before this is called, the idle task might
+ * contain synchronous grace-period primitives (during which time, this idle
+ * task is booting the system, and such primitives are no-ops).  After this
+ * function is called, any synchronous grace-period primitives are run as
+ * expedited, with the requesting task driving the grace period forward.
+ * A later core_initcall() rcu_exp_runtime_mode() will switch to full
+ * runtime RCU functionality.
  */
 void rcu_scheduler_starting(void)
 {
 	WARN_ON(num_online_cpus() != 1);
 	WARN_ON(nr_context_switches() > 0);
-	rcu_scheduler_active = 1;
+	rcu_test_sync_prims();
+	rcu_scheduler_active = RCU_SCHEDULER_INIT;
+	rcu_test_sync_prims();
 }
 
 /*

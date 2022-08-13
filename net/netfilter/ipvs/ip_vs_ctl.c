@@ -97,7 +97,6 @@ static bool __ip_vs_addr_is_local_v6(struct net *net,
 static void update_defense_level(struct netns_ipvs *ipvs)
 {
 	struct sysinfo i;
-	static int old_secure_tcp = 0;
 	int availmem;
 	int nomem;
 	int to_change = -1;
@@ -178,35 +177,35 @@ static void update_defense_level(struct netns_ipvs *ipvs)
 	spin_lock(&ipvs->securetcp_lock);
 	switch (ipvs->sysctl_secure_tcp) {
 	case 0:
-		if (old_secure_tcp >= 2)
+		if (ipvs->old_secure_tcp >= 2)
 			to_change = 0;
 		break;
 	case 1:
 		if (nomem) {
-			if (old_secure_tcp < 2)
+			if (ipvs->old_secure_tcp < 2)
 				to_change = 1;
 			ipvs->sysctl_secure_tcp = 2;
 		} else {
-			if (old_secure_tcp >= 2)
+			if (ipvs->old_secure_tcp >= 2)
 				to_change = 0;
 		}
 		break;
 	case 2:
 		if (nomem) {
-			if (old_secure_tcp < 2)
+			if (ipvs->old_secure_tcp < 2)
 				to_change = 1;
 		} else {
-			if (old_secure_tcp >= 2)
+			if (ipvs->old_secure_tcp >= 2)
 				to_change = 0;
 			ipvs->sysctl_secure_tcp = 1;
 		}
 		break;
 	case 3:
-		if (old_secure_tcp < 2)
+		if (ipvs->old_secure_tcp < 2)
 			to_change = 1;
 		break;
 	}
-	old_secure_tcp = ipvs->sysctl_secure_tcp;
+	ipvs->old_secure_tcp = ipvs->sysctl_secure_tcp;
 	if (to_change >= 0)
 		ip_vs_protocol_timeout_change(ipvs,
 					      ipvs->sysctl_secure_tcp > 1);
@@ -2040,12 +2039,16 @@ static int ip_vs_info_seq_show(struct seq_file *seq, void *v)
 		seq_puts(seq,
 			 "  -> RemoteAddress:Port Forward Weight ActiveConn InActConn\n");
 	} else {
+		struct net *net = seq_file_net(seq);
+		struct netns_ipvs *ipvs = net_ipvs(net);
 		const struct ip_vs_service *svc = v;
 		const struct ip_vs_iter *iter = seq->private;
 		const struct ip_vs_dest *dest;
 		struct ip_vs_scheduler *sched = rcu_dereference(svc->scheduler);
 		char *sched_name = sched ? sched->name : "none";
 
+		if (svc->ipvs != ipvs)
+			return 0;
 		if (iter->table == ip_vs_svc_table) {
 #ifdef CONFIG_IP_VS_IPV6
 			if (svc->af == AF_INET6)
@@ -2255,6 +2258,18 @@ static int ip_vs_set_timeout(struct netns_ipvs *ipvs, struct ip_vs_timeout_user 
 		  u->udp_timeout);
 
 #ifdef CONFIG_IP_VS_PROTO_TCP
+	if (u->tcp_timeout < 0 || u->tcp_timeout > (INT_MAX / HZ) ||
+	    u->tcp_fin_timeout < 0 || u->tcp_fin_timeout > (INT_MAX / HZ)) {
+		return -EINVAL;
+	}
+#endif
+
+#ifdef CONFIG_IP_VS_PROTO_UDP
+	if (u->udp_timeout < 0 || u->udp_timeout > (INT_MAX / HZ))
+		return -EINVAL;
+#endif
+
+#ifdef CONFIG_IP_VS_PROTO_TCP
 	if (u->tcp_timeout) {
 		pd = ip_vs_proto_data_get(ipvs, IPPROTO_TCP);
 		pd->timeout_table[IP_VS_TCP_S_ESTABLISHED]
@@ -2386,14 +2401,12 @@ do_ip_vs_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 			struct ipvs_sync_daemon_cfg cfg;
 
 			memset(&cfg, 0, sizeof(cfg));
-			strlcpy(cfg.mcast_ifn, dm->mcast_ifn,
-				sizeof(cfg.mcast_ifn));
+			ret = -EINVAL;
+			if (strscpy(cfg.mcast_ifn, dm->mcast_ifn,
+				    sizeof(cfg.mcast_ifn)) <= 0)
+				goto out_dec;
 			cfg.syncid = dm->syncid;
-			rtnl_lock();
-			mutex_lock(&ipvs->sync_mutex);
 			ret = start_sync_thread(ipvs, &cfg, dm->state);
-			mutex_unlock(&ipvs->sync_mutex);
-			rtnl_unlock();
 		} else {
 			mutex_lock(&ipvs->sync_mutex);
 			ret = stop_sync_thread(ipvs, dm->state);
@@ -2410,6 +2423,10 @@ do_ip_vs_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 	} else if (cmd == IP_VS_SO_SET_TIMEOUT) {
 		/* Set timeout values for (tcp tcpfin udp) */
 		ret = ip_vs_set_timeout(ipvs, (struct ip_vs_timeout_user *)arg);
+		goto out_unlock;
+	} else if (!len) {
+		/* No more commands with len == 0 below */
+		ret = -EINVAL;
 		goto out_unlock;
 	}
 
@@ -2429,12 +2446,19 @@ do_ip_vs_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 		}
 	}
 
+	if ((cmd == IP_VS_SO_SET_ADD || cmd == IP_VS_SO_SET_EDIT) &&
+	    strnlen(usvc.sched_name, IP_VS_SCHEDNAME_MAXLEN) ==
+	    IP_VS_SCHEDNAME_MAXLEN) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
 	/* Check for valid protocol: TCP or UDP or SCTP, even for fwmark!=0 */
 	if (usvc.protocol != IPPROTO_TCP && usvc.protocol != IPPROTO_UDP &&
 	    usvc.protocol != IPPROTO_SCTP) {
-		pr_err("set_ctl: invalid protocol: %d %pI4:%d %s\n",
+		pr_err("set_ctl: invalid protocol: %d %pI4:%d\n",
 		       usvc.protocol, &usvc.addr.ip,
-		       ntohs(usvc.port), usvc.sched_name);
+		       ntohs(usvc.port));
 		ret = -EFAULT;
 		goto out_unlock;
 	}
@@ -2480,9 +2504,6 @@ do_ip_vs_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 		break;
 	case IP_VS_SO_SET_DELDEST:
 		ret = ip_vs_del_dest(svc, &udest);
-		break;
-	default:
-		ret = -EINVAL;
 	}
 
   out_unlock:
@@ -2863,7 +2884,7 @@ static const struct nla_policy ip_vs_cmd_policy[IPVS_CMD_ATTR_MAX + 1] = {
 static const struct nla_policy ip_vs_daemon_policy[IPVS_DAEMON_ATTR_MAX + 1] = {
 	[IPVS_DAEMON_ATTR_STATE]	= { .type = NLA_U32 },
 	[IPVS_DAEMON_ATTR_MCAST_IFN]	= { .type = NLA_NUL_STRING,
-					    .len = IP_VS_IFNAME_MAXLEN },
+					    .len = IP_VS_IFNAME_MAXLEN - 1 },
 	[IPVS_DAEMON_ATTR_SYNC_ID]	= { .type = NLA_U32 },
 	[IPVS_DAEMON_ATTR_SYNC_MAXLEN]	= { .type = NLA_U16 },
 	[IPVS_DAEMON_ATTR_MCAST_GROUP]	= { .type = NLA_U32 },
@@ -2881,7 +2902,7 @@ static const struct nla_policy ip_vs_svc_policy[IPVS_SVC_ATTR_MAX + 1] = {
 	[IPVS_SVC_ATTR_PORT]		= { .type = NLA_U16 },
 	[IPVS_SVC_ATTR_FWMARK]		= { .type = NLA_U32 },
 	[IPVS_SVC_ATTR_SCHED_NAME]	= { .type = NLA_NUL_STRING,
-					    .len = IP_VS_SCHEDNAME_MAXLEN },
+					    .len = IP_VS_SCHEDNAME_MAXLEN - 1 },
 	[IPVS_SVC_ATTR_PE_NAME]		= { .type = NLA_NUL_STRING,
 					    .len = IP_VS_PENAME_MAXLEN },
 	[IPVS_SVC_ATTR_FLAGS]		= { .type = NLA_BINARY,
@@ -3088,6 +3109,17 @@ nla_put_failure:
 	return skb->len;
 }
 
+static bool ip_vs_is_af_valid(int af)
+{
+	if (af == AF_INET)
+		return true;
+#ifdef CONFIG_IP_VS_IPV6
+	if (af == AF_INET6 && ipv6_mod_enabled())
+		return true;
+#endif
+	return false;
+}
+
 static int ip_vs_genl_parse_service(struct netns_ipvs *ipvs,
 				    struct ip_vs_service_user_kern *usvc,
 				    struct nlattr *nla, int full_entry,
@@ -3114,11 +3146,7 @@ static int ip_vs_genl_parse_service(struct netns_ipvs *ipvs,
 	memset(usvc, 0, sizeof(*usvc));
 
 	usvc->af = nla_get_u16(nla_af);
-#ifdef CONFIG_IP_VS_IPV6
-	if (usvc->af != AF_INET && usvc->af != AF_INET6)
-#else
-	if (usvc->af != AF_INET)
-#endif
+	if (!ip_vs_is_af_valid(usvc->af))
 		return -EAFNOSUPPORT;
 
 	if (nla_fwmark) {
@@ -3484,12 +3512,8 @@ static int ip_vs_genl_new_daemon(struct netns_ipvs *ipvs, struct nlattr **attrs)
 	if (ipvs->mixed_address_family_dests > 0)
 		return -EINVAL;
 
-	rtnl_lock();
-	mutex_lock(&ipvs->sync_mutex);
 	ret = start_sync_thread(ipvs, &c,
 				nla_get_u32(attrs[IPVS_DAEMON_ATTR_STATE]));
-	mutex_unlock(&ipvs->sync_mutex);
-	rtnl_unlock();
 	return ret;
 }
 
@@ -3619,6 +3643,11 @@ static int ip_vs_genl_set_cmd(struct sk_buff *skb, struct genl_info *info)
 		 */
 		if (udest.af == 0)
 			udest.af = svc->af;
+
+		if (!ip_vs_is_af_valid(udest.af)) {
+			ret = -EAFNOSUPPORT;
+			goto out;
+		}
 
 		if (udest.af != svc->af && cmd != IPVS_CMD_DEL_DEST) {
 			/* The synchronization protocol is incompatible
@@ -3996,6 +4025,9 @@ static void __net_exit ip_vs_control_net_cleanup_sysctl(struct netns_ipvs *ipvs)
 
 static struct notifier_block ip_vs_dst_notifier = {
 	.notifier_call = ip_vs_dst_event,
+#ifdef CONFIG_IP_VS_IPV6
+	.priority = ADDRCONF_NOTIFY_PRIORITY + 5,
+#endif
 };
 
 int __net_init ip_vs_control_net_init(struct netns_ipvs *ipvs)

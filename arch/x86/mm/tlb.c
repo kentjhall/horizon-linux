@@ -6,16 +6,18 @@
 #include <linux/interrupt.h>
 #include <linux/export.h>
 #include <linux/cpu.h>
+#include <linux/debugfs.h>
 
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
+#include <asm/nospec-branch.h>
 #include <asm/cache.h>
 #include <asm/apic.h>
 #include <asm/uv/uv.h>
-#include <linux/debugfs.h>
+#include <asm/kaiser.h>
 
 /*
- *	Smarter SMP flushing macros.
+ *	TLB flushing, formerly SMP-only
  *		c/o Linus Torvalds.
  *
  *	These mean you can really definitely utterly forget about
@@ -28,13 +30,49 @@
  *	Implement flush IPI by CALL_FUNCTION_VECTOR, Alex Shi
  */
 
-#ifdef CONFIG_SMP
+/*
+ * Use bit 0 to mangle the TIF_SPEC_IB state into the mm pointer which is
+ * stored in cpu_tlb_state.last_user_mm_ibpb.
+ */
+#define LAST_USER_MM_IBPB	0x1UL
+
+atomic64_t last_mm_ctx_id = ATOMIC64_INIT(1);
 
 struct flush_tlb_info {
 	struct mm_struct *flush_mm;
 	unsigned long flush_start;
 	unsigned long flush_end;
 };
+
+static void load_new_mm_cr3(pgd_t *pgdir)
+{
+	unsigned long new_mm_cr3 = __pa(pgdir);
+
+	if (kaiser_enabled) {
+		/*
+		 * We reuse the same PCID for different tasks, so we must
+		 * flush all the entries for the PCID out when we change tasks.
+		 * Flush KERN below, flush USER when returning to userspace in
+		 * kaiser's SWITCH_USER_CR3 (_SWITCH_TO_USER_CR3) macro.
+		 *
+		 * invpcid_flush_single_context(X86_CR3_PCID_ASID_USER) could
+		 * do it here, but can only be used if X86_FEATURE_INVPCID is
+		 * available - and many machines support pcid without invpcid.
+		 *
+		 * If X86_CR3_PCID_KERN_FLUSH actually added something, then it
+		 * would be needed in the write_cr3() below - if PCIDs enabled.
+		 */
+		BUILD_BUG_ON(X86_CR3_PCID_KERN_FLUSH);
+		kaiser_flush_tlb_on_return_to_user();
+	}
+
+	/*
+	 * Caution: many callers of this function expect
+	 * that load_cr3() is serializing and orders TLB
+	 * fills with respect to the mm_cpumask writes.
+	 */
+	write_cr3(new_mm_cr3);
+}
 
 /*
  * We cannot call mmdrop() because we are in interrupt context,
@@ -47,7 +85,7 @@ void leave_mm(int cpu)
 		BUG();
 	if (cpumask_test_cpu(cpu, mm_cpumask(active_mm))) {
 		cpumask_clear_cpu(cpu, mm_cpumask(active_mm));
-		load_cr3(swapper_pg_dir);
+		load_new_mm_cr3(swapper_pg_dir);
 		/*
 		 * This gets called in the idle path where RCU
 		 * functions differently.  Tracing normally
@@ -59,8 +97,6 @@ void leave_mm(int cpu)
 }
 EXPORT_SYMBOL_GPL(leave_mm);
 
-#endif /* CONFIG_SMP */
-
 void switch_mm(struct mm_struct *prev, struct mm_struct *next,
 	       struct task_struct *tsk)
 {
@@ -71,19 +107,109 @@ void switch_mm(struct mm_struct *prev, struct mm_struct *next,
 	local_irq_restore(flags);
 }
 
+static inline unsigned long mm_mangle_tif_spec_ib(struct task_struct *next)
+{
+	unsigned long next_tif = task_thread_info(next)->flags;
+	unsigned long ibpb = (next_tif >> TIF_SPEC_IB) & LAST_USER_MM_IBPB;
+
+	return (unsigned long)next->mm | ibpb;
+}
+
+static void cond_ibpb(struct task_struct *next)
+{
+	if (!next || !next->mm)
+		return;
+
+	/*
+	 * Both, the conditional and the always IBPB mode use the mm
+	 * pointer to avoid the IBPB when switching between tasks of the
+	 * same process. Using the mm pointer instead of mm->context.ctx_id
+	 * opens a hypothetical hole vs. mm_struct reuse, which is more or
+	 * less impossible to control by an attacker. Aside of that it
+	 * would only affect the first schedule so the theoretically
+	 * exposed data is not really interesting.
+	 */
+	if (static_branch_likely(&switch_mm_cond_ibpb)) {
+		unsigned long prev_mm, next_mm;
+
+		/*
+		 * This is a bit more complex than the always mode because
+		 * it has to handle two cases:
+		 *
+		 * 1) Switch from a user space task (potential attacker)
+		 *    which has TIF_SPEC_IB set to a user space task
+		 *    (potential victim) which has TIF_SPEC_IB not set.
+		 *
+		 * 2) Switch from a user space task (potential attacker)
+		 *    which has TIF_SPEC_IB not set to a user space task
+		 *    (potential victim) which has TIF_SPEC_IB set.
+		 *
+		 * This could be done by unconditionally issuing IBPB when
+		 * a task which has TIF_SPEC_IB set is either scheduled in
+		 * or out. Though that results in two flushes when:
+		 *
+		 * - the same user space task is scheduled out and later
+		 *   scheduled in again and only a kernel thread ran in
+		 *   between.
+		 *
+		 * - a user space task belonging to the same process is
+		 *   scheduled in after a kernel thread ran in between
+		 *
+		 * - a user space task belonging to the same process is
+		 *   scheduled in immediately.
+		 *
+		 * Optimize this with reasonably small overhead for the
+		 * above cases. Mangle the TIF_SPEC_IB bit into the mm
+		 * pointer of the incoming task which is stored in
+		 * cpu_tlbstate.last_user_mm_ibpb for comparison.
+		 */
+		next_mm = mm_mangle_tif_spec_ib(next);
+		prev_mm = this_cpu_read(cpu_tlbstate.last_user_mm_ibpb);
+
+		/*
+		 * Issue IBPB only if the mm's are different and one or
+		 * both have the IBPB bit set.
+		 */
+		if (next_mm != prev_mm &&
+		    (next_mm | prev_mm) & LAST_USER_MM_IBPB)
+			indirect_branch_prediction_barrier();
+
+		this_cpu_write(cpu_tlbstate.last_user_mm_ibpb, next_mm);
+	}
+
+	if (static_branch_unlikely(&switch_mm_always_ibpb)) {
+		/*
+		 * Only flush when switching to a user space task with a
+		 * different context than the user space task which ran
+		 * last on this CPU.
+		 */
+		if (this_cpu_read(cpu_tlbstate.last_user_mm) != next->mm) {
+			indirect_branch_prediction_barrier();
+			this_cpu_write(cpu_tlbstate.last_user_mm, next->mm);
+		}
+	}
+}
+
 void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			struct task_struct *tsk)
 {
 	unsigned cpu = smp_processor_id();
 
 	if (likely(prev != next)) {
+		/*
+		 * Avoid user/user BTB poisoning by flushing the branch
+		 * predictor when switching between processes. This stops
+		 * one process from doing Spectre-v2 attacks on another.
+		 */
+		cond_ibpb(tsk);
+
 		if (IS_ENABLED(CONFIG_VMAP_STACK)) {
 			/*
 			 * If our current stack is in vmalloc space and isn't
 			 * mapped in the new pgd, we'll double-fault.  Forcibly
 			 * map it.
 			 */
-			unsigned int stack_pgd_index = pgd_index(current_stack_pointer());
+			unsigned int stack_pgd_index = pgd_index(current_stack_pointer);
 
 			pgd_t *pgd = next->pgd + stack_pgd_index;
 
@@ -91,10 +217,8 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 				set_pgd(pgd, init_mm.pgd[stack_pgd_index]);
 		}
 
-#ifdef CONFIG_SMP
 		this_cpu_write(cpu_tlbstate.state, TLBSTATE_OK);
 		this_cpu_write(cpu_tlbstate.active_mm, next);
-#endif
 
 		cpumask_set_cpu(cpu, mm_cpumask(next));
 
@@ -126,7 +250,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		 * ordering guarantee we need.
 		 *
 		 */
-		load_cr3(next->pgd);
+		load_new_mm_cr3(next->pgd);
 
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
 
@@ -152,9 +276,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		if (unlikely(prev->context.ldt != next->context.ldt))
 			load_mm_ldt(next);
 #endif
-	}
-#ifdef CONFIG_SMP
-	  else {
+	} else {
 		this_cpu_write(cpu_tlbstate.state, TLBSTATE_OK);
 		BUG_ON(this_cpu_read(cpu_tlbstate.active_mm) != next);
 
@@ -175,16 +297,13 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			 * As above, load_cr3() is serializing and orders TLB
 			 * fills with respect to the mm_cpumask write.
 			 */
-			load_cr3(next->pgd);
+			load_new_mm_cr3(next->pgd);
 			trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
 			load_mm_cr4(next);
 			load_mm_ldt(next);
 		}
 	}
-#endif
 }
-
-#ifdef CONFIG_SMP
 
 /*
  * The flush IPI assumes that a thread switch happens in this order:
@@ -263,8 +382,6 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
 {
 	struct flush_tlb_info info;
 
-	if (end == 0)
-		end = start + PAGE_SIZE;
 	info.flush_mm = mm;
 	info.flush_start = start;
 	info.flush_end = end;
@@ -289,23 +406,6 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
 	smp_call_function_many(cpumask, flush_tlb_func, &info, 1);
 }
 
-void flush_tlb_current_task(void)
-{
-	struct mm_struct *mm = current->mm;
-
-	preempt_disable();
-
-	count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
-
-	/* This is an implicit full barrier that synchronizes with switch_mm. */
-	local_flush_tlb();
-
-	trace_tlb_flush(TLB_LOCAL_SHOOTDOWN, TLB_FLUSH_ALL);
-	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
-		flush_tlb_others(mm_cpumask(mm), mm, 0UL, TLB_FLUSH_ALL);
-	preempt_enable();
-}
-
 /*
  * See Documentation/x86/tlb.txt for details.  We choose 33
  * because it is large enough to cover the vast majority (at
@@ -326,6 +426,12 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	unsigned long base_pages_to_flush = TLB_FLUSH_ALL;
 
 	preempt_disable();
+
+	if ((end != TLB_FLUSH_ALL) && !(vmflag & VM_HUGETLB))
+		base_pages_to_flush = (end - start) >> PAGE_SHIFT;
+	if (base_pages_to_flush > tlb_single_page_flush_ceiling)
+		base_pages_to_flush = TLB_FLUSH_ALL;
+
 	if (current->active_mm != mm) {
 		/* Synchronize with switch_mm. */
 		smp_mb();
@@ -342,15 +448,11 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 		goto out;
 	}
 
-	if ((end != TLB_FLUSH_ALL) && !(vmflag & VM_HUGETLB))
-		base_pages_to_flush = (end - start) >> PAGE_SHIFT;
-
 	/*
 	 * Both branches below are implicit full barriers (MOV to CR or
 	 * INVLPG) that synchronize with switch_mm.
 	 */
-	if (base_pages_to_flush > tlb_single_page_flush_ceiling) {
-		base_pages_to_flush = TLB_FLUSH_ALL;
+	if (base_pages_to_flush == TLB_FLUSH_ALL) {
 		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
 		local_flush_tlb();
 	} else {
@@ -368,33 +470,6 @@ out:
 	}
 	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
 		flush_tlb_others(mm_cpumask(mm), mm, start, end);
-	preempt_enable();
-}
-
-void flush_tlb_page(struct vm_area_struct *vma, unsigned long start)
-{
-	struct mm_struct *mm = vma->vm_mm;
-
-	preempt_disable();
-
-	if (current->active_mm == mm) {
-		if (current->mm) {
-			/*
-			 * Implicit full barrier (INVLPG) that synchronizes
-			 * with switch_mm.
-			 */
-			__flush_tlb_one(start);
-		} else {
-			leave_mm(smp_processor_id());
-
-			/* Synchronize with switch_mm. */
-			smp_mb();
-		}
-	}
-
-	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
-		flush_tlb_others(mm_cpumask(mm), mm, start, 0UL);
-
 	preempt_enable();
 }
 
@@ -482,5 +557,3 @@ static int __init create_tlb_single_page_flush_ceiling(void)
 	return 0;
 }
 late_initcall(create_tlb_single_page_flush_ceiling);
-
-#endif /* CONFIG_SMP */

@@ -2,6 +2,7 @@
  * Devices PM QoS constraints management
  *
  * Copyright (C) 2011 Texas Instruments, Inc.
+ * Copyright (c) 2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -42,6 +43,7 @@
 #include <linux/export.h>
 #include <linux/pm_runtime.h>
 #include <linux/err.h>
+#include <linux/workqueue.h>
 #include <trace/events/power.h>
 
 #include "power.h"
@@ -166,6 +168,9 @@ static int apply_constraint(struct dev_pm_qos_request *req,
 	case DEV_PM_QOS_FLAGS:
 		ret = pm_qos_update_flags(&qos->flags, &req->data.flr,
 					  action, value);
+		blocking_notifier_call_chain(&dev_pm_notifiers,
+					     (unsigned long)value,
+					     req);
 		break;
 	default:
 		ret = -EINVAL;
@@ -185,7 +190,7 @@ static int dev_pm_qos_constraints_allocate(struct device *dev)
 {
 	struct dev_pm_qos *qos;
 	struct pm_qos_constraints *c;
-	struct blocking_notifier_head *n;
+	struct blocking_notifier_head *n, *fn;
 
 	qos = kzalloc(sizeof(*qos), GFP_KERNEL);
 	if (!qos)
@@ -197,6 +202,14 @@ static int dev_pm_qos_constraints_allocate(struct device *dev)
 		return -ENOMEM;
 	}
 	BLOCKING_INIT_NOTIFIER_HEAD(n);
+
+	fn = kzalloc(sizeof(*fn), GFP_KERNEL);
+	if (!fn) {
+		kfree(n);
+		kfree(qos);
+		return -ENOMEM;
+	}
+	BLOCKING_INIT_NOTIFIER_HEAD(fn);
 
 	c = &qos->resume_latency;
 	plist_head_init(&c->list);
@@ -214,6 +227,7 @@ static int dev_pm_qos_constraints_allocate(struct device *dev)
 	c->type = PM_QOS_MIN;
 
 	INIT_LIST_HEAD(&qos->flags.list);
+	qos->flags.notifiers = fn;
 
 	spin_lock_irq(&dev->power.lock);
 	dev->power.qos = qos;
@@ -253,7 +267,7 @@ void dev_pm_qos_constraints_destroy(struct device *dev)
 	__dev_pm_qos_hide_flags(dev);
 
 	qos = dev->power.qos;
-	if (!qos)
+	if (IS_ERR_OR_NULL(qos))
 		goto out;
 
 	/* Flush the constraints lists for the device. */
@@ -281,7 +295,7 @@ void dev_pm_qos_constraints_destroy(struct device *dev)
 	dev->power.qos = ERR_PTR(-ENODEV);
 	spin_unlock_irq(&dev->power.lock);
 
-	kfree(c->notifiers);
+	kfree(qos->resume_latency.notifiers);
 	kfree(qos);
 
  out:
@@ -295,6 +309,21 @@ static bool dev_pm_qos_invalid_request(struct device *dev,
 {
 	return !req || (req->type == DEV_PM_QOS_LATENCY_TOLERANCE
 			&& !dev->power.set_latency_tolerance);
+}
+
+/**
+ * dev_pm_qos_work_fn - the timeout handler of dev_pm_qos_update_request_timeout
+ * @work: work struct for the delayed work (timeout)
+ *
+ * This cancels the timeout request by falling back to the default at timeout.
+ */
+static void dev_pm_qos_work_fn(struct work_struct *work)
+{
+	struct dev_pm_qos_request *req = container_of(to_delayed_work(work),
+						  struct dev_pm_qos_request,
+						  work);
+
+	dev_pm_qos_update_request(req, 0);
 }
 
 static int __dev_pm_qos_add_request(struct device *dev,
@@ -314,6 +343,8 @@ static int __dev_pm_qos_add_request(struct device *dev,
 		ret = -ENODEV;
 	else if (!dev->power.qos)
 		ret = dev_pm_qos_constraints_allocate(dev);
+
+	INIT_DELAYED_WORK(&req->work, dev_pm_qos_work_fn);
 
 	trace_dev_pm_qos_add_request(dev_name(dev), type, value);
 	if (!ret) {
@@ -444,10 +475,36 @@ static int __dev_pm_qos_remove_request(struct dev_pm_qos_request *req)
 
 	trace_dev_pm_qos_remove_request(dev_name(req->dev), req->type,
 					PM_QOS_DEFAULT_VALUE);
+
+	if (delayed_work_pending(&req->work))
+		cancel_delayed_work_sync(&req->work);
+
 	ret = apply_constraint(req, PM_QOS_REMOVE_REQ, PM_QOS_DEFAULT_VALUE);
 	memset(req, 0, sizeof(*req));
 	return ret;
 }
+
+/**
+ * dev_pm_qos_update_request_timeout - modifies an existing qos request
+ * temporarily.
+ * @req : handle to list element holding a pm_qos request to use
+ * @new_value: defines the temporal qos request
+ * @timeout_us: the effective duration of this qos request in usecs.
+ *
+ * After timeout_us, this qos request is cancelled automatically.
+ */
+int dev_pm_qos_update_request_timeout(struct dev_pm_qos_request *req,
+				      s32 new_value, unsigned long timeout_us)
+{
+	if (delayed_work_pending(&req->work))
+		cancel_delayed_work_sync(&req->work);
+
+	dev_pm_qos_update_request(req, new_value);
+	schedule_delayed_work(&req->work, usecs_to_jiffies(timeout_us));
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dev_pm_qos_update_request_timeout);
 
 /**
  * dev_pm_qos_remove_request - modifies an existing qos request
@@ -467,6 +524,9 @@ static int __dev_pm_qos_remove_request(struct dev_pm_qos_request *req)
 int dev_pm_qos_remove_request(struct dev_pm_qos_request *req)
 {
 	int ret;
+
+	if (delayed_work_pending(&req->work))
+		cancel_delayed_work_sync(&req->work);
 
 	mutex_lock(&dev_pm_qos_mtx);
 	ret = __dev_pm_qos_remove_request(req);
@@ -503,6 +563,10 @@ int dev_pm_qos_add_notifier(struct device *dev, struct notifier_block *notifier)
 		ret = blocking_notifier_chain_register(dev->power.qos->resume_latency.notifiers,
 						       notifier);
 
+	if (!ret)
+		ret = blocking_notifier_chain_register(
+				dev->power.qos->flags.notifiers, notifier);
+
 	mutex_unlock(&dev_pm_qos_mtx);
 	return ret;
 }
@@ -526,9 +590,13 @@ int dev_pm_qos_remove_notifier(struct device *dev,
 	mutex_lock(&dev_pm_qos_mtx);
 
 	/* Silently return if the constraints object is not present. */
-	if (!IS_ERR_OR_NULL(dev->power.qos))
+	if (!IS_ERR_OR_NULL(dev->power.qos)) {
 		retval = blocking_notifier_chain_unregister(dev->power.qos->resume_latency.notifiers,
 							    notifier);
+		retval = blocking_notifier_chain_unregister(
+				dev->power.qos->flags.notifiers,
+				notifier);
+	}
 
 	mutex_unlock(&dev_pm_qos_mtx);
 	return retval;

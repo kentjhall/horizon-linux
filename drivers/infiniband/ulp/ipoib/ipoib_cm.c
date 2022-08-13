@@ -1009,12 +1009,14 @@ static int ipoib_cm_rep_handler(struct ib_cm_id *cm_id, struct ib_cm_event *even
 
 	skb_queue_head_init(&skqueue);
 
+	netif_tx_lock_bh(p->dev);
 	spin_lock_irq(&priv->lock);
 	set_bit(IPOIB_FLAG_OPER_UP, &p->flags);
 	if (p->neigh)
 		while ((skb = __skb_dequeue(&p->neigh->queue)))
 			__skb_queue_tail(&skqueue, skb);
 	spin_unlock_irq(&priv->lock);
+	netif_tx_unlock_bh(p->dev);
 
 	while ((skb = __skb_dequeue(&skqueue))) {
 		skb->dev = p->dev;
@@ -1054,8 +1056,6 @@ static struct ib_qp *ipoib_cm_create_tx_qp(struct net_device *dev, struct ipoib_
 
 	tx_qp = ib_create_qp(priv->pd, &attr);
 	if (PTR_ERR(tx_qp) == -EINVAL) {
-		ipoib_warn(priv, "can't use GFP_NOIO for QPs on device %s, using GFP_KERNEL\n",
-			   priv->ca->name);
 		attr.create_flags &= ~IB_QP_CREATE_USE_GFP_NOIO;
 		tx_qp = ib_create_qp(priv->pd, &attr);
 	}
@@ -1394,7 +1394,7 @@ static void ipoib_cm_tx_reap(struct work_struct *work)
 
 	while (!list_empty(&priv->cm.reap_list)) {
 		p = list_entry(priv->cm.reap_list.next, typeof(*p), list);
-		list_del(&p->list);
+		list_del_init(&p->list);
 		spin_unlock_irqrestore(&priv->lock, flags);
 		netif_tx_unlock_bh(dev);
 		ipoib_cm_tx_destroy(p);
@@ -1422,11 +1422,15 @@ static void ipoib_cm_skb_reap(struct work_struct *work)
 		spin_unlock_irqrestore(&priv->lock, flags);
 		netif_tx_unlock_bh(dev);
 
-		if (skb->protocol == htons(ETH_P_IP))
+		if (skb->protocol == htons(ETH_P_IP)) {
+			memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
 			icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED, htonl(mtu));
+		}
 #if IS_ENABLED(CONFIG_IPV6)
-		else if (skb->protocol == htons(ETH_P_IPV6))
+		else if (skb->protocol == htons(ETH_P_IPV6)) {
+			memset(IP6CB(skb), 0, sizeof(*IP6CB(skb)));
 			icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu);
+		}
 #endif
 		dev_kfree_skb_any(skb);
 
@@ -1513,12 +1517,14 @@ static ssize_t set_mode(struct device *d, struct device_attribute *attr,
 
 	ret = ipoib_set_mode(dev, buf);
 
-	rtnl_unlock();
+	/* The assumption is that the function ipoib_set_mode returned
+	 * with the rtnl held by it, if not the value -EBUSY returned,
+	 * then no need to rtnl_unlock
+	 */
+	if (ret != -EBUSY)
+		rtnl_unlock();
 
-	if (!ret)
-		return count;
-
-	return ret;
+	return (!ret || ret == -EBUSY) ? count : ret;
 }
 
 static DEVICE_ATTR(mode, S_IWUSR | S_IRUGO, show_mode, set_mode);

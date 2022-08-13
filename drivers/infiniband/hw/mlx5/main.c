@@ -325,6 +325,27 @@ __be16 mlx5_get_roce_udp_sport(struct mlx5_ib_dev *dev, u8 port_num,
 	return cpu_to_be16(MLX5_CAP_ROCE(dev->mdev, r_roce_min_src_udp_port));
 }
 
+int mlx5_get_roce_gid_type(struct mlx5_ib_dev *dev, u8 port_num,
+			   int index, enum ib_gid_type *gid_type)
+{
+	struct ib_gid_attr attr;
+	union ib_gid gid;
+	int ret;
+
+	ret = ib_get_cached_gid(&dev->ib_dev, port_num, index, &gid, &attr);
+	if (ret)
+		return ret;
+
+	if (!attr.ndev)
+		return -ENODEV;
+
+	dev_put(attr.ndev);
+
+	*gid_type = attr.gid_type;
+
+	return 0;
+}
+
 static int mlx5_use_mad_ifc(struct mlx5_ib_dev *dev)
 {
 	if (MLX5_CAP_GEN(dev->mdev, port_type) == MLX5_CAP_PORT_TYPE_IB)
@@ -496,6 +517,7 @@ static int mlx5_ib_query_device(struct ib_device *ibdev,
 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
 	struct mlx5_core_dev *mdev = dev->mdev;
 	int err = -ENOMEM;
+	int max_sq_desc;
 	int max_rq_sg;
 	int max_sq_sg;
 	u64 min_page_size = 1ull << MLX5_CAP_GEN(mdev, log_pg_sz);
@@ -618,9 +640,10 @@ static int mlx5_ib_query_device(struct ib_device *ibdev,
 	props->max_qp_wr	   = 1 << MLX5_CAP_GEN(mdev, log_max_qp_sz);
 	max_rq_sg =  MLX5_CAP_GEN(mdev, max_wqe_sz_rq) /
 		     sizeof(struct mlx5_wqe_data_seg);
-	max_sq_sg = (MLX5_CAP_GEN(mdev, max_wqe_sz_sq) -
-		     sizeof(struct mlx5_wqe_ctrl_seg)) /
-		     sizeof(struct mlx5_wqe_data_seg);
+	max_sq_desc = min_t(int, MLX5_CAP_GEN(mdev, max_wqe_sz_sq), 512);
+	max_sq_sg = (max_sq_desc - sizeof(struct mlx5_wqe_ctrl_seg) -
+		     sizeof(struct mlx5_wqe_raddr_seg)) /
+		sizeof(struct mlx5_wqe_data_seg);
 	props->max_sge = min(max_rq_sg, max_sq_sg);
 	props->max_sge_rd	   = MLX5_MAX_SGE_RD;
 	props->max_cq		   = 1 << MLX5_CAP_GEN(mdev, log_max_cq);
@@ -687,31 +710,26 @@ enum mlx5_ib_width {
 	MLX5_IB_WIDTH_12X	= 1 << 4
 };
 
-static int translate_active_width(struct ib_device *ibdev, u8 active_width,
+static void translate_active_width(struct ib_device *ibdev, u8 active_width,
 				  u8 *ib_width)
 {
 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
-	int err = 0;
 
-	if (active_width & MLX5_IB_WIDTH_1X) {
+	if (active_width & MLX5_IB_WIDTH_1X)
 		*ib_width = IB_WIDTH_1X;
-	} else if (active_width & MLX5_IB_WIDTH_2X) {
-		mlx5_ib_dbg(dev, "active_width %d is not supported by IB spec\n",
-			    (int)active_width);
-		err = -EINVAL;
-	} else if (active_width & MLX5_IB_WIDTH_4X) {
+	else if (active_width & MLX5_IB_WIDTH_4X)
 		*ib_width = IB_WIDTH_4X;
-	} else if (active_width & MLX5_IB_WIDTH_8X) {
+	else if (active_width & MLX5_IB_WIDTH_8X)
 		*ib_width = IB_WIDTH_8X;
-	} else if (active_width & MLX5_IB_WIDTH_12X) {
+	else if (active_width & MLX5_IB_WIDTH_12X)
 		*ib_width = IB_WIDTH_12X;
-	} else {
-		mlx5_ib_dbg(dev, "Invalid active_width %d\n",
+	else {
+		mlx5_ib_dbg(dev, "Invalid active_width %d, setting width to default value: 4x\n",
 			    (int)active_width);
-		err = -EINVAL;
+		*ib_width = IB_WIDTH_4X;
 	}
 
-	return err;
+	return;
 }
 
 static int mlx5_mtu_to_ib_mtu(int mtu)
@@ -819,10 +837,8 @@ static int mlx5_query_hca_port(struct ib_device *ibdev, u8 port,
 	if (err)
 		goto out;
 
-	err = translate_active_width(ibdev, ib_link_width_oper,
-				     &props->active_width);
-	if (err)
-		goto out;
+	translate_active_width(ibdev, ib_link_width_oper, &props->active_width);
+
 	err = mlx5_query_port_ib_proto_oper(mdev, &props->active_speed, port);
 	if (err)
 		goto out;
@@ -1103,13 +1119,13 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
 	 * pretend we don't support reading the HCA's core clock. This is also
 	 * forced by mmap function.
 	 */
-	if (PAGE_SIZE <= 4096 &&
-	    field_avail(typeof(resp), hca_core_clock_offset, udata->outlen)) {
-		resp.comp_mask |=
-			MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_CORE_CLOCK_OFFSET;
-		resp.hca_core_clock_offset =
-			offsetof(struct mlx5_init_seg, internal_timer_h) %
-			PAGE_SIZE;
+	if (field_avail(typeof(resp), hca_core_clock_offset, udata->outlen)) {
+		if (PAGE_SIZE <= 4096) {
+			resp.comp_mask |=
+				MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_CORE_CLOCK_OFFSET;
+			resp.hca_core_clock_offset =
+				offsetof(struct mlx5_init_seg, internal_timer_h) % PAGE_SIZE;
+		}
 		resp.response_length += sizeof(resp.hca_core_clock_offset) +
 					sizeof(resp.reserved2);
 	}
@@ -1290,7 +1306,9 @@ static void mlx5_ib_disassociate_ucontext(struct ib_ucontext *ibcontext)
 	/* need to protect from a race on closing the vma as part of
 	 * mlx5_ib_vma_close.
 	 */
-	down_read(&owning_mm->mmap_sem);
+	down_write(&owning_mm->mmap_sem);
+	if (!mmget_still_valid(owning_mm))
+		goto skip_mm;
 	list_for_each_entry_safe(vma_private, n, &context->vma_private_list,
 				 list) {
 		vma = vma_private->vma;
@@ -1300,11 +1318,13 @@ static void mlx5_ib_disassociate_ucontext(struct ib_ucontext *ibcontext)
 		/* context going to be destroyed, should
 		 * not access ops any more.
 		 */
+		vma->vm_flags &= ~(VM_SHARED | VM_MAYSHARE);
 		vma->vm_ops = NULL;
 		list_del(&vma_private->list);
 		kfree(vma_private);
 	}
-	up_read(&owning_mm->mmap_sem);
+skip_mm:
+	up_write(&owning_mm->mmap_sem);
 	mmput(owning_mm);
 	put_task_struct(owning_process);
 }
@@ -2491,6 +2511,8 @@ static int create_umr_res(struct mlx5_ib_dev *dev)
 	qp->real_qp    = qp;
 	qp->uobject    = NULL;
 	qp->qp_type    = MLX5_IB_QPT_REG_UMR;
+	qp->send_cq    = init_attr->send_cq;
+	qp->recv_cq    = init_attr->recv_cq;
 
 	attr->qp_state = IB_QPS_INIT;
 	attr->port_num = 1;
@@ -2548,6 +2570,18 @@ error_0:
 	kfree(attr);
 	kfree(init_attr);
 	return ret;
+}
+
+static u8 mlx5_get_umr_fence(u8 umr_fence_cap)
+{
+	switch (umr_fence_cap) {
+	case MLX5_CAP_UMR_FENCE_NONE:
+		return MLX5_FENCE_MODE_NONE;
+	case MLX5_CAP_UMR_FENCE_SMALL:
+		return MLX5_FENCE_MODE_INITIATOR_SMALL;
+	default:
+		return MLX5_FENCE_MODE_STRONG_ORDERING;
+	}
 }
 
 static int create_dev_resources(struct mlx5_ib_resources *devr)
@@ -3076,6 +3110,8 @@ static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
 
 	mlx5_ib_internal_fill_odp_caps(dev);
 
+	dev->umr_fence = mlx5_get_umr_fence(MLX5_CAP_GEN(mdev, umr_fence));
+
 	if (MLX5_CAP_GEN(mdev, imaicl)) {
 		dev->ib_dev.alloc_mw		= mlx5_ib_alloc_mw;
 		dev->ib_dev.dealloc_mw		= mlx5_ib_dealloc_mw;
@@ -3139,9 +3175,11 @@ static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
 	if (err)
 		goto err_rsrc;
 
-	err = mlx5_ib_alloc_q_counters(dev);
-	if (err)
-		goto err_odp;
+	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt)) {
+		err = mlx5_ib_alloc_q_counters(dev);
+		if (err)
+			goto err_odp;
+	}
 
 	err = ib_register_device(&dev->ib_dev, NULL);
 	if (err)
@@ -3169,7 +3207,8 @@ err_dev:
 	ib_unregister_device(&dev->ib_dev);
 
 err_q_cnt:
-	mlx5_ib_dealloc_q_counters(dev);
+	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt))
+		mlx5_ib_dealloc_q_counters(dev);
 
 err_odp:
 	mlx5_ib_odp_remove_one(dev);
@@ -3199,7 +3238,8 @@ static void mlx5_ib_remove(struct mlx5_core_dev *mdev, void *context)
 
 	mlx5_remove_roce_notifier(dev);
 	ib_unregister_device(&dev->ib_dev);
-	mlx5_ib_dealloc_q_counters(dev);
+	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt))
+		mlx5_ib_dealloc_q_counters(dev);
 	destroy_umrc_res(dev);
 	mlx5_ib_odp_remove_one(dev);
 	destroy_dev_resources(&dev->devr);

@@ -1,0 +1,58 @@
+lp88xx bindings
+
+Required properties:
+  - compatible: Should be one of "ti,lp8580", "ti,lp8863", "ti,lp8880"
+  - reg: 0x2c for I2C slave address or SPI chip select address.
+  - region-map: Region map code for LED 0 ~ LED5. Region map code is 0 to 5.
+                In case of PWM mode, then only single region should be mapped.
+
+Optional properties:
+  - advanced-slope-enabled: Advanced slope effect.
+  - enable-gpios: GPIO specifiers for HW enable pin.
+  - irq-gpios: GPIO specifiers for fault interrupt pin.
+  - pwms: PWM specifiers for backlight control.
+  - slope-time-ms: Lighting effect. Slope time from 0 to 500.
+  - names: Array of backlight driver name strings, in order, for each LED group.
+  - max-input-brt: Maximum expected brightness value passed to the driver.
+    This value is used to scale requested brightness values to the device's
+    actual maximum brightness.
+  - init-brt: Initial backlight brightness (applied to all LED groups). Must be
+    scaled to max-input-brt, if provided, or otherwise max device brightness.
+
+Example 1)
+I2C for device configuration, map region 0 to all LEDs and PWM input for
+backlight control.
+
+	i2c1: i2c@f0018000 {
+		backlight: lp8580@2c {
+			compatible = "ti,lp8580";
+			reg = <0x2c>;
+			region-map = <0 0 0 0 0 0>;
+
+			advanced-slope-enabled;
+			enable-gpios = <&pioC 16 GPIO_ACTIVE_HIGH>;
+			pwms = <&pwm0 0 10000 0>;
+			slope-time-ms = <300>;
+		};
+	};
+
+Example 2)
+SPI for device configuration, CS is 0, backlight control through SPI,
+interrupt handling, region 0 for LED 0, 1, 2, region 1 for LED 3, 4, 5.
+
+	spi1: spi@f8008000 {
+		cs-gpios = <&pioC 25 0>;
+		status = "okay";
+
+		backlight_spi: lp8880@0 {
+			compatible = "ti,lp8880";
+			spi-max-frequency = <8000000>;
+			reg = <0>;
+
+			region-map = <0 0 0 1 1 1>;
+			slope-time-ms = <300>;
+			advanced-slope-enabled;
+			enable-gpios = <&pioC 16 GPIO_ACTIVE_HIGH>;
+			irq-gpios = <&pioB 25 GPIO_ACTIVE_LOW>;
+		};
+	};

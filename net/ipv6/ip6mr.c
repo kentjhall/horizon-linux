@@ -72,6 +72,8 @@ struct mr6_table {
 #endif
 };
 
+#include <linux/nospec.h>
+
 struct ip6mr_rule {
 	struct fib_rule		common;
 };
@@ -495,6 +497,7 @@ static void *ipmr_mfc_seq_start(struct seq_file *seq, loff_t *pos)
 		return ERR_PTR(-ENOENT);
 
 	it->mrt = mrt;
+	it->cache = NULL;
 	return *pos ? ipmr_mfc_seq_idx(net, seq->private, *pos - 1)
 		: SEQ_START_TOKEN;
 }
@@ -774,7 +777,8 @@ failure:
  *	Delete a VIF entry
  */
 
-static int mif6_delete(struct mr6_table *mrt, int vifi, struct list_head *head)
+static int mif6_delete(struct mr6_table *mrt, int vifi, int notify,
+		       struct list_head *head)
 {
 	struct mif_device *v;
 	struct net_device *dev;
@@ -820,7 +824,7 @@ static int mif6_delete(struct mr6_table *mrt, int vifi, struct list_head *head)
 					     dev->ifindex, &in6_dev->cnf);
 	}
 
-	if (v->flags & MIFF_REGISTER)
+	if ((v->flags & MIFF_REGISTER) && !notify)
 		unregister_netdevice_queue(dev, head);
 
 	dev_put(dev);
@@ -1331,7 +1335,6 @@ static int ip6mr_device_event(struct notifier_block *this,
 	struct mr6_table *mrt;
 	struct mif_device *v;
 	int ct;
-	LIST_HEAD(list);
 
 	if (event != NETDEV_UNREGISTER)
 		return NOTIFY_DONE;
@@ -1340,10 +1343,9 @@ static int ip6mr_device_event(struct notifier_block *this,
 		v = &mrt->vif6_table[0];
 		for (ct = 0; ct < mrt->maxvif; ct++, v++) {
 			if (v->dev == dev)
-				mif6_delete(mrt, ct, &list);
+				mif6_delete(mrt, ct, 1, NULL);
 		}
 	}
-	unregister_netdevice_many(&list);
 
 	return NOTIFY_DONE;
 }
@@ -1552,7 +1554,7 @@ static void mroute_clean_tables(struct mr6_table *mrt, bool all)
 	for (i = 0; i < mrt->maxvif; i++) {
 		if (!all && (mrt->vif6_table[i].flags & VIFF_STATIC))
 			continue;
-		mif6_delete(mrt, i, &list);
+		mif6_delete(mrt, i, 0, &list);
 	}
 	unregister_netdevice_many(&list);
 
@@ -1666,6 +1668,10 @@ int ip6_mroute_setsockopt(struct sock *sk, int optname, char __user *optval, uns
 	struct net *net = sock_net(sk);
 	struct mr6_table *mrt;
 
+	if (sk->sk_type != SOCK_RAW ||
+	    inet_sk(sk)->inet_num != IPPROTO_ICMPV6)
+		return -EOPNOTSUPP;
+
 	mrt = ip6mr_get_table(net, raw6_sk(sk)->ip6mr_table ? : RT6_TABLE_DFLT);
 	if (!mrt)
 		return -ENOENT;
@@ -1677,9 +1683,6 @@ int ip6_mroute_setsockopt(struct sock *sk, int optname, char __user *optval, uns
 
 	switch (optname) {
 	case MRT6_INIT:
-		if (sk->sk_type != SOCK_RAW ||
-		    inet_sk(sk)->inet_num != IPPROTO_ICMPV6)
-			return -EOPNOTSUPP;
 		if (optlen < sizeof(int))
 			return -EINVAL;
 
@@ -1706,7 +1709,7 @@ int ip6_mroute_setsockopt(struct sock *sk, int optname, char __user *optval, uns
 		if (copy_from_user(&mifi, optval, sizeof(mifi_t)))
 			return -EFAULT;
 		rtnl_lock();
-		ret = mif6_delete(mrt, mifi, NULL);
+		ret = mif6_delete(mrt, mifi, 0, NULL);
 		rtnl_unlock();
 		return ret;
 
@@ -1789,7 +1792,8 @@ int ip6_mroute_setsockopt(struct sock *sk, int optname, char __user *optval, uns
 		ret = 0;
 		if (!ip6mr_new_table(net, v))
 			ret = -ENOMEM;
-		raw6_sk(sk)->ip6mr_table = v;
+		else
+			raw6_sk(sk)->ip6mr_table = v;
 		rtnl_unlock();
 		return ret;
 	}
@@ -1814,6 +1818,10 @@ int ip6_mroute_getsockopt(struct sock *sk, int optname, char __user *optval,
 	int val;
 	struct net *net = sock_net(sk);
 	struct mr6_table *mrt;
+
+	if (sk->sk_type != SOCK_RAW ||
+	    inet_sk(sk)->inet_num != IPPROTO_ICMPV6)
+		return -EOPNOTSUPP;
 
 	mrt = ip6mr_get_table(net, raw6_sk(sk)->ip6mr_table ? : RT6_TABLE_DFLT);
 	if (!mrt)
@@ -1872,6 +1880,7 @@ int ip6mr_ioctl(struct sock *sk, int cmd, void __user *arg)
 			return -EFAULT;
 		if (vr.mifi >= mrt->maxvif)
 			return -EINVAL;
+		vr.mifi = array_index_nospec(vr.mifi, mrt->maxvif);
 		read_lock(&mrt_lock);
 		vif = &mrt->vif6_table[vr.mifi];
 		if (MIF_EXISTS(mrt, vr.mifi)) {
@@ -1946,6 +1955,7 @@ int ip6mr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 			return -EFAULT;
 		if (vr.mifi >= mrt->maxvif)
 			return -EINVAL;
+		vr.mifi = array_index_nospec(vr.mifi, mrt->maxvif);
 		read_lock(&mrt_lock);
 		vif = &mrt->vif6_table[vr.mifi];
 		if (MIF_EXISTS(mrt, vr.mifi)) {
@@ -1987,10 +1997,10 @@ int ip6mr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 
 static inline int ip6mr_forward2_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
-	__IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)),
-			IPSTATS_MIB_OUTFORWDATAGRAMS);
-	__IP6_ADD_STATS(net, ip6_dst_idev(skb_dst(skb)),
-			IPSTATS_MIB_OUTOCTETS, skb->len);
+	IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)),
+		      IPSTATS_MIB_OUTFORWDATAGRAMS);
+	IP6_ADD_STATS(net, ip6_dst_idev(skb_dst(skb)),
+		      IPSTATS_MIB_OUTOCTETS, skb->len);
 	return dst_output(net, sk, skb);
 }
 

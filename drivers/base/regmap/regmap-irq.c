@@ -18,11 +18,13 @@
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
+#include <linux/system-wakeup.h>
 
 #include "internal.h"
 
 struct regmap_irq_chip_data {
 	struct mutex lock;
+	struct mutex shutdown_lock;
 	struct irq_chip irq_chip;
 
 	struct regmap *map;
@@ -31,8 +33,10 @@ struct regmap_irq_chip_data {
 	int irq_base;
 	struct irq_domain *domain;
 
+	int shutdown;
 	int irq;
 	int wake_count;
+	bool wakeup_print_enable;
 
 	void *status_reg_buf;
 	unsigned int *status_buf;
@@ -81,6 +85,9 @@ static void regmap_irq_sync_unlock(struct irq_data *data)
 	 * suppress pointless writes.
 	 */
 	for (i = 0; i < d->chip->num_regs; i++) {
+		if (!d->chip->mask_base)
+			continue;
+
 		reg = d->chip->mask_base +
 			(i * map->reg_stride * d->irq_reg_stride);
 		if (d->chip->mask_invert) {
@@ -259,6 +266,17 @@ static const struct irq_chip regmap_irq_chip = {
 	.irq_set_wake		= regmap_irq_set_wake,
 };
 
+static void print_wakeup_irq(struct device *dev, int irq)
+{
+	struct irq_desc *desc;
+
+	desc = irq_to_desc(irq);
+	if (!desc || !desc->action || !desc->action->name)
+		dev_info(dev, "Device WAKEUP sub-irq %d\n", irq);
+	else
+		dev_info(dev, "Device WAKEUP sub-irq %s\n", desc->action->name);
+}
+
 static irqreturn_t regmap_irq_thread(int irq, void *d)
 {
 	struct regmap_irq_chip_data *data = d;
@@ -266,8 +284,19 @@ static irqreturn_t regmap_irq_thread(int irq, void *d)
 	struct regmap *map = data->map;
 	int ret, i;
 	bool handled = false;
+	bool print_wakeup = false;
+	int sub_irq;
 	u32 reg;
 
+	if (data->wakeup_print_enable && (irq == get_wakeup_reason_irq()))
+		print_wakeup = true;
+
+	mutex_lock(&data->shutdown_lock);
+	if (data->shutdown) {
+		dev_err(map->dev, "IRQ %d thread calls after shutdown\n", irq);
+		goto exit;
+	}
+	
 	if (chip->handle_pre_irq)
 		chip->handle_pre_irq(chip->irq_drv_data);
 
@@ -360,11 +389,16 @@ static irqreturn_t regmap_irq_thread(int irq, void *d)
 	for (i = 0; i < chip->num_irqs; i++) {
 		if (data->status_buf[chip->irqs[i].reg_offset /
 				     map->reg_stride] & chip->irqs[i].mask) {
-			handle_nested_irq(irq_find_mapping(data->domain, i));
+			sub_irq = irq_find_mapping(data->domain, i);
+			if (print_wakeup)
+				print_wakeup_irq(map->dev, sub_irq);
+
+			handle_nested_irq(sub_irq);
 			handled = true;
 		}
 	}
 
+	data->wakeup_print_enable = false;
 	if (chip->runtime_pm)
 		pm_runtime_put(map->dev);
 
@@ -372,6 +406,7 @@ exit:
 	if (chip->handle_post_irq)
 		chip->handle_post_irq(chip->irq_drv_data);
 
+	mutex_unlock(&data->shutdown_lock);
 	if (handled)
 		return IRQ_HANDLED;
 	else
@@ -417,6 +452,7 @@ int regmap_add_irq_chip(struct regmap *map, int irq, int irq_flags,
 			struct regmap_irq_chip_data **data)
 {
 	struct regmap_irq_chip_data *d;
+	struct irq_desc *desc;
 	int i;
 	int ret = -ENOMEM;
 	u32 reg;
@@ -508,6 +544,14 @@ int regmap_add_irq_chip(struct regmap *map, int irq, int irq_flags,
 
 	mutex_init(&d->lock);
 
+	/* Determine interrupt controller nesting depth for lockdep */
+	desc = irq_to_desc(d->irq);
+	for (i = 0; desc; ++i)
+		desc = irq_to_desc(desc->parent_irq);
+	lockdep_set_subclass(&d->lock, i);
+
+	mutex_init(&d->shutdown_lock);
+
 	for (i = 0; i < chip->num_irqs; i++)
 		d->mask_buf_def[chip->irqs[i].reg_offset / map->reg_stride]
 			|= chip->irqs[i].mask;
@@ -515,6 +559,9 @@ int regmap_add_irq_chip(struct regmap *map, int irq, int irq_flags,
 	/* Mask all the interrupts by default */
 	for (i = 0; i < chip->num_regs; i++) {
 		d->mask_buf[i] = d->mask_buf_def[i];
+		if (!chip->mask_base)
+			continue;
+
 		reg = chip->mask_base +
 			(i * map->reg_stride * d->irq_reg_stride);
 		if (chip->mask_invert)
@@ -784,6 +831,59 @@ void devm_regmap_del_irq_chip(struct device *dev, int irq,
 		WARN_ON(rc);
 }
 EXPORT_SYMBOL_GPL(devm_regmap_del_irq_chip);
+
+/**
+ * regmap_shutdown_irq_chip(): Shutdown all interrupts
+ *
+ * @d:   regmap_irq_chip_data allocated by regmap_add_irq_chip()
+ */
+void regmap_shutdown_irq_chip(struct regmap_irq_chip_data *d)
+{
+	u32 reg;
+	int i, ret;
+
+	if (!d)
+		return;
+
+	mutex_lock(&d->shutdown_lock);
+	disable_irq(d->irq);
+
+	/* Mask all the interrupts by default */
+	for (i = 0; i < d->chip->num_regs; i++) {
+		if (!d->chip->mask_base)
+			continue;
+
+		reg = d->chip->mask_base +
+			(i * d->map->reg_stride * d->irq_reg_stride);
+		if (d->chip->mask_invert)
+			ret = regmap_update_bits(d->map, reg,
+					d->mask_buf_def[i], ~d->mask_buf_def[i]);
+		else
+			ret = regmap_update_bits(d->map, reg,
+					d->mask_buf_def[i], d->mask_buf_def[i]);
+		if (ret != 0)
+			dev_err(d->map->dev, "Failed to set masks in 0x%x: %d\n",
+				reg, ret);
+	}
+
+	d->shutdown = true;
+	mutex_unlock(&d->shutdown_lock);
+}
+EXPORT_SYMBOL_GPL(regmap_shutdown_irq_chip);
+
+int regmap_irq_suspend_noirq(struct regmap_irq_chip_data *d)
+{
+	d->wakeup_print_enable = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(regmap_irq_suspend_noirq);
+
+int regmap_irq_resume(struct regmap_irq_chip_data *d)
+{
+	d->wakeup_print_enable = false;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(regmap_irq_resume);
 
 /**
  * regmap_irq_chip_get_base(): Retrieve interrupt base for a regmap IRQ chip

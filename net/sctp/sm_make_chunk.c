@@ -856,7 +856,11 @@ struct sctp_chunk *sctp_make_shutdown(const struct sctp_association *asoc,
 	sctp_shutdownhdr_t shut;
 	__u32 ctsn;
 
-	ctsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
+	if (chunk && chunk->asoc)
+		ctsn = sctp_tsnmap_get_ctsn(&chunk->asoc->peer.tsn_map);
+	else
+		ctsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
+
 	shut.cum_tsn_ack = htonl(ctsn);
 
 	retval = sctp_make_control(asoc, SCTP_CID_SHUTDOWN, 0,
@@ -1373,9 +1377,14 @@ static struct sctp_chunk *_sctp_make_chunk(const struct sctp_association *asoc,
 	sctp_chunkhdr_t *chunk_hdr;
 	struct sk_buff *skb;
 	struct sock *sk;
+	int chunklen;
+
+	chunklen = SCTP_PAD4(sizeof(*chunk_hdr) + paylen);
+	if (chunklen > SCTP_MAX_CHUNK_LEN)
+		goto nodata;
 
 	/* No need to allocate LL here, as this is only a chunk. */
-	skb = alloc_skb(SCTP_PAD4(sizeof(sctp_chunkhdr_t) + paylen), gfp);
+	skb = alloc_skb(chunklen, gfp);
 	if (!skb)
 		goto nodata;
 

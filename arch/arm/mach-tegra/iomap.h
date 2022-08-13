@@ -1,6 +1,8 @@
 /*
  * Copyright (C) 2010 Google, Inc.
  *
+ * Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+ *
  * Author:
  *	Colin Cross <ccross@google.com>
  *	Erik Gilling <konkers@google.com>
@@ -87,6 +89,15 @@
 
 #define TEGRA_EMC1_BASE			0x7001A800
 #define TEGRA_EMC1_SIZE			SZ_2K
+
+#define TEGRA_T210_EMC_BASE		0x7001B000
+#define TEGRA_T210_EMC_SIZE		SZ_4K
+
+#define TEGRA_T210_EMC0_BASE		0x7001E000
+#define TEGRA_T210_EMC0_SIZE		SZ_4K
+
+#define TEGRA_T210_EMC1_BASE		0x7001F000
+#define TEGRA_T210_EMC1_SIZE		SZ_4K
 
 #define TEGRA124_EMC_BASE		0x7001B000
 #define TEGRA124_EMC_SIZE		SZ_2K

@@ -1,6 +1,7 @@
 config SUSPEND
 	bool "Suspend to RAM and standby"
 	depends on ARCH_SUSPEND_POSSIBLE
+	select RTC_LIB
 	default y
 	---help---
 	  Allow the system to enter sleep states in which main memory is
@@ -27,6 +28,10 @@ config SUSPEND_SKIP_SYNC
 	  Some systems prefer not to pay this cost on every invocation
 	  of suspend, or they are content with invoking sync() from
 	  user-space before invoking suspend.  Say Y if that's your case.
+
+config WAKELOCK
+	bool
+	default y
 
 config HIBERNATE_CALLBACKS
 	bool
@@ -105,6 +110,7 @@ config PM_SLEEP
 	def_bool y
 	depends on SUSPEND || HIBERNATE_CALLBACKS
 	select PM
+	select SRCU
 
 config PM_SLEEP_SMP
 	def_bool y

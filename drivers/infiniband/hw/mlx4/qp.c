@@ -1280,7 +1280,8 @@ static int _mlx4_ib_destroy_qp(struct ib_qp *qp)
 	if (is_qp0(dev, mqp))
 		mlx4_CLOSE_PORT(dev->dev, mqp->port);
 
-	if (dev->qp1_proxy[mqp->port - 1] == mqp) {
+	if (mqp->mlx4_ib_qp_type == MLX4_IB_QPT_PROXY_GSI &&
+	    dev->qp1_proxy[mqp->port - 1] == mqp) {
 		mutex_lock(&dev->qp1_proxy_lock[mqp->port - 1]);
 		dev->qp1_proxy[mqp->port - 1] = NULL;
 		mutex_unlock(&dev->qp1_proxy_lock[mqp->port - 1]);
@@ -1668,7 +1669,7 @@ static int __mlx4_ib_modify_qp(struct ib_qp *ibqp,
 			context->mtu_msgmax = (IB_MTU_4096 << 5) |
 					      ilog2(dev->dev->caps.max_gso_sz);
 		else
-			context->mtu_msgmax = (IB_MTU_4096 << 5) | 12;
+			context->mtu_msgmax = (IB_MTU_4096 << 5) | 13;
 	} else if (attr_mask & IB_QP_PATH_MTU) {
 		if (attr->path_mtu < IB_MTU_256 || attr->path_mtu > IB_MTU_4096) {
 			pr_err("path MTU (%u) is invalid\n",
@@ -1764,14 +1765,14 @@ static int __mlx4_ib_modify_qp(struct ib_qp *ibqp,
 		u8 port_num = mlx4_is_bonded(to_mdev(ibqp->device)->dev) ? 1 :
 			attr_mask & IB_QP_PORT ? attr->port_num : qp->port;
 		union ib_gid gid;
-		struct ib_gid_attr gid_attr;
+		struct ib_gid_attr gid_attr = {.gid_type = IB_GID_TYPE_IB};
 		u16 vlan = 0xffff;
 		u8 smac[ETH_ALEN];
 		int status = 0;
 		int is_eth = rdma_cap_eth_ah(&dev->ib_dev, port_num) &&
 			attr->ah_attr.ah_flags & IB_AH_GRH;
 
-		if (is_eth) {
+		if (is_eth && attr->ah_attr.ah_flags & IB_AH_GRH) {
 			int index = attr->ah_attr.grh.sgid_index;
 
 			status = ib_get_cached_gid(ibqp->device, port_num,
@@ -2306,6 +2307,7 @@ static int build_sriov_qp0_header(struct mlx4_ib_sqp *sqp,
 	int send_size;
 	int header_size;
 	int spc;
+	int err;
 	int i;
 
 	if (wr->wr.opcode != IB_WR_SEND)
@@ -2340,7 +2342,9 @@ static int build_sriov_qp0_header(struct mlx4_ib_sqp *sqp,
 
 	sqp->ud_header.lrh.virtual_lane    = 0;
 	sqp->ud_header.bth.solicited_event = !!(wr->wr.send_flags & IB_SEND_SOLICITED);
-	ib_get_cached_pkey(ib_dev, sqp->qp.port, 0, &pkey);
+	err = ib_get_cached_pkey(ib_dev, sqp->qp.port, 0, &pkey);
+	if (err)
+		return err;
 	sqp->ud_header.bth.pkey = cpu_to_be16(pkey);
 	if (sqp->qp.mlx4_ib_qp_type == MLX4_IB_QPT_TUN_SMI_OWNER)
 		sqp->ud_header.bth.destination_qpn = cpu_to_be32(wr->remote_qpn);
@@ -2617,9 +2621,14 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_ud_wr *wr,
 	}
 	sqp->ud_header.bth.solicited_event = !!(wr->wr.send_flags & IB_SEND_SOLICITED);
 	if (!sqp->qp.ibqp.qp_num)
-		ib_get_cached_pkey(ib_dev, sqp->qp.port, sqp->pkey_index, &pkey);
+		err = ib_get_cached_pkey(ib_dev, sqp->qp.port, sqp->pkey_index,
+					 &pkey);
 	else
-		ib_get_cached_pkey(ib_dev, sqp->qp.port, wr->pkey_index, &pkey);
+		err = ib_get_cached_pkey(ib_dev, sqp->qp.port, wr->pkey_index,
+					 &pkey);
+	if (err)
+		return err;
+
 	sqp->ud_header.bth.pkey = cpu_to_be16(pkey);
 	sqp->ud_header.bth.destination_qpn = cpu_to_be32(wr->remote_qpn);
 	sqp->ud_header.bth.psn = cpu_to_be32((sqp->send_psn++) & ((1 << 24) - 1));

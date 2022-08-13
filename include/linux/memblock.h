@@ -64,6 +64,7 @@ extern bool movable_node_enabled;
 #ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
 #define __init_memblock __meminit
 #define __initdata_memblock __meminitdata
+void memblock_discard(void);
 #else
 #define __init_memblock
 #define __initdata_memblock
@@ -77,8 +78,6 @@ phys_addr_t memblock_find_in_range_node(phys_addr_t size, phys_addr_t align,
 					int nid, ulong flags);
 phys_addr_t memblock_find_in_range(phys_addr_t start, phys_addr_t end,
 				   phys_addr_t size, phys_addr_t align);
-phys_addr_t get_allocated_memblock_reserved_regions_info(phys_addr_t *addr);
-phys_addr_t get_allocated_memblock_memory_regions_info(phys_addr_t *addr);
 void memblock_allow_resize(void);
 int memblock_add_node(phys_addr_t base, phys_addr_t size, int nid);
 int memblock_add(phys_addr_t base, phys_addr_t size);
@@ -92,6 +91,7 @@ int memblock_mark_hotplug(phys_addr_t base, phys_addr_t size);
 int memblock_clear_hotplug(phys_addr_t base, phys_addr_t size);
 int memblock_mark_mirror(phys_addr_t base, phys_addr_t size);
 int memblock_mark_nomap(phys_addr_t base, phys_addr_t size);
+int memblock_clear_nomap(phys_addr_t base, phys_addr_t size);
 ulong choose_memblock_flags(void);
 
 /* Low level functions */
@@ -111,6 +111,9 @@ void __next_mem_range_rev(u64 *idx, int nid, ulong flags,
 
 void __next_reserved_mem_region(u64 *idx, phys_addr_t *out_start,
 				phys_addr_t *out_end);
+
+void __memblock_free_early(phys_addr_t base, phys_addr_t size);
+void __memblock_free_late(phys_addr_t base, phys_addr_t size);
 
 /**
  * for_each_mem_range - iterate through memblock areas from type_a and not
@@ -421,8 +424,16 @@ static inline void early_memtest(phys_addr_t start, phys_addr_t end)
 }
 #endif
 
+extern unsigned long memblock_reserved_memory_within(phys_addr_t start_addr,
+		phys_addr_t end_addr);
 #else
 static inline phys_addr_t memblock_alloc(phys_addr_t size, phys_addr_t align)
+{
+	return 0;
+}
+
+static inline unsigned long memblock_reserved_memory_within(phys_addr_t start_addr,
+		phys_addr_t end_addr)
 {
 	return 0;
 }

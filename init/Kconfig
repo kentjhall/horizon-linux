@@ -400,6 +400,15 @@ config IRQ_TIME_ACCOUNTING
 
 	  If in doubt, say N here.
 
+config SCHED_WALT
+        bool "Support window based load tracking"
+        depends on SMP
+        help
+        This feature will allow the scheduler to maintain a tunable window
+	based set of metrics for tasks and runqueues. These metrics can be
+	used to guide task placement as well as task frequency requirements
+	for cpufreq governors.
+
 config BSD_PROCESS_ACCT
 	bool "BSD Process Accounting"
 	depends on MULTIUSER
@@ -822,7 +831,8 @@ config IKCONFIG_PROC
 
 config LOG_BUF_SHIFT
 	int "Kernel log buffer size (16 => 64KB, 17 => 128KB)"
-	range 12 25
+	range 12 25 if !H8300
+	range 12 19 if H8300
 	default 17
 	depends on PRINTK
 	help
@@ -875,17 +885,19 @@ config LOG_CPU_MAX_BUF_SHIFT
 		     13 =>   8 KB for each CPU
 		     12 =>   4 KB for each CPU
 
-config NMI_LOG_BUF_SHIFT
-	int "Temporary per-CPU NMI log buffer size (12 => 4KB, 13 => 8KB)"
+config PRINTK_SAFE_LOG_BUF_SHIFT
+	int "Temporary per-CPU printk log buffer size (12 => 4KB, 13 => 8KB)"
 	range 10 21
 	default 13
-	depends on PRINTK_NMI
+	depends on PRINTK
 	help
-	  Select the size of a per-CPU buffer where NMI messages are temporary
-	  stored. They are copied to the main log buffer in a safe context
-	  to avoid a deadlock. The value defines the size as a power of 2.
+	  Select the size of an alternate printk per-CPU buffer where messages
+	  printed from usafe contexts are temporary stored. One example would
+	  be NMI messages, another one - printk recursion. The messages are
+	  copied to the main log buffer in a safe context to avoid a deadlock.
+	  The value defines the size as a power of 2.
 
-	  NMI messages are rare and limited. The largest one is when
+	  Those messages are rare and limited. The largest one is when
 	  a backtrace is printed. It usually fits into 4KB. Select
 	  8KB if you want to be on the safe side.
 
@@ -971,6 +983,82 @@ menuconfig CGROUPS
 
 if CGROUPS
 
+config CGROUP_DEBUG
+	bool "Example debug cgroup subsystem"
+	default n
+	help
+	  This option enables a simple cgroup subsystem that
+	  exports useful debugging information about the cgroups
+	  framework.
+
+	  Say N if unsure.
+
+config CGROUP_FREEZER
+	bool "Freezer cgroup subsystem"
+	help
+	  Provides a way to freeze and unfreeze all tasks in a
+	  cgroup.
+
+config CGROUP_PIDS
+	bool "PIDs cgroup subsystem"
+	help
+	  Provides enforcement of process number limits in the scope of a
+	  cgroup. Any attempt to fork more processes than is allowed in the
+	  cgroup will fail. PIDs are fundamentally a global resource because it
+	  is fairly trivial to reach PID exhaustion before you reach even a
+	  conservative kmemcg limit. As a result, it is possible to grind a
+	  system to halt without being limited by other cgroup policies. The
+	  PIDs cgroup subsystem is designed to stop this from happening.
+
+	  It should be noted that organisational operations (such as attaching
+	  to a cgroup hierarchy will *not* be blocked by the PIDs subsystem),
+	  since the PIDs limit only affects a process's ability to fork, not to
+	  attach to a cgroup.
+
+config CGROUP_DEVICE
+	bool "Device controller for cgroups"
+	help
+	  Provides a cgroup implementing whitelists for devices which
+	  a process in the cgroup can mknod or open.
+
+config CPUSETS
+	bool "Cpuset support"
+	help
+	  This option will let you create and manage CPUSETs which
+	  allow dynamically partitioning a system into sets of CPUs and
+	  Memory Nodes and assigning tasks to run only within those sets.
+	  This is primarily useful on large SMP or NUMA systems.
+
+	  Say N if unsure.
+
+config PROC_PID_CPUSET
+	bool "Include legacy /proc/<pid>/cpuset file"
+	depends on CPUSETS
+	default y
+
+config CGROUP_CPUACCT
+	bool "Simple CPU accounting cgroup subsystem"
+	help
+	  Provides a simple Resource Controller for monitoring the
+	  total CPU consumed by the tasks in a cgroup.
+
+config CGROUP_SCHEDTUNE
+	bool "CFS tasks boosting cgroup subsystem (EXPERIMENTAL)"
+	depends on SCHED_TUNE
+	help
+	  This option provides the "schedtune" controller which improves the
+	  flexibility of the task boosting mechanism by introducing the support
+	  to define "per task" boost values.
+
+	  This new controller:
+	  1. allows only a two layers hierarchy, where the root defines the
+	     system-wide boost value and its direct childrens define each one a
+	     different "class of tasks" to be boosted with a different value
+	  2. supports up to 16 different task classes, each one which could be
+	     configured with a different boost value
+
+	  Say N if unsure.
+
 config PAGE_COUNTER
        bool
 
@@ -1053,6 +1141,7 @@ config FAIR_GROUP_SCHED
 config CFS_BANDWIDTH
 	bool "CPU bandwidth provisioning for FAIR_GROUP_SCHED"
 	depends on FAIR_GROUP_SCHED
+	depends on !SCHED_WALT
 	default n
 	help
 	  This option allows users to define CPU bandwidth rates (limits) for
@@ -1154,6 +1243,19 @@ config CGROUP_PERF
 
 	  Say N if unsure.
 
+config CGROUP_BPF
+	bool "Support for eBPF programs attached to cgroups"
+	depends on BPF_SYSCALL
+	select SOCK_CGROUP_DATA
+	help
+	  Allow attaching eBPF programs to a cgroup using the bpf(2)
+	  syscall command BPF_PROG_ATTACH.
+
+	  In which context these programs are accessed depends on the type
+	  of attachment. For instance, programs that are attached using
+	  BPF_CGROUP_INET_INGRESS will be executed on the ingress path of
+	  inet sockets.
+
 config CGROUP_DEBUG
 	bool "Example controller"
 	default n
@@ -1162,6 +1264,10 @@ config CGROUP_DEBUG
 	  debugging information about the cgroups framework.
 
 	  Say N.
+
+config SOCK_CGROUP_DATA
+	bool
+	default n
 
 endif # CGROUPS
 
@@ -1247,6 +1353,43 @@ config SCHED_AUTOGROUP
 	  of workloads isolates aggressive CPU burners (like build jobs) from
 	  desktop applications.  Task group autogeneration is currently based
 	  upon task session.
+
+config SCHED_TUNE
+	bool "Boosting for CFS tasks (EXPERIMENTAL)"
+	depends on SMP
+	help
+	  This option enables the system-wide support for task boosting.
+	  When this support is enabled a new sysctl interface is exposed to
+	  userspace via:
+	     /proc/sys/kernel/sched_cfs_boost
+	  which allows to set a system-wide boost value in range [0..100].
+
+	  The currently boosting strategy is implemented in such a way that:
+	  - a 0% boost value requires to operate in "standard" mode by
+	    scheduling all tasks at the minimum capacities required by their
+	    workload demand
+	  - a 100% boost value requires to push at maximum the task
+	    performances, "regardless" of the incurred energy consumption
+
+	  A boost value in between these two boundaries is used to bias the
+	  power/performance trade-off, the higher the boost value the more the
+	  scheduler is biased toward performance boosting instead of energy
+	  efficiency.
+
+	  Since this support exposes a single system-wide knob, the specified
+	  boost value is applied to all (CFS) tasks in the system.
+
+	  If unsure, say N.
+
+config DEFAULT_USE_ENERGY_AWARE
+	bool "Default to enabling the Energy Aware Scheduler feature"
+	default n
+	help
+	  This option defaults the ENERGY_AWARE scheduling feature to true,
+	  as without SCHED_DEBUG set this feature can't be enabled or disabled
+	  via sysctl.
+
+	  Say N if unsure.
 
 config SYSFS_DEPRECATED
 	bool "Enable deprecated sysfs features to support old userspace tools"
@@ -1609,6 +1752,13 @@ config BPF_SYSCALL
 	  Enable the bpf() system call that allows to manipulate eBPF
 	  programs and maps via file descriptors.
 
+config BPF_JIT_ALWAYS_ON
+	bool "Permanently enable BPF JIT and remove BPF interpreter"
+	depends on BPF_SYSCALL && HAVE_EBPF_JIT && BPF_JIT
+	help
+	  Enables BPF JIT and removes BPF interpreter to avoid
+	  speculative execution of BPF instructions by the interpreter
+
 config SHMEM
 	bool "Use full shmem filesystem" if EXPERT
 	default y
@@ -1619,6 +1769,13 @@ config SHMEM
 	  to userspace as tmpfs if TMPFS is enabled. Disabling this
 	  option replaces shmem and tmpfs with the much simpler ramfs code,
 	  which may be appropriate on small systems without swap.
+
+config SHMEM_ALL_RAM
+	bool "Allow shmem to use all RAM" if EXPERT
+	depends on SHMEM
+	help
+	  By default, shmem is only allowed to use half of RAM. With this
+	  enabled, it is allowed to use all of the RAM.
 
 config AIO
 	bool "Enable AIO support" if EXPERT
@@ -2099,7 +2256,7 @@ endif # MODULES
 
 config MODULES_TREE_LOOKUP
 	def_bool y
-	depends on PERF_EVENTS || TRACING
+	depends on PERF_EVENTS || TRACING || CFI_CLANG
 
 config INIT_ALL_POSSIBLE
 	bool
@@ -2126,5 +2283,15 @@ config ASN1
 	  that can be interpreted by the ASN.1 stream decoder and used to
 	  inform it as to what tags are to be expected in a stream and what
 	  functions to call on what tags.
+
+config DIAG_KERNEL
+	bool "Diag kernel"
+	default n
+	help
+	  Mount boot image to /root for diag image booting when the system-as-root
+	  feature is enabled. This config should only be enabled when building Diag
+	  kernel.
+
+	  If unsure, say N.
 
 source "kernel/Kconfig.locks"

@@ -61,6 +61,13 @@ config EXTCON_MAX3355
 	  enable a system with an integrated USB OTG dual-role transceiver to
 	  function as an USB OTG dual-role device.
 
+config EXTCON_CABLE_XLATE
+	tristate "Cable translator based on different cable type"
+	help
+	  Say Y here to enable cable translator which receives the cable states
+	  from different extcon and report as different cable state based on the
+	  state table.
+
 config EXTCON_MAX77693
 	tristate "Maxim MAX77693 EXTCON Support"
 	depends on MFD_MAX77693 && INPUT

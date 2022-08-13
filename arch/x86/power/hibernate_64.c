@@ -11,6 +11,7 @@
 #include <linux/gfp.h>
 #include <linux/smp.h>
 #include <linux/suspend.h>
+#include <linux/cpu.h>
 
 #include <asm/init.h>
 #include <asm/proto.h>
@@ -126,7 +127,7 @@ static int relocate_restore_code(void)
 	if (!relocated_restore_code)
 		return -ENOMEM;
 
-	memcpy((void *)relocated_restore_code, &core_restore_code, PAGE_SIZE);
+	memcpy((void *)relocated_restore_code, core_restore_code, PAGE_SIZE);
 
 	/* Make the page containing the relocated code executable */
 	pgd = (pgd_t *)__va(read_cr3()) + pgd_index(relocated_restore_code);
@@ -149,7 +150,7 @@ static int relocate_restore_code(void)
 	return 0;
 }
 
-int swsusp_arch_resume(void)
+asmlinkage int swsusp_arch_resume(void)
 {
 	int error;
 
@@ -197,8 +198,8 @@ int arch_hibernation_header_save(void *addr, unsigned int max_size)
 
 	if (max_size < sizeof(struct restore_data_record))
 		return -EOVERFLOW;
-	rdr->jump_address = (unsigned long)&restore_registers;
-	rdr->jump_address_phys = __pa_symbol(&restore_registers);
+	rdr->jump_address = (unsigned long)restore_registers;
+	rdr->jump_address_phys = __pa_symbol(restore_registers);
 	rdr->cr3 = restore_cr3;
 	rdr->magic = RESTORE_MAGIC;
 	return 0;
@@ -217,4 +218,36 @@ int arch_hibernation_header_restore(void *addr)
 	jump_address_phys = rdr->jump_address_phys;
 	restore_cr3 = rdr->cr3;
 	return (rdr->magic == RESTORE_MAGIC) ? 0 : -EINVAL;
+}
+
+int arch_resume_nosmt(void)
+{
+	int ret = 0;
+	/*
+	 * We reached this while coming out of hibernation. This means
+	 * that SMT siblings are sleeping in hlt, as mwait is not safe
+	 * against control transition during resume (see comment in
+	 * hibernate_resume_nonboot_cpu_disable()).
+	 *
+	 * If the resumed kernel has SMT disabled, we have to take all the
+	 * SMT siblings out of hlt, and offline them again so that they
+	 * end up in mwait proper.
+	 *
+	 * Called with hotplug disabled.
+	 */
+	cpu_hotplug_enable();
+	if (cpu_smt_control == CPU_SMT_DISABLED ||
+			cpu_smt_control == CPU_SMT_FORCE_DISABLED) {
+		enum cpuhp_smt_control old = cpu_smt_control;
+
+		ret = cpuhp_smt_enable();
+		if (ret)
+			goto out;
+		ret = cpuhp_smt_disable(old);
+		if (ret)
+			goto out;
+	}
+out:
+	cpu_hotplug_disable();
+	return ret;
 }

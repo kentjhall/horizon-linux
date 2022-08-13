@@ -199,7 +199,7 @@ static int ixgbe_get_settings(struct net_device *netdev,
 	if (supported_link & IXGBE_LINK_SPEED_100_FULL)
 		ecmd->supported |= ixgbe_isbackplane(hw->phy.media_type) ?
 				   SUPPORTED_1000baseKX_Full :
-				   SUPPORTED_1000baseT_Full;
+				   SUPPORTED_100baseT_Full;
 
 	/* default advertised speed if phy.autoneg_advertised isn't set */
 	ecmd->advertising = ecmd->supported;
@@ -3192,7 +3192,8 @@ static int ixgbe_get_module_info(struct net_device *dev,
 		page_swap = true;
 	}
 
-	if (sff8472_rev == IXGBE_SFF_SFF_8472_UNSUP || page_swap) {
+	if (sff8472_rev == IXGBE_SFF_SFF_8472_UNSUP || page_swap ||
+	    !(addr_mode & IXGBE_SFF_DDM_IMPLEMENTED)) {
 		/* We have a SFP, but it does not support SFF-8472 */
 		modinfo->type = ETH_MODULE_SFF_8079;
 		modinfo->eeprom_len = ETH_MODULE_SFF_8079_LEN;

@@ -1,7 +1,7 @@
 /*
  * Junction temperature thermal driver for Maxim Max77620.
  *
- * Copyright (c) 2016, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2016-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * Author: Laxman Dewangan <ldewangan@nvidia.com>
  *	   Mallikarjun Kasoju <mkasoju@nvidia.com>
@@ -21,7 +21,7 @@
 #include <linux/slab.h>
 #include <linux/thermal.h>
 
-#define MAX77620_NORMAL_OPERATING_TEMP	100000
+#define MAX77620_NORMAL_OPERATING_TEMP	50000
 #define MAX77620_TJALARM1_TEMP		120000
 #define MAX77620_TJALARM2_TEMP		140000
 
@@ -104,14 +104,20 @@ static int max77620_thermal_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	pdev->dev.of_node = pdev->dev.parent->of_node;
-
 	mtherm->dev = &pdev->dev;
 	mtherm->rmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!mtherm->rmap) {
 		dev_err(&pdev->dev, "Failed to get parent regmap\n");
 		return -ENODEV;
 	}
+
+	/*
+	 * Drop any current reference to a device-tree node and get a
+	 * reference to the parent's node which will be balanced on reprobe or
+	 * on platform-device release.
+	 */
+	of_node_put(pdev->dev.of_node);
+	pdev->dev.of_node = of_node_get(pdev->dev.parent->of_node);
 
 	mtherm->tz_device = devm_thermal_zone_of_sensor_register(&pdev->dev, 0,
 				mtherm, &max77620_thermal_ops);

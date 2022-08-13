@@ -188,22 +188,22 @@ static inline int qt2_setdevice(struct usb_device *dev, u8 *data)
 }
 
 
-static inline int qt2_getdevice(struct usb_device *dev, u8 *data)
-{
-	return usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-			       QT_SET_GET_DEVICE, 0xc0, 0, 0,
-			       data, 3, QT2_USB_TIMEOUT);
-}
-
 static inline int qt2_getregister(struct usb_device *dev,
 				  u8 uart,
 				  u8 reg,
 				  u8 *data)
 {
-	return usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-			       QT_SET_GET_REGISTER, 0xc0, reg,
-			       uart, data, sizeof(*data), QT2_USB_TIMEOUT);
+	int ret;
 
+	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
+			      QT_SET_GET_REGISTER, 0xc0, reg,
+			      uart, data, sizeof(*data), QT2_USB_TIMEOUT);
+	if (ret < sizeof(*data)) {
+		if (ret >= 0)
+			ret = -EIO;
+	}
+
+	return ret;
 }
 
 static inline int qt2_setregister(struct usb_device *dev,
@@ -372,9 +372,11 @@ static int qt2_open(struct tty_struct *tty, struct usb_serial_port *port)
 				 0xc0, 0,
 				 device_port, data, 2, QT2_USB_TIMEOUT);
 
-	if (status < 0) {
+	if (status < 2) {
 		dev_err(&port->dev, "%s - open port failed %i\n", __func__,
 			status);
+		if (status >= 0)
+			status = -EIO;
 		kfree(data);
 		return status;
 	}
@@ -408,16 +410,12 @@ static void qt2_close(struct usb_serial_port *port)
 {
 	struct usb_serial *serial;
 	struct qt2_port_private *port_priv;
-	unsigned long flags;
 	int i;
 
 	serial = port->serial;
 	port_priv = usb_get_serial_port_data(port);
 
-	spin_lock_irqsave(&port_priv->urb_lock, flags);
 	usb_kill_urb(port_priv->write_urb);
-	port_priv->urb_in_use = false;
-	spin_unlock_irqrestore(&port_priv->urb_lock, flags);
 
 	/* flush the port transmit buffer */
 	i = usb_control_msg(serial->dev,
@@ -874,7 +872,10 @@ static void qt2_update_msr(struct usb_serial_port *port, unsigned char *ch)
 	u8 newMSR = (u8) *ch;
 	unsigned long flags;
 
+	/* May be called from qt2_process_read_urb() for an unbound port. */
 	port_priv = usb_get_serial_port_data(port);
+	if (!port_priv)
+		return;
 
 	spin_lock_irqsave(&port_priv->lock, flags);
 	port_priv->shadowMSR = newMSR;
@@ -902,7 +903,10 @@ static void qt2_update_lsr(struct usb_serial_port *port, unsigned char *ch)
 	unsigned long flags;
 	u8 newLSR = (u8) *ch;
 
+	/* May be called from qt2_process_read_urb() for an unbound port. */
 	port_priv = usb_get_serial_port_data(port);
+	if (!port_priv)
+		return;
 
 	if (newLSR & UART_LSR_BI)
 		newLSR &= (u8) (UART_LSR_OE | UART_LSR_BI);

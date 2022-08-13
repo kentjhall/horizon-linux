@@ -549,6 +549,9 @@ void __init mount_root(void)
 void __init prepare_namespace(void)
 {
 	int is_floppy;
+#ifdef CONFIG_DIAG_KERNEL
+	int err;
+#endif
 
 	if (root_delay) {
 		printk(KERN_INFO "Waiting %d sec before mounting root device...\n",
@@ -566,6 +569,7 @@ void __init prepare_namespace(void)
 	wait_for_device_probe();
 
 	md_run_setup();
+	dm_run_setup();
 
 	if (saved_root_name[0]) {
 		root_device_name = saved_root_name;
@@ -600,8 +604,17 @@ void __init prepare_namespace(void)
 	mount_root();
 out:
 	devtmpfs_mount("dev");
+#ifndef CONFIG_DIAG_KERNEL
 	sys_mount(".", "/", NULL, MS_MOVE, NULL);
 	sys_chroot(".");
+#else
+	/* Mount root to /system_root for Diag image */
+	sys_mount(".", "/system_root", NULL, MS_MOVE, NULL);
+	err = sys_mount("/system_root/system", "/system", NULL, MS_BIND, NULL);
+	pr_info("Diag: bind mount /system, err=%d\n", err);
+	sys_chroot("/");
+	sys_chdir("/");
+#endif
 }
 
 static bool is_tmpfs;

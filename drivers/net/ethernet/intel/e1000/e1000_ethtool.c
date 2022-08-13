@@ -628,6 +628,7 @@ static int e1000_set_ringparam(struct net_device *netdev,
 	for (i = 0; i < adapter->num_rx_queues; i++)
 		rxdr[i].count = rxdr->count;
 
+	err = 0;
 	if (netif_running(adapter->netdev)) {
 		/* Try to get new resources before deleting old */
 		err = e1000_setup_all_rx_resources(adapter);
@@ -645,17 +646,16 @@ static int e1000_set_ringparam(struct net_device *netdev,
 		adapter->tx_ring = tx_old;
 		e1000_free_all_rx_resources(adapter);
 		e1000_free_all_tx_resources(adapter);
-		kfree(tx_old);
-		kfree(rx_old);
 		adapter->rx_ring = rxdr;
 		adapter->tx_ring = txdr;
 		err = e1000_up(adapter);
-		if (err)
-			goto err_setup;
 	}
+	kfree(tx_old);
+	kfree(rx_old);
 
 	clear_bit(__E1000_RESETTING, &adapter->flags);
-	return 0;
+	return err;
+
 err_setup_tx:
 	e1000_free_all_rx_resources(adapter);
 err_setup_rx:
@@ -665,8 +665,8 @@ err_setup_rx:
 err_alloc_rx:
 	kfree(txdr);
 err_alloc_tx:
-	e1000_up(adapter);
-err_setup:
+	if (netif_running(adapter->netdev))
+		e1000_up(adapter);
 	clear_bit(__E1000_RESETTING, &adapter->flags);
 	return err;
 }
@@ -1825,11 +1825,12 @@ static void e1000_get_ethtool_stats(struct net_device *netdev,
 {
 	struct e1000_adapter *adapter = netdev_priv(netdev);
 	int i;
-	char *p = NULL;
 	const struct e1000_stats *stat = e1000_gstrings_stats;
 
 	e1000_update_stats(adapter);
-	for (i = 0; i < E1000_GLOBAL_STATS_LEN; i++) {
+	for (i = 0; i < E1000_GLOBAL_STATS_LEN; i++, stat++) {
+		char *p;
+
 		switch (stat->type) {
 		case NETDEV_STATS:
 			p = (char *)netdev + stat->stat_offset;
@@ -1840,15 +1841,13 @@ static void e1000_get_ethtool_stats(struct net_device *netdev,
 		default:
 			WARN_ONCE(1, "Invalid E1000 stat type: %u index %d\n",
 				  stat->type, i);
-			break;
+			continue;
 		}
 
 		if (stat->sizeof_stat == sizeof(u64))
 			data[i] = *(u64 *)p;
 		else
 			data[i] = *(u32 *)p;
-
-		stat++;
 	}
 /* BUG_ON(i != E1000_STATS_LEN); */
 }

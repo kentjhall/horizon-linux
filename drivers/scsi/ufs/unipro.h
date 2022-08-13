@@ -2,6 +2,7 @@
  * drivers/scsi/ufs/unipro.h
  *
  * Copyright (C) 2013 Samsung Electronics Co., Ltd.
+ * Copyright (c) 2014-2018, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -52,7 +53,7 @@
 #define RX_HS_UNTERMINATED_ENABLE		0x00A6
 #define RX_ENTER_HIBERN8			0x00A7
 #define RX_BYPASS_8B10B_ENABLE			0x00A8
-#define RX_TERMINATION_FORCE_ENABLE		0x0089
+#define RX_TERMINATION_FORCE_ENABLE		0x00A9
 #define RX_MIN_ACTIVATETIME_CAPABILITY		0x008F
 #define RX_HIBERN8TIME_CAPABILITY		0x0092
 #define RX_REFCLKFREQ				0x00EB
@@ -109,7 +110,10 @@
 #define PA_MAXRXSPEEDFAST	0x1541
 #define PA_MAXRXSPEEDSLOW	0x1542
 #define PA_TXLINKSTARTUPHS	0x1544
-#define PA_LOCAL_TX_LCC_ENABLE	0x155E
+#define PA_TxHsG1SyncLength	0x1552
+#define PA_TxHsG2SyncLength	0x1554
+#define PA_TxHsG3SyncLength	0x1556
+#define PA_Local_TX_LCC_Enable	0x155E
 #define PA_TXSPEEDFAST		0x1565
 #define PA_TXSPEEDSLOW		0x1566
 #define PA_REMOTEVERINFO	0x15A0
@@ -123,6 +127,7 @@
 #define PA_MAXRXHSGEAR		0x1587
 #define PA_RXHSUNTERMCAP	0x15A5
 #define PA_RXLSTERMCAP		0x15A6
+#define PA_GRANULARITY		0x15AA
 #define PA_PACPREQTIMEOUT	0x1590
 #define PA_PACPREQEOBTIMEOUT	0x1591
 #define PA_HIBERN8TIME		0x15A7
@@ -150,13 +155,21 @@
 #define PA_STALLNOCONFIGTIME	0x15A3
 #define PA_SAVECONFIGTIME	0x15A4
 
+#define PA_SCRAMBLING		0x1585
+#define PA_PEERSCRAMBLING	0x155B
+
 #define PA_TACTIVATE_TIME_UNIT_US	10
 #define PA_HIBERN8_TIME_UNIT_US		100
+
+#define SCREN			0x1
 
 /*Other attributes*/
 #define VS_MPHYCFGUPDT		0xD085
 #define VS_DEBUGOMC		0xD09E
 #define VS_POWERSTATE		0xD083
+
+#define PA_GRANULARITY_MIN_VAL	1
+#define PA_GRANULARITY_MAX_VAL	6
 
 /* PHY Adapter Protocol Constants */
 #define PA_MAXDATALANES	4
@@ -266,6 +279,13 @@ enum ufs_unipro_ver {
 #ifdef TRUE
 #undef TRUE
 #endif
+
+/*
+ * DME Attributes
+ */
+#define DME_FC0PROTECTIONTIMEOUTVAL	0xD041
+#define DME_TC0REPLAYTIMEOUTVAL		0xD042
+#define DME_AFC0REQTIMEOUTVAL		0xD043
 
 /* Boolean attribute values */
 enum {

@@ -304,11 +304,11 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	skb->sk  = sk;
 	skb->protocol = htons(ETH_P_IEEE802154);
 
-	dev_put(dev);
-
 	err = dev_queue_xmit(skb);
 	if (err > 0)
 		err = net_xmit_errno(err);
+
+	dev_put(dev);
 
 	return err ?: size;
 
@@ -693,11 +693,11 @@ static int dgram_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	skb->sk  = sk;
 	skb->protocol = htons(ETH_P_IEEE802154);
 
-	dev_put(dev);
-
 	err = dev_queue_xmit(skb);
 	if (err > 0)
 		err = net_xmit_errno(err);
+
+	dev_put(dev);
 
 	return err ?: size;
 
@@ -1003,6 +1003,9 @@ static int ieee802154_create(struct net *net, struct socket *sock,
 
 	switch (sock->type) {
 	case SOCK_RAW:
+		rc = -EPERM;
+		if (!capable(CAP_NET_RAW))
+			goto out;
 		proto = &ieee802154_raw_prot;
 		ops = &ieee802154_raw_ops;
 		break;

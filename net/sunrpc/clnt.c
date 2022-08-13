@@ -336,6 +336,11 @@ out:
 
 static DEFINE_IDA(rpc_clids);
 
+void rpc_cleanup_clids(void)
+{
+	ida_destroy(&rpc_clids);
+}
+
 static int rpc_alloc_clid(struct rpc_clnt *clnt)
 {
 	int clid;
@@ -960,10 +965,20 @@ out:
 }
 EXPORT_SYMBOL_GPL(rpc_bind_new_program);
 
+void rpc_task_release_transport(struct rpc_task *task)
+{
+	struct rpc_xprt *xprt = task->tk_xprt;
+
+	if (xprt) {
+		task->tk_xprt = NULL;
+		xprt_put(xprt);
+	}
+}
+EXPORT_SYMBOL_GPL(rpc_task_release_transport);
+
 void rpc_task_release_client(struct rpc_task *task)
 {
 	struct rpc_clnt *clnt = task->tk_client;
-	struct rpc_xprt *xprt = task->tk_xprt;
 
 	if (clnt != NULL) {
 		/* Remove from client task list */
@@ -974,12 +989,14 @@ void rpc_task_release_client(struct rpc_task *task)
 
 		rpc_release_client(clnt);
 	}
+	rpc_task_release_transport(task);
+}
 
-	if (xprt != NULL) {
-		task->tk_xprt = NULL;
-
-		xprt_put(xprt);
-	}
+static
+void rpc_task_set_transport(struct rpc_task *task, struct rpc_clnt *clnt)
+{
+	if (!task->tk_xprt)
+		task->tk_xprt = xprt_iter_get_next(&clnt->cl_xpi);
 }
 
 static
@@ -987,8 +1004,7 @@ void rpc_task_set_client(struct rpc_task *task, struct rpc_clnt *clnt)
 {
 
 	if (clnt != NULL) {
-		if (task->tk_xprt == NULL)
-			task->tk_xprt = xprt_iter_get_next(&clnt->cl_xpi);
+		rpc_task_set_transport(task, clnt);
 		task->tk_client = clnt;
 		atomic_inc(&clnt->cl_count);
 		if (clnt->cl_softrtry)
@@ -1545,6 +1561,7 @@ call_start(struct rpc_task *task)
 	task->tk_msg.rpc_proc->p_count++;
 	clnt->cl_stats->rpccnt++;
 	task->tk_action = call_reserve;
+	rpc_task_set_transport(task, clnt);
 }
 
 /*
@@ -1919,6 +1936,14 @@ call_connect_status(struct rpc_task *task)
 	task->tk_status = 0;
 	switch (status) {
 	case -ECONNREFUSED:
+		/* A positive refusal suggests a rebind is needed. */
+		if (RPC_IS_SOFTCONN(task))
+			break;
+		if (clnt->cl_autobind) {
+			rpc_force_rebind(clnt);
+			task->tk_action = call_bind;
+			return;
+		}
 	case -ECONNRESET:
 	case -ECONNABORTED:
 	case -ENETUNREACH:
@@ -2701,6 +2726,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
 	xprt = xprt_iter_xprt(&clnt->cl_xpi);
 	if (xps == NULL || xprt == NULL) {
 		rcu_read_unlock();
+		xprt_switch_put(xps);
 		return -EAGAIN;
 	}
 	resvport = xprt->resvport;

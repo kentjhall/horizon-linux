@@ -160,8 +160,10 @@ static int get_burstcount(struct tpm_chip *chip)
 	u32 value;
 
 	/* wait for burstcount */
-	/* which timeout value, spec has 2 answers (c & d) */
-	stop = jiffies + chip->timeout_d;
+	if (chip->flags & TPM_CHIP_FLAG_TPM2)
+		stop = jiffies + chip->timeout_a;
+	else
+		stop = jiffies + chip->timeout_d;
 	do {
 		rc = tpm_tis_read32(priv, TPM_STS(priv->locality), &value);
 		if (rc < 0)
@@ -185,7 +187,12 @@ static int recv_data(struct tpm_chip *chip, u8 *buf, size_t count)
 				 TPM_STS_DATA_AVAIL | TPM_STS_VALID,
 				 chip->timeout_c,
 				 &priv->read_queue, true) == 0) {
-		burstcnt = min_t(int, get_burstcount(chip), count - size);
+		burstcnt = get_burstcount(chip);
+		if (burstcnt < 0) {
+			dev_err(&chip->dev, "Unable to read burstcount\n");
+			return burstcnt;
+		}
+		burstcnt = min_t(int, burstcnt, count - size);
 
 		rc = tpm_tis_read_bytes(priv, TPM_DATA_FIFO(priv->locality),
 					burstcnt, buf + size);
@@ -201,7 +208,8 @@ static int tpm_tis_recv(struct tpm_chip *chip, u8 *buf, size_t count)
 {
 	struct tpm_tis_data *priv = dev_get_drvdata(&chip->dev);
 	int size = 0;
-	int expected, status;
+	int status;
+	u32 expected;
 
 	if (count < TPM_HEADER_SIZE) {
 		size = -EIO;
@@ -216,7 +224,7 @@ static int tpm_tis_recv(struct tpm_chip *chip, u8 *buf, size_t count)
 	}
 
 	expected = be32_to_cpu(*(__be32 *) (buf + 2));
-	if (expected > count) {
+	if (expected > count || expected < TPM_HEADER_SIZE) {
 		size = -EIO;
 		goto out;
 	}
@@ -249,7 +257,7 @@ out:
  * tpm.c can skip polling for the data to be available as the interrupt is
  * waited for here
  */
-static int tpm_tis_send_data(struct tpm_chip *chip, u8 *buf, size_t len)
+static int tpm_tis_send_data(struct tpm_chip *chip, const u8 *buf, size_t len)
 {
 	struct tpm_tis_data *priv = dev_get_drvdata(&chip->dev);
 	int rc, status, burstcnt;
@@ -271,7 +279,13 @@ static int tpm_tis_send_data(struct tpm_chip *chip, u8 *buf, size_t len)
 	}
 
 	while (count < len - 1) {
-		burstcnt = min_t(int, get_burstcount(chip), len - count - 1);
+		burstcnt = get_burstcount(chip);
+		if (burstcnt < 0) {
+			dev_err(&chip->dev, "Unable to read burstcount\n");
+			rc = burstcnt;
+			goto out_err;
+		}
+		burstcnt = min_t(int, burstcnt, len - count - 1);
 		rc = tpm_tis_write_bytes(priv, TPM_DATA_FIFO(priv->locality),
 					 burstcnt, buf + count);
 		if (rc < 0)
@@ -315,6 +329,9 @@ static void disable_interrupts(struct tpm_chip *chip)
 	u32 intmask;
 	int rc;
 
+	if (priv->irq == 0)
+		return;
+
 	rc = tpm_tis_read32(priv, TPM_INT_ENABLE(priv->locality), &intmask);
 	if (rc < 0)
 		intmask = 0;
@@ -332,7 +349,7 @@ static void disable_interrupts(struct tpm_chip *chip)
  * tpm.c can skip polling for the data to be available as the interrupt is
  * waited for here
  */
-static int tpm_tis_send_main(struct tpm_chip *chip, u8 *buf, size_t len)
+static int tpm_tis_send_main(struct tpm_chip *chip, const u8 *buf, size_t len)
 {
 	struct tpm_tis_data *priv = dev_get_drvdata(&chip->dev);
 	int rc;
@@ -772,9 +789,12 @@ int tpm_tis_core_init(struct device *dev, struct tpm_tis_data *priv, int irq,
 		if (irq) {
 			tpm_tis_probe_irq_single(chip, intmask, IRQF_SHARED,
 						 irq);
-			if (!(chip->flags & TPM_CHIP_FLAG_IRQ))
+			if (!(chip->flags & TPM_CHIP_FLAG_IRQ)) {
 				dev_err(&chip->dev, FW_BUG
 					"TPM interrupt not working, polling instead\n");
+
+				disable_interrupts(chip);
+			}
 		} else {
 			tpm_tis_probe_irq(chip, intmask);
 		}

@@ -90,6 +90,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/perf_event.h>
+#include <linux/nospec.h>
 #include <asm/cpu_device_id.h>
 #include <asm/intel-family.h>
 #include "../perf_event.h"
@@ -97,14 +98,14 @@
 MODULE_LICENSE("GPL");
 
 #define DEFINE_CSTATE_FORMAT_ATTR(_var, _name, _format)		\
-static ssize_t __cstate_##_var##_show(struct kobject *kobj,	\
-				struct kobj_attribute *attr,	\
+static ssize_t __cstate_##_var##_show(struct device *dev,	\
+				struct device_attribute *attr,	\
 				char *page)			\
 {								\
 	BUILD_BUG_ON(sizeof(_format) >= PAGE_SIZE);		\
 	return sprintf(page, _format "\n");			\
 }								\
-static struct kobj_attribute format_attr_##_var =		\
+static struct device_attribute format_attr_##_var =		\
 	__ATTR(_name, 0444, __cstate_##_var##_show, NULL)
 
 static ssize_t cstate_get_attr_cpumask(struct device *dev,
@@ -300,6 +301,7 @@ static int cstate_pmu_event_init(struct perf_event *event)
 	} else if (event->pmu == &cstate_pkg_pmu) {
 		if (cfg >= PERF_CSTATE_PKG_EVENT_MAX)
 			return -EINVAL;
+		cfg = array_index_nospec((unsigned long)cfg, PERF_CSTATE_PKG_EVENT_MAX);
 		if (!pkg_msr[cfg].attr)
 			return -EINVAL;
 		event->hw.event_base = pkg_msr[cfg].msr;
@@ -434,6 +436,7 @@ static struct pmu cstate_core_pmu = {
 	.stop		= cstate_pmu_event_stop,
 	.read		= cstate_pmu_event_update,
 	.capabilities	= PERF_PMU_CAP_NO_INTERRUPT,
+	.module		= THIS_MODULE,
 };
 
 static struct pmu cstate_pkg_pmu = {
@@ -447,6 +450,7 @@ static struct pmu cstate_pkg_pmu = {
 	.stop		= cstate_pmu_event_stop,
 	.read		= cstate_pmu_event_update,
 	.capabilities	= PERF_PMU_CAP_NO_INTERRUPT,
+	.module		= THIS_MODULE,
 };
 
 static const struct cstate_model nhm_cstates __initconst = {
@@ -527,8 +531,8 @@ static const struct x86_cpu_id intel_cstates_match[] __initconst = {
 
 	X86_CSTATES_MODEL(INTEL_FAM6_HASWELL_ULT, hswult_cstates),
 
-	X86_CSTATES_MODEL(INTEL_FAM6_ATOM_SILVERMONT1, slm_cstates),
-	X86_CSTATES_MODEL(INTEL_FAM6_ATOM_SILVERMONT2, slm_cstates),
+	X86_CSTATES_MODEL(INTEL_FAM6_ATOM_SILVERMONT, slm_cstates),
+	X86_CSTATES_MODEL(INTEL_FAM6_ATOM_SILVERMONT_X, slm_cstates),
 	X86_CSTATES_MODEL(INTEL_FAM6_ATOM_AIRMONT,     slm_cstates),
 
 	X86_CSTATES_MODEL(INTEL_FAM6_BROADWELL_CORE,   snb_cstates),
@@ -594,6 +598,9 @@ static int __init cstate_probe(const struct cstate_model *cm)
 
 static inline void cstate_cleanup(void)
 {
+	cpuhp_remove_state_nocalls(CPUHP_AP_PERF_X86_CSTATE_ONLINE);
+	cpuhp_remove_state_nocalls(CPUHP_AP_PERF_X86_CSTATE_STARTING);
+
 	if (has_cstate_core)
 		perf_pmu_unregister(&cstate_core_pmu);
 
@@ -606,16 +613,16 @@ static int __init cstate_init(void)
 	int err;
 
 	cpuhp_setup_state(CPUHP_AP_PERF_X86_CSTATE_STARTING,
-			  "AP_PERF_X86_CSTATE_STARTING", cstate_cpu_init,
-			  NULL);
+			  "perf/x86/cstate:starting", cstate_cpu_init, NULL);
 	cpuhp_setup_state(CPUHP_AP_PERF_X86_CSTATE_ONLINE,
-			  "AP_PERF_X86_CSTATE_ONLINE", NULL, cstate_cpu_exit);
+			  "perf/x86/cstate:online", NULL, cstate_cpu_exit);
 
 	if (has_cstate_core) {
 		err = perf_pmu_register(&cstate_core_pmu, cstate_core_pmu.name, -1);
 		if (err) {
 			has_cstate_core = false;
 			pr_info("Failed to register cstate core pmu\n");
+			cstate_cleanup();
 			return err;
 		}
 	}
@@ -629,8 +636,7 @@ static int __init cstate_init(void)
 			return err;
 		}
 	}
-
-	return err;
+	return 0;
 }
 
 static int __init cstate_pmu_init(void)
@@ -655,8 +661,6 @@ module_init(cstate_pmu_init);
 
 static void __exit cstate_pmu_exit(void)
 {
-	cpuhp_remove_state_nocalls(CPUHP_AP_PERF_X86_CSTATE_ONLINE);
-	cpuhp_remove_state_nocalls(CPUHP_AP_PERF_X86_CSTATE_STARTING);
 	cstate_cleanup();
 }
 module_exit(cstate_pmu_exit);

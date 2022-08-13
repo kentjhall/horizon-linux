@@ -167,6 +167,18 @@ void crypto_remove_spawns(struct crypto_alg *alg, struct list_head *list,
 
 			spawn->alg = NULL;
 			spawns = &inst->alg.cra_users;
+
+			/*
+			 * We may encounter an unregistered instance here, since
+			 * an instance's spawns are set up prior to the instance
+			 * being registered.  An unregistered instance will have
+			 * NULL ->cra_users.next, since ->cra_users isn't
+			 * properly initialized until registration.  But an
+			 * unregistered instance cannot have any users, so treat
+			 * it the same as ->cra_users being empty.
+			 */
+			if (spawns->next == NULL)
+				break;
 		}
 	} while ((spawns = crypto_more_spawns(alg, &stack, &top,
 					      &secondary_spawns)));
@@ -356,6 +368,7 @@ int crypto_register_alg(struct crypto_alg *alg)
 	struct crypto_larval *larval;
 	int err;
 
+	alg->cra_flags &= ~CRYPTO_ALG_DEAD;
 	err = crypto_check_alg(alg);
 	if (err)
 		return err;
@@ -639,11 +652,9 @@ EXPORT_SYMBOL_GPL(crypto_grab_spawn);
 
 void crypto_drop_spawn(struct crypto_spawn *spawn)
 {
-	if (!spawn->alg)
-		return;
-
 	down_write(&crypto_alg_sem);
-	list_del(&spawn->list);
+	if (spawn->alg)
+		list_del(&spawn->list);
 	up_write(&crypto_alg_sem);
 }
 EXPORT_SYMBOL_GPL(crypto_drop_spawn);
@@ -651,22 +662,16 @@ EXPORT_SYMBOL_GPL(crypto_drop_spawn);
 static struct crypto_alg *crypto_spawn_alg(struct crypto_spawn *spawn)
 {
 	struct crypto_alg *alg;
-	struct crypto_alg *alg2;
 
 	down_read(&crypto_alg_sem);
 	alg = spawn->alg;
-	alg2 = alg;
-	if (alg2)
-		alg2 = crypto_mod_get(alg2);
+	if (alg && !crypto_mod_get(alg)) {
+		alg->cra_flags |= CRYPTO_ALG_DYING;
+		alg = NULL;
+	}
 	up_read(&crypto_alg_sem);
 
-	if (!alg2) {
-		if (alg)
-			crypto_shoot_alg(alg);
-		return ERR_PTR(-EAGAIN);
-	}
-
-	return alg;
+	return alg ?: ERR_PTR(-EAGAIN);
 }
 
 struct crypto_tfm *crypto_spawn_tfm(struct crypto_spawn *spawn, u32 type,

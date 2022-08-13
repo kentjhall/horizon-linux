@@ -1,0 +1,50 @@
+MAX77812 voltage regulator
+
+Required properties:
+- compatible: "maxim,max77812-regulator"
+- reg: I2C slave address
+
+Regulators subnode:
+
+MAX77812 supports four regulators, regulators should be described under
+    regualtors subnode.
+
+Optional properties:
+-maxim,ramp-up-slew-rate: to configure slew rate during regulator
+	 voltage ramp up time
+-maxim,ramp-down-slew-rate: to configre slew rate during regulator
+	 voltage ramp down time
+-maxim,soft-start-slew-rate: to configure slew rate during regulator
+	enable time
+-maxim,shutdown-slew-rate: to configure slew rate during regulator
+	disable time or shutdown time
+
+Each regulator is defined using the standard binding for regulators.
+
+Example:
+
+	max77812@1b {
+		compatible = "maxim,max77812-regulator";
+		reg = <0x1b>;
+
+		regulators {
+			m1vout {
+				regulator-name = "mvout1";
+				regulator-min-microvolt = <250000>;
+				regulator-max-microvolt = <1525000>;
+				regulator-boot-on;
+				regulator-always-on;
+				regulator-init-mode = <REGULATOR_MODE_NORMAL>;
+			};
+
+			m2vout {
+				regulator-name = "mvout2";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <250000>;
+				regulator-max-microvolt = <1525000>;
+				regulator-init-mode = <REGULATOR_MODE_NORMAL>;
+			};
+		};
+	};
+

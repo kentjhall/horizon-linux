@@ -42,6 +42,7 @@
 #include <asm/desc_defs.h>
 #include <asm/kmap_types.h>
 #include <asm/pgtable_types.h>
+#include <asm/nospec-branch.h>
 
 struct page;
 struct thread_struct;
@@ -391,7 +392,9 @@ int paravirt_disable_iospace(void);
  * offset into the paravirt_patch_template structure, and can therefore be
  * freely converted back into a structure offset.
  */
-#define PARAVIRT_CALL	"call *%c[paravirt_opptr];"
+#define PARAVIRT_CALL					\
+	ANNOTATE_RETPOLINE_SAFE				\
+	"call *%c[paravirt_opptr];"
 
 /*
  * These macros are intended to wrap calls through one of the paravirt
@@ -459,8 +462,8 @@ int paravirt_disable_iospace(void);
  */
 #ifdef CONFIG_X86_32
 #define PVOP_VCALL_ARGS							\
-	unsigned long __eax = __eax, __edx = __edx, __ecx = __ecx;	\
-	register void *__sp asm("esp")
+	unsigned long __eax = __eax, __edx = __edx, __ecx = __ecx;
+
 #define PVOP_CALL_ARGS			PVOP_VCALL_ARGS
 
 #define PVOP_CALL_ARG1(x)		"a" ((unsigned long)(x))
@@ -480,8 +483,8 @@ int paravirt_disable_iospace(void);
 /* [re]ax isn't an arg, but the return val */
 #define PVOP_VCALL_ARGS						\
 	unsigned long __edi = __edi, __esi = __esi,		\
-		__edx = __edx, __ecx = __ecx, __eax = __eax;	\
-	register void *__sp asm("rsp")
+		__edx = __edx, __ecx = __ecx, __eax = __eax;
+
 #define PVOP_CALL_ARGS		PVOP_VCALL_ARGS
 
 #define PVOP_CALL_ARG1(x)		"D" ((unsigned long)(x))
@@ -520,7 +523,7 @@ int paravirt_disable_iospace(void);
 			asm volatile(pre				\
 				     paravirt_alt(PARAVIRT_CALL)	\
 				     post				\
-				     : call_clbr, "+r" (__sp)		\
+				     : call_clbr, ASM_CALL_CONSTRAINT	\
 				     : paravirt_type(op),		\
 				       paravirt_clobber(clbr),		\
 				       ##__VA_ARGS__			\
@@ -530,7 +533,7 @@ int paravirt_disable_iospace(void);
 			asm volatile(pre				\
 				     paravirt_alt(PARAVIRT_CALL)	\
 				     post				\
-				     : call_clbr, "+r" (__sp)		\
+				     : call_clbr, ASM_CALL_CONSTRAINT	\
 				     : paravirt_type(op),		\
 				       paravirt_clobber(clbr),		\
 				       ##__VA_ARGS__			\
@@ -557,7 +560,7 @@ int paravirt_disable_iospace(void);
 		asm volatile(pre					\
 			     paravirt_alt(PARAVIRT_CALL)		\
 			     post					\
-			     : call_clbr, "+r" (__sp)			\
+			     : call_clbr, ASM_CALL_CONSTRAINT		\
 			     : paravirt_type(op),			\
 			       paravirt_clobber(clbr),			\
 			       ##__VA_ARGS__				\

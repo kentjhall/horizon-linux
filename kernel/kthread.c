@@ -18,6 +18,7 @@
 #include <linux/freezer.h>
 #include <linux/ptrace.h>
 #include <linux/uaccess.h>
+#include <linux/cgroup.h>
 #include <trace/events/sched.h>
 
 static DEFINE_SPINLOCK(kthread_create_lock);
@@ -205,6 +206,7 @@ static int kthread(void *_create)
 	ret = -EINTR;
 
 	if (!test_bit(KTHREAD_SHOULD_STOP, &self.flags)) {
+		cgroup_kthread_ready();
 		__kthread_parkme(&self);
 		ret = threadfn(data);
 	}
@@ -288,8 +290,14 @@ static struct task_struct *__kthread_create_on_node(int (*threadfn)(void *data),
 	task = create->result;
 	if (!IS_ERR(task)) {
 		static const struct sched_param param = { .sched_priority = 0 };
+		char name[TASK_COMM_LEN];
 
-		vsnprintf(task->comm, sizeof(task->comm), namefmt, args);
+		/*
+		 * task is already visible to other tasks, so updating
+		 * COMM must be protected.
+		 */
+		vsnprintf(name, sizeof(name), namefmt, args);
+		set_task_comm(task, name);
 		/*
 		 * root may have changed our (kthreadd's) priority or CPU mask.
 		 * The kernel thread should not inherit these properties.
@@ -530,6 +538,7 @@ int kthreadd(void *unused)
 	set_mems_allowed(node_states[N_MEMORY]);
 
 	current->flags |= PF_NOFREEZE;
+	cgroup_init_kthreadd();
 
 	for (;;) {
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -819,7 +828,8 @@ void kthread_delayed_work_timer_fn(unsigned long __data)
 	/* Move the work from worker->delayed_work_list. */
 	WARN_ON_ONCE(list_empty(&work->node));
 	list_del_init(&work->node);
-	kthread_insert_work(worker, work, &worker->work_list);
+	if (!work->canceling)
+		kthread_insert_work(worker, work, &worker->work_list);
 
 	spin_unlock(&worker->lock);
 }

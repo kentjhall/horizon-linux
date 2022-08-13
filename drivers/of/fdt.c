@@ -4,6 +4,8 @@
  * Copyright 2009 Benjamin Herrenschmidt, IBM Corp
  * benh@kernel.crashing.org
  *
+ * Copyright (c) 2021, NVIDIA CORPORATION, All rights reserved.
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
  * version 2 as published by the Free Software Foundation.
@@ -397,8 +399,8 @@ static int unflatten_dt_nodes(const void *blob,
 	struct device_node *root;
 	int offset = 0, depth = 0, initial_depth = 0;
 #define FDT_MAX_DEPTH	64
-	unsigned int fpsizes[FDT_MAX_DEPTH];
-	struct device_node *nps[FDT_MAX_DEPTH];
+	unsigned int fpsizes[FDT_MAX_DEPTH + 1];
+	struct device_node *nps[FDT_MAX_DEPTH + 1];
 	void *base = mem;
 	bool dryrun = !base;
 
@@ -505,6 +507,9 @@ static void *__unflatten_device_tree(const void *blob,
 
 	/* Allocate memory for the expanded device tree */
 	mem = dt_alloc(size + 4, __alignof__(struct device_node));
+	if (!mem)
+		return NULL;
+
 	memset(mem, 0, size);
 
 	*(__be32 *)(mem + size) = cpu_to_be32(0xdeadbeef);
@@ -600,14 +605,14 @@ static int __init __reserved_mem_reserve_reg(unsigned long node,
 		base = dt_mem_next_cell(dt_root_addr_cells, &prop);
 		size = dt_mem_next_cell(dt_root_size_cells, &prop);
 
-		if (size &&
-		    early_init_dt_reserve_memory_arch(base, size, nomap) == 0)
-			pr_debug("Reserved memory: reserved region for node '%s': base %pa, size %ld MiB\n",
-				uname, &base, (unsigned long)size / SZ_1M);
-		else
-			pr_info("Reserved memory: failed to reserve memory for node '%s': base %pa, size %ld MiB\n",
-				uname, &base, (unsigned long)size / SZ_1M);
-
+		if (size) {
+			if (early_init_dt_reserve_memory_arch(base, size, nomap) == 0)
+				pr_debug("Reserved memory: reserved region for node '%s': base %pa, size %ld MiB\n",
+					uname, &base, (unsigned long)size / SZ_1M);
+			else
+				pr_err("Reserved memory: failed to reserve memory for node '%s': base %pa, size %ld MiB\n",
+					uname, &base, (unsigned long)size / SZ_1M);
+			}
 		len -= t_len;
 		if (first) {
 			fdt_reserved_mem_save_node(node, uname, base, size);
@@ -738,9 +743,12 @@ int __init of_scan_flat_dt(int (*it)(unsigned long node,
 	const char *pathp;
 	int offset, rc = 0, depth = -1;
 
-        for (offset = fdt_next_node(blob, -1, &depth);
-             offset >= 0 && depth >= 0 && !rc;
-             offset = fdt_next_node(blob, offset, &depth)) {
+	if (!blob)
+		return 0;
+
+	for (offset = fdt_next_node(blob, -1, &depth);
+	     offset >= 0 && depth >= 0 && !rc;
+	     offset = fdt_next_node(blob, offset, &depth)) {
 
 		pathp = fdt_get_name(blob, offset, NULL);
 		if (*pathp == '/')
@@ -929,7 +937,7 @@ int __init early_init_dt_scan_chosen_stdout(void)
 	int offset;
 	const char *p, *q, *options = NULL;
 	int l;
-	const struct earlycon_id *match;
+	const struct earlycon_id **p_match;
 	const void *fdt = initial_boot_params;
 
 	offset = fdt_path_offset(fdt, "/chosen");
@@ -956,7 +964,10 @@ int __init early_init_dt_scan_chosen_stdout(void)
 		return 0;
 	}
 
-	for (match = __earlycon_table; match < __earlycon_table_end; match++) {
+	for (p_match = __earlycon_table; p_match < __earlycon_table_end;
+	     p_match++) {
+		const struct earlycon_id *match = *p_match;
+
 		if (!match->compatible[0])
 			continue;
 
@@ -1035,7 +1046,7 @@ int __init early_init_dt_scan_memory(unsigned long node, const char *uname,
 
 	endp = reg + (l / sizeof(__be32));
 
-	pr_debug("memory scan node %s, reg size %d,\n", uname, l);
+	pr_info("memory scan node %s, reg size %d,\n", uname, l);
 
 	while ((endp - reg) >= (dt_root_addr_cells + dt_root_size_cells)) {
 		u64 base, size;
@@ -1045,7 +1056,7 @@ int __init early_init_dt_scan_memory(unsigned long node, const char *uname,
 
 		if (size == 0)
 			continue;
-		pr_debug(" - %llx ,  %llx\n", (unsigned long long)base,
+		pr_info(" - %llx ,  %llx\n", (unsigned long long)base,
 		    (unsigned long long)size);
 
 		early_init_dt_add_memory_arch(base, size);
@@ -1054,42 +1065,66 @@ int __init early_init_dt_scan_memory(unsigned long node, const char *uname,
 	return 0;
 }
 
+/*
+ * Convert configs to something easy to use in C code
+ */
+#if defined(CONFIG_CMDLINE_FORCE)
+static const int overwrite_incoming_cmdline = 1;
+static const int read_dt_cmdline;
+static const int concat_cmdline;
+#elif defined(CONFIG_CMDLINE_EXTEND)
+static const int overwrite_incoming_cmdline;
+static const int read_dt_cmdline = 1;
+static const int concat_cmdline = 1;
+#else /* CMDLINE_FROM_BOOTLOADER */
+static const int overwrite_incoming_cmdline;
+static const int read_dt_cmdline = 1;
+static const int concat_cmdline;
+#endif
+
+#ifdef CONFIG_CMDLINE
+static const char *config_cmdline = CONFIG_CMDLINE;
+#else
+static const char *config_cmdline = "";
+#endif
+
 int __init early_init_dt_scan_chosen(unsigned long node, const char *uname,
 				     int depth, void *data)
 {
-	int l;
-	const char *p;
+	int l = 0;
+	const char *p = NULL;
+	char *cmdline = data;
 
 	pr_debug("search \"chosen\", depth: %d, uname: %s\n", depth, uname);
 
-	if (depth != 1 || !data ||
+	if (depth != 1 || !cmdline ||
 	    (strcmp(uname, "chosen") != 0 && strcmp(uname, "chosen@0") != 0))
 		return 0;
 
 	early_init_dt_check_for_initrd(node);
 
-	/* Retrieve command line */
-	p = of_get_flat_dt_prop(node, "bootargs", &l);
-	if (p != NULL && l > 0)
-		strlcpy(data, p, min((int)l, COMMAND_LINE_SIZE));
+	/* Put CONFIG_CMDLINE in if forced or if data had nothing in it to start */
+	if (overwrite_incoming_cmdline || !cmdline[0])
+		strlcpy(cmdline, config_cmdline, COMMAND_LINE_SIZE);
 
-	/*
-	 * CONFIG_CMDLINE is meant to be a default in case nothing else
-	 * managed to set the command line, unless CONFIG_CMDLINE_FORCE
-	 * is set in which case we override whatever was found earlier.
-	 */
-#ifdef CONFIG_CMDLINE
-#if defined(CONFIG_CMDLINE_EXTEND)
-	strlcat(data, " ", COMMAND_LINE_SIZE);
-	strlcat(data, CONFIG_CMDLINE, COMMAND_LINE_SIZE);
-#elif defined(CONFIG_CMDLINE_FORCE)
-	strlcpy(data, CONFIG_CMDLINE, COMMAND_LINE_SIZE);
-#else
-	/* No arguments from boot loader, use kernel's  cmdl*/
-	if (!((char *)data)[0])
-		strlcpy(data, CONFIG_CMDLINE, COMMAND_LINE_SIZE);
-#endif
-#endif /* CONFIG_CMDLINE */
+	/* Retrieve command line unless forcing */
+	if (read_dt_cmdline)
+		p = of_get_flat_dt_prop(node, "bootargs", &l);
+
+	if (p != NULL && l > 0) {
+		if (concat_cmdline) {
+			int cmdline_len;
+			int copy_len;
+			strlcat(cmdline, " ", COMMAND_LINE_SIZE);
+			cmdline_len = strlen(cmdline);
+			copy_len = COMMAND_LINE_SIZE - cmdline_len - 1;
+			copy_len = min((int)l, copy_len);
+			strncpy(cmdline + cmdline_len, p, copy_len);
+			cmdline[cmdline_len + copy_len] = '\0';
+		} else {
+			strlcpy(cmdline, p, min((int)l, COMMAND_LINE_SIZE));
+		}
+	}
 
 	pr_debug("Command line is: %s\n", (char*)data);
 

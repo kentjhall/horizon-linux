@@ -130,7 +130,6 @@ static void pcrypt_aead_done(struct crypto_async_request *areq, int err)
 	struct padata_priv *padata = pcrypt_request_padata(preq);
 
 	padata->info = err;
-	req->base.flags &= ~CRYPTO_TFM_REQ_MAY_SLEEP;
 
 	padata_do_serial(padata);
 }
@@ -254,6 +253,14 @@ static void pcrypt_aead_exit_tfm(struct crypto_aead *tfm)
 	crypto_free_aead(ctx->child);
 }
 
+static void pcrypt_free(struct aead_instance *inst)
+{
+	struct pcrypt_instance_ctx *ctx = aead_instance_ctx(inst);
+
+	crypto_drop_aead(&ctx->spawn);
+	kfree(inst);
+}
+
 static int pcrypt_init_instance(struct crypto_instance *inst,
 				struct crypto_alg *alg)
 {
@@ -319,6 +326,8 @@ static int pcrypt_create_aead(struct crypto_template *tmpl, struct rtattr **tb,
 	inst->alg.encrypt = pcrypt_aead_encrypt;
 	inst->alg.decrypt = pcrypt_aead_decrypt;
 
+	inst->free = pcrypt_free;
+
 	err = aead_register_instance(tmpl, inst);
 	if (err)
 		goto out_drop_aead;
@@ -347,14 +356,6 @@ static int pcrypt_create(struct crypto_template *tmpl, struct rtattr **tb)
 	}
 
 	return -EINVAL;
-}
-
-static void pcrypt_free(struct crypto_instance *inst)
-{
-	struct pcrypt_instance_ctx *ctx = crypto_instance_ctx(inst);
-
-	crypto_drop_aead(&ctx->spawn);
-	kfree(inst);
 }
 
 static int pcrypt_cpumask_change_notify(struct notifier_block *self,
@@ -392,7 +393,7 @@ static int pcrypt_sysfs_add(struct padata_instance *pinst, const char *name)
 	int ret;
 
 	pinst->kobj.kset = pcrypt_kset;
-	ret = kobject_add(&pinst->kobj, NULL, name);
+	ret = kobject_add(&pinst->kobj, NULL, "%s", name);
 	if (!ret)
 		kobject_uevent(&pinst->kobj, KOBJ_ADD);
 
@@ -469,7 +470,6 @@ static void pcrypt_fini_padata(struct padata_pcrypt *pcrypt)
 static struct crypto_template pcrypt_tmpl = {
 	.name = "pcrypt",
 	.create = pcrypt_create,
-	.free = pcrypt_free,
 	.module = THIS_MODULE,
 };
 
@@ -504,11 +504,12 @@ err:
 
 static void __exit pcrypt_exit(void)
 {
+	crypto_unregister_template(&pcrypt_tmpl);
+
 	pcrypt_fini_padata(&pencrypt);
 	pcrypt_fini_padata(&pdecrypt);
 
 	kset_unregister(pcrypt_kset);
-	crypto_unregister_template(&pcrypt_tmpl);
 }
 
 module_init(pcrypt_init);

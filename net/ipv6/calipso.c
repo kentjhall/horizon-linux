@@ -799,8 +799,7 @@ static int calipso_opt_update(struct sock *sk, struct ipv6_opt_hdr *hop)
 {
 	struct ipv6_txoptions *old = txopt_get(inet6_sk(sk)), *txopts;
 
-	txopts = ipv6_renew_options_kern(sk, old, IPV6_HOPOPTS,
-					 hop, hop ? ipv6_optlen(hop) : 0);
+	txopts = ipv6_renew_options(sk, old, IPV6_HOPOPTS, hop);
 	txopt_put(old);
 	if (IS_ERR(txopts))
 		return PTR_ERR(txopts);
@@ -1062,7 +1061,8 @@ static int calipso_opt_getattr(const unsigned char *calipso,
 			goto getattr_return;
 		}
 
-		secattr->flags |= NETLBL_SECATTR_MLS_CAT;
+		if (secattr->attr.mls.cat)
+			secattr->flags |= NETLBL_SECATTR_MLS_CAT;
 	}
 
 	secattr->type = NETLBL_NLTYPE_CALIPSO;
@@ -1222,8 +1222,7 @@ static int calipso_req_setattr(struct request_sock *req,
 	if (IS_ERR(new))
 		return PTR_ERR(new);
 
-	txopts = ipv6_renew_options_kern(sk, req_inet->ipv6_opt, IPV6_HOPOPTS,
-					 new, new ? ipv6_optlen(new) : 0);
+	txopts = ipv6_renew_options(sk, req_inet->ipv6_opt, IPV6_HOPOPTS, new);
 
 	kfree(new);
 
@@ -1260,8 +1259,7 @@ static void calipso_req_delattr(struct request_sock *req)
 	if (calipso_opt_del(req_inet->ipv6_opt->hopopt, &new))
 		return; /* Nothing to do */
 
-	txopts = ipv6_renew_options_kern(sk, req_inet->ipv6_opt, IPV6_HOPOPTS,
-					 new, new ? ipv6_optlen(new) : 0);
+	txopts = ipv6_renew_options(sk, req_inet->ipv6_opt, IPV6_HOPOPTS, new);
 
 	if (!IS_ERR(txopts)) {
 		txopts = xchg(&req_inet->ipv6_opt, txopts);
@@ -1319,7 +1317,7 @@ static int calipso_skbuff_setattr(struct sk_buff *skb,
 	struct ipv6hdr *ip6_hdr;
 	struct ipv6_opt_hdr *hop;
 	unsigned char buf[CALIPSO_MAX_BUFFER];
-	int len_delta, new_end, pad;
+	int len_delta, new_end, pad, payload;
 	unsigned int start, end;
 
 	ip6_hdr = ipv6_hdr(skb);
@@ -1346,6 +1344,8 @@ static int calipso_skbuff_setattr(struct sk_buff *skb,
 	if (ret_val < 0)
 		return ret_val;
 
+	ip6_hdr = ipv6_hdr(skb); /* Reset as skb_cow() may have moved it */
+
 	if (len_delta) {
 		if (len_delta > 0)
 			skb_push(skb, len_delta);
@@ -1355,6 +1355,8 @@ static int calipso_skbuff_setattr(struct sk_buff *skb,
 			sizeof(*ip6_hdr) + start);
 		skb_reset_network_header(skb);
 		ip6_hdr = ipv6_hdr(skb);
+		payload = ntohs(ip6_hdr->payload_len);
+		ip6_hdr->payload_len = htons(payload + len_delta);
 	}
 
 	hop = (struct ipv6_opt_hdr *)(ip6_hdr + 1);

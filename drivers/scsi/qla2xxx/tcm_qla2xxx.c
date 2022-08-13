@@ -484,24 +484,12 @@ static int tcm_qla2xxx_handle_cmd(scsi_qla_host_t *vha, struct qla_tgt_cmd *cmd,
 static void tcm_qla2xxx_handle_data_work(struct work_struct *work)
 {
 	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
-	unsigned long flags;
 
 	/*
 	 * Ensure that the complete FCP WRITE payload has been received.
 	 * Otherwise return an exception via CHECK_CONDITION status.
 	 */
 	cmd->cmd_in_wq = 0;
-
-	spin_lock_irqsave(&cmd->cmd_lock, flags);
-	cmd->cmd_flags |= CMD_FLAG_DATA_WORK;
-	if (cmd->aborted) {
-		cmd->cmd_flags |= CMD_FLAG_DATA_WORK_FREE;
-		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
-
-		tcm_qla2xxx_free_cmd(cmd);
-		return;
-	}
-	spin_unlock_irqrestore(&cmd->cmd_lock, flags);
 
 	cmd->vha->tgt_counters.qla_core_ret_ctio++;
 	if (!cmd->write_data_transferred) {
@@ -682,34 +670,13 @@ static void tcm_qla2xxx_queue_tm_rsp(struct se_cmd *se_cmd)
 	qlt_xmit_tm_rsp(mcmd);
 }
 
-
-#define DATA_WORK_NOT_FREE(_flags) \
-	(( _flags & (CMD_FLAG_DATA_WORK|CMD_FLAG_DATA_WORK_FREE)) == \
-	 CMD_FLAG_DATA_WORK)
 static void tcm_qla2xxx_aborted_task(struct se_cmd *se_cmd)
 {
 	struct qla_tgt_cmd *cmd = container_of(se_cmd,
 				struct qla_tgt_cmd, se_cmd);
-	unsigned long flags;
 
 	if (qlt_abort_cmd(cmd))
 		return;
-
-	spin_lock_irqsave(&cmd->cmd_lock, flags);
-	if ((cmd->state == QLA_TGT_STATE_NEW)||
-		((cmd->state == QLA_TGT_STATE_DATA_IN) &&
-		 DATA_WORK_NOT_FREE(cmd->cmd_flags)) ) {
-
-		cmd->cmd_flags |= CMD_FLAG_DATA_WORK_FREE;
-		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
-		/* Cmd have not reached firmware.
-		 * Use this trigger to free it. */
-		tcm_qla2xxx_free_cmd(cmd);
-		return;
-	}
-	spin_unlock_irqrestore(&cmd->cmd_lock, flags);
-	return;
-
 }
 
 static void tcm_qla2xxx_clear_sess_lookup(struct tcm_qla2xxx_lport *,
@@ -854,38 +821,14 @@ static ssize_t tcm_qla2xxx_tpg_enable_show(struct config_item *item,
 			atomic_read(&tpg->lport_tpg_enabled));
 }
 
-static void tcm_qla2xxx_depend_tpg(struct work_struct *work)
-{
-	struct tcm_qla2xxx_tpg *base_tpg = container_of(work,
-				struct tcm_qla2xxx_tpg, tpg_base_work);
-	struct se_portal_group *se_tpg = &base_tpg->se_tpg;
-	struct scsi_qla_host *base_vha = base_tpg->lport->qla_vha;
-
-	if (!target_depend_item(&se_tpg->tpg_group.cg_item)) {
-		atomic_set(&base_tpg->lport_tpg_enabled, 1);
-		qlt_enable_vha(base_vha);
-	}
-	complete(&base_tpg->tpg_base_comp);
-}
-
-static void tcm_qla2xxx_undepend_tpg(struct work_struct *work)
-{
-	struct tcm_qla2xxx_tpg *base_tpg = container_of(work,
-				struct tcm_qla2xxx_tpg, tpg_base_work);
-	struct se_portal_group *se_tpg = &base_tpg->se_tpg;
-	struct scsi_qla_host *base_vha = base_tpg->lport->qla_vha;
-
-	if (!qlt_stop_phase1(base_vha->vha_tgt.qla_tgt)) {
-		atomic_set(&base_tpg->lport_tpg_enabled, 0);
-		target_undepend_item(&se_tpg->tpg_group.cg_item);
-	}
-	complete(&base_tpg->tpg_base_comp);
-}
-
 static ssize_t tcm_qla2xxx_tpg_enable_store(struct config_item *item,
 		const char *page, size_t count)
 {
 	struct se_portal_group *se_tpg = to_tpg(item);
+	struct se_wwn *se_wwn = se_tpg->se_tpg_wwn;
+	struct tcm_qla2xxx_lport *lport = container_of(se_wwn,
+			struct tcm_qla2xxx_lport, lport_wwn);
+	struct scsi_qla_host *vha = lport->qla_vha;
 	struct tcm_qla2xxx_tpg *tpg = container_of(se_tpg,
 			struct tcm_qla2xxx_tpg, se_tpg);
 	unsigned long op;
@@ -904,24 +847,17 @@ static ssize_t tcm_qla2xxx_tpg_enable_store(struct config_item *item,
 		if (atomic_read(&tpg->lport_tpg_enabled))
 			return -EEXIST;
 
-		INIT_WORK(&tpg->tpg_base_work, tcm_qla2xxx_depend_tpg);
+		atomic_set(&tpg->lport_tpg_enabled, 1);
+		qlt_enable_vha(vha);
 	} else {
 		if (!atomic_read(&tpg->lport_tpg_enabled))
 			return count;
 
-		INIT_WORK(&tpg->tpg_base_work, tcm_qla2xxx_undepend_tpg);
+		atomic_set(&tpg->lport_tpg_enabled, 0);
+		qlt_stop_phase1(vha->vha_tgt.qla_tgt);
+		qlt_stop_phase2(vha->vha_tgt.qla_tgt);
 	}
-	init_completion(&tpg->tpg_base_comp);
-	schedule_work(&tpg->tpg_base_work);
-	wait_for_completion(&tpg->tpg_base_comp);
 
-	if (op) {
-		if (!atomic_read(&tpg->lport_tpg_enabled))
-			return -ENODEV;
-	} else {
-		if (atomic_read(&tpg->lport_tpg_enabled))
-			return -EPERM;
-	}
 	return count;
 }
 
@@ -1084,6 +1020,7 @@ static ssize_t tcm_qla2xxx_npiv_tpg_enable_store(struct config_item *item,
 
 		atomic_set(&tpg->lport_tpg_enabled, 0);
 		qlt_stop_phase1(vha->vha_tgt.qla_tgt);
+		qlt_stop_phase2(vha->vha_tgt.qla_tgt);
 	}
 
 	return count;

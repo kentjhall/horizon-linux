@@ -1995,18 +1995,20 @@ static ssize_t target_dev_alua_lu_gp_store(struct config_item *item,
 	/*
 	 * Associate lu_gp_mem with lu_gp_new.
 	 */
-	__core_alua_attach_lu_gp_mem(lu_gp_mem, lu_gp_new);
+	if (lu_gp_new)
+		__core_alua_attach_lu_gp_mem(lu_gp_mem, lu_gp_new);
 	spin_unlock(&lu_gp_mem->lu_gp_mem_lock);
+	if (lu_gp_new) {
+		pr_debug("Target_Core_ConfigFS: %s %s/%s to ALUA LU Group:"
+			" core/alua/lu_gps/%s, ID: %hu\n",
+			(move) ? "Moving" : "Adding",
+			config_item_name(&hba->hba_group.cg_item),
+			config_item_name(&dev->dev_group.cg_item),
+			config_item_name(&lu_gp_new->lu_gp_group.cg_item),
+			lu_gp_new->lu_gp_id);
 
-	pr_debug("Target_Core_ConfigFS: %s %s/%s to ALUA LU Group:"
-		" core/alua/lu_gps/%s, ID: %hu\n",
-		(move) ? "Moving" : "Adding",
-		config_item_name(&hba->hba_group.cg_item),
-		config_item_name(&dev->dev_group.cg_item),
-		config_item_name(&lu_gp_new->lu_gp_group.cg_item),
-		lu_gp_new->lu_gp_id);
-
-	core_alua_put_lu_gp_from_name(lu_gp_new);
+		core_alua_put_lu_gp_from_name(lu_gp_new);
+	}
 	return count;
 }
 

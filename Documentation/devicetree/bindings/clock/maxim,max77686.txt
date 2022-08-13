@@ -28,6 +28,10 @@ Required properties:
 
 Optional properties:
 - clock-output-names: From common clock binding.
+- enable-clock32k-out: Enable clock32K output at boot. This is applicable for
+		     	max77620 only.
+- maxim,enable-clock32k-out: Same as enable-clock32k-out. This is applicable for
+			max77620 only.
 
 Each clock is assigned an identifier and client nodes can use this identifier
 to specify the clock which they consume. Following indices are allowed:

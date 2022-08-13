@@ -1,5 +1,6 @@
 #include <linux/mm.h>
 #include <linux/gfp.h>
+#include <linux/hugetlb.h>
 #include <asm/pgalloc.h>
 #include <asm/pgtable.h>
 #include <asm/tlb.h>
@@ -250,7 +251,7 @@ static void pgd_mop_up_pmds(struct mm_struct *mm, pgd_t *pgdp)
 		if (pgd_val(pgd) != 0) {
 			pmd_t *pmd = (pmd_t *)pgd_page_vaddr(pgd);
 
-			pgdp[i] = native_make_pgd(0);
+			pgd_clear(&pgdp[i]);
 
 			paravirt_release_pmd(pgd_val(pgd) >> PAGE_SHIFT);
 			pmd_free(mm, pmd);
@@ -344,14 +345,15 @@ static inline void _pgd_free(pgd_t *pgd)
 		kmem_cache_free(pgd_cache, pgd);
 }
 #else
+
 static inline pgd_t *_pgd_alloc(void)
 {
-	return (pgd_t *)__get_free_page(PGALLOC_GFP);
+	return (pgd_t *)__get_free_pages(PGALLOC_GFP, PGD_ALLOCATION_ORDER);
 }
 
 static inline void _pgd_free(pgd_t *pgd)
 {
-	free_page((unsigned long)pgd);
+	free_pages((unsigned long)pgd, PGD_ALLOCATION_ORDER);
 }
 #endif /* CONFIG_X86_PAE */
 
@@ -417,7 +419,7 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 	int changed = !pte_same(*ptep, entry);
 
 	if (changed && dirty) {
-		*ptep = entry;
+		set_pte(ptep, entry);
 		pte_update(vma->vm_mm, address, ptep);
 	}
 
@@ -434,7 +436,7 @@ int pmdp_set_access_flags(struct vm_area_struct *vma,
 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
 
 	if (changed && dirty) {
-		*pmdp = entry;
+		set_pmd(pmdp, entry);
 		/*
 		 * We had a write-protection fault here and changed the pmd
 		 * to to more permissive. No need to flush the TLB for that,
@@ -542,8 +544,8 @@ void __native_set_fixmap(enum fixed_addresses idx, pte_t pte)
 	fixmaps_set++;
 }
 
-void native_set_fixmap(enum fixed_addresses idx, phys_addr_t phys,
-		       pgprot_t flags)
+void native_set_fixmap(unsigned /* enum fixed_addresses */ idx,
+		       phys_addr_t phys, pgprot_t flags)
 {
 	__native_set_fixmap(idx, pfn_pte(phys >> PAGE_SHIFT, flags));
 }
@@ -576,6 +578,10 @@ int pud_set_huge(pud_t *pud, phys_addr_t addr, pgprot_t prot)
 	    (mtrr != MTRR_TYPE_WRBACK))
 		return 0;
 
+	/* Bail out if we are we on a populated non-leaf entry: */
+	if (pud_present(*pud) && !pud_huge(*pud))
+		return 0;
+
 	prot = pgprot_4k_2_large(prot);
 
 	set_pte((pte_t *)pud, pfn_pte(
@@ -603,6 +609,10 @@ int pmd_set_huge(pmd_t *pmd, phys_addr_t addr, pgprot_t prot)
 			     __func__, addr, addr + PMD_SIZE);
 		return 0;
 	}
+
+	/* Bail out if we are we on a populated non-leaf entry: */
+	if (pmd_present(*pmd) && !pmd_huge(*pmd))
+		return 0;
 
 	prot = pgprot_4k_2_large(prot);
 
@@ -642,4 +652,99 @@ int pmd_clear_huge(pmd_t *pmd)
 
 	return 0;
 }
+
+#ifdef CONFIG_X86_64
+/**
+ * pud_free_pmd_page - Clear pud entry and free pmd page.
+ * @pud: Pointer to a PUD.
+ * @addr: Virtual address associated with pud.
+ *
+ * Context: The pud range has been unmapped and TLB purged.
+ * Return: 1 if clearing the entry succeeded. 0 otherwise.
+ *
+ * NOTE: Callers must allow a single page allocation.
+ */
+int pud_free_pmd_page(pud_t *pud, unsigned long addr)
+{
+	pmd_t *pmd, *pmd_sv;
+	pte_t *pte;
+	int i;
+
+	if (pud_none(*pud))
+		return 1;
+
+	pmd = (pmd_t *)pud_page_vaddr(*pud);
+	pmd_sv = (pmd_t *)__get_free_page(GFP_KERNEL);
+	if (!pmd_sv)
+		return 0;
+
+	for (i = 0; i < PTRS_PER_PMD; i++) {
+		pmd_sv[i] = pmd[i];
+		if (!pmd_none(pmd[i]))
+			pmd_clear(&pmd[i]);
+	}
+
+	pud_clear(pud);
+
+	/* INVLPG to clear all paging-structure caches */
+	flush_tlb_kernel_range(addr, addr + PAGE_SIZE-1);
+
+	for (i = 0; i < PTRS_PER_PMD; i++) {
+		if (!pmd_none(pmd_sv[i])) {
+			pte = (pte_t *)pmd_page_vaddr(pmd_sv[i]);
+			free_page((unsigned long)pte);
+		}
+	}
+
+	free_page((unsigned long)pmd_sv);
+
+	pgtable_pmd_page_dtor(virt_to_page(pmd));
+	free_page((unsigned long)pmd);
+
+	return 1;
+}
+
+/**
+ * pmd_free_pte_page - Clear pmd entry and free pte page.
+ * @pmd: Pointer to a PMD.
+ * @addr: Virtual address associated with pmd.
+ *
+ * Context: The pmd range has been unmapped and TLB purged.
+ * Return: 1 if clearing the entry succeeded. 0 otherwise.
+ */
+int pmd_free_pte_page(pmd_t *pmd, unsigned long addr)
+{
+	pte_t *pte;
+
+	if (pmd_none(*pmd))
+		return 1;
+
+	pte = (pte_t *)pmd_page_vaddr(*pmd);
+	pmd_clear(pmd);
+
+	/* INVLPG to clear all paging-structure caches */
+	flush_tlb_kernel_range(addr, addr + PAGE_SIZE-1);
+
+	free_page((unsigned long)pte);
+
+	return 1;
+}
+
+#else /* !CONFIG_X86_64 */
+
+int pud_free_pmd_page(pud_t *pud, unsigned long addr)
+{
+	return pud_none(*pud);
+}
+
+/*
+ * Disable free page handling on x86-PAE. This assures that ioremap()
+ * does not update sync'd pmd entries. See vmalloc_sync_one().
+ */
+int pmd_free_pte_page(pmd_t *pmd, unsigned long addr)
+{
+	return pmd_none(*pmd);
+}
+
+#endif /* CONFIG_X86_64 */
 #endif	/* CONFIG_HAVE_ARCH_HUGE_VMAP */

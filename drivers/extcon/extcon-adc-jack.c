@@ -27,6 +27,8 @@
 #include <linux/iio/consumer.h>
 #include <linux/extcon/extcon-adc-jack.h>
 #include <linux/extcon.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
 
 /**
  * struct adc_jack_data - internal data for adc_jack device driver
@@ -44,13 +46,15 @@ struct adc_jack_data {
 	struct device *dev;
 	struct extcon_dev *edev;
 
-	const unsigned int **cable_names;
+	unsigned int *cable_names;
 	struct adc_jack_cond *adc_conditions;
 	int num_conditions;
 
 	int irq;
 	unsigned long handling_delay; /* in jiffies */
+	int debounce_jiffies;
 	struct delayed_work handler;
+	struct timer_list timer;
 
 	struct iio_channel *chan;
 	bool wakeup_source;
@@ -61,13 +65,13 @@ static void adc_jack_handler(struct work_struct *work)
 	struct adc_jack_data *data = container_of(to_delayed_work(work),
 			struct adc_jack_data,
 			handler);
-	struct adc_jack_cond *def;
+	struct adc_jack_cond *def = NULL;
 	int ret, adc_val;
 	int i;
 
 	ret = iio_read_channel_raw(data->chan, &adc_val);
 	if (ret < 0) {
-		dev_err(&data->edev->dev, "read channel() error: %d\n", ret);
+		dev_err(data->dev, "read channel() error: %d\n", ret);
 		return;
 	}
 
@@ -85,15 +89,113 @@ static void adc_jack_handler(struct work_struct *work)
 		def = &data->adc_conditions[i];
 		extcon_set_state_sync(data->edev, def->id, false);
 	}
+	
+	dev_info(data->dev,
+		"ADC Lower:Value:Upper = %d:%d:%d, Cable:%d\n",
+		def->min_adc, adc_val, def->max_adc, dev->id);
+
+}
+
+static void ecx_extcon_notifier_timer(unsigned long _data)
+{
+	struct adc_jack_data *data = (struct adc_jack_data *)_data;
+
+	schedule_delayed_work(&data->handler, data->handling_delay);
 }
 
 static irqreturn_t adc_jack_irq_thread(int irq, void *_data)
 {
 	struct adc_jack_data *data = _data;
 
-	queue_delayed_work(system_power_efficient_wq,
-			   &data->handler, data->handling_delay);
+	if (data->debounce_jiffies)
+		mod_timer(&data->timer, jiffies + data->debounce_jiffies);
+	else
+		queue_delayed_work(system_power_efficient_wq,
+				   &data->handler, data->handling_delay);
+
 	return IRQ_HANDLED;
+}
+
+static struct adc_jack_pdata *of_get_platform_data(
+		struct platform_device *pdev)
+{
+	struct adc_jack_pdata *pdata;
+	struct device_node *np = pdev->dev.of_node;
+	u32 pval;
+	int ret;
+	u32 state, min_adc, max_adc;
+	int nstates, ncables;
+	int i;
+
+	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
+	if (!pdata)
+		return ERR_PTR(-ENOMEM);
+
+	of_property_read_string(np, "extcon-adc-jack,name", &pdata->name);
+	if (!pdata->name)
+		pdata->name = np->name;
+
+	ret = of_property_read_string_index(np, "io-channel-names", 0,
+				&pdata->consumer_channel);
+	if (ret < 0)
+		return ERR_PTR(ret);
+
+	ret = of_property_read_u32(np, "extcon-adc-jack,irq-flags", &pval);
+	if (!ret)
+		pdata->irq_flags = pval;
+
+	ret = of_property_read_u32(np, "extcon-adc-jack,handling-delay", &pval);
+	if (!ret)
+		pdata->handling_delay_ms = pval;
+
+	ret = of_property_read_u32(np, "extcon-adc-jack,debounce-ms", &pval);
+	if (!ret)
+		pdata->debounce_ms = pval;
+
+	nstates = of_property_count_u32_elems(np, "extcon-adc-jack,states");
+	if (nstates < 0)
+		return ERR_PTR(nstates);
+	if (!nstates || (nstates % 3))
+		return ERR_PTR(-EINVAL);
+
+	nstates = nstates/3;
+
+	pdata->adc_conditions = devm_kzalloc(&pdev->dev, (nstates + 1) *
+				sizeof(*pdata->adc_conditions), GFP_KERNEL);
+	if (!pdata->adc_conditions)
+		return ERR_PTR(-ENOMEM);
+	for (i = 0; i < nstates; ++i) {
+		min_adc = 0;
+		max_adc = 0;
+		state = 0;
+
+		of_property_read_u32_index(np, "extcon-adc-jack,states",
+					i * 3 + 0, &state);
+		of_property_read_u32_index(np, "extcon-adc-jack,states",
+					i * 3 + 1, &min_adc);
+		of_property_read_u32_index(np, "extcon-adc-jack,states",
+					i * 3 + 2, &max_adc);
+
+		pdata->adc_conditions[i].state = state;
+		pdata->adc_conditions[i].min_adc = (int) min_adc;
+		pdata->adc_conditions[i].max_adc = (int) max_adc;
+	};
+
+	ncables = of_property_count_u32_elems(np, "extcon-adc-jack,cable-names");
+	if (ncables < 0)
+		return ERR_PTR(ncables);
+
+	pdata->cable_names = devm_kzalloc(&pdev->dev, ncables *
+				sizeof(*pdata->cable_names), GFP_KERNEL);
+	if (!pdata->cable_names)
+		return ERR_PTR(-ENOMEM);
+
+	ret = of_property_read_u32_array(np, "extcon-adc-jack,cable-names",
+			pdata->cable_names, ncables);
+	if (ret)
+		return ERR_PTR(-EINVAL);
+
+	return pdata;
 }
 
 static int adc_jack_probe(struct platform_device *pdev)
@@ -101,6 +203,15 @@ static int adc_jack_probe(struct platform_device *pdev)
 	struct adc_jack_data *data;
 	struct adc_jack_pdata *pdata = dev_get_platdata(&pdev->dev);
 	int i, err = 0;
+
+	if (!pdata && pdev->dev.of_node) {
+		pdata = of_get_platform_data(pdev);
+		if (IS_ERR(pdata))
+			return PTR_ERR(pdata);
+	}
+
+	if (!pdata)
+		return -EINVAL;
 
 	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
@@ -128,14 +239,17 @@ static int adc_jack_probe(struct platform_device *pdev)
 	for (i = 0; data->adc_conditions[i].id != EXTCON_NONE; i++);
 	data->num_conditions = i;
 
-	data->chan = iio_channel_get(&pdev->dev, pdata->consumer_channel);
+	data->chan = devm_iio_channel_get(&pdev->dev, pdata->consumer_channel);
 	if (IS_ERR(data->chan))
 		return PTR_ERR(data->chan);
 
 	data->handling_delay = msecs_to_jiffies(pdata->handling_delay_ms);
 	data->wakeup_source = pdata->wakeup_source;
+	data->debounce_jiffies = msecs_to_jiffies(pdata->debounce_ms);
 
 	INIT_DEFERRABLE_WORK(&data->handler, adc_jack_handler);
+	setup_timer(&data->timer,
+		ecx_extcon_notifier_timer, (unsigned long)data);
 
 	platform_set_drvdata(pdev, data);
 
@@ -144,7 +258,9 @@ static int adc_jack_probe(struct platform_device *pdev)
 		return err;
 
 	data->irq = platform_get_irq(pdev, 0);
-	if (!data->irq) {
+	if (data->irq < 0)
+		data->irq = irq_of_parse_and_map(pdev->dev.of_node, 0);
+	if (data->irq < 0) {
 		dev_err(&pdev->dev, "platform_get_irq failed\n");
 		return -ENODEV;
 	}
@@ -160,6 +276,7 @@ static int adc_jack_probe(struct platform_device *pdev)
 	if (data->wakeup_source)
 		device_init_wakeup(&pdev->dev, 1);
 
+	device_init_wakeup(data->dev, true);
 	adc_jack_handler(&data->handler.work);
 	return 0;
 }
@@ -170,7 +287,6 @@ static int adc_jack_remove(struct platform_device *pdev)
 
 	free_irq(data->irq, data);
 	cancel_work_sync(&data->handler.work);
-	iio_channel_release(data->chan);
 
 	return 0;
 }
@@ -201,12 +317,20 @@ static int adc_jack_resume(struct device *dev)
 static SIMPLE_DEV_PM_OPS(adc_jack_pm_ops,
 		adc_jack_suspend, adc_jack_resume);
 
+static struct of_device_id of_adc_jack_tbl[] = {
+	{ .compatible = "extcon-adc-jack", },
+	{ /* end */ }
+};
+MODULE_DEVICE_TABLE(of, of_adc_jack_tbl);
+
 static struct platform_driver adc_jack_driver = {
 	.probe          = adc_jack_probe,
 	.remove         = adc_jack_remove,
 	.driver         = {
 		.name   = "adc-jack",
 		.pm = &adc_jack_pm_ops,
+		.owner  = THIS_MODULE,
+		.of_match_table = of_adc_jack_tbl,
 	},
 };
 

@@ -430,9 +430,6 @@ void choose_random_location(unsigned long input,
 {
 	unsigned long random_addr, min_addr;
 
-	/* By default, keep output position unchanged. */
-	*virt_addr = *output;
-
 	if (cmdline_find_option_bool("nokaslr")) {
 		warn("KASLR disabled: 'nokaslr' on cmdline.");
 		return;
@@ -463,10 +460,17 @@ void choose_random_location(unsigned long input,
 			add_identity_map(random_addr, output_size);
 			*output = random_addr;
 		}
+
+		/*
+		 * This loads the identity mapping page table.
+		 * This should only be done if a new physical address
+		 * is found for the kernel, otherwise we should keep
+		 * the old page table to make it be like the "nokaslr"
+		 * case.
+		 */
+		finalize_identity_maps();
 	}
 
-	/* This actually loads the identity pagetable on x86_64. */
-	finalize_identity_maps();
 
 	/* Pick random virtual address starting from LOAD_PHYSICAL_ADDR. */
 	if (IS_ENABLED(CONFIG_X86_64))

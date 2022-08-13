@@ -106,6 +106,8 @@ static struct pci_device_id ioat_pci_tbl[] = {
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX8) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX9) },
 
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_SKX) },
+
 	/* I/OAT v3.3 platforms */
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BWD0) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BWD1) },
@@ -127,7 +129,7 @@ static void
 ioat_init_channel(struct ioatdma_device *ioat_dma,
 		  struct ioatdma_chan *ioat_chan, int idx);
 static void ioat_intr_quirk(struct ioatdma_device *ioat_dma);
-static int ioat_enumerate_channels(struct ioatdma_device *ioat_dma);
+static void ioat_enumerate_channels(struct ioatdma_device *ioat_dma);
 static int ioat3_dma_self_test(struct ioatdma_device *ioat_dma);
 
 static int ioat_dca_enabled = 1;
@@ -243,10 +245,15 @@ static bool is_bdx_ioat(struct pci_dev *pdev)
 	}
 }
 
+static inline bool is_skx_ioat(struct pci_dev *pdev)
+{
+	return (pdev->device == PCI_DEVICE_ID_INTEL_IOAT_SKX) ? true : false;
+}
+
 static bool is_xeon_cb32(struct pci_dev *pdev)
 {
 	return is_jf_ioat(pdev) || is_snb_ioat(pdev) || is_ivb_ioat(pdev) ||
-		is_hsw_ioat(pdev) || is_bdx_ioat(pdev);
+		is_hsw_ioat(pdev) || is_bdx_ioat(pdev) || is_skx_ioat(pdev);
 }
 
 bool is_bwd_ioat(struct pci_dev *pdev)
@@ -381,7 +388,7 @@ static int ioat_dma_self_test(struct ioatdma_device *ioat_dma)
 	if (memcmp(src, dest, IOAT_TEST_SIZE)) {
 		dev_err(dev, "Self-test copy failed compare, disabling\n");
 		err = -ENODEV;
-		goto free_resources;
+		goto unmap_dma;
 	}
 
 unmap_dma:
@@ -566,7 +573,7 @@ static void ioat_dma_remove(struct ioatdma_device *ioat_dma)
  * ioat_enumerate_channels - find and initialize the device's channels
  * @ioat_dma: the ioat dma device to be enumerated
  */
-static int ioat_enumerate_channels(struct ioatdma_device *ioat_dma)
+static void ioat_enumerate_channels(struct ioatdma_device *ioat_dma)
 {
 	struct ioatdma_chan *ioat_chan;
 	struct device *dev = &ioat_dma->pdev->dev;
@@ -585,7 +592,7 @@ static int ioat_enumerate_channels(struct ioatdma_device *ioat_dma)
 	xfercap_log = readb(ioat_dma->reg_base + IOAT_XFERCAP_OFFSET);
 	xfercap_log &= 0x1f; /* bits [4:0] valid */
 	if (xfercap_log == 0)
-		return 0;
+		return;
 	dev_dbg(dev, "%s: xfercap = %d\n", __func__, 1 << xfercap_log);
 
 	for (i = 0; i < dma->chancnt; i++) {
@@ -602,7 +609,6 @@ static int ioat_enumerate_channels(struct ioatdma_device *ioat_dma)
 		}
 	}
 	dma->chancnt = i;
-	return i;
 }
 
 /**
@@ -691,7 +697,7 @@ static int ioat_alloc_chan_resources(struct dma_chan *c)
 	/* doing 2 32bit writes to mmio since 1 64b write doesn't work */
 	ioat_chan->completion =
 		dma_pool_zalloc(ioat_chan->ioat_dma->completion_pool,
-				GFP_KERNEL, &ioat_chan->completion_dma);
+				GFP_NOWAIT, &ioat_chan->completion_dma);
 	if (!ioat_chan->completion)
 		return -ENOMEM;
 
@@ -701,7 +707,7 @@ static int ioat_alloc_chan_resources(struct dma_chan *c)
 	       ioat_chan->reg_base + IOAT_CHANCMP_OFFSET_HIGH);
 
 	order = IOAT_MAX_ORDER;
-	ring = ioat_alloc_ring(c, order, GFP_KERNEL);
+	ring = ioat_alloc_ring(c, order, GFP_NOWAIT);
 	if (!ring)
 		return -ENOMEM;
 
@@ -1203,8 +1209,15 @@ static void ioat_shutdown(struct pci_dev *pdev)
 
 		spin_lock_bh(&ioat_chan->prep_lock);
 		set_bit(IOAT_CHAN_DOWN, &ioat_chan->state);
-		del_timer_sync(&ioat_chan->timer);
 		spin_unlock_bh(&ioat_chan->prep_lock);
+		/*
+		 * Synchronization rule for del_timer_sync():
+		 *  - The caller must not hold locks which would prevent
+		 *    completion of the timer's handler.
+		 * So prep_lock cannot be held before calling it.
+		 */
+		del_timer_sync(&ioat_chan->timer);
+
 		/* this should quiesce then reset */
 		ioat_reset_hw(ioat_chan);
 	}
@@ -1350,6 +1363,8 @@ static int ioat_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	device->version = readb(device->reg_base + IOAT_VER_OFFSET);
 	if (device->version >= IOAT_VER_3_0) {
+		if (is_skx_ioat(pdev))
+			device->version = IOAT_VER_3_2;
 		err = ioat3_dma_probe(device, ioat_dca_enabled);
 
 		if (device->version >= IOAT_VER_3_3)

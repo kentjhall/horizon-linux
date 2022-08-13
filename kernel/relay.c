@@ -163,7 +163,7 @@ static struct rchan_buf *relay_create_buf(struct rchan *chan)
 {
 	struct rchan_buf *buf;
 
-	if (chan->n_subbufs > UINT_MAX / sizeof(size_t *))
+	if (chan->n_subbufs > KMALLOC_MAX_SIZE / sizeof(size_t *))
 		return NULL;
 
 	buf = kzalloc(sizeof(struct rchan_buf), GFP_KERNEL);
@@ -196,6 +196,7 @@ free_buf:
 static void relay_destroy_channel(struct kref *kref)
 {
 	struct rchan *chan = container_of(kref, struct rchan, kref);
+	free_percpu(chan->buf);
 	kfree(chan);
 }
 
@@ -578,6 +579,11 @@ struct rchan *relay_open(const char *base_filename,
 		return NULL;
 
 	chan->buf = alloc_percpu(struct rchan_buf *);
+	if (!chan->buf) {
+		kfree(chan);
+		return NULL;
+	}
+
 	chan->version = RELAYFS_CHANNEL_VERSION;
 	chan->n_subbufs = n_subbufs;
 	chan->subbuf_size = subbuf_size;
@@ -611,7 +617,6 @@ free_bufs:
 
 	kref_put(&chan->kref, relay_destroy_channel);
 	mutex_unlock(&relay_channels_mutex);
-	kfree(chan);
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(relay_open);
@@ -809,11 +814,11 @@ void relay_subbufs_consumed(struct rchan *chan,
 {
 	struct rchan_buf *buf;
 
-	if (!chan)
+	if (!chan || cpu >= NR_CPUS)
 		return;
 
 	buf = *per_cpu_ptr(chan->buf, cpu);
-	if (cpu >= NR_CPUS || !buf || subbufs_consumed > chan->n_subbufs)
+	if (!buf || subbufs_consumed > chan->n_subbufs)
 		return;
 
 	if (subbufs_consumed > buf->subbufs_produced - buf->subbufs_consumed)

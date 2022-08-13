@@ -23,6 +23,7 @@
 #include <linux/page_ext.h>
 #include <linux/err.h>
 #include <linux/page_ref.h>
+#include <linux/memremap.h>
 
 struct mempolicy;
 struct anon_vma;
@@ -74,6 +75,10 @@ extern int mmap_rnd_compat_bits __read_mostly;
 
 #ifndef page_to_virt
 #define page_to_virt(x)	__va(PFN_PHYS(page_to_pfn(x)))
+#endif
+
+#ifndef lm_alias
+#define lm_alias(x)	__va(__pa_symbol(x))
 #endif
 
 /*
@@ -280,6 +285,7 @@ extern pgprot_t protection_map[16];
 #define FAULT_FLAG_USER		0x40	/* The fault originated in userspace */
 #define FAULT_FLAG_REMOTE	0x80	/* faulting for non current tsk/mm */
 #define FAULT_FLAG_INSTRUCTION  0x100	/* The fault was during an instruction fetch */
+#define FAULT_FLAG_NO_CMA      0x200    /* don't use CMA pages */
 
 /*
  * vm_fault is filled by the the pagefault handler and passed to the vma's
@@ -347,6 +353,7 @@ struct fault_env {
 struct vm_operations_struct {
 	void (*open)(struct vm_area_struct * area);
 	void (*close)(struct vm_area_struct * area);
+	int (*split)(struct vm_area_struct * area, unsigned long addr);
 	int (*mremap)(struct vm_area_struct * area);
 	int (*fault)(struct vm_area_struct *vma, struct vm_fault *vmf);
 	int (*pmd_fault)(struct vm_area_struct *, unsigned long address,
@@ -402,6 +409,9 @@ struct vm_operations_struct {
 	 */
 	struct page *(*find_special_page)(struct vm_area_struct *vma,
 					  unsigned long addr);
+	/* called when driver allows fixing ptes with none protections */
+	bool (*fixup_prot)(struct vm_area_struct *vma, unsigned long addr,
+			  pgoff_t pgoff);
 };
 
 struct mmu_gather;
@@ -499,11 +509,11 @@ static inline int is_vmalloc_or_module_addr(const void *x)
 
 extern void kvfree(const void *addr);
 
-static inline atomic_t *compound_mapcount_ptr(struct page *page)
-{
-	return &page[1].compound_mapcount;
-}
-
+/*
+ * Mapcount of compound page as a whole, does not include mapped sub-pages.
+ *
+ * Must be called only for compound pages or any their tail sub-pages.
+ */
 static inline int compound_mapcount(struct page *page)
 {
 	VM_BUG_ON_PAGE(!PageCompound(page), page);
@@ -523,10 +533,16 @@ static inline void page_mapcount_reset(struct page *page)
 
 int __page_mapcount(struct page *page);
 
+/*
+ * Mapcount of 0-order page; when compound sub-page, includes
+ * compound_mapcount().
+ *
+ * Result is undefined for pages which cannot be mapped into userspace.
+ * For example SLAB or special types of pages. See function page_has_type().
+ * They use this place in struct page differently.
+ */
 static inline int page_mapcount(struct page *page)
 {
-	VM_BUG_ON_PAGE(PageSlab(page), page);
-
 	if (unlikely(PageCompound(page)))
 		return __page_mapcount(page);
 	return atomic_read(&page->_mapcount) + 1;
@@ -745,6 +761,8 @@ static inline bool is_zone_device_page(const struct page *page)
 {
 	return page_zonenum(page) == ZONE_DEVICE;
 }
+static inline bool is_device_private_page(const struct page *page);
+static inline bool is_device_public_page(const struct page *page);
 #else
 static inline void get_zone_device_page(struct page *page)
 {
@@ -756,7 +774,21 @@ static inline bool is_zone_device_page(const struct page *page)
 {
 	return false;
 }
+
+static inline bool is_device_private_page(const struct page *page)
+{
+	return false;
+}
+
+static inline bool is_device_public_page(const struct page *page)
+{
+	return false;
+}
 #endif
+
+/* 127: arbitrary random number, small enough to assemble well */
+#define page_ref_zero_or_close_to_overflow(page) \
+	((unsigned int) page_ref_count(page) + 127u <= 127u)
 
 static inline void get_page(struct page *page)
 {
@@ -765,22 +797,39 @@ static inline void get_page(struct page *page)
 	 * Getting a normal page or the head of a compound page
 	 * requires to already have an elevated page->_refcount.
 	 */
-	VM_BUG_ON_PAGE(page_ref_count(page) <= 0, page);
+	VM_BUG_ON_PAGE(page_ref_zero_or_close_to_overflow(page), page);
 	page_ref_inc(page);
 
 	if (unlikely(is_zone_device_page(page)))
 		get_zone_device_page(page);
 }
 
+static inline __must_check bool try_get_page(struct page *page)
+{
+	page = compound_head(page);
+	if (WARN_ON_ONCE(page_ref_count(page) <= 0))
+		return false;
+	page_ref_inc(page);
+	return true;
+}
+
 static inline void put_page(struct page *page)
 {
 	page = compound_head(page);
 
+	/*
+	 * For private device pages we need to catch refcount transition from
+	 * 2 to 1, when refcount reach one it means the private device page is
+	 * free and we need to inform the device driver through callback. See
+	 * include/linux/memremap.h and HMM for details.
+	 */
+	if (unlikely(is_zone_device_page(page))) {
+		put_zone_device_page(page);
+		return;
+	}
+
 	if (put_page_testzero(page))
 		__put_page(page);
-
-	if (unlikely(is_zone_device_page(page)))
-		put_zone_device_page(page);
 }
 
 #if defined(CONFIG_SPARSEMEM) && !defined(CONFIG_SPARSEMEM_VMEMMAP)
@@ -1138,6 +1187,7 @@ extern void pagefault_out_of_memory(void);
 extern void show_free_areas(unsigned int flags);
 extern bool skip_free_areas_node(unsigned int flags, int nid);
 
+void shmem_set_file(struct vm_area_struct *vma, struct file *file);
 int shmem_zero_setup(struct vm_area_struct *);
 #ifdef CONFIG_SHMEM
 bool shmem_mapping(struct address_space *mapping);
@@ -1163,8 +1213,10 @@ struct zap_details {
 	bool check_swap_entries;		/* Check also swap entries */
 };
 
-struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
-		pte_t pte);
+struct page *_vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
+			     pte_t pte, bool with_public_device);
+#define vm_normal_page(vma, addr, pte) _vm_normal_page(vma, addr, pte, false)
+
 struct page *vm_normal_page_pmd(struct vm_area_struct *vma, unsigned long addr,
 				pmd_t pmd);
 
@@ -1174,6 +1226,30 @@ void zap_page_range(struct vm_area_struct *vma, unsigned long address,
 		unsigned long size, struct zap_details *);
 void unmap_vmas(struct mmu_gather *tlb, struct vm_area_struct *start_vma,
 		unsigned long start, unsigned long end);
+/*
+ * This has to be called after a get_task_mm()/mmget_not_zero()
+ * followed by taking the mmap_sem for writing before modifying the
+ * vmas or anything the coredump pretends not to change from under it.
+ *
+ * It also has to be called when mmgrab() is used in the context of
+ * the process, but then the mm_count refcount is transferred outside
+ * the context of the process to run down_write() on that pinned mm.
+ *
+ * NOTE: find_extend_vma() called from GUP context is the only place
+ * that can modify the "mm" (notably the vm_start/end) under mmap_sem
+ * for reading and outside the context of the process, so it is also
+ * the only case that holds the mmap_sem for reading that must call
+ * this function. Generally if the mmap_sem is hold for reading
+ * there's no need of this check after get_task_mm()/mmget_not_zero().
+ *
+ * This function can be obsoleted and the check can be removed, after
+ * the coredump code will hold the mmap_sem for writing before
+ * invoking the ->core_dump methods.
+ */
+static inline bool mmget_still_valid(struct mm_struct *mm)
+{
+	return likely(!mm->core_state);
+}
 
 /**
  * mm_walk - callbacks for walk_page_range
@@ -1270,6 +1346,8 @@ extern int access_process_vm(struct task_struct *tsk, unsigned long addr, void *
 		unsigned int gup_flags);
 extern int access_remote_vm(struct mm_struct *mm, unsigned long addr,
 		void *buf, int len, unsigned int gup_flags);
+extern int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
+		unsigned long addr, void *buf, int len, unsigned int gup_flags);
 
 long get_user_pages_remote(struct task_struct *tsk, struct mm_struct *mm,
 			    unsigned long start, unsigned long nr_pages,
@@ -1285,6 +1363,19 @@ long __get_user_pages_unlocked(struct task_struct *tsk, struct mm_struct *mm,
 			       struct page **pages, unsigned int gup_flags);
 long get_user_pages_unlocked(unsigned long start, unsigned long nr_pages,
 		    struct page **pages, unsigned int gup_flags);
+#ifdef CONFIG_FS_DAX
+long get_user_pages_longterm(unsigned long start, unsigned long nr_pages,
+			    unsigned int gup_flags, struct page **pages,
+			    struct vm_area_struct **vmas);
+#else
+static inline long get_user_pages_longterm(unsigned long start,
+		unsigned long nr_pages, unsigned int gup_flags,
+		struct page **pages, struct vm_area_struct **vmas)
+{
+	return get_user_pages(start, nr_pages, gup_flags, pages, vmas);
+}
+#endif /* CONFIG_FS_DAX */
+
 int get_user_pages_fast(unsigned long start, int nr_pages, int write,
 			struct page **pages);
 
@@ -1354,37 +1445,9 @@ int clear_page_dirty_for_io(struct page *page);
 
 int get_cmdline(struct task_struct *task, char *buffer, int buflen);
 
-/* Is the vma a continuation of the stack vma above it? */
-static inline int vma_growsdown(struct vm_area_struct *vma, unsigned long addr)
-{
-	return vma && (vma->vm_end == addr) && (vma->vm_flags & VM_GROWSDOWN);
-}
-
 static inline bool vma_is_anonymous(struct vm_area_struct *vma)
 {
 	return !vma->vm_ops;
-}
-
-static inline int stack_guard_page_start(struct vm_area_struct *vma,
-					     unsigned long addr)
-{
-	return (vma->vm_flags & VM_GROWSDOWN) &&
-		(vma->vm_start == addr) &&
-		!vma_growsdown(vma->vm_prev, addr);
-}
-
-/* Is the vma a continuation of the stack vma below it? */
-static inline int vma_growsup(struct vm_area_struct *vma, unsigned long addr)
-{
-	return vma && (vma->vm_start == addr) && (vma->vm_flags & VM_GROWSUP);
-}
-
-static inline int stack_guard_page_end(struct vm_area_struct *vma,
-					   unsigned long addr)
-{
-	return (vma->vm_flags & VM_GROWSUP) &&
-		(vma->vm_end == addr) &&
-		!vma_growsup(vma->vm_next, addr);
 }
 
 int vma_is_stack_for_current(struct vm_area_struct *vma);
@@ -1974,7 +2037,7 @@ static inline int vma_adjust(struct vm_area_struct *vma, unsigned long start,
 extern struct vm_area_struct *vma_merge(struct mm_struct *,
 	struct vm_area_struct *prev, unsigned long addr, unsigned long end,
 	unsigned long vm_flags, struct anon_vma *, struct file *, pgoff_t,
-	struct mempolicy *, struct vm_userfaultfd_ctx);
+	struct mempolicy *, struct vm_userfaultfd_ctx, const char __user *);
 extern struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *);
 extern int split_vma(struct mm_struct *,
 	struct vm_area_struct *, unsigned long addr, int new_below);
@@ -2125,6 +2188,7 @@ void page_cache_async_readahead(struct address_space *mapping,
 				pgoff_t offset,
 				unsigned long size);
 
+extern unsigned long stack_guard_gap;
 /* Generic expand stack which grows the stack according to GROWS{UP,DOWN} */
 extern int expand_stack(struct vm_area_struct *vma, unsigned long address);
 
@@ -2153,6 +2217,30 @@ static inline struct vm_area_struct * find_vma_intersection(struct mm_struct * m
 	return vma;
 }
 
+static inline unsigned long vm_start_gap(struct vm_area_struct *vma)
+{
+	unsigned long vm_start = vma->vm_start;
+
+	if (vma->vm_flags & VM_GROWSDOWN) {
+		vm_start -= stack_guard_gap;
+		if (vm_start > vma->vm_start)
+			vm_start = 0;
+	}
+	return vm_start;
+}
+
+static inline unsigned long vm_end_gap(struct vm_area_struct *vma)
+{
+	unsigned long vm_end = vma->vm_end;
+
+	if (vma->vm_flags & VM_GROWSUP) {
+		vm_end += stack_guard_gap;
+		if (vm_end < vma->vm_end)
+			vm_end = -PAGE_SIZE;
+	}
+	return vm_end;
+}
+
 static inline unsigned long vma_pages(struct vm_area_struct *vma)
 {
 	return (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
@@ -2168,6 +2256,12 @@ static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
 		vma = NULL;
 
 	return vma;
+}
+
+static inline bool range_in_vma(struct vm_area_struct *vma,
+				unsigned long start, unsigned long end)
+{
+	return (vma && vma->vm_start <= start && end <= vma->vm_end);
 }
 
 #ifdef CONFIG_MMU
@@ -2229,6 +2323,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
 #define FOLL_MLOCK	0x1000	/* lock present pages */
 #define FOLL_REMOTE	0x2000	/* we are working on non-current tsk/mm */
 #define FOLL_COW	0x4000	/* internal GUP flag */
+#define FOLL_ANON	0x8000	/* don't do file mappings */
 
 typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
 			void *data);

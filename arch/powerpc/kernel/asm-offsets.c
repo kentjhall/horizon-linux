@@ -240,6 +240,9 @@ int main(void)
 #ifdef CONFIG_PPC_BOOK3S_64
 	DEFINE(PACAMCEMERGSP, offsetof(struct paca_struct, mc_emergency_sp));
 	DEFINE(PACA_IN_MCE, offsetof(struct paca_struct, in_mce));
+	DEFINE(PACA_RFI_FLUSH_FALLBACK_AREA, offsetof(struct paca_struct, rfi_flush_fallback_area));
+	DEFINE(PACA_EXRFI, offsetof(struct paca_struct, exrfi));
+	DEFINE(PACA_L1D_FLUSH_SIZE, offsetof(struct paca_struct, l1d_flush_size));
 #endif
 	DEFINE(PACAHWCPUID, offsetof(struct paca_struct, hw_cpu_id));
 	DEFINE(PACAKEXECSTATE, offsetof(struct paca_struct, kexec_state));
@@ -380,6 +383,7 @@ int main(void)
 	DEFINE(WTOM_CLOCK_NSEC, offsetof(struct vdso_data, wtom_clock_nsec));
 	DEFINE(STAMP_XTIME, offsetof(struct vdso_data, stamp_xtime));
 	DEFINE(STAMP_SEC_FRAC, offsetof(struct vdso_data, stamp_sec_fraction));
+	DEFINE(CLOCK_HRTIMER_RES, offsetof(struct vdso_data, hrtimer_res));
 	DEFINE(CFG_ICACHE_BLOCKSZ, offsetof(struct vdso_data, icache_block_size));
 	DEFINE(CFG_DCACHE_BLOCKSZ, offsetof(struct vdso_data, dcache_block_size));
 	DEFINE(CFG_ICACHE_LOGBLOCKSZ, offsetof(struct vdso_data, icache_log_block_size));
@@ -408,7 +412,6 @@ int main(void)
 	DEFINE(CLOCK_REALTIME, CLOCK_REALTIME);
 	DEFINE(CLOCK_MONOTONIC, CLOCK_MONOTONIC);
 	DEFINE(NSEC_PER_SEC, NSEC_PER_SEC);
-	DEFINE(CLOCK_REALTIME_RES, MONOTONIC_RES_NSEC);
 
 #ifdef CONFIG_BUG
 	DEFINE(BUG_ENTRY_SIZE, sizeof(struct bug_entry));
@@ -569,6 +572,7 @@ int main(void)
 	DEFINE(VCPU_VRS_TM, offsetof(struct kvm_vcpu, arch.vr_tm.vr));
 	DEFINE(VCPU_VRSAVE_TM, offsetof(struct kvm_vcpu, arch.vrsave_tm));
 	DEFINE(VCPU_CR_TM, offsetof(struct kvm_vcpu, arch.cr_tm));
+	DEFINE(VCPU_XER_TM, offsetof(struct kvm_vcpu, arch.xer_tm));
 	DEFINE(VCPU_LR_TM, offsetof(struct kvm_vcpu, arch.lr_tm));
 	DEFINE(VCPU_CTR_TM, offsetof(struct kvm_vcpu, arch.ctr_tm));
 	DEFINE(VCPU_AMR_TM, offsetof(struct kvm_vcpu, arch.amr_tm));

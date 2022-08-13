@@ -260,8 +260,10 @@ static size_t ramoops_write_kmsg_hdr(struct persistent_ram_zone *prz,
 		compressed ? 'C' : 'D');
 	WARN_ON_ONCE(!hdr);
 	len = hdr ? strlen(hdr) : 0;
-	persistent_ram_write(prz, hdr, len);
-	kfree(hdr);
+	if (hdr) {
+		persistent_ram_write(prz, hdr, len);
+		kfree(hdr);
+	}
 
 	return len;
 }
@@ -320,6 +322,17 @@ static int notrace ramoops_pstore_write_buf(enum pstore_type_id type,
 		return -ENOSPC;
 
 	prz = cxt->przs[cxt->dump_write_cnt];
+
+	/*
+	 * Since this is a new crash dump, we need to reset the buffer in
+	 * case it still has an old dump present. Without this, the new dump
+	 * will get appended, which would seriously confuse anything trying
+	 * to check dump file contents. Specifically, ramoops_read_kmsg_hdr()
+	 * expects to find a dump header in the beginning of buffer data, so
+	 * we must to reset the buffer values, in order to ensure that the
+	 * header will be written to the beginning of the buffer.
+	 */
+	persistent_ram_zap(prz);
 
 	hlen = ramoops_write_kmsg_hdr(prz, compressed);
 	if (size + hlen > prz->buffer_size)
@@ -434,7 +447,7 @@ static int ramoops_init_przs(struct device *dev, struct ramoops_context *cxt,
 	for (i = 0; i < cxt->max_dump_cnt; i++) {
 		cxt->przs[i] = persistent_ram_new(*paddr, cxt->record_size, 0,
 						  &cxt->ecc_info,
-						  cxt->memtype);
+						  cxt->memtype, 0);
 		if (IS_ERR(cxt->przs[i])) {
 			err = PTR_ERR(cxt->przs[i]);
 			dev_err(dev, "failed to request mem region (0x%zx@0x%llx): %d\n",
@@ -471,7 +484,8 @@ static int ramoops_init_prz(struct device *dev, struct ramoops_context *cxt,
 		return -ENOMEM;
 	}
 
-	*prz = persistent_ram_new(*paddr, sz, sig, &cxt->ecc_info, cxt->memtype);
+	*prz = persistent_ram_new(*paddr, sz, sig, &cxt->ecc_info,
+				  cxt->memtype, 0);
 	if (IS_ERR(*prz)) {
 		int err = PTR_ERR(*prz);
 
@@ -547,6 +561,12 @@ static int ramoops_parse_dt(struct platform_device *pdev,
 #undef parse_size
 
 	return 0;
+}
+
+void notrace ramoops_console_write_buf(const char *buf, size_t size)
+{
+	struct ramoops_context *cxt = &oops_cxt;
+	persistent_ram_write(cxt->cprz, buf, size);
 }
 
 static int ramoops_probe(struct platform_device *pdev)

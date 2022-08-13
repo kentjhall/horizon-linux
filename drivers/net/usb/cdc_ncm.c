@@ -576,8 +576,8 @@ static void cdc_ncm_set_dgram_size(struct usbnet *dev, int new_size)
 	/* read current mtu value from device */
 	err = usbnet_read_cmd(dev, USB_CDC_GET_MAX_DATAGRAM_SIZE,
 			      USB_TYPE_CLASS | USB_DIR_IN | USB_RECIP_INTERFACE,
-			      0, iface_no, &max_datagram_size, 2);
-	if (err < 0) {
+			      0, iface_no, &max_datagram_size, sizeof(max_datagram_size));
+	if (err != sizeof(max_datagram_size)) {
 		dev_dbg(&dev->intf->dev, "GET_MAX_DATAGRAM_SIZE failed\n");
 		goto out;
 	}
@@ -588,7 +588,7 @@ static void cdc_ncm_set_dgram_size(struct usbnet *dev, int new_size)
 	max_datagram_size = cpu_to_le16(ctx->max_datagram_size);
 	err = usbnet_write_cmd(dev, USB_CDC_SET_MAX_DATAGRAM_SIZE,
 			       USB_TYPE_CLASS | USB_DIR_OUT | USB_RECIP_INTERFACE,
-			       0, iface_no, &max_datagram_size, 2);
+			       0, iface_no, &max_datagram_size, sizeof(max_datagram_size));
 	if (err < 0)
 		dev_dbg(&dev->intf->dev, "SET_MAX_DATAGRAM_SIZE failed\n");
 
@@ -679,8 +679,12 @@ cdc_ncm_find_endpoints(struct usbnet *dev, struct usb_interface *intf)
 	u8 ep;
 
 	for (ep = 0; ep < intf->cur_altsetting->desc.bNumEndpoints; ep++) {
-
 		e = intf->cur_altsetting->endpoint + ep;
+
+		/* ignore endpoints which cannot transfer data */
+		if (!usb_endpoint_maxp(&e->desc))
+			continue;
+
 		switch (e->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) {
 		case USB_ENDPOINT_XFER_INT:
 			if (usb_endpoint_dir_in(&e->desc)) {
@@ -769,8 +773,10 @@ int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_
 	u8 *buf;
 	int len;
 	int temp;
+	int err;
 	u8 iface_no;
 	struct usb_cdc_parsed_header hdr;
+	__le16 curr_ntb_format;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -873,6 +879,32 @@ int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_
 	if (temp) {
 		dev_dbg(&intf->dev, "set interface failed\n");
 		goto error2;
+	}
+
+	/*
+	 * Some Huawei devices have been observed to come out of reset in NDP32 mode.
+	 * Let's check if this is the case, and set the device to NDP16 mode again if
+	 * needed.
+	*/
+	if (ctx->drvflags & CDC_NCM_FLAG_RESET_NTB16) {
+		err = usbnet_read_cmd(dev, USB_CDC_GET_NTB_FORMAT,
+				      USB_TYPE_CLASS | USB_DIR_IN | USB_RECIP_INTERFACE,
+				      0, iface_no, &curr_ntb_format, 2);
+		if (err < 0) {
+			goto error2;
+		}
+
+		if (curr_ntb_format == cpu_to_le16(USB_CDC_NCM_NTB32_FORMAT)) {
+			dev_info(&intf->dev, "resetting NTB format to 16-bit");
+			err = usbnet_write_cmd(dev, USB_CDC_SET_NTB_FORMAT,
+					       USB_TYPE_CLASS | USB_DIR_OUT
+					       | USB_RECIP_INTERFACE,
+					       USB_CDC_NCM_NTB16_FORMAT,
+					       iface_no, NULL, 0);
+
+			if (err < 0)
+				goto error2;
+		}
 	}
 
 	cdc_ncm_find_endpoints(dev, ctx->data);
@@ -1090,12 +1122,16 @@ cdc_ncm_fill_tx_frame(struct usbnet *dev, struct sk_buff *skb, __le32 sign)
 	u16 n = 0, index, ndplen;
 	u8 ready2send = 0;
 	u32 delayed_ndp_size;
+	size_t padding_count;
 
 	/* When our NDP gets written in cdc_ncm_ndp(), then skb_out->len gets updated
 	 * accordingly. Otherwise, we should check here.
 	 */
 	if (ctx->drvflags & CDC_NCM_FLAG_NDP_TO_END)
-		delayed_ndp_size = ctx->max_ndp_size;
+		delayed_ndp_size = ctx->max_ndp_size +
+			max_t(u32,
+			      ctx->tx_ndp_modulus,
+			      ctx->tx_modulus + ctx->tx_remainder) - 1;
 	else
 		delayed_ndp_size = 0;
 
@@ -1228,7 +1264,7 @@ cdc_ncm_fill_tx_frame(struct usbnet *dev, struct sk_buff *skb, __le32 sign)
 	/* If requested, put NDP at end of frame. */
 	if (ctx->drvflags & CDC_NCM_FLAG_NDP_TO_END) {
 		nth16 = (struct usb_cdc_ncm_nth16 *)skb_out->data;
-		cdc_ncm_align_tail(skb_out, ctx->tx_ndp_modulus, 0, ctx->tx_max);
+		cdc_ncm_align_tail(skb_out, ctx->tx_ndp_modulus, 0, ctx->tx_max - ctx->max_ndp_size);
 		nth16->wNdpIndex = cpu_to_le16(skb_out->len);
 		memcpy(skb_put(skb_out, ctx->max_ndp_size), ctx->delayed_ndp16, ctx->max_ndp_size);
 
@@ -1246,11 +1282,14 @@ cdc_ncm_fill_tx_frame(struct usbnet *dev, struct sk_buff *skb, __le32 sign)
 	 * a ZLP after full sized NTBs.
 	 */
 	if (!(dev->driver_info->flags & FLAG_SEND_ZLP) &&
-	    skb_out->len > ctx->min_tx_pkt)
-		memset(skb_put(skb_out, ctx->tx_max - skb_out->len), 0,
-		       ctx->tx_max - skb_out->len);
-	else if (skb_out->len < ctx->tx_max && (skb_out->len % dev->maxpacket) == 0)
+	    skb_out->len > ctx->min_tx_pkt) {
+		padding_count = ctx->tx_max - skb_out->len;
+		if (!WARN_ON(padding_count > ctx->tx_max))
+			memset(skb_put(skb_out, padding_count), 0, padding_count);
+	} else if (skb_out->len < ctx->tx_max &&
+		   (skb_out->len % dev->maxpacket) == 0) {
 		*skb_put(skb_out, 1) = 0;	/* force short packet */
+	}
 
 	/* set final frame length */
 	nth16 = (struct usb_cdc_ncm_nth16 *)skb_out->data;
@@ -1567,9 +1606,6 @@ static void cdc_ncm_status(struct usbnet *dev, struct urb *urb)
 		 * USB_CDC_NOTIFY_NETWORK_CONNECTION notification shall be
 		 * sent by device after USB_CDC_NOTIFY_SPEED_CHANGE.
 		 */
-		netif_info(dev, link, dev->net,
-			   "network connection: %sconnected\n",
-			   !!event->wValue ? "" : "dis");
 		usbnet_link_change(dev, !!event->wValue, 0);
 		break;
 

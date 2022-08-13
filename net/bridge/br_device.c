@@ -48,15 +48,19 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 		return NETDEV_TX_OK;
 	}
 
-	u64_stats_update_begin(&brstats->syncp);
-	brstats->tx_packets++;
-	brstats->tx_bytes += skb->len;
-	u64_stats_update_end(&brstats->syncp);
-
+#ifdef CONFIG_NET_SWITCHDEV
+	skb->offload_fwd_mark = 0;
+#endif
 	BR_INPUT_SKB_CB(skb)->brdev = dev;
 
 	skb_reset_mac_header(skb);
 	skb_pull(skb, ETH_HLEN);
+
+	u64_stats_update_begin(&brstats->syncp);
+	brstats->tx_packets++;
+	/* Exclude ETH_HLEN from byte stats for consistency with Rx chain */
+	brstats->tx_bytes += skb->len;
+	u64_stats_update_end(&brstats->syncp);
 
 	if (!br_allowed_ingress(br, br_vlan_group_rcu(br), skb, &vid))
 		goto out;
@@ -174,6 +178,7 @@ static struct rtnl_link_stats64 *br_get_stats64(struct net_device *dev,
 		sum.rx_packets += tmp.rx_packets;
 	}
 
+	netdev_stats_to_stats64(stats, &dev->stats);
 	stats->tx_bytes   = sum.tx_bytes;
 	stats->tx_packets = sum.tx_packets;
 	stats->rx_bytes   = sum.rx_bytes;
@@ -206,6 +211,12 @@ static int br_set_mac_address(struct net_device *dev, void *p)
 
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
+
+	/* dev_set_mac_addr() can be called by a master device on bridge's
+	 * NETDEV_UNREGISTER, but since it's being destroyed do nothing
+	 */
+	if (dev->reg_state != NETREG_REGISTERED)
+		return -EBUSY;
 
 	spin_lock_bh(&br->lock);
 	if (!ether_addr_equal(dev->dev_addr, addr->sa_data)) {

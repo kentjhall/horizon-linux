@@ -1,3 +1,14 @@
 config TEGRA_CLK_EMC
 	def_bool y
 	depends on TEGRA124_EMC
+
+config TEGRA_CLK_DEBUG
+	def_bool y
+	depends on DEBUG_FS
+	---help---
+	Enable debugfs entries to change clock parent/rate/state
+
+config TEGRA_CLK_DFLL
+	depends on (ARCH_TEGRA_124_SOC || ARCH_TEGRA_210_SOC)
+	select PM_OPP
+	def_bool y

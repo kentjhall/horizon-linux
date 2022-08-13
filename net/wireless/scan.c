@@ -70,7 +70,7 @@ module_param(bss_entries_limit, int, 0644);
 MODULE_PARM_DESC(bss_entries_limit,
                  "limit to number of scan BSS entries (per wiphy, default 1000)");
 
-#define IEEE80211_SCAN_RESULT_EXPIRE	(30 * HZ)
+#define IEEE80211_SCAN_RESULT_EXPIRE	(7 * HZ)
 
 static void bss_free(struct cfg80211_internal_bss *bss)
 {
@@ -407,6 +407,8 @@ const u8 *cfg80211_find_ie_match(u8 eid, const u8 *ies, int len,
 				 const u8 *match, int match_len,
 				 int match_offset)
 {
+	const struct element *elem;
+
 	/* match_offset can't be smaller than 2, unless match_len is
 	 * zero, in which case match_offset must be zero as well.
 	 */
@@ -414,14 +416,10 @@ const u8 *cfg80211_find_ie_match(u8 eid, const u8 *ies, int len,
 		    (!match_len && match_offset)))
 		return NULL;
 
-	while (len >= 2 && len >= ies[1] + 2) {
-		if ((ies[0] == eid) &&
-		    (ies[1] + 2 >= match_offset + match_len) &&
-		    !memcmp(ies + match_offset, match, match_len))
-			return ies;
-
-		len -= ies[1] + 2;
-		ies += ies[1] + 2;
+	for_each_element_id(elem, eid, ies, len) {
+		if (elem->datalen >= match_offset - 2 + match_len &&
+		    !memcmp(elem->data + match_offset - 2, match, match_len))
+			return (void *)elem;
 	}
 
 	return NULL;
@@ -978,13 +976,23 @@ cfg80211_bss_update(struct cfg80211_registered_device *rdev,
 	return NULL;
 }
 
+/*
+ * Update RX channel information based on the available frame payload
+ * information. This is mainly for the 2.4 GHz band where frames can be received
+ * from neighboring channels and the Beacon frames use the DSSS Parameter Set
+ * element to indicate the current (transmitting) channel, but this might also
+ * be needed on other bands if RX frequency does not match with the actual
+ * operating channel of a BSS.
+ */
 static struct ieee80211_channel *
 cfg80211_get_bss_channel(struct wiphy *wiphy, const u8 *ie, size_t ielen,
-			 struct ieee80211_channel *channel)
+			 struct ieee80211_channel *channel,
+			 enum nl80211_bss_scan_width scan_width)
 {
 	const u8 *tmp;
 	u32 freq;
 	int channel_number = -1;
+	struct ieee80211_channel *alt_channel;
 
 	tmp = cfg80211_find_ie(WLAN_EID_DS_PARAMS, ie, ielen);
 	if (tmp && tmp[1] == 1) {
@@ -998,16 +1006,45 @@ cfg80211_get_bss_channel(struct wiphy *wiphy, const u8 *ie, size_t ielen,
 		}
 	}
 
-	if (channel_number < 0)
+	if (channel_number < 0) {
+		/* No channel information in frame payload */
 		return channel;
+	}
 
 	freq = ieee80211_channel_to_frequency(channel_number, channel->band);
-	channel = ieee80211_get_channel(wiphy, freq);
-	if (!channel)
+	alt_channel = ieee80211_get_channel(wiphy, freq);
+	if (!alt_channel) {
+		if (channel->band == NL80211_BAND_2GHZ) {
+			/*
+			 * Better not allow unexpected channels when that could
+			 * be going beyond the 1-11 range (e.g., discovering
+			 * BSS on channel 12 when radio is configured for
+			 * channel 11.
+			 */
+			return NULL;
+		}
+
+		/* No match for the payload channel number - ignore it */
+		return channel;
+	}
+
+	if (scan_width == NL80211_BSS_CHAN_WIDTH_10 ||
+	    scan_width == NL80211_BSS_CHAN_WIDTH_5) {
+		/*
+		 * Ignore channel number in 5 and 10 MHz channels where there
+		 * may not be an n:1 or 1:n mapping between frequencies and
+		 * channel numbers.
+		 */
+		return channel;
+	}
+
+	/*
+	 * Use the channel determined through the payload channel number
+	 * instead of the RX channel reported by the driver.
+	 */
+	if (alt_channel->flags & IEEE80211_CHAN_DISABLED)
 		return NULL;
-	if (channel->flags & IEEE80211_CHAN_DISABLED)
-		return NULL;
-	return channel;
+	return alt_channel;
 }
 
 /* Returned bss is reference counted and must be cleaned up appropriately. */
@@ -1032,7 +1069,8 @@ cfg80211_inform_bss_data(struct wiphy *wiphy,
 		    (data->signal < 0 || data->signal > 100)))
 		return NULL;
 
-	channel = cfg80211_get_bss_channel(wiphy, ie, ielen, data->chan);
+	channel = cfg80211_get_bss_channel(wiphy, ie, ielen, data->chan,
+					   data->scan_width);
 	if (!channel)
 		return NULL;
 
@@ -1130,7 +1168,7 @@ cfg80211_inform_bss_frame_data(struct wiphy *wiphy,
 		return NULL;
 
 	channel = cfg80211_get_bss_channel(wiphy, mgmt->u.beacon.variable,
-					   ielen, data->chan);
+					   ielen, data->chan, data->scan_width);
 	if (!channel)
 		return NULL;
 

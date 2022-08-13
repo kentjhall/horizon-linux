@@ -437,10 +437,13 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	struct netem_skb_cb *cb;
 	struct sk_buff *skb2;
 	struct sk_buff *segs = NULL;
-	unsigned int len = 0, last_len, prev_len = qdisc_pkt_len(skb);
-	int nb = 0;
+	unsigned int prev_len = qdisc_pkt_len(skb);
 	int count = 1;
 	int rc = NET_XMIT_SUCCESS;
+	int rc_drop = NET_XMIT_DROP;
+
+	/* Do not fool qdisc_drop_all() */
+	skb->prev = NULL;
 
 	/* Random duplication */
 	if (q->duplicate && q->duplicate >= get_crandom(&q->dup_cor))
@@ -462,7 +465,7 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	/* If a delay is expected, orphan the skb. (orphaning usually takes
 	 * place at TX completion time, so _before_ the link transit delay)
 	 */
-	if (q->latency || q->jitter)
+	if (q->latency || q->jitter || q->rate)
 		skb_orphan_partial(skb);
 
 	/*
@@ -471,12 +474,13 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	 * skb will be queued.
 	 */
 	if (count > 1 && (skb2 = skb_clone(skb, GFP_ATOMIC)) != NULL) {
-		struct Qdisc *rootq = qdisc_root(sch);
+		struct Qdisc *rootq = qdisc_root_bh(sch);
 		u32 dupsave = q->duplicate; /* prevent duplicating a dup... */
 
 		q->duplicate = 0;
 		rootq->enqueue(skb2, rootq, to_free);
 		q->duplicate = dupsave;
+		rc_drop = NET_XMIT_SUCCESS;
 	}
 
 	/*
@@ -489,7 +493,8 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		if (skb_is_gso(skb)) {
 			segs = netem_segment(skb, sch, to_free);
 			if (!segs)
-				return NET_XMIT_DROP;
+				return rc_drop;
+			qdisc_skb_cb(segs)->pkt_len = segs->len;
 		} else {
 			segs = skb;
 		}
@@ -505,6 +510,7 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		if (skb->ip_summed == CHECKSUM_PARTIAL &&
 		    skb_checksum_help(skb)) {
 			qdisc_drop(skb, sch, to_free);
+			skb = NULL;
 			goto finish_segs;
 		}
 
@@ -512,8 +518,10 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 			1<<(prandom_u32() % 8);
 	}
 
-	if (unlikely(sch->q.qlen >= sch->limit))
-		return qdisc_drop(skb, sch, to_free);
+	if (unlikely(sch->q.qlen >= sch->limit)) {
+		qdisc_drop_all(skb, sch, to_free);
+		return rc_drop;
+	}
 
 	qdisc_qstats_backlog_inc(sch, skb);
 
@@ -530,21 +538,31 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		now = psched_get_time();
 
 		if (q->rate) {
-			struct sk_buff *last;
+			struct netem_skb_cb *last = NULL;
 
-			if (sch->q.qlen)
-				last = sch->q.tail;
-			else
-				last = netem_rb_to_skb(rb_last(&q->t_root));
+			if (sch->q.tail)
+				last = netem_skb_cb(sch->q.tail);
+			if (q->t_root.rb_node) {
+				struct sk_buff *t_skb;
+				struct netem_skb_cb *t_last;
+
+				t_skb = netem_rb_to_skb(rb_last(&q->t_root));
+				t_last = netem_skb_cb(t_skb);
+				if (!last ||
+				    t_last->time_to_send > last->time_to_send) {
+					last = t_last;
+				}
+			}
+
 			if (last) {
 				/*
 				 * Last packet in queue is reference point (now),
 				 * calculate this time bonus and subtract
 				 * from delay.
 				 */
-				delay -= netem_skb_cb(last)->time_to_send - now;
+				delay -= last->time_to_send - now;
 				delay = max_t(psched_tdiff_t, 0, delay);
-				now = netem_skb_cb(last)->time_to_send;
+				now = last->time_to_send;
 			}
 
 			delay += packet_len_2_sched_time(qdisc_pkt_len(skb), q);
@@ -568,6 +586,12 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 
 finish_segs:
 	if (segs) {
+		unsigned int len, last_len;
+		int nb;
+
+		len = skb ? skb->len : 0;
+		nb = skb ? 1 : 0;
+
 		while (segs) {
 			skb2 = segs->next;
 			segs->next = NULL;
@@ -583,9 +607,10 @@ finish_segs:
 			}
 			segs = skb2;
 		}
-		sch->q.qlen += nb;
-		if (nb > 1)
-			qdisc_tree_reduce_backlog(sch, 1 - nb, prev_len - len);
+		/* Parent qdiscs accounted for 1 skb of size @prev_len */
+		qdisc_tree_reduce_backlog(sch, -(nb - 1), -(len - prev_len));
+	} else if (!skb) {
+		return NET_XMIT_DROP;
 	}
 	return NET_XMIT_SUCCESS;
 }
@@ -694,7 +719,7 @@ static int get_dist_table(struct Qdisc *sch, const struct nlattr *attr)
 	int i;
 	size_t s;
 
-	if (n > NETEM_DIST_MAX)
+	if (!n || n > NETEM_DIST_MAX)
 		return -EINVAL;
 
 	s = sizeof(struct disttable) + n * sizeof(s16);
@@ -927,10 +952,10 @@ static int netem_init(struct Qdisc *sch, struct nlattr *opt)
 	struct netem_sched_data *q = qdisc_priv(sch);
 	int ret;
 
+	qdisc_watchdog_init(&q->watchdog, sch);
+
 	if (!opt)
 		return -EINVAL;
-
-	qdisc_watchdog_init(&q->watchdog, sch);
 
 	q->loss_model = CLG_RANDOM;
 	ret = netem_change(sch, opt);

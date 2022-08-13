@@ -628,7 +628,8 @@ int mlx5_mr_cache_init(struct mlx5_ib_dev *dev)
 		ent->order = i + 2;
 		ent->dev = dev;
 
-		if (dev->mdev->profile->mask & MLX5_PROF_MASK_MR_CACHE)
+		if ((dev->mdev->profile->mask & MLX5_PROF_MASK_MR_CACHE) &&
+		    (mlx5_core_is_pf(dev->mdev)))
 			limit = dev->mdev->profile->mr_cache[i].limit;
 		else
 			limit = 0;
@@ -646,6 +647,33 @@ int mlx5_mr_cache_init(struct mlx5_ib_dev *dev)
 	return 0;
 }
 
+static void wait_for_async_commands(struct mlx5_ib_dev *dev)
+{
+	struct mlx5_mr_cache *cache = &dev->cache;
+	struct mlx5_cache_ent *ent;
+	int total = 0;
+	int i;
+	int j;
+
+	for (i = 0; i < MAX_MR_CACHE_ENTRIES; i++) {
+		ent = &cache->ent[i];
+		for (j = 0 ; j < 1000; j++) {
+			if (!ent->pending)
+				break;
+			msleep(50);
+		}
+	}
+	for (i = 0; i < MAX_MR_CACHE_ENTRIES; i++) {
+		ent = &cache->ent[i];
+		total += ent->pending;
+	}
+
+	if (total)
+		mlx5_ib_warn(dev, "aborted while there are %d pending mr requests\n", total);
+	else
+		mlx5_ib_warn(dev, "done with all pending requests\n");
+}
+
 int mlx5_mr_cache_cleanup(struct mlx5_ib_dev *dev)
 {
 	int i;
@@ -659,6 +687,7 @@ int mlx5_mr_cache_cleanup(struct mlx5_ib_dev *dev)
 		clean_keys(dev, i);
 
 	destroy_workqueue(dev->cache.wq);
+	wait_for_async_commands(dev);
 	del_timer_sync(&dev->delay_timer);
 
 	return 0;
@@ -1619,6 +1648,7 @@ struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd,
 	MLX5_SET(mkc, mkc, access_mode, mr->access_mode);
 	MLX5_SET(mkc, mkc, umr_en, 1);
 
+	mr->ibmr.device = pd->device;
 	err = mlx5_core_create_mkey(dev->mdev, &mr->mmkey, in, inlen);
 	if (err)
 		goto err_destroy_psv;
@@ -1791,18 +1821,18 @@ mlx5_ib_sg_to_klms(struct mlx5_ib_mr *mr,
 
 	mr->ibmr.iova = sg_dma_address(sg) + sg_offset;
 	mr->ibmr.length = 0;
-	mr->ndescs = sg_nents;
 
 	for_each_sg(sgl, sg, sg_nents, i) {
-		if (unlikely(i > mr->max_descs))
+		if (unlikely(i >= mr->max_descs))
 			break;
 		klms[i].va = cpu_to_be64(sg_dma_address(sg) + sg_offset);
 		klms[i].bcount = cpu_to_be32(sg_dma_len(sg) - sg_offset);
 		klms[i].key = cpu_to_be32(lkey);
-		mr->ibmr.length += sg_dma_len(sg);
+		mr->ibmr.length += sg_dma_len(sg) - sg_offset;
 
 		sg_offset = 0;
 	}
+	mr->ndescs = i;
 
 	if (sg_offset_p)
 		*sg_offset_p = sg_offset;

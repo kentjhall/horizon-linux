@@ -294,7 +294,7 @@ struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
 
 	return __udp6_lib_lookup(dev_net(skb->dev), &iph->saddr, sport,
 				 &iph->daddr, dport, inet6_iif(skb),
-				 &udp_table, skb);
+				 &udp_table, NULL);
 }
 EXPORT_SYMBOL_GPL(udp6_lib_lookup_skb);
 
@@ -479,7 +479,7 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 	struct net *net = dev_net(skb->dev);
 
 	sk = __udp6_lib_lookup(net, daddr, uh->dest, saddr, uh->source,
-			       inet6_iif(skb), udptable, skb);
+			       inet6_iif(skb), udptable, NULL);
 	if (!sk) {
 		__ICMP6_INC_STATS(net, __in6_dev_get(skb->dev),
 				  ICMP6_MIB_INERRORS);
@@ -601,7 +601,7 @@ int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	/*
 	 * UDP-Lite specific tests, ignored on UDP sockets (see net/ipv4/udp.c).
 	 */
-	if ((is_udplite & UDPLITE_RECV_CC)  &&  UDP_SKB_CB(skb)->partial_cov) {
+	if ((up->pcflag & UDPLITE_RECV_CC)  &&  UDP_SKB_CB(skb)->partial_cov) {
 
 		if (up->pcrlen == 0) {          /* full coverage was set  */
 			net_dbg_ratelimited("UDPLITE6: partial coverage %d while full coverage %d requested\n",
@@ -915,6 +915,7 @@ static void udp6_hwcsum_outgoing(struct sock *sk, struct sk_buff *skb,
 		 */
 		offset = skb_transport_offset(skb);
 		skb->csum = skb_checksum(skb, offset, skb->len - offset, 0);
+		csum = skb->csum;
 
 		skb->ip_summed = CHECKSUM_NONE;
 
@@ -1037,6 +1038,7 @@ int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	ipc6.hlimit = -1;
 	ipc6.tclass = -1;
 	ipc6.dontfrag = -1;
+	sockc.tsflags = sk->sk_tsflags;
 
 	/* destination address check */
 	if (sin6) {
@@ -1048,6 +1050,10 @@ int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 			if (addr_len < SIN6_LEN_RFC2133)
 				return -EINVAL;
 			daddr = &sin6->sin6_addr;
+			if (ipv6_addr_any(daddr) &&
+			    ipv6_addr_v4mapped(&np->saddr))
+				ipv6_addr_set_v4mapped(htonl(INADDR_LOOPBACK),
+						       daddr);
 			break;
 		case AF_INET:
 			goto do_udp_sendmsg;
@@ -1156,7 +1162,7 @@ do_udp_sendmsg:
 		fl6.flowi6_oif = np->sticky_pktinfo.ipi6_ifindex;
 
 	fl6.flowi6_mark = sk->sk_mark;
-	sockc.tsflags = sk->sk_tsflags;
+	fl6.flowi6_uid = sk->sk_uid;
 
 	if (msg->msg_controllen) {
 		opt = &opt_space;

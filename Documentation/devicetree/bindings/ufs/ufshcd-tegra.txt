@@ -1,0 +1,66 @@
+* NVIDIA Tegra, Universal Flash Storage (UFS) Host Controller
+
+UFSHC nodes are defined to describe on-chip UFS host controllers.
+Each UFS controller instance should have its own node.
+
+Required properties:
+- compatible        : compatible list, contains "jedec,ufs-1.1"
+- interrupts        : <interrupt mapping for UFS host controller IRQ>
+- reg               : <registers mapping>
+
+Optional properties:
+- clocks                : List of phandle and clock specifier pairs
+- clock-names           : List of clock input name strings sorted in the same
+                          order as the clocks property.
+- freq-table-hz		: Array of <min max> operating frequencies stored in the same
+                          order as the clocks property. If this property is not
+			  defined or a value in the array is "0" then it is assumed
+			  that the frequency is set by the parent clock or a
+			  fixed rate clock source.
+
+- nvidia,enable-rx-calib : Enables rx calibration functionality.
+			   It is required for UFS High Speed modes.
+- nvidia,enable-x2-config : Enables 2 lane register programming support.
+			   Should be enabled if 2 lanes are dedicated to UFS.
+- nvidia,enable-hs-mode : Flag to enable UFS High Speed modes. If this flag is not set
+                          UFS will be enumerated in PWM mode.
+- nvidia,mask-fast-auto-mode :  Flag to disable fast auto mode.
+				When enabled UFS Fast auto mode will not be supported and
+				fast mode will be supported.
+- nvidia,mask-hs-mode-b : Flag to disable hs_rate_b series.
+			  When enabled UFS hs_rate_b series will not be supported and
+			  hs_rate_a series will be supported.
+- nvidia,enable-hibern8-war : Flag to enable hibernate war.
+			      when enabled, ufs tegra driver will enable a WAR to reset Mphy.
+- nvidia,max-hs-gear : Flag to set Max UFS HS Gear. Values are defined as below.
+			   UFS_HS_G1 = <1>;
+			   UFS_HS_G2 = <2>;
+		           UFS_HS_G3 = <3>;
+- nvidia,max-pwm-gear : Flag to set Max UFS PWM Gear. Values are defined as below.
+			   UFS_PWM_G1 = <1>;
+			   UFS_PWM_G2 = <2>;
+			   UFS_PWM_G3 = <3>;
+			   UFS_PWM_G4 = <4>;
+			   UFS_PWM_G5 = <5>;
+			   UFS_PWM_G6 = <6>;
+			   UFS_PWM_G7 = <7>;
+
+Note: If above properties are not defined it can be assumed that the supply
+regulators or clocks are always on.
+
+Example:
+	ufshc@0xfc598000 {
+		compatible = "jedec,ufs-1.1";
+		reg = <0xfc598000 0x800>;
+		interrupts = <0 28 0>;
+
+		clocks = <&core 0>, <&ref 0>, <&iface 0>;
+		clock-names = "core_clk", "ref_clk", "iface_clk";
+		freq-table-hz = <100000000 200000000>, <0 0>, <0 0>;
+		nvidia,enable-x2-config;
+		nvidia,enable-rx-calib;
+		nvidia,enable-hs-mode;
+		nvidia,mask-fast-auto-mode;
+		nvidia,max-hs-gear = <3>;
+		nvidia,max-pwm-gear = <4>;
+	};

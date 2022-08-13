@@ -257,7 +257,7 @@ static u64 scan_dispatch_log(u64 stop_tb)
  * Accumulate stolen time by scanning the dispatch trace log.
  * Called on entry from user mode.
  */
-void accumulate_stolen_time(void)
+void notrace accumulate_stolen_time(void)
 {
 	u64 sst, ust;
 	u8 save_soft_enabled = local_paca->soft_enabled;
@@ -407,6 +407,7 @@ void arch_vtime_task_switch(struct task_struct *prev)
 	struct cpu_accounting_data *acct = get_accounting(current);
 
 	acct->starttime = get_accounting(prev)->starttime;
+	acct->startspurr = get_accounting(prev)->startspurr;
 	acct->system_time = 0;
 	acct->user_time = 0;
 }
@@ -718,12 +719,20 @@ static int __init get_freq(char *name, int cells, unsigned long *val)
 static void start_cpu_decrementer(void)
 {
 #if defined(CONFIG_BOOKE) || defined(CONFIG_40x)
+	unsigned int tcr;
+
 	/* Clear any pending timer interrupts */
 	mtspr(SPRN_TSR, TSR_ENW | TSR_WIS | TSR_DIS | TSR_FIS);
 
-	/* Enable decrementer interrupt */
-	mtspr(SPRN_TCR, TCR_DIE);
-#endif /* defined(CONFIG_BOOKE) || defined(CONFIG_40x) */
+	tcr = mfspr(SPRN_TCR);
+	/*
+	 * The watchdog may have already been enabled by u-boot. So leave
+	 * TRC[WP] (Watchdog Period) alone.
+	 */
+	tcr &= TCR_WP_MASK;	/* Clear all bits except for TCR[WP] */
+	tcr |= TCR_DIE;		/* Enable decrementer */
+	mtspr(SPRN_TCR, tcr);
+#endif
 }
 
 void __init generic_calibrate_decr(void)
@@ -853,6 +862,7 @@ void update_vsyscall_old(struct timespec *wall_time, struct timespec *wtm,
 	vdso_data->wtom_clock_nsec = wtm->tv_nsec;
 	vdso_data->stamp_xtime = *wall_time;
 	vdso_data->stamp_sec_fraction = frac_sec;
+	vdso_data->hrtimer_res = hrtimer_resolution;
 	smp_wmb();
 	++(vdso_data->tb_update_count);
 }

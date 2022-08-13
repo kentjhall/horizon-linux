@@ -33,7 +33,7 @@ static inline void hlist_nulls_del_init_rcu(struct hlist_nulls_node *n)
 {
 	if (!hlist_nulls_unhashed(n)) {
 		__hlist_nulls_del(n);
-		n->pprev = NULL;
+		WRITE_ONCE(n->pprev, NULL);
 	}
 }
 
@@ -65,7 +65,7 @@ static inline void hlist_nulls_del_init_rcu(struct hlist_nulls_node *n)
 static inline void hlist_nulls_del_rcu(struct hlist_nulls_node *n)
 {
 	__hlist_nulls_del(n);
-	n->pprev = LIST_POISON2;
+	WRITE_ONCE(n->pprev, LIST_POISON2);
 }
 
 /**
@@ -93,10 +93,10 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
 	struct hlist_nulls_node *first = h->first;
 
 	n->next = first;
-	n->pprev = &h->first;
+	WRITE_ONCE(n->pprev, &h->first);
 	rcu_assign_pointer(hlist_nulls_first_rcu(h), n);
 	if (!is_a_nulls(first))
-		first->pprev = &n->next;
+		WRITE_ONCE(first->pprev, &n->next);
 }
 
 /**
@@ -105,9 +105,8 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
  * @h: the list to add to.
  *
  * Description:
- * Adds the specified element to the end of the specified hlist_nulls,
- * while permitting racing traversals.  NOTE: tail insertion requires
- * list traversal.
+ * Adds the specified element to the specified hlist_nulls,
+ * while permitting racing traversals.
  *
  * The caller must take whatever precautions are necessary
  * (such as holding appropriate locks) to avoid racing
@@ -120,18 +119,18 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
  * list-traversal primitive must be guarded by rcu_read_lock().
  */
 static inline void hlist_nulls_add_tail_rcu(struct hlist_nulls_node *n,
-					struct hlist_nulls_head *h)
+					    struct hlist_nulls_head *h)
 {
 	struct hlist_nulls_node *i, *last = NULL;
 
-	for (i = hlist_nulls_first_rcu(h); !is_a_nulls(i);
-	     i = hlist_nulls_next_rcu(i))
+	/* Note: write side code, so rcu accessors are not needed. */
+	for (i = h->first; !is_a_nulls(i); i = i->next)
 		last = i;
 
 	if (last) {
 		n->next = last->next;
 		n->pprev = &last->next;
-		rcu_assign_pointer(hlist_nulls_next_rcu(last), n);
+		rcu_assign_pointer(hlist_next_rcu(last), n);
 	} else {
 		hlist_nulls_add_head_rcu(n, h);
 	}
@@ -156,5 +155,19 @@ static inline void hlist_nulls_add_tail_rcu(struct hlist_nulls_node *n,
 		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
 		pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)))
 
+/**
+ * hlist_nulls_for_each_entry_safe -
+ *   iterate over list of given type safe against removal of list entry
+ * @tpos:	the type * to use as a loop cursor.
+ * @pos:	the &struct hlist_nulls_node to use as a loop cursor.
+ * @head:	the head for your list.
+ * @member:	the name of the hlist_nulls_node within the struct.
+ */
+#define hlist_nulls_for_each_entry_safe(tpos, pos, head, member)		\
+	for (({barrier();}),							\
+	     pos = rcu_dereference_raw(hlist_nulls_first_rcu(head));		\
+		(!is_a_nulls(pos)) &&						\
+		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member);	\
+		   pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)); 1; });)
 #endif
 #endif

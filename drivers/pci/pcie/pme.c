@@ -40,6 +40,12 @@ static int __init pcie_pme_setup(char *str)
 }
 __setup("pcie_pme=", pcie_pme_setup);
 
+void pcie_pme_disable_msi(void)
+{
+	pcie_pme_msi_disabled = true;
+}
+EXPORT_SYMBOL(pcie_pme_disable_msi);
+
 enum pme_suspend_level {
 	PME_SUSPEND_NONE = 0,
 	PME_SUSPEND_WAKEUP,
@@ -232,6 +238,9 @@ static void pcie_pme_work_fn(struct work_struct *work)
 			break;
 
 		pcie_capability_read_dword(port, PCI_EXP_RTSTA, &rtsta);
+		if (rtsta == (u32) ~0)
+			break;
+
 		if (rtsta & PCI_EXP_RTSTA_PME) {
 			/*
 			 * Clear PME status of the port.  If there are other
@@ -279,7 +288,7 @@ static irqreturn_t pcie_pme_irq(int irq, void *context)
 	spin_lock_irqsave(&data->lock, flags);
 	pcie_capability_read_dword(port, PCI_EXP_RTSTA, &rtsta);
 
-	if (!(rtsta & PCI_EXP_RTSTA_PME)) {
+	if (rtsta == (u32) ~0 || !(rtsta & PCI_EXP_RTSTA_PME)) {
 		spin_unlock_irqrestore(&data->lock, flags);
 		return IRQ_NONE;
 	}
@@ -448,6 +457,17 @@ static int pcie_pme_resume(struct pcie_device *srv)
 	return 0;
 }
 
+/**
+ * pcie_pme_remove - Prepare PCIe PME service device for removal.
+ * @srv - PCIe service device to remove.
+ */
+static void pcie_pme_remove(struct pcie_device *srv)
+{
+	pcie_pme_suspend(srv);
+	free_irq(srv->irq, srv);
+	kfree(get_service_data(srv));
+}
+
 static struct pcie_port_service_driver pcie_pme_driver = {
 	.name		= "pcie_pme",
 	.port_type	= PCI_EXP_TYPE_ROOT_PORT,
@@ -456,6 +476,7 @@ static struct pcie_port_service_driver pcie_pme_driver = {
 	.probe		= pcie_pme_probe,
 	.suspend	= pcie_pme_suspend,
 	.resume		= pcie_pme_resume,
+	.remove		= pcie_pme_remove,
 };
 
 /**

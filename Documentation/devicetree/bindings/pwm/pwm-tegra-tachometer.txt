@@ -1,0 +1,35 @@
+Tegra SoC Tachometer controller
+
+Required properties:
+- compatible: For Tegra186, must contain "nvidia,pwm-tegra186-tachometer".
+- reg: physical base address and length of the controller's registers
+- #pwm-cells: should be 2. See pwm.txt in this directory for a description of
+  the cells format.
+- clocks: Must contain one entry, for the module clock.
+  See ../clocks/clock-bindings.txt for details.
+  Must have the clock name as "tach".
+- resets: Must contain an entry for each entry in reset-names.
+  See ../reset/reset.txt for details.
+- reset-names: Must include the following entries:
+  - tach
+- pulse-per-rev: Pulse per revolutions. This is based on the Fan property.
+- capture-window-length: Window length for capturing PWM signal.
+
+
+Optional properties:
+- enable-dynamic-clock-gating: Enable dynamic clock gating. Once register read,
+	clock is disabled.
+
+Example:
+
+	tachometer@39c0000 {
+		compatible = "nvidia,pwm-tegra186-tachometer";
+		reg = <0x0 0x039c0000 0x0 0x10>;
+		clocks = <&tegra_car TEGRA186_CLK_TACH>;
+		clock-names = "tach";
+		resets = <&tegra_car TEGRA186_RESET_TACH>;
+		reset-names = "tach";
+		pulse-per-rev = <2>;
+		capture-window-length = <2>;
+		#pwm-cells = <2>;
+	};

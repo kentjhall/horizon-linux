@@ -2,6 +2,7 @@
 /* The industrial I/O core
  *
  * Copyright (c) 2008 Jonathan Cameron
+ * Copyright (c) 2014-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 as published by
@@ -46,6 +47,12 @@ enum iio_chan_info_enum {
 	IIO_CHAN_INFO_DEBOUNCE_TIME,
 	IIO_CHAN_INFO_CALIBEMISSIVITY,
 	IIO_CHAN_INFO_OVERSAMPLING_RATIO,
+	IIO_CHAN_INFO_THRESHOLD_LOW,
+	IIO_CHAN_INFO_THRESHOLD_HIGH,
+	IIO_CHAN_INFO_BATCH_FLAGS,
+	IIO_CHAN_INFO_BATCH_PERIOD,
+	IIO_CHAN_INFO_BATCH_TIMEOUT,
+	IIO_CHAN_INFO_BATCH_FLUSH,
 };
 
 enum iio_shared_by {
@@ -548,6 +555,8 @@ struct iio_dev {
 	struct dentry			*debugfs_dentry;
 	unsigned			cached_reg_addr;
 #endif
+	char				link_name[16];
+	struct device_type		dev_type;
 };
 
 const struct iio_chan_spec
@@ -561,6 +570,7 @@ int iio_device_claim_direct_mode(struct iio_dev *indio_dev);
 void iio_device_release_direct_mode(struct iio_dev *indio_dev);
 
 extern struct bus_type iio_bus_type;
+extern const char * const iio_chan_type_name_spec[];
 
 /**
  * iio_device_put() - reference counted deallocation of struct device

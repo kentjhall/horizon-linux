@@ -9,6 +9,7 @@ menu "Serial drivers"
 
 config SERIAL_EARLYCON
 	bool
+	depends on SERIAL_CORE
 	help
 	  Support for early consoles with the earlycon parameter. This enables
 	  the console before standard serial driver is probed. The console is
@@ -314,7 +315,7 @@ config SERIAL_SIRFSOC_CONSOLE
 
 config SERIAL_TEGRA
 	tristate "NVIDIA Tegra20/30 SoC serial controller"
-	depends on ARCH_TEGRA && TEGRA20_APB_DMA
+	depends on ARCH_TEGRA && TEGRA20_APB_DMA || TEGRA186_GPC_DMA
 	select SERIAL_CORE
 	help
 	  Support for the on-chip UARTs on the NVIDIA Tegra series SOCs
@@ -1662,6 +1663,26 @@ config SERIAL_MVEBU_CONSOLE
 	  (the system console is the device which receives all kernel messages
 	  and warnings and which allows logins in single user mode)
 	  Otherwise, say 'N'.
+
+config SERIAL_UBLOX_GPS_SPI
+	tristate "u-blox SPI GPS support"
+	depends on SPI
+	default n
+	help
+	  This driver uses SPI to communicate with the u-blox GPS module
+	  and has a serial tty device interface to the user-space, making
+	  it easy to read/write data from/to the GPS.
+
+	  If unsure, say N.
+
+config SERIAL_UBLOX_GPS
+       tristate "u-blox 6 I2C GPS support"
+       depends on I2C
+       default n
+       help
+         This driver uses i2c to communicate with the u-blox 6 GPS module
+         and has a serial tty device interface to the user-space, making
+         it easy to read/write data from/to the GPS.
 
 endmenu
 

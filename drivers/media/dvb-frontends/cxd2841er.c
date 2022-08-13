@@ -261,7 +261,9 @@ static int cxd2841er_write_regs(struct cxd2841er_priv *priv,
 static int cxd2841er_write_reg(struct cxd2841er_priv *priv,
 			       u8 addr, u8 reg, u8 val)
 {
-	return cxd2841er_write_regs(priv, addr, reg, &val, 1);
+	u8 tmp = val; /* see gcc.gnu.org/bugzilla/show_bug.cgi?id=81715 */
+
+	return cxd2841er_write_regs(priv, addr, reg, &tmp, 1);
 }
 
 static int cxd2841er_read_regs(struct cxd2841er_priv *priv,
@@ -3852,7 +3854,9 @@ static struct  dvb_frontend_ops cxd2841er_t_c_ops = {
 			FE_CAN_MUTE_TS |
 			FE_CAN_2G_MODULATION,
 		.frequency_min = 42000000,
-		.frequency_max = 1002000000
+		.frequency_max = 1002000000,
+		.symbol_rate_min = 870000,
+		.symbol_rate_max = 11700000
 	},
 	.init = cxd2841er_init_tc,
 	.sleep = cxd2841er_sleep_tc,

@@ -275,16 +275,16 @@ static void zfcp_free_low_mem_buffers(struct zfcp_adapter *adapter)
  */
 int zfcp_status_read_refill(struct zfcp_adapter *adapter)
 {
-	while (atomic_read(&adapter->stat_miss) > 0)
+	while (atomic_add_unless(&adapter->stat_miss, -1, 0))
 		if (zfcp_fsf_status_read(adapter->qdio)) {
+			atomic_inc(&adapter->stat_miss); /* undo add -1 */
 			if (atomic_read(&adapter->stat_miss) >=
 			    adapter->stat_read_buf_num) {
 				zfcp_erp_adapter_reopen(adapter, 0, "axsref1");
 				return 1;
 			}
 			break;
-		} else
-			atomic_dec(&adapter->stat_miss);
+		}
 	return 0;
 }
 
@@ -357,6 +357,8 @@ struct zfcp_adapter *zfcp_adapter_enqueue(struct ccw_device *ccw_device)
 	INIT_WORK(&adapter->ns_up_work, zfcp_fc_sym_name_update);
 
 	adapter->next_port_scan = jiffies;
+
+	adapter->erp_action.adapter = adapter;
 
 	if (zfcp_qdio_setup(adapter))
 		goto failed;
@@ -513,6 +515,9 @@ struct zfcp_port *zfcp_port_enqueue(struct zfcp_adapter *adapter, u64 wwpn,
 	port->dev.parent = &adapter->ccw_device->dev;
 	port->dev.groups = zfcp_port_attr_groups;
 	port->dev.release = zfcp_port_release;
+
+	port->erp_action.adapter = adapter;
+	port->erp_action.port = port;
 
 	if (dev_set_name(&port->dev, "0x%016llx", (unsigned long long)wwpn)) {
 		kfree(port);

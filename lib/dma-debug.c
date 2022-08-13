@@ -435,6 +435,7 @@ void debug_dma_dump_mappings(struct device *dev)
 		}
 
 		spin_unlock_irqrestore(&bucket->lock, flags);
+		cond_resched();
 	}
 }
 EXPORT_SYMBOL(debug_dma_dump_mappings);
@@ -872,6 +873,111 @@ out_unlock:
 	return count;
 }
 
+char *__weak debug_dma_platformdata(struct device *dev)
+{
+	/* empty string by default */
+	static char buf[1];
+
+	return buf;
+}
+
+static inline void seq_print_ip_sym(struct seq_file *s, unsigned long ip)
+{
+	seq_printf(s, "[<%p>] %pS\n", (void *)ip, (void *)ip);
+}
+
+void seq_print_trace(struct seq_file *s, struct stack_trace *trace)
+{
+	int i;
+
+	if (WARN_ON(!trace->entries))
+		return;
+
+	for (i = trace->skip; i < trace->nr_entries; i++)
+		seq_print_ip_sym(s, trace->entries[i]);
+}
+
+/*
+ * Print all map entries just in the order they are stored. We assume that the
+ * user will be able to parse this later anyway. Detailed output includes stack
+ * traces of allocations.
+ */
+void seq_print_dma_mappings(struct seq_file *s, int detail)
+{
+	int idx;
+
+	for (idx = 0; idx < HASH_SIZE; idx++) {
+		struct hash_bucket *bucket = &dma_entry_hash[idx];
+		struct dma_debug_entry *entry;
+		unsigned long flags;
+
+		spin_lock_irqsave(&bucket->lock, flags);
+
+		list_for_each_entry(entry, &bucket->list, list) {
+			seq_printf(s,
+				   "    %s %s idx %d P=%Lx D=%llx L=%llx %s A=%s\n",
+				   dev_name(entry->dev),
+				   type2name[entry->type], idx,
+				   phys_addr(entry),
+				   entry->dev_addr, entry->size,
+				   dir2name[entry->direction],
+				   debug_dma_platformdata(entry->dev));
+
+			if (detail)
+				seq_print_trace(s, &entry->stacktrace);
+		}
+
+		spin_unlock_irqrestore(&bucket->lock, flags);
+	}
+}
+
+void __weak dma_debugfs_platform_info(struct dentry *dent)
+{
+}
+
+static int _dump_allocs(struct seq_file *s, void *data)
+{
+	int detail = (int)s->private;
+
+	seq_print_dma_mappings(s, detail);
+	return 0;
+}
+
+#define DEFINE_DEBUGFS(__name, __func, __data)                          \
+static int __name ## _open(struct inode *inode, struct file *file)      \
+{                                                                       \
+	return single_open(file, __func, __data);                       \
+}                                                                       \
+static const struct file_operations __name ## _fops = {                 \
+	.open           = __name ## _open,                              \
+	.read           = seq_read,                                     \
+	.llseek         = seq_lseek,                                    \
+	.release        = single_release,                               \
+}
+
+DEFINE_DEBUGFS(_dump_allocs, _dump_allocs, NULL);
+DEFINE_DEBUGFS(_dump_allocs_detail, _dump_allocs, (void *)1);
+#undef DEFINE_DEBUGFS
+
+static int map_dump_debug_fs_init(void)
+{
+#define CREATE_FILE(name) \
+	debugfs_create_file(#name, S_IRUGO, \
+				dma_debug_dent, NULL, \
+				&_##name##_fops)
+
+	if (!CREATE_FILE(dump_allocs))
+		return -ENOMEM;
+
+	if (!CREATE_FILE(dump_allocs_detail))
+		return -ENOMEM;
+
+#undef CREATE_FILE
+
+	dma_debugfs_platform_info(dma_debug_dent);
+	return 0;
+}
+
 static const struct file_operations filter_fops = {
 	.read  = filter_read,
 	.write = filter_write,
@@ -924,6 +1030,9 @@ static int dma_debug_fs_init(void)
 	filter_dent = debugfs_create_file("driver_filter", 0644,
 					  dma_debug_dent, NULL, &filter_fops);
 	if (!filter_dent)
+		goto out_err;
+
+	if (map_dump_debug_fs_init())
 		goto out_err;
 
 	return 0;

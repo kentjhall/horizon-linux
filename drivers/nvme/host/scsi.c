@@ -1761,7 +1761,7 @@ static int nvme_trans_io(struct nvme_ns *ns, struct sg_io_hdr *hdr, u8 is_write,
 	xfer_bytes = min(((u64)hdr->dxfer_len), sum_iov_len);
 
 	/* If block count and actual data buffer size dont match, error out */
-	if (xfer_bytes != (cdb_info.xfer_len << ns->lba_shift)) {
+	if (xfer_bytes != ((u64)cdb_info.xfer_len << ns->lba_shift)) {
 		res = -EINVAL;
 		goto out;
 	}

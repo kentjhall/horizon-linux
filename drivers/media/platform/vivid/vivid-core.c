@@ -102,12 +102,14 @@ MODULE_PARM_DESC(ccs_out_mode, " output crop/compose/scale mode:\n"
 			   "\t\t    bit 0=crop, 1=compose, 2=scale,\n"
 			   "\t\t    -1=user-controlled (default)");
 
-static unsigned multiplanar[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 1 };
+static unsigned
+multiplanar[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 2 };
 module_param_array(multiplanar, uint, NULL, 0444);
 MODULE_PARM_DESC(multiplanar, " 1 (default) creates a single planar device, 2 creates a multiplanar device.");
 
 /* Default: video + vbi-cap (raw and sliced) + radio rx + radio tx + sdr + vbi-out + vid-out */
-static unsigned node_types[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 0x1d3d };
+/* Expose only video capture and video output nodes for the current test pipeline */
+static unsigned node_types[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 0x0101 };
 module_param_array(node_types, uint, NULL, 0444);
 MODULE_PARM_DESC(node_types, " node types, default is 0x1d3d. Bitmask with the following meaning:\n"
 			     "\t\t    bit 0: Video Capture node\n"
@@ -120,24 +122,28 @@ MODULE_PARM_DESC(node_types, " node types, default is 0x1d3d. Bitmask with the f
 			     "\t\t    bit 16: Framebuffer for testing overlays");
 
 /* Default: 4 inputs */
-static unsigned num_inputs[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 4 };
+/* Force to have only one input for current test pipeline */
+static unsigned num_inputs[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 1 };
 module_param_array(num_inputs, uint, NULL, 0444);
 MODULE_PARM_DESC(num_inputs, " number of inputs, default is 4");
 
 /* Default: input 0 = WEBCAM, 1 = TV, 2 = SVID, 3 = HDMI */
-static unsigned input_types[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 0xe4 };
+/* support only HDMI input type for current test pipeline */
+static unsigned input_types[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 0x03 };
 module_param_array(input_types, uint, NULL, 0444);
 MODULE_PARM_DESC(input_types, " input types, default is 0xe4. Two bits per input,\n"
 			      "\t\t    bits 0-1 == input 0, bits 31-30 == input 15.\n"
 			      "\t\t    Type 0 == webcam, 1 == TV, 2 == S-Video, 3 == HDMI");
 
 /* Default: 2 outputs */
-static unsigned num_outputs[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 2 };
+/* Force to have only one output for current test pipeline */
+static unsigned num_outputs[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 1 };
 module_param_array(num_outputs, uint, NULL, 0444);
 MODULE_PARM_DESC(num_outputs, " number of outputs, default is 2");
 
 /* Default: output 0 = SVID, 1 = HDMI */
-static unsigned output_types[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 2 };
+/* support only HDMI output type for current test pipeline */
+static unsigned output_types[VIVID_MAX_DEVS] = { [0 ... (VIVID_MAX_DEVS - 1)] = 0x01 };
 module_param_array(output_types, uint, NULL, 0444);
 MODULE_PARM_DESC(output_types, " output types, default is 0x02. One bit per output,\n"
 			      "\t\t    bit 0 == output 0, bit 15 == output 15.\n"
@@ -203,7 +209,8 @@ static int vidioc_querycap(struct file *file, void  *priv,
 	struct vivid_dev *dev = video_drvdata(file);
 
 	strcpy(cap->driver, "vivid");
-	strcpy(cap->card, "vivid");
+	snprintf(cap->card, sizeof(cap->card),
+			"%s", dev->v4l2_dev.name);
 	snprintf(cap->bus_info, sizeof(cap->bus_info),
 			"platform:%s", dev->v4l2_dev.name);
 
@@ -632,6 +639,35 @@ static void vivid_dev_release(struct v4l2_device *v4l2_dev)
 	kfree(dev);
 }
 
+static int vivid_parse_dt(struct video_device *vfd, struct vivid_dev *dev)
+{
+	struct device_node *vivid_node = NULL;
+	struct device_node *node = NULL;
+	char temp_str[OF_MAX_STR_LEN];
+
+	vivid_node = of_find_node_by_name(NULL, "vivid-driver");
+	if (!vivid_node) {
+		dev_err(&vfd->dev, "%s:cannot find vivid node\n", __func__);
+		return -ENODATA;
+	}
+
+	snprintf(temp_str, sizeof(temp_str), "%s%d", "instance", dev->inst);
+	node = of_find_node_by_name(vivid_node, temp_str);
+	if (!node) {
+		dev_err(&vfd->dev, "%s:cannot find instance node\n", __func__);
+		return -ENODATA;
+	}
+
+	sensor_common_init_sensor_properties(&vfd->dev,
+		node, &dev->sensor_props);
+
+	v4l2_ctrl_s_ctrl(dev->ctrl_sensormodes, dev->sensor_props.num_modes);
+
+	vivid_update_sensorprops(dev);
+
+	return 0;
+}
+
 static int vivid_create_instance(struct platform_device *pdev, int inst)
 {
 	static const struct v4l2_dv_timings def_dv_timings =
@@ -954,9 +990,11 @@ static int vivid_create_instance(struct platform_device *pdev, int inst)
 	dev->fmt_out = &vivid_formats[0];
 	if (!dev->multiplanar)
 		vivid_formats[0].data_offset[0] = 0;
+	dev->embedded_data_height = DEF_METADATA_HEIGHT;
+	dev->fmt_out_metadata_height = DEF_METADATA_HEIGHT;
 	dev->webcam_size_idx = 1;
 	dev->webcam_ival_idx = 3;
-	tpg_s_fourcc(&dev->tpg, dev->fmt_cap->fourcc);
+	tpg_s_fourcc(&dev->tpg, dev->fmt_cap->fourcc, DEF_METADATA_HEIGHT);
 	dev->std_cap = V4L2_STD_PAL;
 	dev->std_out = V4L2_STD_PAL;
 	if (dev->input_type[0] == TV || dev->input_type[0] == SVID)
@@ -984,6 +1022,11 @@ static int vivid_create_instance(struct platform_device *pdev, int inst)
 	dev->edid_max_blocks = dev->edid_blocks = 2;
 	memcpy(dev->edid, vivid_hdmi_edid, sizeof(vivid_hdmi_edid));
 	ktime_get_ts(&dev->radio_rds_init_ts);
+
+	/* initialize locks */
+	spin_lock_init(&dev->slock);
+	mutex_init(&dev->mutex);
+	mutex_init(&dev->mutex_framerate);
 
 	/* create all controls */
 	ret = vivid_create_controls(dev, ccs_cap == -1, ccs_out == -1, no_error_inj,
@@ -1014,10 +1057,6 @@ static int vivid_create_instance(struct platform_device *pdev, int inst)
 	dev->fb_cap.fmt.pixelformat = dev->fmt_cap->fourcc;
 	dev->fb_cap.fmt.bytesperline = dev->src_rect.width * tpg_g_twopixelsize(&dev->tpg, 0) / 2;
 	dev->fb_cap.fmt.sizeimage = dev->src_rect.height * dev->fb_cap.fmt.bytesperline;
-
-	/* initialize locks */
-	spin_lock_init(&dev->slock);
-	mutex_init(&dev->mutex);
 
 	/* init dma queues */
 	INIT_LIST_HEAD(&dev->vid_cap_active);
@@ -1189,6 +1228,10 @@ static int vivid_create_instance(struct platform_device *pdev, int inst)
 			goto unreg_dev;
 		v4l2_info(&dev->v4l2_dev, "V4L2 capture device registered as %s\n",
 					  video_device_node_name(vfd));
+
+		ret = vivid_parse_dt(vfd, dev);
+		if (ret < 0)
+			goto unreg_dev;
 	}
 
 	if (dev->has_vid_out) {

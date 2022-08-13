@@ -789,7 +789,7 @@ static uint64_t _mv88e6xxx_get_ethtool_stat(struct mv88e6xxx_chip *chip,
 			err = mv88e6xxx_port_read(chip, port, s->reg + 1, &reg);
 			if (err)
 				return UINT64_MAX;
-			high = reg;
+			low |= ((u32)reg) << 16;
 		}
 		break;
 	case BANK0:
@@ -798,7 +798,7 @@ static uint64_t _mv88e6xxx_get_ethtool_stat(struct mv88e6xxx_chip *chip,
 		if (s->sizeof_stat == 8)
 			_mv88e6xxx_stats_read(chip, s->reg + 1, &high);
 	}
-	value = (((u64)high) << 16) | low;
+	value = (((u64)high) << 32) | low;
 	return value;
 }
 
@@ -1742,7 +1742,7 @@ static int _mv88e6xxx_vtu_get(struct mv88e6xxx_chip *chip, u16 vid,
 	int err;
 
 	if (!vid)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 
 	err = _mv88e6xxx_vtu_vid_write(chip, vid - 1);
 	if (err)
@@ -3846,6 +3846,8 @@ static int mv88e6xxx_probe(struct mdio_device *mdiodev)
 		mv88e6xxx_mdio_unregister(chip);
 		return err;
 	}
+	if (chip->reset)
+		usleep_range(1000, 2000);
 
 	return 0;
 }

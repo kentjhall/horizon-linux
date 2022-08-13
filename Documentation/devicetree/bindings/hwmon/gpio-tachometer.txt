@@ -1,0 +1,25 @@
+Device tree bindings for fan tach output connected to IRQ capable GPIO.
+
+Required properties:
+- compatible	: "nvidia,gpio-tachometer"
+- win-len	: Duration in multiples of 100ms, for which the IRQ will be enabled
+		  while measuring speed. Maximum allowed value is 5 seconds to avoid
+		  possible IRQ overload at high speed.
+- pulse-per-rev	: Number of signals generated on the tach output pin by the motor
+		  for one full rotation.
+- gpio		: GPIO pin on which tach output of the motor is connected.
+
+Optional properties:
+- schedule-delay: Time in milliseconds for the background thread to monitor the speed.
+		  If the measured speed is 0, system shutdown will be initiated.
+		  Time duration should be higher than win-len time.
+
+Example:
+        gpio_tachometer {
+                compatible = "nvidia,gpio-tachometer";
+                win-len = <2>;			/*For every measurement, take samples for 200ms*/
+                pulse-per-rev = <2>;		/*Motor generates 2 pulses for every full rotation*/
+                schedule-delay = <10000>;	/*Check motor speed every 10seconds and shutdown if motor is stopped*/
+                gpio = <&tegra_main_gpio TEGRA_MAIN_GPIO(Y, 1) 0>;
+                status = "okay";
+        };

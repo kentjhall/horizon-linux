@@ -141,7 +141,7 @@ int ib_nl_handle_ip_res_resp(struct sk_buff *skb,
 	if (ib_nl_is_good_ip_resp(nlh))
 		ib_nl_process_good_ip_rsep(nlh);
 
-	return skb->len;
+	return 0;
 }
 
 static int ib_nl_ip_send_msg(struct rdma_dev_addr *dev_addr,
@@ -208,6 +208,22 @@ int rdma_addr_size(struct sockaddr *addr)
 	}
 }
 EXPORT_SYMBOL(rdma_addr_size);
+
+int rdma_addr_size_in6(struct sockaddr_in6 *addr)
+{
+	int ret = rdma_addr_size((struct sockaddr *) addr);
+
+	return ret <= sizeof(*addr) ? ret : 0;
+}
+EXPORT_SYMBOL(rdma_addr_size_in6);
+
+int rdma_addr_size_kss(struct __kernel_sockaddr_storage *addr)
+{
+	int ret = rdma_addr_size((struct sockaddr *) addr);
+
+	return ret <= sizeof(*addr) ? ret : 0;
+}
+EXPORT_SYMBOL(rdma_addr_size_kss);
 
 static struct rdma_addr_client self;
 
@@ -437,24 +453,18 @@ static int addr6_resolve(struct sockaddr_in6 *src_in,
 	struct flowi6 fl6;
 	struct dst_entry *dst;
 	struct rt6_info *rt;
-	int ret;
 
 	memset(&fl6, 0, sizeof fl6);
 	fl6.daddr = dst_in->sin6_addr;
 	fl6.saddr = src_in->sin6_addr;
 	fl6.flowi6_oif = addr->bound_dev_if;
 
-	dst = ip6_route_output(addr->net, NULL, &fl6);
-	if ((ret = dst->error))
-		goto put;
+	dst = ipv6_stub->ipv6_dst_lookup_flow(addr->net, NULL, &fl6, NULL);
+	if (IS_ERR(dst))
+		return PTR_ERR(dst);
 
 	rt = (struct rt6_info *)dst;
-	if (ipv6_addr_any(&fl6.saddr)) {
-		ret = ipv6_dev_get_saddr(addr->net, ip6_dst_idev(dst)->dev,
-					 &fl6.daddr, 0, &fl6.saddr);
-		if (ret)
-			goto put;
-
+	if (ipv6_addr_any(&src_in->sin6_addr)) {
 		src_in->sin6_family = AF_INET6;
 		src_in->sin6_addr = fl6.saddr;
 	}
@@ -471,9 +481,6 @@ static int addr6_resolve(struct sockaddr_in6 *src_in,
 
 	*pdst = dst;
 	return 0;
-put:
-	dst_release(dst);
-	return ret;
 }
 #else
 static int addr6_resolve(struct sockaddr_in6 *src_in,
@@ -518,6 +525,11 @@ static int addr_resolve(struct sockaddr *src_in,
 	struct dst_entry *dst;
 	int ret;
 
+	if (!addr->net) {
+		pr_warn_ratelimited("%s: missing namespace\n", __func__);
+		return -EINVAL;
+	}
+
 	if (src_in->sa_family == AF_INET) {
 		struct rtable *rt = NULL;
 		const struct sockaddr_in *dst_in4 =
@@ -539,6 +551,7 @@ static int addr_resolve(struct sockaddr *src_in,
 		const struct sockaddr_in6 *dst_in6 =
 			(const struct sockaddr_in6 *)dst_in;
 
+		dst = NULL;
 		ret = addr6_resolve((struct sockaddr_in6 *)src_in,
 				    dst_in6, addr,
 				    &dst);
@@ -555,7 +568,6 @@ static int addr_resolve(struct sockaddr *src_in,
 	}
 
 	addr->bound_dev_if = ndev->ifindex;
-	addr->net = dev_net(ndev);
 	dev_put(ndev);
 
 	return ret;
@@ -723,14 +735,13 @@ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
 	struct net_device *dev;
 
 	union {
-		struct sockaddr     _sockaddr;
 		struct sockaddr_in  _sockaddr_in;
 		struct sockaddr_in6 _sockaddr_in6;
 	} sgid_addr, dgid_addr;
 
 
-	rdma_gid2ip(&sgid_addr._sockaddr, sgid);
-	rdma_gid2ip(&dgid_addr._sockaddr, dgid);
+	rdma_gid2ip((struct sockaddr *)&sgid_addr, sgid);
+	rdma_gid2ip((struct sockaddr *)&dgid_addr, dgid);
 
 	memset(&dev_addr, 0, sizeof(dev_addr));
 	if (if_index)
@@ -739,8 +750,9 @@ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
 
 	ctx.addr = &dev_addr;
 	init_completion(&ctx.comp);
-	ret = rdma_resolve_ip(&self, &sgid_addr._sockaddr, &dgid_addr._sockaddr,
-			&dev_addr, 1000, resolve_cb, &ctx);
+	ret = rdma_resolve_ip(&self, (struct sockaddr *)&sgid_addr,
+			      (struct sockaddr *)&dgid_addr, &dev_addr, 1000,
+			      resolve_cb, &ctx);
 	if (ret)
 		return ret;
 
@@ -770,16 +782,15 @@ int rdma_addr_find_smac_by_sgid(union ib_gid *sgid, u8 *smac, u16 *vlan_id)
 	int ret = 0;
 	struct rdma_dev_addr dev_addr;
 	union {
-		struct sockaddr     _sockaddr;
 		struct sockaddr_in  _sockaddr_in;
 		struct sockaddr_in6 _sockaddr_in6;
 	} gid_addr;
 
-	rdma_gid2ip(&gid_addr._sockaddr, sgid);
+	rdma_gid2ip((struct sockaddr *)&gid_addr, sgid);
 
 	memset(&dev_addr, 0, sizeof(dev_addr));
 	dev_addr.net = &init_net;
-	ret = rdma_translate_ip(&gid_addr._sockaddr, &dev_addr, vlan_id);
+	ret = rdma_translate_ip((struct sockaddr *)&gid_addr, &dev_addr, vlan_id);
 	if (ret)
 		return ret;
 

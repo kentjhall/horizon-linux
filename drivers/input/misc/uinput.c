@@ -39,6 +39,7 @@
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
 #include <linux/uinput.h>
+#include <linux/overflow.h>
 #include <linux/input/mt.h>
 #include "../input-compat.h"
 
@@ -230,6 +231,18 @@ static int uinput_dev_erase_effect(struct input_dev *dev, int effect_id)
 	return uinput_request_submit(udev, &request);
 }
 
+static int uinput_dev_flush(struct input_dev *dev, struct file *file)
+{
+	/*
+	 * If we are called with file == NULL that means we are tearing
+	 * down the device, and therefore we can not handle FF erase
+	 * requests: either we are handling UI_DEV_DESTROY (and holding
+	 * the udev->mutex), or the file descriptor is closed and there is
+	 * nobody on the other side anymore.
+	 */
+	return file ? input_ff_flush(dev, file) : 0;
+}
+
 static void uinput_destroy_device(struct uinput_device *udev)
 {
 	const char *name, *phys;
@@ -263,13 +276,21 @@ static int uinput_create_device(struct uinput_device *udev)
 		return -EINVAL;
 	}
 
-	if (test_bit(ABS_MT_SLOT, dev->absbit)) {
-		nslot = input_abs_get_max(dev, ABS_MT_SLOT) + 1;
-		error = input_mt_init_slots(dev, nslot, 0);
-		if (error)
+	if (test_bit(EV_ABS, dev->evbit)) {
+		input_alloc_absinfo(dev);
+		if (!dev->absinfo) {
+			error = -EINVAL;
 			goto fail1;
-	} else if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
-		input_set_events_per_packet(dev, 60);
+		}
+
+		if (test_bit(ABS_MT_SLOT, dev->absbit)) {
+			nslot = input_abs_get_max(dev, ABS_MT_SLOT) + 1;
+			error = input_mt_init_slots(dev, nslot, 0);
+			if (error)
+				goto fail1;
+		} else if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
+			input_set_events_per_packet(dev, 60);
+		}
 	}
 
 	if (test_bit(EV_FF, dev->evbit) && !udev->ff_effects_max) {
@@ -289,6 +310,12 @@ static int uinput_create_device(struct uinput_device *udev)
 		dev->ff->playback = uinput_dev_playback;
 		dev->ff->set_gain = uinput_dev_set_gain;
 		dev->ff->set_autocenter = uinput_dev_set_autocenter;
+		/*
+		 * The standard input_ff_flush() implementation does
+		 * not quite work for uinput as we can't reasonably
+		 * handle FF requests during device teardown.
+		 */
+		dev->flush = uinput_dev_flush;
 	}
 
 	error = input_register_device(udev->dev);
@@ -327,7 +354,7 @@ static int uinput_open(struct inode *inode, struct file *file)
 static int uinput_validate_absinfo(struct input_dev *dev, unsigned int code,
 				   const struct input_absinfo *abs)
 {
-	int min, max;
+	int min, max, range;
 
 	min = abs->minimum;
 	max = abs->maximum;
@@ -339,7 +366,7 @@ static int uinput_validate_absinfo(struct input_dev *dev, unsigned int code,
 		return -EINVAL;
 	}
 
-	if (abs->flat > max - min) {
+	if (!check_sub_overflow(max, min, &range) && abs->flat > range) {
 		printk(KERN_DEBUG
 		       "%s: abs_flat #%02x out of range: %d (min:%d/max:%d)\n",
 		       UINPUT_NAME, code, abs->flat, min, max);
@@ -529,6 +556,9 @@ static ssize_t uinput_inject_events(struct uinput_device *udev,
 		 */
 		if (input_event_from_user(buffer + bytes, &ev))
 			return -EFAULT;
+		if ((ev.type == EV_ABS) &&
+				(ev.code >= (ABS_MT_LAST + ABS_MT_FIRST)))
+			return -EINVAL;
 
 		input_event(udev->dev, ev.type, ev.code, ev.value);
 		bytes += input_event_size();
@@ -779,7 +809,7 @@ static int uinput_str_to_user(void __user *dest, const char *str,
 static long uinput_ioctl_handler(struct file *file, unsigned int cmd,
 				 unsigned long arg, void __user *p)
 {
-	int			retval;
+	long			retval;
 	struct uinput_device	*udev = file->private_data;
 	struct uinput_ff_upload ff_up;
 	struct uinput_ff_erase  ff_erase;
@@ -982,13 +1012,31 @@ static long uinput_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 #ifdef CONFIG_COMPAT
 
-#define UI_SET_PHYS_COMPAT	_IOW(UINPUT_IOCTL_BASE, 108, compat_uptr_t)
+/*
+ * These IOCTLs change their size and thus their numbers between
+ * 32 and 64 bits.
+ */
+#define UI_SET_PHYS_COMPAT		\
+	_IOW(UINPUT_IOCTL_BASE, 108, compat_uptr_t)
+#define UI_BEGIN_FF_UPLOAD_COMPAT	\
+	_IOWR(UINPUT_IOCTL_BASE, 200, struct uinput_ff_upload_compat)
+#define UI_END_FF_UPLOAD_COMPAT		\
+	_IOW(UINPUT_IOCTL_BASE, 201, struct uinput_ff_upload_compat)
 
 static long uinput_compat_ioctl(struct file *file,
 				unsigned int cmd, unsigned long arg)
 {
-	if (cmd == UI_SET_PHYS_COMPAT)
+	switch (cmd) {
+	case UI_SET_PHYS_COMPAT:
 		cmd = UI_SET_PHYS;
+		break;
+	case UI_BEGIN_FF_UPLOAD_COMPAT:
+		cmd = UI_BEGIN_FF_UPLOAD;
+		break;
+	case UI_END_FF_UPLOAD_COMPAT:
+		cmd = UI_END_FF_UPLOAD;
+		break;
+	}
 
 	return uinput_ioctl_handler(file, cmd, arg, compat_ptr(arg));
 }

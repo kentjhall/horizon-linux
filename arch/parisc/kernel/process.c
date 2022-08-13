@@ -39,6 +39,7 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
+#include <linux/cpu.h>
 #include <linux/module.h>
 #include <linux/personality.h>
 #include <linux/ptrace.h>
@@ -50,6 +51,7 @@
 #include <linux/uaccess.h>
 #include <linux/rcupdate.h>
 #include <linux/random.h>
+#include <linux/nmi.h>
 
 #include <asm/io.h>
 #include <asm/asm-offsets.h>
@@ -139,6 +141,11 @@ void machine_power_off(void)
 
 	printk(KERN_EMERG "System shut down completed.\n"
 	       "Please power this system off now.");
+
+	/* prevent soft lockup/stalled CPU messages for endless loop. */
+	rcu_sysrq_start();
+	lockup_detector_suspend();
+	for (;;);
 }
 
 void (*pm_power_off)(void) = machine_power_off;
@@ -173,6 +180,39 @@ int dump_task_fpu (struct task_struct *tsk, elf_fpregset_t *r)
 	memcpy(r, tsk->thread.regs.fr, sizeof(*r));
 	return 1;
 }
+
+/*
+ * Idle thread support
+ *
+ * Detect when running on QEMU with SeaBIOS PDC Firmware and let
+ * QEMU idle the host too.
+ */
+
+int running_on_qemu __read_mostly;
+EXPORT_SYMBOL(running_on_qemu);
+
+void __cpuidle arch_cpu_idle_dead(void)
+{
+	/* nop on real hardware, qemu will offline CPU. */
+	asm volatile("or %%r31,%%r31,%%r31\n":::);
+}
+
+void __cpuidle arch_cpu_idle(void)
+{
+	local_irq_enable();
+
+	/* nop on real hardware, qemu will idle sleep. */
+	asm volatile("or %%r10,%%r10,%%r10\n":::);
+}
+
+static int __init parisc_idle_init(void)
+{
+	if (!running_on_qemu)
+		cpu_idle_poll_ctrl(1);
+
+	return 0;
+}
+arch_initcall(parisc_idle_init);
 
 /*
  * Copy architecture-specific thread state

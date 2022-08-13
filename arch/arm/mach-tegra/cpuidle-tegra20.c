@@ -1,7 +1,7 @@
 /*
  * CPU idle driver for Tegra CPUs
  *
- * Copyright (c) 2010-2012, NVIDIA Corporation.
+ * Copyright (c) 2010-2016, NVIDIA CORPORATION. All rights reserved.
  * Copyright (c) 2011 Google, Inc.
  * Author: Colin Cross <ccross@android.com>
  *         Gary King <gking@nvidia.com>
@@ -26,12 +26,13 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 
+#include <soc/tegra/flowctrl.h>
+
 #include <asm/cpuidle.h>
 #include <asm/smp_plat.h>
 #include <asm/suspend.h>
 
 #include "cpuidle.h"
-#include "flowctrl.h"
 #include "iomap.h"
 #include "irq.h"
 #include "pm.h"

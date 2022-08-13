@@ -524,7 +524,7 @@ static int reiserfs_get_blocks_direct_io(struct inode *inode,
 	 * referenced in convert_tail_for_hole() that may be called from
 	 * reiserfs_get_block()
 	 */
-	bh_result->b_size = (1 << inode->i_blkbits);
+	bh_result->b_size = i_blocksize(inode);
 
 	ret = reiserfs_get_block(inode, iblock, bh_result,
 				 create | GET_BLOCK_NO_DANGLE);
@@ -1554,11 +1554,7 @@ void reiserfs_read_locked_inode(struct inode *inode,
 	 * set version 1, version 2 could be used too, because stat data
 	 * key is the same in both versions
 	 */
-	key.version = KEY_FORMAT_3_5;
-	key.on_disk_key.k_dir_id = dirino;
-	key.on_disk_key.k_objectid = inode->i_ino;
-	key.on_disk_key.k_offset = 0;
-	key.on_disk_key.k_type = 0;
+	_make_cpu_key(&key, KEY_FORMAT_3_5, dirino, inode->i_ino, 0, 0, 3);
 
 	/* look for the object's stat data */
 	retval = search_item(inode->i_sb, &key, &path_to_sd);
@@ -2102,6 +2098,15 @@ int reiserfs_new_inode(struct reiserfs_transaction_handle *th,
 		goto out_inserted_sd;
 	}
 
+	/*
+	 * Mark it private if we're creating the privroot
+	 * or something under it.
+	 */
+	if (IS_PRIVATE(dir) || dentry == REISERFS_SB(sb)->priv_root) {
+		inode->i_flags |= S_PRIVATE;
+		inode->i_opflags &= ~IOP_XATTR;
+	}
+
 	if (reiserfs_posixacl(inode->i_sb)) {
 		reiserfs_write_unlock(inode->i_sb);
 		retval = reiserfs_inherit_default_acl(th, dir, dentry, inode);
@@ -2116,8 +2121,7 @@ int reiserfs_new_inode(struct reiserfs_transaction_handle *th,
 		reiserfs_warning(inode->i_sb, "jdm-13090",
 				 "ACLs aren't enabled in the fs, "
 				 "but vfs thinks they are!");
-	} else if (IS_PRIVATE(dir))
-		inode->i_flags |= S_PRIVATE;
+	}
 
 	if (security->name) {
 		reiserfs_write_unlock(inode->i_sb);
@@ -2162,7 +2166,8 @@ out_end_trans:
 out_inserted_sd:
 	clear_nlink(inode);
 	th->t_trans_id = 0;	/* so the caller can't use this handle later */
-	unlock_new_inode(inode); /* OK to do even if we hadn't locked it */
+	if (inode->i_state & I_NEW)
+		unlock_new_inode(inode);
 	iput(inode);
 	return err;
 }

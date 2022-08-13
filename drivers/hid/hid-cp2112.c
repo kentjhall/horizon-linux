@@ -167,7 +167,7 @@ struct cp2112_device {
 	atomic_t xfer_avail;
 	struct gpio_chip gc;
 	u8 *in_out_buffer;
-	spinlock_t lock;
+	struct mutex lock;
 };
 
 static int gpio_push_pull = 0xFF;
@@ -179,16 +179,17 @@ static int cp2112_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
 	struct cp2112_device *dev = gpiochip_get_data(chip);
 	struct hid_device *hdev = dev->hdev;
 	u8 *buf = dev->in_out_buffer;
-	unsigned long flags;
 	int ret;
 
-	spin_lock_irqsave(&dev->lock, flags);
+	mutex_lock(&dev->lock);
 
 	ret = hid_hw_raw_request(hdev, CP2112_GPIO_CONFIG, buf,
 				 CP2112_GPIO_CONFIG_LENGTH, HID_FEATURE_REPORT,
 				 HID_REQ_GET_REPORT);
 	if (ret != CP2112_GPIO_CONFIG_LENGTH) {
 		hid_err(hdev, "error requesting GPIO config: %d\n", ret);
+		if (ret >= 0)
+			ret = -EIO;
 		goto exit;
 	}
 
@@ -198,16 +199,18 @@ static int cp2112_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
 	ret = hid_hw_raw_request(hdev, CP2112_GPIO_CONFIG, buf,
 				 CP2112_GPIO_CONFIG_LENGTH, HID_FEATURE_REPORT,
 				 HID_REQ_SET_REPORT);
-	if (ret < 0) {
+	if (ret != CP2112_GPIO_CONFIG_LENGTH) {
 		hid_err(hdev, "error setting GPIO config: %d\n", ret);
+		if (ret >= 0)
+			ret = -EIO;
 		goto exit;
 	}
 
 	ret = 0;
 
 exit:
-	spin_unlock_irqrestore(&dev->lock, flags);
-	return ret <= 0 ? ret : -EIO;
+	mutex_unlock(&dev->lock);
+	return ret;
 }
 
 static void cp2112_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
@@ -215,10 +218,9 @@ static void cp2112_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
 	struct cp2112_device *dev = gpiochip_get_data(chip);
 	struct hid_device *hdev = dev->hdev;
 	u8 *buf = dev->in_out_buffer;
-	unsigned long flags;
 	int ret;
 
-	spin_lock_irqsave(&dev->lock, flags);
+	mutex_lock(&dev->lock);
 
 	buf[0] = CP2112_GPIO_SET;
 	buf[1] = value ? 0xff : 0;
@@ -230,7 +232,7 @@ static void cp2112_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
 	if (ret < 0)
 		hid_err(hdev, "error setting GPIO values: %d\n", ret);
 
-	spin_unlock_irqrestore(&dev->lock, flags);
+	mutex_unlock(&dev->lock);
 }
 
 static int cp2112_gpio_get(struct gpio_chip *chip, unsigned offset)
@@ -238,10 +240,9 @@ static int cp2112_gpio_get(struct gpio_chip *chip, unsigned offset)
 	struct cp2112_device *dev = gpiochip_get_data(chip);
 	struct hid_device *hdev = dev->hdev;
 	u8 *buf = dev->in_out_buffer;
-	unsigned long flags;
 	int ret;
 
-	spin_lock_irqsave(&dev->lock, flags);
+	mutex_lock(&dev->lock);
 
 	ret = hid_hw_raw_request(hdev, CP2112_GPIO_GET, buf,
 				 CP2112_GPIO_GET_LENGTH, HID_FEATURE_REPORT,
@@ -255,7 +256,7 @@ static int cp2112_gpio_get(struct gpio_chip *chip, unsigned offset)
 	ret = (buf[1] >> offset) & 1;
 
 exit:
-	spin_unlock_irqrestore(&dev->lock, flags);
+	mutex_unlock(&dev->lock);
 
 	return ret;
 }
@@ -266,10 +267,9 @@ static int cp2112_gpio_direction_output(struct gpio_chip *chip,
 	struct cp2112_device *dev = gpiochip_get_data(chip);
 	struct hid_device *hdev = dev->hdev;
 	u8 *buf = dev->in_out_buffer;
-	unsigned long flags;
 	int ret;
 
-	spin_lock_irqsave(&dev->lock, flags);
+	mutex_lock(&dev->lock);
 
 	ret = hid_hw_raw_request(hdev, CP2112_GPIO_CONFIG, buf,
 				 CP2112_GPIO_CONFIG_LENGTH, HID_FEATURE_REPORT,
@@ -290,7 +290,7 @@ static int cp2112_gpio_direction_output(struct gpio_chip *chip,
 		goto fail;
 	}
 
-	spin_unlock_irqrestore(&dev->lock, flags);
+	mutex_unlock(&dev->lock);
 
 	/*
 	 * Set gpio value when output direction is already set,
@@ -301,7 +301,7 @@ static int cp2112_gpio_direction_output(struct gpio_chip *chip,
 	return 0;
 
 fail:
-	spin_unlock_irqrestore(&dev->lock, flags);
+	mutex_unlock(&dev->lock);
 	return ret < 0 ? ret : -EIO;
 }
 
@@ -1057,7 +1057,7 @@ static int cp2112_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if (!dev->in_out_buffer)
 		return -ENOMEM;
 
-	spin_lock_init(&dev->lock);
+	mutex_init(&dev->lock);
 
 	ret = hid_parse(hdev);
 	if (ret) {

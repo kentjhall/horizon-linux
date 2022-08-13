@@ -113,6 +113,7 @@ static int cts_cbc_encrypt(struct skcipher_request *req)
 
 	sg = scatterwalk_ffwd(rctx->sg, req->dst, offset - bsize);
 	scatterwalk_map_and_copy(d + bsize, sg, 0, bsize, 0);
+	memcpy(req->iv, d+bsize, bsize);
 
 	memset(d, 0, bsize);
 	scatterwalk_map_and_copy(d, req->src, offset, lastn, 0);

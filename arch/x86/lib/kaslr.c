@@ -5,6 +5,7 @@
  * kernel starts. This file is included in the compressed kernel and
  * normally linked in the regular.
  */
+#include <asm/asm.h>
 #include <asm/kaslr.h>
 #include <asm/msr.h>
 #include <asm/archrandom.h>
@@ -34,8 +35,8 @@ static inline u16 i8254(void)
 	u16 status, timer;
 
 	do {
-		outb(I8254_PORT_CONTROL,
-		     I8254_CMD_READBACK | I8254_SELECT_COUNTER0);
+		outb(I8254_CMD_READBACK | I8254_SELECT_COUNTER0,
+		     I8254_PORT_CONTROL);
 		status = inb(I8254_PORT_COUNTER0);
 		timer  = inb(I8254_PORT_COUNTER0);
 		timer |= inb(I8254_PORT_COUNTER0) << 8;
@@ -79,7 +80,7 @@ unsigned long kaslr_get_random_long(const char *purpose)
 	}
 
 	/* Circular multiply for better bit diffusion */
-	asm("mul %3"
+	asm(_ASM_MUL "%3"
 	    : "=a" (random), "=d" (raw)
 	    : "a" (random), "rm" (mix_const));
 	random += raw;

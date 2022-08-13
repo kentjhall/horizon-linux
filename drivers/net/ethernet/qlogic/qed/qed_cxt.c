@@ -54,7 +54,7 @@
 #define ILT_CFG_REG(cli, reg)	PSWRQ2_REG_ ## cli ## _ ## reg ## _RT_OFFSET
 
 /* ILT entry structure */
-#define ILT_ENTRY_PHY_ADDR_MASK		0x000FFFFFFFFFFFULL
+#define ILT_ENTRY_PHY_ADDR_MASK		(~0ULL >> 12)
 #define ILT_ENTRY_PHY_ADDR_SHIFT	0
 #define ILT_ENTRY_VALID_MASK		0x1ULL
 #define ILT_ENTRY_VALID_SHIFT		52
@@ -271,16 +271,34 @@ struct qed_tm_iids {
 	u32 per_vf_tids;
 };
 
-static void qed_cxt_tm_iids(struct qed_cxt_mngr *p_mngr,
+static void qed_cxt_tm_iids(struct qed_hwfn *p_hwfn,
+			    struct qed_cxt_mngr *p_mngr,
 			    struct qed_tm_iids *iids)
 {
-	u32 i, j;
+	bool tm_vf_required = false;
+	bool tm_required = false;
+	int i, j;
 
-	for (i = 0; i < MAX_CONN_TYPES; i++) {
+	/* Timers is a special case -> we don't count how many cids require
+	 * timers but what's the max cid that will be used by the timer block.
+	 * therefore we traverse in reverse order, and once we hit a protocol
+	 * that requires the timers memory, we'll sum all the protocols up
+	 * to that one.
+	 */
+	for (i = MAX_CONN_TYPES - 1; i >= 0; i--) {
 		struct qed_conn_type_cfg *p_cfg = &p_mngr->conn_cfg[i];
 
-		if (tm_cid_proto(i)) {
+		if (tm_cid_proto(i) || tm_required) {
+			if (p_cfg->cid_count)
+				tm_required = true;
+
 			iids->pf_cids += p_cfg->cid_count;
+		}
+
+		if (tm_cid_proto(i) || tm_vf_required) {
+			if (p_cfg->cids_per_vf)
+				tm_vf_required = true;
+
 			iids->per_vf_cids += p_cfg->cids_per_vf;
 		}
 	}
@@ -321,7 +339,7 @@ static void qed_cxt_qm_iids(struct qed_hwfn *p_hwfn,
 		vf_tids += segs[NUM_TASK_PF_SEGMENTS].count;
 	}
 
-	iids->vf_cids += vf_cids * p_mngr->vf_count;
+	iids->vf_cids = vf_cids;
 	iids->tids += vf_tids * p_mngr->vf_count;
 
 	DP_VERBOSE(p_hwfn, QED_MSG_ILT,
@@ -373,8 +391,9 @@ static void qed_cxt_set_proto_cid_count(struct qed_hwfn *p_hwfn,
 		u32 page_sz = p_mgr->clients[ILT_CLI_CDUC].p_size.val;
 		u32 cxt_size = CONN_CXT_SIZE(p_hwfn);
 		u32 elems_per_page = ILT_PAGE_IN_BYTES(page_sz) / cxt_size;
+		u32 align = elems_per_page * DQ_RANGE_ALIGN;
 
-		p_conn->cid_count = roundup(p_conn->cid_count, elems_per_page);
+		p_conn->cid_count = roundup(p_conn->cid_count, align);
 	}
 }
 
@@ -695,7 +714,7 @@ int qed_cxt_cfg_ilt_compute(struct qed_hwfn *p_hwfn)
 
 	/* TM PF */
 	p_cli = &p_mngr->clients[ILT_CLI_TM];
-	qed_cxt_tm_iids(p_mngr, &tm_iids);
+	qed_cxt_tm_iids(p_hwfn, p_mngr, &tm_iids);
 	total = tm_iids.pf_cids + tm_iids.pf_tids_total;
 	if (total) {
 		p_blk = &p_cli->pf_blks[0];
@@ -1590,7 +1609,7 @@ static void qed_tm_init_pf(struct qed_hwfn *p_hwfn)
 	u8 i;
 
 	memset(&tm_iids, 0, sizeof(tm_iids));
-	qed_cxt_tm_iids(p_mngr, &tm_iids);
+	qed_cxt_tm_iids(p_hwfn, p_mngr, &tm_iids);
 
 	/* @@@TBD No pre-scan for now */
 

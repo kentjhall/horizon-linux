@@ -90,6 +90,7 @@ void pci_bus_remove_resources(struct pci_bus *bus)
 		kfree(bus_res);
 	}
 }
+EXPORT_SYMBOL_GPL(pci_bus_remove_resources);
 
 int devm_request_pci_bus_resources(struct device *dev,
 				   struct list_head *resources)
@@ -324,12 +325,8 @@ void pci_bus_add_device(struct pci_dev *dev)
 
 	dev->match_driver = true;
 	retval = device_attach(&dev->dev);
-	if (retval < 0 && retval != -EPROBE_DEFER) {
+	if (retval < 0 && retval != -EPROBE_DEFER)
 		dev_warn(&dev->dev, "device attach failed (%d)\n", retval);
-		pci_proc_detach_device(dev);
-		pci_remove_sysfs_dev_files(dev);
-		return;
-	}
 
 	dev->is_added = 1;
 }

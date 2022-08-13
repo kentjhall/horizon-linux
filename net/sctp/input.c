@@ -421,7 +421,7 @@ void sctp_icmp_redirect(struct sock *sk, struct sctp_transport *t,
 {
 	struct dst_entry *dst;
 
-	if (!t)
+	if (sock_owned_by_user(sk) || !t)
 		return;
 	dst = sctp_transport_dst_check(t);
 	if (dst)
@@ -449,7 +449,7 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
 		else {
 			if (!mod_timer(&t->proto_unreach_timer,
 						jiffies + (HZ/20)))
-				sctp_association_hold(asoc);
+				sctp_transport_hold(t);
 		}
 	} else {
 		struct net *net = sock_net(sk);
@@ -458,7 +458,7 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
 			 "encountered!\n", __func__);
 
 		if (del_timer(&t->proto_unreach_timer))
-			sctp_association_put(asoc);
+			sctp_transport_put(t);
 
 		sctp_do_sm(net, SCTP_EVENT_T_OTHER,
 			   SCTP_ST_OTHER(SCTP_EVENT_ICMP_PROTO_UNREACH),
@@ -473,15 +473,14 @@ struct sock *sctp_err_lookup(struct net *net, int family, struct sk_buff *skb,
 			     struct sctp_association **app,
 			     struct sctp_transport **tpp)
 {
+	struct sctp_init_chunk *chunkhdr, _chunkhdr;
 	union sctp_addr saddr;
 	union sctp_addr daddr;
 	struct sctp_af *af;
 	struct sock *sk = NULL;
 	struct sctp_association *asoc;
 	struct sctp_transport *transport = NULL;
-	struct sctp_init_chunk *chunkhdr;
 	__u32 vtag = ntohl(sctphdr->vtag);
-	int len = skb->len - ((void *)sctphdr - (void *)skb->data);
 
 	*app = NULL; *tpp = NULL;
 
@@ -516,13 +515,16 @@ struct sock *sctp_err_lookup(struct net *net, int family, struct sk_buff *skb,
 	 * discard the packet.
 	 */
 	if (vtag == 0) {
-		chunkhdr = (void *)sctphdr + sizeof(struct sctphdr);
-		if (len < sizeof(struct sctphdr) + sizeof(sctp_chunkhdr_t)
-			  + sizeof(__be32) ||
+		/* chunk header + first 4 octects of init header */
+		chunkhdr = skb_header_pointer(skb, skb_transport_offset(skb) +
+					      sizeof(struct sctphdr),
+					      sizeof(struct sctp_chunkhdr) +
+					      sizeof(__be32), &_chunkhdr);
+		if (!chunkhdr ||
 		    chunkhdr->chunk_hdr.type != SCTP_CID_INIT ||
-		    ntohl(chunkhdr->init_hdr.init_tag) != asoc->c.my_vtag) {
+		    ntohl(chunkhdr->init_hdr.init_tag) != asoc->c.my_vtag)
 			goto out;
-		}
+
 	} else if (vtag != asoc->c.peer_vtag) {
 		goto out;
 	}
@@ -810,7 +812,7 @@ static inline int sctp_hash_cmp(struct rhashtable_compare_arg *arg,
 		return err;
 
 	asoc = t->asoc;
-	if (!net_eq(sock_net(asoc->base.sk), x->net))
+	if (!net_eq(asoc->base.net, x->net))
 		goto out;
 	if (x->ep) {
 		if (x->ep != asoc->ep)
@@ -833,7 +835,7 @@ static inline u32 sctp_hash_obj(const void *data, u32 len, u32 seed)
 {
 	const struct sctp_transport *t = data;
 	const union sctp_addr *paddr = &t->ipaddr;
-	const struct net *net = sock_net(t->asoc->base.sk);
+	const struct net *net = t->asoc->base.net;
 	u16 lport = htons(t->asoc->base.bind_addr.port);
 	u32 addr;
 

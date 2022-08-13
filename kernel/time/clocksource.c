@@ -272,8 +272,15 @@ static void clocksource_watchdog(unsigned long data)
 	next_cpu = cpumask_next(raw_smp_processor_id(), cpu_online_mask);
 	if (next_cpu >= nr_cpu_ids)
 		next_cpu = cpumask_first(cpu_online_mask);
-	watchdog_timer.expires += WATCHDOG_INTERVAL;
-	add_timer_on(&watchdog_timer, next_cpu);
+
+	/*
+	 * Arm timer if not already pending: could race with concurrent
+	 * pair clocksource_stop_watchdog() clocksource_start_watchdog().
+	 */
+	if (!timer_pending(&watchdog_timer)) {
+		watchdog_timer.expires += WATCHDOG_INTERVAL;
+		add_timer_on(&watchdog_timer, next_cpu);
+	}
 out:
 	spin_unlock(&watchdog_lock);
 }
@@ -980,6 +987,25 @@ sysfs_show_available_clocksources(struct device *dev,
 	return count;
 }
 
+/**
+ * sysfs_show_offset_ns - sysfs interface for reading start count
+ * @dev:	unused
+ * @attr:	unused
+ * @buf:	char buffer to be filled with start count
+ *
+ * Provides the start count of clock source
+ */
+static ssize_t
+sysfs_show_offset_ns(struct device *dev,
+		       struct device_attribute *attr,
+		       char *buf)
+{
+	ssize_t count = 0;
+
+	count = sprintf(buf, "%llu\n", curr_clocksource->offset_ns);
+	return count;
+}
+
 /*
  * Sysfs setup bits:
  */
@@ -990,6 +1016,9 @@ static DEVICE_ATTR(unbind_clocksource, 0200, NULL, sysfs_unbind_clocksource);
 
 static DEVICE_ATTR(available_clocksource, 0444,
 		   sysfs_show_available_clocksources, NULL);
+
+static DEVICE_ATTR(offset_ns, 0444,
+		   sysfs_show_offset_ns, NULL);
 
 static struct bus_type clocksource_subsys = {
 	.name = "clocksource",
@@ -1018,6 +1047,10 @@ static int __init init_clocksource_sysfs(void)
 		error = device_create_file(
 				&device_clocksource,
 				&dev_attr_available_clocksource);
+	if (!error)
+		error = device_create_file(
+				&device_clocksource,
+				&dev_attr_offset_ns);
 	return error;
 }
 

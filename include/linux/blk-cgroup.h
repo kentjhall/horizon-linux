@@ -619,6 +619,8 @@ static inline struct blkg_rwstat blkg_rwstat_read(struct blkg_rwstat *rwstat)
 	struct blkg_rwstat result;
 	int i;
 
+	memset(&result, 0, sizeof(result));
+
 	for (i = 0; i < BLKG_RWSTAT_NR; i++)
 		atomic64_set(&result.aux_cnt[i],
 			     percpu_counter_sum_positive(&rwstat->cpu_cnt[i]));

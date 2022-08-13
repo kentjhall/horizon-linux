@@ -29,6 +29,7 @@ Optional properties:
 - max-frequency: maximum operating clock frequency
 - no-1-8-v: when present, denotes that 1.8v card voltage is not supported on
   this system, even if the controller claims it is.
+- only-1-8-v: when present, denotes only 1.8V signal voltage support.
 - cap-sd-highspeed: SD high-speed timing is supported
 - cap-mmc-highspeed: MMC high-speed timing is supported
 - sd-uhs-sdr12: SD UHS SDR12 speed is supported

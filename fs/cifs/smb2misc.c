@@ -209,6 +209,13 @@ smb2_check_message(char *buf, unsigned int length, struct TCP_Server_Info *srvr)
 			return 0;
 
 		/*
+		 * Some windows servers (win2016) will pad also the final
+		 * PDU in a compound to 8 bytes.
+		 */
+		if (((clc_len + 7) & ~7) == len)
+			return 0;
+
+		/*
 		 * MacOS server pads after SMB2.1 write response with 3 bytes
 		 * of junk. Other servers match RFC1001 len to actual
 		 * SMB2/SMB3 frame length (header + smb2 response specific data)
@@ -467,7 +474,6 @@ smb2_tcon_has_lease(struct cifs_tcon *tcon, struct smb2_lease_break *rsp,
 	__u8 lease_state;
 	struct list_head *tmp;
 	struct cifsFileInfo *cfile;
-	struct TCP_Server_Info *server = tcon->ses->server;
 	struct cifs_pending_open *open;
 	struct cifsInodeInfo *cinode;
 	int ack_req = le32_to_cpu(rsp->Flags &
@@ -485,16 +491,19 @@ smb2_tcon_has_lease(struct cifs_tcon *tcon, struct smb2_lease_break *rsp,
 
 		cifs_dbg(FYI, "found in the open list\n");
 		cifs_dbg(FYI, "lease key match, lease break 0x%x\n",
-			 le32_to_cpu(rsp->NewLeaseState));
-
-		server->ops->set_oplock_level(cinode, lease_state, 0, NULL);
+			 lease_state);
 
 		if (ack_req)
 			cfile->oplock_break_cancelled = false;
 		else
 			cfile->oplock_break_cancelled = true;
 
-		queue_work(cifsiod_wq, &cfile->oplock_break);
+		set_bit(CIFS_INODE_PENDING_OPLOCK_BREAK, &cinode->flags);
+
+		cfile->oplock_epoch = le16_to_cpu(rsp->Epoch);
+		cfile->oplock_level = lease_state;
+
+		cifs_queue_oplock_break(cfile);
 		kfree(lw);
 		return true;
 	}
@@ -515,7 +524,7 @@ smb2_tcon_has_lease(struct cifs_tcon *tcon, struct smb2_lease_break *rsp,
 
 		cifs_dbg(FYI, "found in the pending open list\n");
 		cifs_dbg(FYI, "lease key match, lease break 0x%x\n",
-			 le32_to_cpu(rsp->NewLeaseState));
+			 lease_state);
 
 		open->oplock = lease_state;
 	}
@@ -599,10 +608,10 @@ smb2_is_valid_oplock_break(char *buffer, struct TCP_Server_Info *server)
 	spin_lock(&cifs_tcp_ses_lock);
 	list_for_each(tmp, &server->smb_ses_list) {
 		ses = list_entry(tmp, struct cifs_ses, smb_ses_list);
+
 		list_for_each(tmp1, &ses->tcon_list) {
 			tcon = list_entry(tmp1, struct cifs_tcon, tcon_list);
 
-			cifs_stats_inc(&tcon->stats.cifs_stats.num_oplock_brks);
 			spin_lock(&tcon->open_file_lock);
 			list_for_each(tmp2, &tcon->openFileList) {
 				cfile = list_entry(tmp2, struct cifsFileInfo,
@@ -614,6 +623,8 @@ smb2_is_valid_oplock_break(char *buffer, struct TCP_Server_Info *server)
 					continue;
 
 				cifs_dbg(FYI, "file id match, oplock break\n");
+				cifs_stats_inc(
+				    &tcon->stats.cifs_stats.num_oplock_brks);
 				cinode = CIFS_I(d_inode(cfile->dentry));
 				spin_lock(&cfile->file_info_lock);
 				if (!CIFS_CACHE_WRITE(cinode) &&
@@ -625,32 +636,65 @@ smb2_is_valid_oplock_break(char *buffer, struct TCP_Server_Info *server)
 				set_bit(CIFS_INODE_PENDING_OPLOCK_BREAK,
 					&cinode->flags);
 
-				/*
-				 * Set flag if the server downgrades the oplock
-				 * to L2 else clear.
-				 */
-				if (rsp->OplockLevel)
-					set_bit(
-					   CIFS_INODE_DOWNGRADE_OPLOCK_TO_L2,
-					   &cinode->flags);
-				else
-					clear_bit(
-					   CIFS_INODE_DOWNGRADE_OPLOCK_TO_L2,
-					   &cinode->flags);
+				cfile->oplock_epoch = 0;
+				cfile->oplock_level = rsp->OplockLevel;
+
 				spin_unlock(&cfile->file_info_lock);
-				queue_work(cifsiod_wq, &cfile->oplock_break);
+
+				cifs_queue_oplock_break(cfile);
 
 				spin_unlock(&tcon->open_file_lock);
 				spin_unlock(&cifs_tcp_ses_lock);
 				return true;
 			}
 			spin_unlock(&tcon->open_file_lock);
-			spin_unlock(&cifs_tcp_ses_lock);
-			cifs_dbg(FYI, "No matching file for oplock break\n");
-			return true;
 		}
 	}
 	spin_unlock(&cifs_tcp_ses_lock);
 	cifs_dbg(FYI, "Can not process oplock break for non-existent connection\n");
 	return false;
+}
+
+void
+smb2_cancelled_close_fid(struct work_struct *work)
+{
+	struct close_cancelled_open *cancelled = container_of(work,
+					struct close_cancelled_open, work);
+
+	cifs_dbg(VFS, "Close unmatched open\n");
+
+	SMB2_close(0, cancelled->tcon, cancelled->fid.persistent_fid,
+		   cancelled->fid.volatile_fid);
+	cifs_put_tcon(cancelled->tcon);
+	kfree(cancelled);
+}
+
+int
+smb2_handle_cancelled_mid(char *buffer, struct TCP_Server_Info *server)
+{
+	struct smb2_hdr *hdr = (struct smb2_hdr *)buffer;
+	struct smb2_create_rsp *rsp = (struct smb2_create_rsp *)buffer;
+	struct cifs_tcon *tcon;
+	struct close_cancelled_open *cancelled;
+
+	if (hdr->Command != SMB2_CREATE || hdr->Status != STATUS_SUCCESS)
+		return 0;
+
+	cancelled = kzalloc(sizeof(*cancelled), GFP_KERNEL);
+	if (!cancelled)
+		return -ENOMEM;
+
+	tcon = smb2_find_smb_tcon(server, hdr->SessionId, hdr->TreeId);
+	if (!tcon) {
+		kfree(cancelled);
+		return -ENOENT;
+	}
+
+	cancelled->fid.persistent_fid = rsp->PersistentFileId;
+	cancelled->fid.volatile_fid = rsp->VolatileFileId;
+	cancelled->tcon = tcon;
+	INIT_WORK(&cancelled->work, smb2_cancelled_close_fid);
+	queue_work(cifsiod_wq, &cancelled->work);
+
+	return 0;
 }

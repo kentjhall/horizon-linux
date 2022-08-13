@@ -89,6 +89,7 @@
 #include <linux/magic.h>
 #include <linux/slab.h>
 #include <linux/xattr.h>
+#include <linux/nospec.h>
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
@@ -497,7 +498,7 @@ static struct socket *sockfd_lookup_light(int fd, int *err, int *fput_needed)
 	if (f.file) {
 		sock = sock_from_file(f.file, err);
 		if (likely(sock)) {
-			*fput_needed = f.flags;
+			*fput_needed = f.flags & FDPUT_FPUT;
 			return sock;
 		}
 		fdput(f);
@@ -533,8 +534,25 @@ static ssize_t sockfs_listxattr(struct dentry *dentry, char *buffer,
 	return used;
 }
 
+static int sockfs_setattr(struct dentry *dentry, struct iattr *iattr)
+{
+	int err = simple_setattr(dentry, iattr);
+
+	if (!err && (iattr->ia_valid & ATTR_UID)) {
+		struct socket *sock = SOCKET_I(d_inode(dentry));
+
+		if (sock->sk)
+			sock->sk->sk_uid = iattr->ia_uid;
+		else
+			err = -ENOENT;
+	}
+
+	return err;
+}
+
 static const struct inode_operations sockfs_inode_ops = {
 	.listxattr = sockfs_listxattr,
+	.setattr = sockfs_setattr,
 };
 
 /**
@@ -577,12 +595,17 @@ EXPORT_SYMBOL(sock_alloc);
  *	an inode not a file.
  */
 
-void sock_release(struct socket *sock)
+static void __sock_release(struct socket *sock, struct inode *inode)
 {
 	if (sock->ops) {
 		struct module *owner = sock->ops->owner;
 
+		if (inode)
+			inode_lock(inode);
 		sock->ops->release(sock);
+		sock->sk = NULL;
+		if (inode)
+			inode_unlock(inode);
 		sock->ops = NULL;
 		module_put(owner);
 	}
@@ -596,6 +619,11 @@ void sock_release(struct socket *sock)
 		return;
 	}
 	sock->file = NULL;
+}
+
+void sock_release(struct socket *sock)
+{
+	__sock_release(sock, NULL);
 }
 EXPORT_SYMBOL(sock_release);
 
@@ -1029,7 +1057,7 @@ static int sock_mmap(struct file *file, struct vm_area_struct *vma)
 
 static int sock_close(struct inode *inode, struct file *filp)
 {
-	sock_release(SOCKET_I(inode));
+	__sock_release(SOCKET_I(inode), inode);
 	return 0;
 }
 
@@ -1702,6 +1730,7 @@ SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
 	/* We assume all kernel code knows the size of sockaddr_storage */
 	msg.msg_namelen = 0;
 	msg.msg_iocb = NULL;
+	msg.msg_flags = 0;
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
 	err = sock_recvmsg(sock, &msg, flags);
@@ -2197,8 +2226,10 @@ int __sys_recvmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
 		return err;
 
 	err = sock_error(sock->sk);
-	if (err)
+	if (err) {
+		datagrams = err;
 		goto out_put;
+	}
 
 	entry = mmsg;
 	compat_entry = (struct compat_mmsghdr __user *)mmsg;
@@ -2335,6 +2366,7 @@ SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
 
 	if (call < 1 || call > SYS_SENDMMSG)
 		return -EINVAL;
+	call = array_index_nospec(call, SYS_SENDMMSG + 1);
 
 	len = nargs[call];
 	if (len > sizeof(a))
@@ -2760,9 +2792,14 @@ static int ethtool_ioctl(struct net *net, struct compat_ifreq __user *ifr32)
 		    copy_in_user(&rxnfc->fs.ring_cookie,
 				 &compat_rxnfc->fs.ring_cookie,
 				 (void __user *)(&rxnfc->fs.location + 1) -
-				 (void __user *)&rxnfc->fs.ring_cookie) ||
-		    copy_in_user(&rxnfc->rule_cnt, &compat_rxnfc->rule_cnt,
-				 sizeof(rxnfc->rule_cnt)))
+				 (void __user *)&rxnfc->fs.ring_cookie))
+			return -EFAULT;
+		if (ethcmd == ETHTOOL_GRXCLSRLALL) {
+			if (put_user(rule_cnt, &rxnfc->rule_cnt))
+				return -EFAULT;
+		} else if (copy_in_user(&rxnfc->rule_cnt,
+					&compat_rxnfc->rule_cnt,
+					sizeof(rxnfc->rule_cnt)))
 			return -EFAULT;
 	}
 
@@ -3150,6 +3187,7 @@ static int compat_sock_ioctl_trans(struct file *file, struct socket *sock,
 	case SIOCSARP:
 	case SIOCGARP:
 	case SIOCDARP:
+	case SIOCOUTQNSD:
 	case SIOCATMARK:
 		return sock_do_ioctl(net, sock, cmd, arg);
 	}
@@ -3310,3 +3348,49 @@ int kernel_sock_shutdown(struct socket *sock, enum sock_shutdown_cmd how)
 	return sock->ops->shutdown(sock, how);
 }
 EXPORT_SYMBOL(kernel_sock_shutdown);
+
+/* This routine returns the IP overhead imposed by a socket i.e.
+ * the length of the underlying IP header, depending on whether
+ * this is an IPv4 or IPv6 socket and the length from IP options turned
+ * on at the socket. Assumes that the caller has a lock on the socket.
+ */
+u32 kernel_sock_ip_overhead(struct sock *sk)
+{
+	struct inet_sock *inet;
+	struct ip_options_rcu *opt;
+	u32 overhead = 0;
+	bool owned_by_user;
+#if IS_ENABLED(CONFIG_IPV6)
+	struct ipv6_pinfo *np;
+	struct ipv6_txoptions *optv6 = NULL;
+#endif /* IS_ENABLED(CONFIG_IPV6) */
+
+	if (!sk)
+		return overhead;
+
+	owned_by_user = sock_owned_by_user(sk);
+	switch (sk->sk_family) {
+	case AF_INET:
+		inet = inet_sk(sk);
+		overhead += sizeof(struct iphdr);
+		opt = rcu_dereference_protected(inet->inet_opt,
+						owned_by_user);
+		if (opt)
+			overhead += opt->opt.optlen;
+		return overhead;
+#if IS_ENABLED(CONFIG_IPV6)
+	case AF_INET6:
+		np = inet6_sk(sk);
+		overhead += sizeof(struct ipv6hdr);
+		if (np)
+			optv6 = rcu_dereference_protected(np->opt,
+							  owned_by_user);
+		if (optv6)
+			overhead += (optv6->opt_flen + optv6->opt_nflen);
+		return overhead;
+#endif /* IS_ENABLED(CONFIG_IPV6) */
+	default: /* Returns 0 overhead if the socket is not ipv4 or ipv6 */
+		return overhead;
+	}
+}
+EXPORT_SYMBOL(kernel_sock_ip_overhead);

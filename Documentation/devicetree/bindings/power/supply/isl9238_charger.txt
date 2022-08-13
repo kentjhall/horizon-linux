@@ -1,0 +1,127 @@
+* ISL9238 battery charger devicetree bindings
+
+Required properties:
+- compatible : "isil,isl9238"
+- reg: I2C slave address
+
+Required nodes:
+- regulators: There must a regulator subnode for the following purposes:
+               Enabling voltage supply to vbus port(to enable otg mode)
+
+Optional properties:
+- isl,charge-current-limit-ma: to set the charging current limit in ma
+
+- isl,max-system-voltage-mv: to set the maximum charging voltage or
+			 system regulating voltage
+
+- isl,max-init-voltage-mv: to set the maximum init charging voltage or
+			 system default regulating voltage
+
+- isl,min-system-voltage-mv: to set the minimum system voltage
+
+- isl,input-voltage-limit-mv: to set input voltage limit
+
+- isl,adapter-current-limit1-ma: to se the adapter current limit 1
+
+- isl,adapter-current-limit2-ma: to se the adapter current limit 2
+
+- isl,acprochot-threshold: assertion threshold for adapter overcurrent
+			   condition.
+
+- isl,dcprochot-threshold: assertion threshold for adapter overcurrent
+			   condition.
+
+- isl,trickle-chg-current-ma: to configure trickle charging current
+
+- isl,current-sense-res: current_sense_reister(rs1, rs2) to configure
+			 charging current limit
+			 charging current depends on sense resister value
+
+- isl,adapter-sense-res: adapter_sense_reister(rs1, rs2) to configure
+			 adapter current limit
+			 adapter current depends on sense resister value
+
+- isl,otg-voltage-mv: to set OTG mode output regulation voltage
+
+- isl,otg-current-ma: to set OTG mode curret
+
+- isl,disable-regulation: disable input volatge regulation, by default
+			  input voltage regulation enabled
+
+- isl,enable-bat-learn-mode: enable battery learn mode, by default
+			    battery learn mode disabled
+
+- isl,disable-turbo-mode: disable turbo mode, by default
+			  turbo charging mode enabled
+
+- isl,enable-auto-charging: enable auto charging mode
+
+- isl,enable-battery-ovp: enables Battery OV (Overvoltage) fault protection
+			by default battery ov fault disabled
+
+- isl,enable-trigger-acok: enables trigger PROCHOT# with ACOK
+			by default acok trigger disabled
+
+- isl,enable-prochot-otg-current: enables trigger PROCHOT# with OTGCURRENT
+			by default otgcurrent trigger disabled
+
+- isl,disable-smbus-timer: disable smbus timer(safety timer)
+			by default smbus timer enabled
+			smbus timer used to ensure the SMBus master
+			is active and to prevent overcharging the battery.
+
+- isl,enable-psys-monitor: enables system power monitor PSYS function
+			by default PSYS function is disabled
+
+- isl,thermal-zone: thermal zone name to get battery temperature
+
+- isl,temp-polling-time-sec: polling time to read battey temp and apply
+		thermal profile
+
+-isl,terminate-chg-current: terminate chagring current, if battery current
+		below terminate charging current then disable charging.
+
+- isl,temp-range: temperature range for thermal profile
+
+- isl,current-voltage-table: current and voltage table for thermal profile
+< 0C - No Charge
+0C to 9C - 1.17A to 13.2V
+10C to 19C - 1.95A to 13.2V
+20C to 49C - 3.90A to 12.75V; then 1.95A 12.75V to 13.2V
+50C to 59C - 1.95A to 12.3V
+> 60C - No Charge
+
+vbus regulator properties:
+================
+regulator-name: vbus regulator name.
+
+charger regulator properties:
+================
+regulator-name: charger regulator name.
+
+Example
+bc_isl9238: isl9238@9 {
+	compatible = "isil,isl9238";
+	reg = <0x09>;
+	isl,charge-current-limit = <4096000>;
+	isl,max-system-voltage = <8192000>;
+	isl,min-system-voltage = <1024000>;
+	isl,input-voltage-limit = <2730000>;
+	isl,enable-auto-charging;
+
+	isl,thermal-zone = "battery";
+	isl,temp-polling-time-sec = <5>;
+	isl,terminate-chg-current = <78000>;
+	isl,temp-range = <0 10 20 50 60>;
+	isl,current-voltage-table = <0 780 1170 3900 1950
+				     0 780 1170 1950 1950
+				     0 13200 13200 12550 12300>;
+
+	vbus {
+		regulator-name = "otg-vbus-reg";
+	};
+
+	charger {
+		regulator-name = "charger-vbus-reg";
+	};
+};

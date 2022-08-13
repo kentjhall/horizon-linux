@@ -609,6 +609,7 @@ static void intel_pstate_hwp_set_online_cpus(void)
 static int pid_param_set(void *data, u64 val)
 {
 	*(u32 *)data = val;
+	pid_params.sample_rate_ns = pid_params.sample_rate_ms * NSEC_PER_MSEC;
 	intel_pstate_reset_all_pid();
 	return 0;
 }
@@ -658,13 +659,13 @@ static void __init intel_pstate_debug_expose_params(void)
 /************************** sysfs begin ************************/
 #define show_one(file_name, object)					\
 	static ssize_t show_##file_name					\
-	(struct kobject *kobj, struct attribute *attr, char *buf)	\
+	(struct kobject *kobj, struct kobj_attribute *attr, char *buf)	\
 	{								\
 		return sprintf(buf, "%u\n", limits->object);		\
 	}
 
 static ssize_t show_turbo_pct(struct kobject *kobj,
-				struct attribute *attr, char *buf)
+				struct kobj_attribute *attr, char *buf)
 {
 	struct cpudata *cpu;
 	int total, no_turbo, turbo_pct;
@@ -680,7 +681,7 @@ static ssize_t show_turbo_pct(struct kobject *kobj,
 }
 
 static ssize_t show_num_pstates(struct kobject *kobj,
-				struct attribute *attr, char *buf)
+				struct kobj_attribute *attr, char *buf)
 {
 	struct cpudata *cpu;
 	int total;
@@ -691,7 +692,7 @@ static ssize_t show_num_pstates(struct kobject *kobj,
 }
 
 static ssize_t show_no_turbo(struct kobject *kobj,
-			     struct attribute *attr, char *buf)
+			     struct kobj_attribute *attr, char *buf)
 {
 	ssize_t ret;
 
@@ -704,7 +705,7 @@ static ssize_t show_no_turbo(struct kobject *kobj,
 	return ret;
 }
 
-static ssize_t store_no_turbo(struct kobject *a, struct attribute *b,
+static ssize_t store_no_turbo(struct kobject *a, struct kobj_attribute *b,
 			      const char *buf, size_t count)
 {
 	unsigned int input;
@@ -728,7 +729,7 @@ static ssize_t store_no_turbo(struct kobject *a, struct attribute *b,
 	return count;
 }
 
-static ssize_t store_max_perf_pct(struct kobject *a, struct attribute *b,
+static ssize_t store_max_perf_pct(struct kobject *a, struct kobj_attribute *b,
 				  const char *buf, size_t count)
 {
 	unsigned int input;
@@ -752,7 +753,7 @@ static ssize_t store_max_perf_pct(struct kobject *a, struct attribute *b,
 	return count;
 }
 
-static ssize_t store_min_perf_pct(struct kobject *a, struct attribute *b,
+static ssize_t store_min_perf_pct(struct kobject *a, struct kobj_attribute *b,
 				  const char *buf, size_t count)
 {
 	unsigned int input;
@@ -818,6 +819,25 @@ static void intel_pstate_hwp_enable(struct cpudata *cpudata)
 		wrmsrl_on_cpu(cpudata->cpu, MSR_HWP_INTERRUPT, 0x00);
 
 	wrmsrl_on_cpu(cpudata->cpu, MSR_PM_ENABLE, 0x1);
+}
+
+#define MSR_IA32_POWER_CTL_BIT_EE	19
+
+/* Disable energy efficiency optimization */
+static void intel_pstate_disable_ee(int cpu)
+{
+	u64 power_ctl;
+	int ret;
+
+	ret = rdmsrl_on_cpu(cpu, MSR_IA32_POWER_CTL, &power_ctl);
+	if (ret)
+		return;
+
+	if (!(power_ctl & BIT(MSR_IA32_POWER_CTL_BIT_EE))) {
+		pr_info("Disabling energy efficiency optimization\n");
+		power_ctl |= BIT(MSR_IA32_POWER_CTL_BIT_EE);
+		wrmsrl_on_cpu(cpu, MSR_IA32_POWER_CTL, power_ctl);
+	}
 }
 
 static int atom_get_min_pstate(void)
@@ -1393,7 +1413,7 @@ static void intel_pstate_update_util(struct update_util_data *data, u64 time,
 static const struct x86_cpu_id intel_pstate_cpu_ids[] = {
 	ICPU(INTEL_FAM6_SANDYBRIDGE, 		core_params),
 	ICPU(INTEL_FAM6_SANDYBRIDGE_X,		core_params),
-	ICPU(INTEL_FAM6_ATOM_SILVERMONT1,	silvermont_params),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT,	silvermont_params),
 	ICPU(INTEL_FAM6_IVYBRIDGE,		core_params),
 	ICPU(INTEL_FAM6_HASWELL_CORE,		core_params),
 	ICPU(INTEL_FAM6_BROADWELL_CORE,		core_params),
@@ -1420,6 +1440,11 @@ static const struct x86_cpu_id intel_pstate_cpu_oob_ids[] __initconst = {
 	{}
 };
 
+static const struct x86_cpu_id intel_pstate_cpu_ee_disable_ids[] = {
+	ICPU(INTEL_FAM6_KABYLAKE_DESKTOP, core_params),
+	{}
+};
+
 static int intel_pstate_init_cpu(unsigned int cpunum)
 {
 	struct cpudata *cpu;
@@ -1435,6 +1460,12 @@ static int intel_pstate_init_cpu(unsigned int cpunum)
 	cpu->cpu = cpunum;
 
 	if (hwp_active) {
+		const struct x86_cpu_id *id;
+
+		id = x86_match_cpu(intel_pstate_cpu_ee_disable_ids);
+		if (id)
+			intel_pstate_disable_ee(cpunum);
+
 		intel_pstate_hwp_enable(cpu);
 		pid_params.sample_rate_ms = 50;
 		pid_params.sample_rate_ns = 50 * NSEC_PER_MSEC;

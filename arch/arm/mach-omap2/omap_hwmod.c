@@ -790,14 +790,14 @@ static int _init_main_clk(struct omap_hwmod *oh)
 	int ret = 0;
 	char name[MOD_CLK_MAX_NAME_LEN];
 	struct clk *clk;
+	static const char modck[] = "_mod_ck";
 
-	/* +7 magic comes from '_mod_ck' suffix */
-	if (strlen(oh->name) + 7 > MOD_CLK_MAX_NAME_LEN)
+	if (strlen(oh->name) >= MOD_CLK_MAX_NAME_LEN - strlen(modck))
 		pr_warn("%s: warning: cropping name for %s\n", __func__,
 			oh->name);
 
-	strncpy(name, oh->name, MOD_CLK_MAX_NAME_LEN - 7);
-	strcat(name, "_mod_ck");
+	strlcpy(name, oh->name, MOD_CLK_MAX_NAME_LEN - strlen(modck));
+	strlcat(name, modck, MOD_CLK_MAX_NAME_LEN);
 
 	clk = clk_get(NULL, name);
 	if (!IS_ERR(clk)) {
@@ -2551,7 +2551,7 @@ static int __init _init(struct omap_hwmod *oh, void *data)
  * a stub; implementing this properly requires iclk autoidle usecounting in
  * the clock code.   No return value.
  */
-static void __init _setup_iclk_autoidle(struct omap_hwmod *oh)
+static void _setup_iclk_autoidle(struct omap_hwmod *oh)
 {
 	struct omap_hwmod_ocp_if *os;
 	struct list_head *p;
@@ -2586,9 +2586,9 @@ static void __init _setup_iclk_autoidle(struct omap_hwmod *oh)
  * reset.  Returns 0 upon success or a negative error code upon
  * failure.
  */
-static int __init _setup_reset(struct omap_hwmod *oh)
+static int _setup_reset(struct omap_hwmod *oh)
 {
-	int r;
+	int r = 0;
 
 	if (oh->_state != _HWMOD_STATE_INITIALIZED)
 		return -EINVAL;
@@ -2647,7 +2647,7 @@ static int __init _setup_reset(struct omap_hwmod *oh)
  *
  * No return value.
  */
-static void __init _setup_postsetup(struct omap_hwmod *oh)
+static void _setup_postsetup(struct omap_hwmod *oh)
 {
 	u8 postsetup_state;
 

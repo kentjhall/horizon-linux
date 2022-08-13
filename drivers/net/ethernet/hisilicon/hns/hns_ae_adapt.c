@@ -149,12 +149,10 @@ static void hns_ae_put_handle(struct hnae_handle *handle)
 	struct hnae_vf_cb *vf_cb = hns_ae_get_vf_cb(handle);
 	int i;
 
-	vf_cb->mac_cb	 = NULL;
-
-	kfree(vf_cb);
-
 	for (i = 0; i < handle->q_num; i++)
 		hns_ae_get_ring_pair(handle->qs[i])->used_by_vf = 0;
+
+	kfree(vf_cb);
 }
 
 static void hns_ae_ring_enable_all(struct hnae_handle *handle, int val)
@@ -289,6 +287,9 @@ void hns_ae_stop(struct hnae_handle *handle)
 	usleep_range(10000, 20000);
 
 	hns_ae_ring_enable_all(handle, 0);
+
+	/* clean rx fbd. */
+	hns_rcb_wait_fbd_clean(handle->qs, handle->q_num, RCB_INT_FLAG_RX);
 
 	(void)hns_mac_vm_config_bc_en(mac_cb, 0, false);
 }
@@ -773,8 +774,9 @@ static int hns_ae_get_rss(struct hnae_handle *handle, u32 *indir, u8 *key,
 		memcpy(key, ppe_cb->rss_key, HNS_PPEV2_RSS_KEY_SIZE);
 
 	/* update the current hash->queue mappings from the shadow RSS table */
-	memcpy(indir, ppe_cb->rss_indir_table,
-	       HNS_PPEV2_RSS_IND_TBL_SIZE * sizeof(*indir));
+	if (indir)
+		memcpy(indir, ppe_cb->rss_indir_table,
+		       HNS_PPEV2_RSS_IND_TBL_SIZE  * sizeof(*indir));
 
 	return 0;
 }
@@ -785,15 +787,19 @@ static int hns_ae_set_rss(struct hnae_handle *handle, const u32 *indir,
 	struct hns_ppe_cb *ppe_cb = hns_get_ppe_cb(handle);
 
 	/* set the RSS Hash Key if specififed by the user */
-	if (key)
-		hns_ppe_set_rss_key(ppe_cb, (u32 *)key);
+	if (key) {
+		memcpy(ppe_cb->rss_key, key, HNS_PPEV2_RSS_KEY_SIZE);
+		hns_ppe_set_rss_key(ppe_cb, ppe_cb->rss_key);
+	}
 
-	/* update the shadow RSS table with user specified qids */
-	memcpy(ppe_cb->rss_indir_table, indir,
-	       HNS_PPEV2_RSS_IND_TBL_SIZE * sizeof(*indir));
+	if (indir) {
+		/* update the shadow RSS table with user specified qids */
+		memcpy(ppe_cb->rss_indir_table, indir,
+		       HNS_PPEV2_RSS_IND_TBL_SIZE  * sizeof(*indir));
 
-	/* now update the hardware */
-	hns_ppe_set_indir_table(ppe_cb, ppe_cb->rss_indir_table);
+		/* now update the hardware */
+		hns_ppe_set_indir_table(ppe_cb, ppe_cb->rss_indir_table);
+	}
 
 	return 0;
 }

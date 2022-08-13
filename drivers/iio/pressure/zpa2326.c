@@ -676,8 +676,10 @@ static int zpa2326_resume(const struct iio_dev *indio_dev)
 	int err;
 
 	err = pm_runtime_get_sync(indio_dev->dev.parent);
-	if (err < 0)
+	if (err < 0) {
+		pm_runtime_put(indio_dev->dev.parent);
 		return err;
+	}
 
 	if (err > 0) {
 		/*
@@ -869,14 +871,14 @@ complete:
 static int zpa2326_wait_oneshot_completion(const struct iio_dev   *indio_dev,
 					   struct zpa2326_private *private)
 {
-	int          ret;
 	unsigned int val;
+	long     timeout;
 
 	zpa2326_dbg(indio_dev, "waiting for one shot completion interrupt");
 
-	ret = wait_for_completion_interruptible_timeout(
+	timeout = wait_for_completion_interruptible_timeout(
 		&private->data_ready, ZPA2326_CONVERSION_JIFFIES);
-	if (ret > 0)
+	if (timeout > 0)
 		/*
 		 * Interrupt handler completed before timeout: return operation
 		 * status.
@@ -886,15 +888,15 @@ static int zpa2326_wait_oneshot_completion(const struct iio_dev   *indio_dev,
 	/* Clear all interrupts just to be sure. */
 	regmap_read(private->regmap, ZPA2326_INT_SOURCE_REG, &val);
 
-	if (!ret)
+	if (!timeout) {
 		/* Timed out. */
-		ret = -ETIME;
+		zpa2326_warn(indio_dev, "no one shot interrupt occurred (%ld)",
+			     timeout);
+		return -ETIME;
+	}
 
-	if (ret != -ERESTARTSYS)
-		zpa2326_warn(indio_dev, "no one shot interrupt occurred (%d)",
-			     ret);
-
-	return ret;
+	zpa2326_warn(indio_dev, "wait for one shot interrupt cancelled");
+	return -ERESTARTSYS;
 }
 
 static int zpa2326_init_managed_irq(struct device          *parent,

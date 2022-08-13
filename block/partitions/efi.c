@@ -109,6 +109,7 @@
  * the partition tables happens after init too.
  */
 static int force_gpt;
+static u64 force_gpt_sector;
 static int __init
 force_gpt_fn(char *str)
 {
@@ -116,6 +117,13 @@ force_gpt_fn(char *str)
 	return 1;
 }
 __setup("gpt", force_gpt_fn);
+
+static int __init force_gpt_sector_fn(char *str)
+{
+	force_gpt_sector = simple_strtoull(str, NULL, 0);
+	return 1;
+}
+__setup("gpt_sector=", force_gpt_sector_fn);
 
 
 /**
@@ -293,7 +301,7 @@ static gpt_entry *alloc_read_gpt_entries(struct parsed_partitions *state,
 	if (!gpt)
 		return NULL;
 
-	count = le32_to_cpu(gpt->num_partition_entries) *
+	count = (size_t)le32_to_cpu(gpt->num_partition_entries) *
                 le32_to_cpu(gpt->sizeof_partition_entry);
 	if (!count)
 		return NULL;
@@ -352,7 +360,7 @@ static int is_gpt_valid(struct parsed_partitions *state, u64 lba,
 			gpt_header **gpt, gpt_entry **ptes)
 {
 	u32 crc, origcrc;
-	u64 lastlba;
+	u64 lastlba, pt_size;
 
 	if (!ptes)
 		return 0;
@@ -434,13 +442,20 @@ static int is_gpt_valid(struct parsed_partitions *state, u64 lba,
 		goto fail;
 	}
 
+	/* Sanity check partition table size */
+	pt_size = (u64)le32_to_cpu((*gpt)->num_partition_entries) *
+		le32_to_cpu((*gpt)->sizeof_partition_entry);
+	if (pt_size > KMALLOC_MAX_SIZE) {
+		pr_debug("GUID Partition Table is too large: %llu > %lu bytes\n",
+			 (unsigned long long)pt_size, KMALLOC_MAX_SIZE);
+		goto fail;
+	}
+
 	if (!(*ptes = alloc_read_gpt_entries(state, *gpt)))
 		goto fail;
 
 	/* Check the GUID Partition Entry Array CRC */
-	crc = efi_crc32((const unsigned char *) (*ptes),
-			le32_to_cpu((*gpt)->num_partition_entries) *
-			le32_to_cpu((*gpt)->sizeof_partition_entry));
+	crc = efi_crc32((const unsigned char *) (*ptes), pt_size);
 
 	if (crc != le32_to_cpu((*gpt)->partition_entry_array_crc32)) {
 		pr_debug("GUID Partition Entry Array CRC check failed.\n");
@@ -627,6 +642,9 @@ static int find_valid_gpt(struct parsed_partitions *state, gpt_header **gpt,
 					 &agpt, &aptes);
         if (!good_agpt && force_gpt)
                 good_agpt = is_gpt_valid(state, lastlba, &agpt, &aptes);
+
+	if (!good_agpt && force_gpt && force_gpt_sector)
+		good_agpt = is_gpt_valid(state, force_gpt_sector, &agpt, &aptes);
 
         /* The obviously unsuccessful case */
         if (!good_pgpt && !good_agpt)

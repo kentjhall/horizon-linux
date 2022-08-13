@@ -326,6 +326,7 @@ static void b53_get_vlan_entry(struct b53_device *dev, u16 vid,
 
 static void b53_set_forwarding(struct b53_device *dev, int enable)
 {
+	struct dsa_switch *ds = dev->ds;
 	u8 mgmt;
 
 	b53_read8(dev, B53_CTRL_PAGE, B53_SWITCH_MODE, &mgmt);
@@ -336,6 +337,15 @@ static void b53_set_forwarding(struct b53_device *dev, int enable)
 		mgmt &= ~SM_SW_FWD_EN;
 
 	b53_write8(dev, B53_CTRL_PAGE, B53_SWITCH_MODE, mgmt);
+
+	/* Include IMP port in dumb forwarding mode when no tagging protocol is
+	 * set
+	 */
+	if (ds->ops->get_tag_protocol(ds) == DSA_TAG_PROTO_NONE) {
+		b53_read8(dev, B53_CTRL_PAGE, B53_SWITCH_CTRL, &mgmt);
+		mgmt |= B53_MII_DUMB_FWDG_EN;
+		b53_write8(dev, B53_CTRL_PAGE, B53_SWITCH_CTRL, mgmt);
+	}
 }
 
 static void b53_enable_vlan(struct b53_device *dev, bool enable)
@@ -1099,12 +1109,15 @@ static int b53_arl_read(struct b53_device *dev, u64 mac,
 			u16 vid, struct b53_arl_entry *ent, u8 *idx,
 			bool is_valid)
 {
+	DECLARE_BITMAP(free_bins, B53_ARLTBL_MAX_BIN_ENTRIES);
 	unsigned int i;
 	int ret;
 
 	ret = b53_arl_op_wait(dev);
 	if (ret)
 		return ret;
+
+	bitmap_zero(free_bins, dev->num_arl_entries);
 
 	/* Read the bins */
 	for (i = 0; i < dev->num_arl_entries; i++) {
@@ -1117,12 +1130,20 @@ static int b53_arl_read(struct b53_device *dev, u64 mac,
 			   B53_ARLTBL_DATA_ENTRY(i), &fwd_entry);
 		b53_arl_to_entry(ent, mac_vid, fwd_entry);
 
-		if (!(fwd_entry & ARLTBL_VALID))
+		if (!(fwd_entry & ARLTBL_VALID)) {
+			set_bit(i, free_bins);
 			continue;
+		}
 		if ((mac_vid & ARLTBL_MAC_MASK) != mac)
 			continue;
 		*idx = i;
+		return 0;
 	}
+
+	if (bitmap_weight(free_bins, dev->num_arl_entries) == 0)
+		return -ENOSPC;
+
+	*idx = find_first_bit(free_bins, dev->num_arl_entries);
 
 	return -ENOENT;
 }
@@ -1153,10 +1174,23 @@ static int b53_arl_op(struct b53_device *dev, int op, int port,
 	if (op)
 		return ret;
 
-	/* We could not find a matching MAC, so reset to a new entry */
-	if (ret) {
+	switch (ret) {
+	case -ETIMEDOUT:
+		return ret;
+	case -ENOSPC:
+		dev_dbg(dev->dev, "{%pM,%.4d} no space left in ARL\n",
+			addr, vid);
+		return is_valid ? ret : 0;
+	case -ENOENT:
+		/* We could not find a matching MAC, so reset to a new entry */
+		dev_dbg(dev->dev, "{%pM,%.4d} not found, using idx: %d\n",
+			addr, vid, idx);
 		fwd_entry = 0;
-		idx = 1;
+		break;
+	default:
+		dev_dbg(dev->dev, "{%pM,%.4d} found, using idx: %d\n",
+			addr, vid, idx);
+		break;
 	}
 
 	memset(&ent, 0, sizeof(ent));
@@ -1506,6 +1540,18 @@ static const struct b53_chip_data b53_switch_chips[] = {
 		.duplex_reg = B53_DUPLEX_STAT_FE,
 	},
 	{
+		.chip_id = BCM5389_DEVICE_ID,
+		.dev_name = "BCM5389",
+		.vlans = 4096,
+		.enabled_ports = 0x1f,
+		.arl_entries = 4,
+		.cpu_port = B53_CPU_PORT,
+		.vta_regs = B53_VTA_REGS,
+		.duplex_reg = B53_DUPLEX_STAT_GE,
+		.jumbo_pm_reg = B53_JUMBO_PORT_MASK,
+		.jumbo_size_reg = B53_JUMBO_MAX_SIZE,
+	},
+	{
 		.chip_id = BCM5395_DEVICE_ID,
 		.dev_name = "BCM5395",
 		.vlans = 4096,
@@ -1558,6 +1604,7 @@ static const struct b53_chip_data b53_switch_chips[] = {
 		.dev_name = "BCM53125",
 		.vlans = 4096,
 		.enabled_ports = 0xff,
+		.arl_entries = 4,
 		.cpu_port = B53_CPU_PORT,
 		.vta_regs = B53_VTA_REGS,
 		.duplex_reg = B53_DUPLEX_STAT_GE,
@@ -1814,6 +1861,7 @@ int b53_switch_detect(struct b53_device *dev)
 		else
 			dev->chip_id = BCM5365_DEVICE_ID;
 		break;
+	case BCM5389_DEVICE_ID:
 	case BCM5395_DEVICE_ID:
 	case BCM5397_DEVICE_ID:
 	case BCM5398_DEVICE_ID:

@@ -14,6 +14,7 @@
 #include <linux/types.h>
 #include <linux/init.h>
 #include <linux/slab.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/notifier.h>
 #include <linux/err.h>
@@ -138,8 +139,13 @@ static void power_supply_deferred_register_work(struct work_struct *work)
 	struct power_supply *psy = container_of(work, struct power_supply,
 						deferred_register_work.work);
 
-	if (psy->dev.parent)
-		mutex_lock(&psy->dev.parent->mutex);
+	if (psy->dev.parent) {
+		while (!mutex_trylock(&psy->dev.parent->mutex)) {
+			if (psy->removing)
+				return;
+			msleep(10);
+		}
+	}
 
 	power_supply_changed(psy);
 
@@ -758,13 +764,13 @@ __power_supply_register(struct device *parent,
 	}
 
 	spin_lock_init(&psy->changed_lock);
-	rc = device_init_wakeup(dev, ws);
-	if (rc)
-		goto wakeup_init_failed;
-
 	rc = device_add(dev);
 	if (rc)
 		goto device_add_failed;
+
+	rc = device_init_wakeup(dev, ws);
+	if (rc)
+		goto wakeup_init_failed;
 
 	rc = psy_register_thermal(psy);
 	if (rc)
@@ -802,8 +808,8 @@ register_cooler_failed:
 	psy_unregister_thermal(psy);
 register_thermal_failed:
 	device_del(dev);
-device_add_failed:
 wakeup_init_failed:
+device_add_failed:
 check_supplies_failed:
 dev_set_name_failed:
 	put_device(dev);
@@ -944,6 +950,7 @@ EXPORT_SYMBOL_GPL(devm_power_supply_register_no_ws);
 void power_supply_unregister(struct power_supply *psy)
 {
 	WARN_ON(atomic_dec_return(&psy->use_cnt));
+	psy->removing = true;
 	cancel_work_sync(&psy->changed_work);
 	cancel_delayed_work_sync(&psy->deferred_register_work);
 	sysfs_remove_link(&psy->dev.kobj, "powers");

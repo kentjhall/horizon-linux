@@ -1,0 +1,123 @@
+* Nvidia sdhci-tegra controller
+
+This file documents differences between the core properties in mmc.txt
+and the properties used by the sdhci-tegra driver.
+
+Required properties:
+- compatible: Should be "nvidia,tegra210-sdhci"
+- reg: Specify start address and registers count details
+- interrupts: Specify the interrupts IRQ info for device
+- id: Specify device id
+
+Optional properties:
+- built-in: Add the check if the device is built-in device
+- bus-width: Specify device bus width details
+- max-clk-limit: Specify the maximum clock limit for the device
+- ddr-clk-limit: Specify the maximum clock frequency in kHz for device in DDR mode
+- mmc-ocr-mask: Specify OCR register masking details
+- uhs-mask: Specify modes that are masked for the device
+	Mask HS200 mode: 0x20
+	Mask HS400 mode: 0x40
+	Mask SDR104 mode: 0x10
+	Mask SDR50 mode: 0x4
+	Mask DDR50 mode: 0x8
+	Mask SDR25 mode: 0x2
+- pll_source: Specify list of clock parents
+- dqs-trim-delay: HS400 Tap value for incoming DQS path trimmer.
+- cd-gpios: details of GPIO port used for SD card detect
+- wp-gpios: details of GPIO port used for SD card write protect mode
+- power-gpios: details of GPIO port used to power up SDIO card
+- default-drv-type: Drive strength to select for SDIO devices is encoded as 8-bit char as follows
+	Drive strength Type B: 0x0
+	Drive strength Type A: 0x1
+	Drive strength Type C: 0x2
+	Drive strength Type D: 0x3
+- disable-dynamic-clock-gating: flag when set disables sdmmc clock gating
+- nvidia,disable-rtpm: Set this flag to disable runtime power management
+  support for sdhci devices.
+- power-off-rail: flag when set enables sdmmc reboot notifier
+- pwrdet-support: flag when set indicates the sdmmc controller instance needs power detect bit programming for voltage switching.
+- pwrdet-bit: Specify Tegra Power Management Controller power detect bit for the particular SDMMC controller instance. This field is specified only when the pwrdet-support is true
+- nvidia,is-emmc: Enable this flag for eMMC devices
+- nvidia,is-sdio: Enable this flag for SDIO devices
+- nvidia,sd-device: Enable this flag for SD devices
+- fixed-clock-freq: The first element is for ID mode. The rest of the entries are for different modes indexed as per ios timings.
+	ID MODE			0
+	MMC_TIMING_LEGACY	1
+	MMC_TIMING_MMC_HS	2
+	MMC_TIMING_SD_HS	3
+	MMC_TIMING_UHS_SDR12	4
+	MMC_TIMING_UHS_SDR25	5
+	MMC_TIMING_UHS_SDR50	6
+	MMC_TIMING_UHS_SDR104	7
+	MMC_TIMING_UHS_DDR50	8
+	MMC_TIMING_MMC_HS200	9
+	MMC_TIMING_MMC_HS400	10
+- nvidia,enable-hwcq: Set this flag to enable HW Command Queue support.
+- nvidia,cd-wakeup-capable: Set this flag to enable card detect event as wake source.
+- nvidia,enable-strobe-mode: Enable enhance strobe mode when eMMC device runs at HS400 mode.
+- nvidia,en-periodic-calib: Enable periodic calibration support for sdmmc1/sdmmc3. Auto calibration sequence will be run at interval of 100ms during sdmmc1/sdmmc3 interfaces are active.
+- nvidia,parent_clk_list: Defines the list of parent clock corresponding to the speed mode.
+- nvidia,set-parent-clk: Use this flag, to select parent clock based on current speed mode, where parent-list available in DT.
+- nvidia,en-periodic-cflush: Set this flag to enable periodic cache flushing
+  to improve write performance without overhead of flushing cache with every
+write.
+- force-non-removable-rescan: Set this flag to force rescan for non-removable
+  devices. Used for SDIO devices to allow re-init during wifi module
+load/unload.
+- only-1-8-v: Set this flag to specify that only 1.8V IO voltage is supported
+  and same should be configured by default.
+- nvidia,clk-en-before-freq-update: Set this flag to enable clock before
+  updating clock frequency rate. This is needed for some SDMMC controller
+instances.
+-nvidia,min-tap-delay: Defines minimum tap delay in picoseconds seen on a SOC.
+This value is SOC specific and used to compute lowerthreshold, upperthreshold, fixed_tap values needed for post auto-tuning correction algorithm.
+-nvidia,max-tap-delay: Defines maximum tap delay in picoseconds seen on a SOC.
+This value is SOC specific and used to compute lowerthreshold, upperthreshold, fixed_tap values needed for post auto-tuning correction algorithm.
+
+Example:
+
+	sdhci@700b0600 {
+		compatible = "nvidia,tegra210-sdhci";
+		reg = <0x0 0x700b0600 0x0 0x200>;
+		interrupts = < 0 31 0x04 >;
+		tap-delay = <4>;
+		trim-delay = <3>;
+		mmc-ocr-mask = <0>;
+		max-clk-limit = <200000000>;
+		uhs-mask = <0x20>; /* Mask HS200 */
+		bus-width = <8>;
+		id = <3>;
+		pll_source = "pll_m", "pll_p";
+		built-in;
+		compad-vref-3v3 = <0x7>;
+		compad-vref-1v8 = <0x7>;
+		disable-dynamic-clock-gating;
+		nvidia,runtime-pm-type = <1>;
+		nvidia,en-periodic-cflush;
+		nvidia,set-parent-clk;
+		nvidia,enable-hwcq;
+		nvidia,parent_clk_list = <"pll_p", "pll_c4_out0", "pll_p">;
+		nvidia,min-tap-delay = <96>;
+		nvidia,max-tap-delay = <139>;
+		only-1-8-v;
+		status = "okay";
+		fixed-clock-freq = <25500000 25500000 24000000 47000000 24000000 47000000 94000000 204000000 0 0 0>;
+	};
+
+	sdhci@700b0000 {
+		tap-delay = <0>;
+		trim-delay = <2>;
+		mmc-ocr-mask = <3>;
+		max-clk-limit = <136000000>;
+		ddr-clk-limit = <41000000>;
+		uhs-mask = <0x8>;
+		bus-width = <4>;
+		id = <0>;
+		pll_source = "pll_m", "pll_p";
+		default-drive-type = <1>;
+		force-non-removable-rescan;
+		nvidia,min-tap-delay = <96>;
+		nvidia,max-tap-delay = <139>;
+		status = "okay";
+	};

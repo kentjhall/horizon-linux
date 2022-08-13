@@ -383,6 +383,8 @@ static void *__netdev_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
  */
 void *netdev_alloc_frag(unsigned int fragsz)
 {
+	fragsz = SKB_DATA_ALIGN(fragsz);
+
 	return __netdev_alloc_frag(fragsz, GFP_ATOMIC | __GFP_COLD);
 }
 EXPORT_SYMBOL(netdev_alloc_frag);
@@ -396,6 +398,8 @@ static void *__napi_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
 
 void *napi_alloc_frag(unsigned int fragsz)
 {
+	fragsz = SKB_DATA_ALIGN(fragsz);
+
 	return __napi_alloc_frag(fragsz, GFP_ATOMIC | __GFP_COLD);
 }
 EXPORT_SYMBOL(napi_alloc_frag);
@@ -485,13 +489,17 @@ EXPORT_SYMBOL(__netdev_alloc_skb);
 struct sk_buff *__napi_alloc_skb(struct napi_struct *napi, unsigned int len,
 				 gfp_t gfp_mask)
 {
-	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+	struct napi_alloc_cache *nc;
 	struct sk_buff *skb;
 	void *data;
 
 	len += NET_SKB_PAD + NET_IP_ALIGN;
 
-	if ((len > SKB_WITH_OVERHEAD(PAGE_SIZE)) ||
+	/* If requested length is either too small or too big,
+	 * we use kmalloc() for skb->head allocation.
+	 */
+	if (len <= SKB_WITH_OVERHEAD(1024) ||
+	    len > SKB_WITH_OVERHEAD(PAGE_SIZE) ||
 	    (gfp_mask & (__GFP_DIRECT_RECLAIM | GFP_DMA))) {
 		skb = __alloc_skb(len, gfp_mask, SKB_ALLOC_RX, NUMA_NO_NODE);
 		if (!skb)
@@ -499,6 +507,7 @@ struct sk_buff *__napi_alloc_skb(struct napi_struct *napi, unsigned int len,
 		goto skb_success;
 	}
 
+	nc = this_cpu_ptr(&napi_alloc_cache);
 	len += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
 	len = SKB_DATA_ALIGN(len);
 
@@ -903,6 +912,8 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
 	n->hdr_len = skb->nohdr ? skb_headroom(skb) : skb->hdr_len;
 	n->cloned = 1;
 	n->nohdr = 0;
+	n->peeked = 0;
+	C(pfmemalloc);
 	n->destructor = NULL;
 	C(tail);
 	C(end);
@@ -1575,6 +1586,27 @@ done:
 	return 0;
 }
 EXPORT_SYMBOL(___pskb_trim);
+
+/* Note : use pskb_trim_rcsum() instead of calling this directly
+ */
+int pskb_trim_rcsum_slow(struct sk_buff *skb, unsigned int len)
+{
+	if (skb->ip_summed == CHECKSUM_COMPLETE) {
+		int delta = skb->len - len;
+
+		skb->csum = csum_block_sub(skb->csum,
+					   skb_checksum(skb, len, delta, 0),
+					   len);
+	} else if (skb->ip_summed == CHECKSUM_PARTIAL) {
+		int hdlen = (len > skb_headlen(skb)) ? skb_headlen(skb) : len;
+		int offset = skb_checksum_start_offset(skb) + skb->csum_offset;
+
+		if (offset + sizeof(__sum16) > hdlen)
+			return -EINVAL;
+	}
+	return __pskb_trim(skb, len);
+}
+EXPORT_SYMBOL(pskb_trim_rcsum_slow);
 
 /**
  *	__pskb_pull_tail - advance tail of skb header
@@ -2423,20 +2455,27 @@ EXPORT_SYMBOL(skb_queue_purge);
 /**
  *	skb_rbtree_purge - empty a skb rbtree
  *	@root: root of the rbtree to empty
+ *	Return value: the sum of truesizes of all purged skbs.
  *
  *	Delete all buffers on an &sk_buff rbtree. Each buffer is removed from
  *	the list and one reference dropped. This function does not take
  *	any lock. Synchronization should be handled by the caller (e.g., TCP
  *	out-of-order queue is protected by the socket lock).
  */
-void skb_rbtree_purge(struct rb_root *root)
+unsigned int skb_rbtree_purge(struct rb_root *root)
 {
-	struct sk_buff *skb, *next;
+	struct rb_node *p = rb_first(root);
+	unsigned int sum = 0;
 
-	rbtree_postorder_for_each_entry_safe(skb, next, root, rbnode)
+	while (p) {
+		struct sk_buff *skb = rb_entry(p, struct sk_buff, rbnode);
+
+		p = rb_next(p);
+		rb_erase(&skb->rbnode, root);
+		sum += skb->truesize;
 		kfree_skb(skb);
-
-	*root = RB_ROOT;
+	}
+	return sum;
 }
 
 /**
@@ -2615,7 +2654,8 @@ void skb_split(struct sk_buff *skb, struct sk_buff *skb1, const u32 len)
 {
 	int pos = skb_headlen(skb);
 
-	skb_shinfo(skb1)->tx_flags = skb_shinfo(skb)->tx_flags & SKBTX_SHARED_FRAG;
+	skb_shinfo(skb1)->tx_flags |= skb_shinfo(skb)->tx_flags &
+				      SKBTX_SHARED_FRAG;
 	if (len < pos)	/* Split line is inside header. */
 		skb_split_inside_header(skb, skb1, len, pos);
 	else		/* Second chunk has no header, nothing to copy. */
@@ -3065,6 +3105,25 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	int pos;
 	int dummy;
 
+	if (list_skb && !list_skb->head_frag && skb_headlen(list_skb) &&
+	    (skb_shinfo(head_skb)->gso_type & SKB_GSO_DODGY)) {
+		/* gso_size is untrusted, and we have a frag_list with a linear
+		 * non head_frag head.
+		 *
+		 * (we assume checking the first list_skb member suffices;
+		 * i.e if either of the list_skb members have non head_frag
+		 * head, then the first one has too).
+		 *
+		 * If head_skb's headlen does not fit requested gso_size, it
+		 * means that the frag_list members do NOT terminate on exact
+		 * gso_size boundaries. Hence we cannot perform skb_frag_t page
+		 * sharing. Therefore we must fallback to copying the frag_list
+		 * skbs; we do so by disabling SG.
+		 */
+		if (mss != GSO_BY_FRAGS && mss != skb_headlen(head_skb))
+			features &= ~NETIF_F_SG;
+	}
+
 	__skb_push(head_skb, doffset);
 	proto = skb_network_protocol(head_skb, &dummy);
 	if (unlikely(!proto))
@@ -3076,22 +3135,32 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	if (sg && csum && (mss != GSO_BY_FRAGS))  {
 		if (!(features & NETIF_F_GSO_PARTIAL)) {
 			struct sk_buff *iter;
+			unsigned int frag_len;
 
 			if (!list_skb ||
 			    !net_gso_ok(features, skb_shinfo(head_skb)->gso_type))
 				goto normal;
 
-			/* Split the buffer at the frag_list pointer.
-			 * This is based on the assumption that all
-			 * buffers in the chain excluding the last
-			 * containing the same amount of data.
+			/* If we get here then all the required
+			 * GSO features except frag_list are supported.
+			 * Try to split the SKB to multiple GSO SKBs
+			 * with no frag_list.
+			 * Currently we can do that only when the buffers don't
+			 * have a linear part and all the buffers except
+			 * the last are of the same length.
 			 */
+			frag_len = list_skb->len;
 			skb_walk_frags(head_skb, iter) {
+				if (frag_len != iter->len && iter->next)
+					goto normal;
 				if (skb_headlen(iter))
 					goto normal;
 
 				len -= iter->len;
 			}
+
+			if (len != frag_len)
+				goto normal;
 		}
 
 		/* GSO partial only requires that we trim off any excess that
@@ -3218,8 +3287,8 @@ normal:
 		skb_copy_from_linear_data_offset(head_skb, offset,
 						 skb_put(nskb, hsize), hsize);
 
-		skb_shinfo(nskb)->tx_flags = skb_shinfo(head_skb)->tx_flags &
-			SKBTX_SHARED_FRAG;
+		skb_shinfo(nskb)->tx_flags |= skb_shinfo(head_skb)->tx_flags &
+					      SKBTX_SHARED_FRAG;
 
 		while (pos < offset + len) {
 			if (i >= nfrags) {
@@ -3240,6 +3309,7 @@ normal:
 				net_warn_ratelimited(
 					"skb_segment: too many frags: %u %u\n",
 					pos, mss);
+				err = -EINVAL;
 				goto err;
 			}
 
@@ -3276,11 +3346,10 @@ skip_fraglist:
 
 perform_csum_check:
 		if (!csum) {
-			if (skb_has_shared_frag(nskb)) {
-				err = __skb_linearize(nskb);
-				if (err)
-					goto err;
-			}
+			if (skb_has_shared_frag(nskb) &&
+			    __skb_linearize(nskb))
+				goto err;
+
 			if (!nskb->remcsum_offload)
 				nskb->ip_summed = CHECKSUM_NONE;
 			SKB_GSO_CB(nskb)->csum =
@@ -3465,23 +3534,17 @@ void __init skb_init(void)
 						NULL);
 }
 
-/**
- *	skb_to_sgvec - Fill a scatter-gather list from a socket buffer
- *	@skb: Socket buffer containing the buffers to be mapped
- *	@sg: The scatter-gather list to map into
- *	@offset: The offset into the buffer's contents to start mapping
- *	@len: Length of buffer space to be mapped
- *
- *	Fill the specified scatter-gather list with mappings/pointers into a
- *	region of the buffer space attached to a socket buffer.
- */
 static int
-__skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len)
+__skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len,
+	       unsigned int recursion_level)
 {
 	int start = skb_headlen(skb);
 	int i, copy = start - offset;
 	struct sk_buff *frag_iter;
 	int elt = 0;
+
+	if (unlikely(recursion_level >= 24))
+		return -EMSGSIZE;
 
 	if (copy > 0) {
 		if (copy > len)
@@ -3501,6 +3564,8 @@ __skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len)
 		end = start + skb_frag_size(&skb_shinfo(skb)->frags[i]);
 		if ((copy = end - offset) > 0) {
 			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			if (unlikely(elt && sg_is_last(&sg[elt - 1])))
+				return -EMSGSIZE;
 
 			if (copy > len)
 				copy = len;
@@ -3515,16 +3580,22 @@ __skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len)
 	}
 
 	skb_walk_frags(skb, frag_iter) {
-		int end;
+		int end, ret;
 
 		WARN_ON(start > offset + len);
 
 		end = start + frag_iter->len;
 		if ((copy = end - offset) > 0) {
+			if (unlikely(elt && sg_is_last(&sg[elt - 1])))
+				return -EMSGSIZE;
+
 			if (copy > len)
 				copy = len;
-			elt += __skb_to_sgvec(frag_iter, sg+elt, offset - start,
-					      copy);
+			ret = __skb_to_sgvec(frag_iter, sg+elt, offset - start,
+					      copy, recursion_level + 1);
+			if (unlikely(ret < 0))
+				return ret;
+			elt += ret;
 			if ((len -= copy) == 0)
 				return elt;
 			offset += copy;
@@ -3534,6 +3605,31 @@ __skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len)
 	BUG_ON(len);
 	return elt;
 }
+
+/**
+ *	skb_to_sgvec - Fill a scatter-gather list from a socket buffer
+ *	@skb: Socket buffer containing the buffers to be mapped
+ *	@sg: The scatter-gather list to map into
+ *	@offset: The offset into the buffer's contents to start mapping
+ *	@len: Length of buffer space to be mapped
+ *
+ *	Fill the specified scatter-gather list with mappings/pointers into a
+ *	region of the buffer space attached to a socket buffer. Returns either
+ *	the number of scatterlist items used, or -EMSGSIZE if the contents
+ *	could not fit.
+ */
+int skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len)
+{
+	int nsg = __skb_to_sgvec(skb, sg, offset, len, 0);
+
+	if (nsg <= 0)
+		return nsg;
+
+	sg_mark_end(&sg[nsg - 1]);
+
+	return nsg;
+}
+EXPORT_SYMBOL_GPL(skb_to_sgvec);
 
 /* As compared with skb_to_sgvec, skb_to_sgvec_nomark only map skb to given
  * sglist without mark the sg which contain last skb data as the end.
@@ -3557,19 +3653,11 @@ __skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len)
 int skb_to_sgvec_nomark(struct sk_buff *skb, struct scatterlist *sg,
 			int offset, int len)
 {
-	return __skb_to_sgvec(skb, sg, offset, len);
+	return __skb_to_sgvec(skb, sg, offset, len, 0);
 }
 EXPORT_SYMBOL_GPL(skb_to_sgvec_nomark);
 
-int skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len)
-{
-	int nsg = __skb_to_sgvec(skb, sg, offset, len);
 
-	sg_mark_end(&sg[nsg - 1]);
-
-	return nsg;
-}
-EXPORT_SYMBOL_GPL(skb_to_sgvec);
 
 /**
  *	skb_cow_data - Check that a socket buffer's data buffers are writable
@@ -3707,7 +3795,7 @@ int sock_queue_err_skb(struct sock *sk, struct sk_buff *skb)
 
 	skb_queue_tail(&sk->sk_error_queue, skb);
 	if (!sock_flag(sk, SOCK_DEAD))
-		sk->sk_data_ready(sk);
+		sk->sk_error_report(sk);
 	return 0;
 }
 EXPORT_SYMBOL(sock_queue_err_skb);
@@ -3779,6 +3867,7 @@ static void __skb_complete_tx_timestamp(struct sk_buff *skb,
 	serr->ee.ee_errno = ENOMSG;
 	serr->ee.ee_origin = SO_EE_ORIGIN_TIMESTAMPING;
 	serr->ee.ee_info = tstype;
+	serr->header.h4.iif = skb->dev ? skb->dev->ifindex : 0;
 	if (sk->sk_tsflags & SOF_TIMESTAMPING_OPT_ID) {
 		serr->ee.ee_data = skb_shinfo(skb)->tskey;
 		if (sk->sk_protocol == IPPROTO_TCP &&
@@ -3812,15 +3901,20 @@ void skb_complete_tx_timestamp(struct sk_buff *skb,
 	struct sock *sk = skb->sk;
 
 	if (!skb_may_tx_timestamp(sk, false))
+		goto err;
+
+	/* Take a reference to prevent skb_orphan() from freeing the socket,
+	 * but only if the socket refcount is not zero.
+	 */
+	if (likely(atomic_inc_not_zero(&sk->sk_refcnt))) {
+		*skb_hwtstamps(skb) = *hwtstamps;
+		__skb_complete_tx_timestamp(skb, sk, SCM_TSTAMP_SND);
+		sock_put(sk);
 		return;
+	}
 
-	/* take a reference to prevent skb_orphan() from freeing the socket */
-	sock_hold(sk);
-
-	*skb_hwtstamps(skb) = *hwtstamps;
-	__skb_complete_tx_timestamp(skb, sk, SCM_TSTAMP_SND);
-
-	sock_put(sk);
+err:
+	kfree_skb(skb);
 }
 EXPORT_SYMBOL_GPL(skb_complete_tx_timestamp);
 
@@ -3846,7 +3940,8 @@ void __skb_tstamp_tx(struct sk_buff *orig_skb,
 		return;
 
 	if (tsonly) {
-		skb_shinfo(skb)->tx_flags = skb_shinfo(orig_skb)->tx_flags;
+		skb_shinfo(skb)->tx_flags |= skb_shinfo(orig_skb)->tx_flags &
+					     SKBTX_ANY_TSTAMP;
 		skb_shinfo(skb)->tskey = skb_shinfo(orig_skb)->tskey;
 	}
 
@@ -3871,7 +3966,7 @@ void skb_complete_wifi_ack(struct sk_buff *skb, bool acked)
 {
 	struct sock *sk = skb->sk;
 	struct sock_exterr_skb *serr;
-	int err;
+	int err = 1;
 
 	skb->wifi_acked_valid = 1;
 	skb->wifi_acked = acked;
@@ -3881,14 +3976,15 @@ void skb_complete_wifi_ack(struct sk_buff *skb, bool acked)
 	serr->ee.ee_errno = ENOMSG;
 	serr->ee.ee_origin = SO_EE_ORIGIN_TXSTATUS;
 
-	/* take a reference to prevent skb_orphan() from freeing the socket */
-	sock_hold(sk);
-
-	err = sock_queue_err_skb(sk, skb);
+	/* Take a reference to prevent skb_orphan() from freeing the socket,
+	 * but only if the socket refcount is not zero.
+	 */
+	if (likely(atomic_inc_not_zero(&sk->sk_refcnt))) {
+		err = sock_queue_err_skb(sk, skb);
+		sock_put(sk);
+	}
 	if (err)
 		kfree_skb(skb);
-
-	sock_put(sk);
 }
 EXPORT_SYMBOL_GPL(skb_complete_wifi_ack);
 
@@ -4359,9 +4455,14 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
 	nf_reset(skb);
 	nf_reset_trace(skb);
 
+#ifdef CONFIG_NET_SWITCHDEV
+	skb->offload_fwd_mark = 0;
+#endif
+
 	if (!xnet)
 		return;
 
+	ipvs_reset(skb);
 	skb_orphan(skb);
 	skb->mark = 0;
 }
@@ -4402,6 +4503,45 @@ unsigned int skb_gso_transport_seglen(const struct sk_buff *skb)
 EXPORT_SYMBOL_GPL(skb_gso_transport_seglen);
 
 /**
+ * skb_gso_size_check - check the skb size, considering GSO_BY_FRAGS
+ *
+ * There are a couple of instances where we have a GSO skb, and we
+ * want to determine what size it would be after it is segmented.
+ *
+ * We might want to check:
+ * -    L3+L4+payload size (e.g. IP forwarding)
+ * - L2+L3+L4+payload size (e.g. sanity check before passing to driver)
+ *
+ * This is a helper to do that correctly considering GSO_BY_FRAGS.
+ *
+ * @seg_len: The segmented length (from skb_gso_*_seglen). In the
+ *           GSO_BY_FRAGS case this will be [header sizes + GSO_BY_FRAGS].
+ *
+ * @max_len: The maximum permissible length.
+ *
+ * Returns true if the segmented length <= max length.
+ */
+static inline bool skb_gso_size_check(const struct sk_buff *skb,
+				      unsigned int seg_len,
+				      unsigned int max_len) {
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	const struct sk_buff *iter;
+
+	if (shinfo->gso_size != GSO_BY_FRAGS)
+		return seg_len <= max_len;
+
+	/* Undo this so we can re-use header sizes */
+	seg_len -= GSO_BY_FRAGS;
+
+	skb_walk_frags(skb, iter) {
+		if (seg_len + skb_headlen(iter) > max_len)
+			return false;
+	}
+
+	return true;
+}
+
+/**
  * skb_gso_validate_mtu - Return in case such skb fits a given MTU
  *
  * @skb: GSO skb
@@ -4412,36 +4552,39 @@ EXPORT_SYMBOL_GPL(skb_gso_transport_seglen);
  */
 bool skb_gso_validate_mtu(const struct sk_buff *skb, unsigned int mtu)
 {
-	const struct skb_shared_info *shinfo = skb_shinfo(skb);
-	const struct sk_buff *iter;
-	unsigned int hlen;
-
-	hlen = skb_gso_network_seglen(skb);
-
-	if (shinfo->gso_size != GSO_BY_FRAGS)
-		return hlen <= mtu;
-
-	/* Undo this so we can re-use header sizes */
-	hlen -= GSO_BY_FRAGS;
-
-	skb_walk_frags(skb, iter) {
-		if (hlen + skb_headlen(iter) > mtu)
-			return false;
-	}
-
-	return true;
+	return skb_gso_size_check(skb, skb_gso_network_seglen(skb), mtu);
 }
 EXPORT_SYMBOL_GPL(skb_gso_validate_mtu);
 
+/**
+ * skb_gso_validate_mac_len - Will a split GSO skb fit in a given length?
+ *
+ * @skb: GSO skb
+ * @len: length to validate against
+ *
+ * skb_gso_validate_mac_len validates if a given skb will fit a wanted
+ * length once split, including L2, L3 and L4 headers and the payload.
+ */
+bool skb_gso_validate_mac_len(const struct sk_buff *skb, unsigned int len)
+{
+	return skb_gso_size_check(skb, skb_gso_mac_seglen(skb), len);
+}
+EXPORT_SYMBOL_GPL(skb_gso_validate_mac_len);
+
 static struct sk_buff *skb_reorder_vlan_header(struct sk_buff *skb)
 {
+	int mac_len;
+
 	if (skb_cow(skb, skb_headroom(skb)) < 0) {
 		kfree_skb(skb);
 		return NULL;
 	}
 
-	memmove(skb->data - ETH_HLEN, skb->data - skb->mac_len - VLAN_HLEN,
-		2 * ETH_ALEN);
+	mac_len = skb->data - skb_mac_header(skb);
+	if (likely(mac_len > VLAN_HLEN + ETH_TLEN)) {
+		memmove(skb_mac_header(skb) + VLAN_HLEN, skb_mac_header(skb),
+			mac_len - VLAN_HLEN - ETH_TLEN);
+	}
 	skb->mac_header += VLAN_HLEN;
 	return skb;
 }
@@ -4459,8 +4602,8 @@ struct sk_buff *skb_vlan_untag(struct sk_buff *skb)
 	skb = skb_share_check(skb, GFP_ATOMIC);
 	if (unlikely(!skb))
 		goto err_free;
-
-	if (unlikely(!pskb_may_pull(skb, VLAN_HLEN)))
+	/* We may access the two bytes after vlan_hdr in vlan_set_encap_proto(). */
+	if (unlikely(!pskb_may_pull(skb, VLAN_HLEN + sizeof(unsigned short))))
 		goto err_free;
 
 	vhdr = (struct vlan_hdr *)skb->data;
@@ -4858,9 +5001,13 @@ static int pskb_carve_inside_nonlinear(struct sk_buff *skb, const u32 off,
 	if (skb_has_frag_list(skb))
 		skb_clone_fraglist(skb);
 
-	if (k == 0) {
-		/* split line is in frag list */
-		pskb_carve_frag_list(skb, shinfo, off - pos, gfp_mask);
+	/* split line is in frag list */
+	if (k == 0 && pskb_carve_frag_list(skb, shinfo, off - pos, gfp_mask)) {
+		/* skb_frag_unref() is not needed here as shinfo->nr_frags = 0. */
+		if (skb_has_frag_list(skb))
+			kfree_skb_list(skb_shinfo(skb)->frag_list);
+		kfree(data);
+		return -ENOMEM;
 	}
 	skb_release_data(skb);
 

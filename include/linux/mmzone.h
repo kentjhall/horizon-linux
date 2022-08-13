@@ -124,8 +124,9 @@ enum zone_stat_item {
 	NR_SLAB_UNRECLAIMABLE,
 	NR_PAGETABLE,		/* used for pagetables */
 	NR_KERNEL_STACK_KB,	/* measured in KiB */
-	/* Second 128 byte cacheline */
+	NR_KAISERTABLE,
 	NR_BOUNCE,
+	/* Second 128 byte cacheline */
 #if IS_ENABLED(CONFIG_ZSMALLOC)
 	NR_ZSPAGES,		/* allocated in zsmalloc */
 #endif
@@ -632,6 +633,8 @@ typedef struct pglist_data {
 	int kswapd_order;
 	enum zone_type kswapd_classzone_idx;
 
+	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
+
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;
 	enum zone_type kcompactd_classzone_idx;
@@ -672,6 +675,8 @@ typedef struct pglist_data {
 	 * is the first PFN that needs to be initialised.
 	 */
 	unsigned long first_deferred_pfn;
+	/* Number of non-deferred pages */
+	unsigned long static_init_pgcnt;
 #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -748,10 +753,18 @@ static inline bool is_dev_zone(const struct zone *zone)
 }
 #endif
 
+#ifndef CONFIG_NEED_MULTIPLE_NODES
+
+extern struct pglist_data contig_page_data;
+#define NODE_DATA(nid)		(&contig_page_data)
+#define NODE_MEM_MAP(nid)	mem_map
+#endif
+
 #include <linux/memory_hotplug.h>
 
 extern struct mutex zonelists_mutex;
-void build_all_zonelists(pg_data_t *pgdat, struct zone *zone);
+void build_all_zonelists(pg_data_t *pgdat, struct zone *zone,
+			 bool hotplug_context);
 void wakeup_kswapd(struct zone *zone, int order, enum zone_type classzone_idx);
 bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 			 int classzone_idx, unsigned int alloc_flags,
@@ -779,7 +792,7 @@ static inline struct pglist_data *lruvec_pgdat(struct lruvec *lruvec)
 #endif
 }
 
-extern unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru);
+extern unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru, int zone_idx);
 
 #ifdef CONFIG_HAVE_MEMORY_PRESENT
 void memory_present(int nid, unsigned long start, unsigned long end);
@@ -880,10 +893,6 @@ extern char numa_zonelist_order[];
 
 #ifndef CONFIG_NEED_MULTIPLE_NODES
 
-extern struct pglist_data contig_page_data;
-#define NODE_DATA(nid)		(&contig_page_data)
-#define NODE_MEM_MAP(nid)	mem_map
-
 #else /* CONFIG_NEED_MULTIPLE_NODES */
 
 #include <asm/mmzone.h>
@@ -962,7 +971,7 @@ static __always_inline struct zoneref *next_zones_zonelist(struct zoneref *z,
 					enum zone_type highest_zoneidx,
 					nodemask_t *nodes)
 {
-	if (likely(!nodes && zonelist_zone_idx(z) <= highest_zoneidx))
+	if (likely(!nodes && zonelist_zone_idx(z) <= (int)highest_zoneidx))
 		return z;
 	return __next_zones_zonelist(z, highest_zoneidx, nodes);
 }
@@ -972,12 +981,16 @@ static __always_inline struct zoneref *next_zones_zonelist(struct zoneref *z,
  * @zonelist - The zonelist to search for a suitable zone
  * @highest_zoneidx - The zone index of the highest zone to return
  * @nodes - An optional nodemask to filter the zonelist with
- * @zone - The first suitable zone found is returned via this parameter
+ * @return - Zoneref pointer for the first suitable zone found (see below)
  *
  * This function returns the first zone at or below a given zone index that is
  * within the allowed nodemask. The zoneref returned is a cursor that can be
  * used to iterate the zonelist with next_zones_zonelist by advancing it by
  * one before calling.
+ *
+ * When no eligible zone is found, zoneref->zone is NULL (zoneref itself is
+ * never NULL). This may happen either genuinely, or due to concurrent nodemask
+ * update due to cpuset modification.
  */
 static inline struct zoneref *first_zones_zonelist(struct zonelist *zonelist,
 					enum zone_type highest_zoneidx,

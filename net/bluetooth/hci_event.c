@@ -1118,6 +1118,9 @@ static void store_pending_adv_report(struct hci_dev *hdev, bdaddr_t *bdaddr,
 {
 	struct discovery_state *d = &hdev->discovery;
 
+	if (len > HCI_MAX_AD_LENGTH)
+		return;
+
 	bacpy(&d->last_adv_addr, bdaddr);
 	d->last_adv_addr_type = bdaddr_type;
 	d->last_adv_rssi = rssi;
@@ -2643,7 +2646,6 @@ static void hci_encrypt_change_evt(struct hci_dev *hdev, struct sk_buff *skb)
 		hci_conn_drop(conn);
 		goto unlock;
 	}
-
 	/* Try reading the encryption key size for encrypted ACL links */
 	if (!ev->status && ev->encrypt && conn->type == ACL_LINK) {
 		struct hci_cp_read_enc_key_size cp;
@@ -3775,6 +3777,7 @@ static void hci_sync_conn_complete_evt(struct hci_dev *hdev,
 	case 0x11:	/* Unsupported Feature or Parameter Value */
 	case 0x1c:	/* SCO interval rejected */
 	case 0x1a:	/* Unsupported Remote Feature */
+	case 0x1e:	/* Invalid LMP Parameters */
 	case 0x1f:	/* Unspecified error */
 	case 0x20:	/* Unsupported LMP Parameter value */
 		if (conn->out) {
@@ -4646,7 +4649,8 @@ static void hci_le_conn_update_complete_evt(struct hci_dev *hdev,
 /* This function requires the caller holds hdev->lock */
 static struct hci_conn *check_pending_le_conn(struct hci_dev *hdev,
 					      bdaddr_t *addr,
-					      u8 addr_type, u8 adv_type)
+					      u8 addr_type, u8 adv_type,
+					      bdaddr_t *direct_rpa)
 {
 	struct hci_conn *conn;
 	struct hci_conn_params *params;
@@ -4697,7 +4701,8 @@ static struct hci_conn *check_pending_le_conn(struct hci_dev *hdev,
 	}
 
 	conn = hci_connect_le(hdev, addr, addr_type, BT_SECURITY_LOW,
-			      HCI_LE_AUTOCONN_TIMEOUT, HCI_ROLE_MASTER);
+			      HCI_LE_AUTOCONN_TIMEOUT, HCI_ROLE_MASTER,
+			      direct_rpa);
 	if (!IS_ERR(conn)) {
 		/* If HCI_AUTO_CONN_EXPLICIT is set, conn is already owned
 		 * by higher layer that tried to connect, if no then
@@ -4754,6 +4759,11 @@ static void process_adv_report(struct hci_dev *hdev, u8 type, bdaddr_t *bdaddr,
 		return;
 	}
 
+	if (len > HCI_MAX_AD_LENGTH) {
+		pr_err_ratelimited("legacy adv larger than 31 bytes");
+		return;
+	}
+
 	/* Find the end of the data in case the report contains padded zero
 	 * bytes at the end causing an invalid length value.
 	 *
@@ -4807,9 +4817,14 @@ static void process_adv_report(struct hci_dev *hdev, u8 type, bdaddr_t *bdaddr,
 		bdaddr_type = irk->addr_type;
 	}
 
-	/* Check if we have been requested to connect to this device */
-	conn = check_pending_le_conn(hdev, bdaddr, bdaddr_type, type);
-	if (conn && type == LE_ADV_IND) {
+	/* Check if we have been requested to connect to this device.
+	 *
+	 * direct_addr is set only for directed advertising reports (it is NULL
+	 * for advertising reports) and is already verified to be RPA above.
+	 */
+	conn = check_pending_le_conn(hdev, bdaddr, bdaddr_type, type,
+								direct_addr);
+	if (conn && type == LE_ADV_IND && len <= HCI_MAX_AD_LENGTH) {
 		/* Store report for later inclusion by
 		 * mgmt_device_connected
 		 */
@@ -4934,10 +4949,14 @@ static void hci_le_adv_report_evt(struct hci_dev *hdev, struct sk_buff *skb)
 		struct hci_ev_le_advertising_info *ev = ptr;
 		s8 rssi;
 
-		rssi = ev->data[ev->length];
-		process_adv_report(hdev, ev->evt_type, &ev->bdaddr,
-				   ev->bdaddr_type, NULL, 0, rssi,
-				   ev->data, ev->length);
+		if (ev->length <= HCI_MAX_AD_LENGTH) {
+			rssi = ev->data[ev->length];
+			process_adv_report(hdev, ev->evt_type, &ev->bdaddr,
+					   ev->bdaddr_type, NULL, 0, rssi,
+					   ev->data, ev->length);
+		} else {
+			bt_dev_err(hdev, "Dropping invalid advertising data");
+		}
 
 		ptr += sizeof(*ev) + ev->length + 1;
 	}
@@ -5121,6 +5140,7 @@ static void hci_le_remote_conn_param_req_evt(struct hci_dev *hdev,
 	hci_send_cmd(hdev, HCI_OP_LE_CONN_PARAM_REQ_REPLY, sizeof(cp), &cp);
 }
 
+
 static void hci_le_direct_adv_report_evt(struct hci_dev *hdev,
 					 struct sk_buff *skb)
 {
@@ -5204,6 +5224,12 @@ static bool hci_get_cmd_complete(struct hci_dev *hdev, u16 opcode,
 			return false;
 		return true;
 	}
+
+	/* Check if request ended in Command Status - no way to retreive
+	 * any extra parameters in this case.
+	 */
+	if (hdr->evt == HCI_EV_CMD_STATUS)
+		return false;
 
 	if (hdr->evt != HCI_EV_CMD_COMPLETE) {
 		BT_DBG("Last event is not cmd complete (0x%2.2x)", hdr->evt);

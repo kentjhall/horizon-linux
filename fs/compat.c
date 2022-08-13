@@ -456,10 +456,6 @@ COMPAT_SYSCALL_DEFINE3(fcntl64, unsigned int, fd, unsigned int, cmd,
 		set_fs(old_fs);
 		if ((conv_cmd == F_GETLK || conv_cmd == F_OFD_GETLK) && ret == 0) {
 			/* need to return lock information - see above for commentary */
-			if (f.l_start > COMPAT_LOFF_T_MAX)
-				ret = -EOVERFLOW;
-			if (f.l_len > COMPAT_LOFF_T_MAX)
-				f.l_len = COMPAT_LOFF_T_MAX;
 			if (ret == 0)
 				ret = put_compat_flock64(&f, compat_ptr(arg));
 		}

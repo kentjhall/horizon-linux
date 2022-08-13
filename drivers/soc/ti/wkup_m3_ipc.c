@@ -377,6 +377,8 @@ static void wkup_m3_rproc_boot_thread(struct wkup_m3_ipc *m3_ipc)
 	ret = rproc_boot(m3_ipc->rproc);
 	if (ret)
 		dev_err(dev, "rproc_boot failed\n");
+	else
+		m3_ipc_state = m3_ipc;
 
 	do_exit(0);
 }
@@ -459,10 +461,9 @@ static int wkup_m3_ipc_probe(struct platform_device *pdev)
 
 	if (IS_ERR(task)) {
 		dev_err(dev, "can't create rproc_boot thread\n");
+		ret = PTR_ERR(task);
 		goto err_put_rproc;
 	}
-
-	m3_ipc_state = m3_ipc;
 
 	return 0;
 

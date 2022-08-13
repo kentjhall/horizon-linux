@@ -109,6 +109,25 @@ static void set_downstream_devices_error_reporting(struct pci_dev *dev,
 	pci_walk_bus(dev->subordinate, set_device_error_reporting, &enable);
 }
 
+void pci_restore_aer_state(struct pci_dev *dev)
+{
+	u32 reg32;
+
+	if (!pci_aer_available() || aer_acpi_firmware_first())
+		return;
+	/*
+	 * Enable error reporting for the root port device and downstream port
+	 * devices.
+	 */
+	set_downstream_devices_error_reporting(dev, true);
+
+	/* Enable Root Port's interrupt in response to error messages */
+	pci_read_config_dword(dev, dev->aer_cap + PCI_ERR_ROOT_COMMAND, &reg32);
+	reg32 |= ROOT_PORT_INTR_ON_MESG_MASK;
+	pci_write_config_dword(dev, dev->aer_cap + PCI_ERR_ROOT_COMMAND, reg32);
+}
+EXPORT_SYMBOL(pci_restore_aer_state);
+
 /**
  * aer_enable_rootport - enable Root Port's interrupts when receiving messages
  * @rpc: pointer to a Root Port data structure

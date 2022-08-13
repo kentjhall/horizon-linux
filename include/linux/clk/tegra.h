@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2018 NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -121,9 +121,33 @@ static inline void tegra_cpu_clock_resume(void)
 }
 #endif
 
+extern bool tegra210_xusb_pll_hw_sequence_is_enabled(void);
 extern void tegra210_xusb_pll_hw_control_enable(void);
 extern void tegra210_xusb_pll_hw_sequence_start(void);
+extern bool tegra210_sata_pll_hw_sequence_is_enabled(void);
 extern void tegra210_sata_pll_hw_control_enable(void);
 extern void tegra210_sata_pll_hw_sequence_start(void);
+extern void tegra210_set_sata_pll_seq_sw(bool state);
+extern void tegra210_put_utmipll_in_iddq(void);
+extern void tegra210_put_utmipll_out_iddq(void);
+extern bool tegra210_plle_hw_sequence_is_enabled(void);
+extern void tegra210_plle_hw_sequence_start(void);
+extern void tegra210_venc_mbist_war(void);
+
+#ifdef CONFIG_COMMON_CLK
+/* To be implemented for COMMON CLK framework */
+/* Get max rate safe at min voltage in all t-ranges; return zero if unknown */
+static inline long tegra_emc_round_rate_updown(unsigned long rate, bool up)
+{
+       return 0;
+}
+#endif
+
+int tegra_super_cdiv_use_therm_controls(bool);
+
+extern void tegra210_csi_source_from_brick(void);
+extern void tegra210_csi_source_from_plld(void);
+
+extern void tegra210_plld2_configure_ss(bool);
 
 #endif /* __LINUX_CLK_TEGRA_H_ */

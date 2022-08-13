@@ -471,8 +471,9 @@ static int handle_in_packet(struct amdtp_stream *s,
 	 * This module supports 'Two-quadlet CIP header with SYT field'.
 	 * For convenience, also check FMT field is AM824 or not.
 	 */
-	if (((cip_header[0] & CIP_EOH_MASK) == CIP_EOH) ||
-	    ((cip_header[1] & CIP_EOH_MASK) != CIP_EOH)) {
+	if ((((cip_header[0] & CIP_EOH_MASK) == CIP_EOH) ||
+	     ((cip_header[1] & CIP_EOH_MASK) != CIP_EOH)) &&
+	    (!(s->flags & CIP_HEADER_WITHOUT_EOH))) {
 		dev_info_ratelimited(&s->unit->device,
 				"Invalid CIP header for AMDTP: %08X:%08X\n",
 				cip_header[0], cip_header[1]);
@@ -606,7 +607,9 @@ static void out_stream_callback(struct fw_iso_context *context, u32 tstamp,
 		cycle = increment_cycle_count(cycle, 1);
 		if (handle_out_packet(s, cycle, i) < 0) {
 			s->packet_index = -1;
-			amdtp_stream_pcm_abort(s);
+			if (in_interrupt())
+				amdtp_stream_pcm_abort(s);
+			WRITE_ONCE(s->pcm_buffer_pointer, SNDRV_PCM_POS_XRUN);
 			return;
 		}
 	}
@@ -658,7 +661,9 @@ static void in_stream_callback(struct fw_iso_context *context, u32 tstamp,
 	/* Queueing error or detecting invalid payload. */
 	if (i < packets) {
 		s->packet_index = -1;
-		amdtp_stream_pcm_abort(s);
+		if (in_interrupt())
+			amdtp_stream_pcm_abort(s);
+		WRITE_ONCE(s->pcm_buffer_pointer, SNDRV_PCM_POS_XRUN);
 		return;
 	}
 

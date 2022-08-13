@@ -51,7 +51,7 @@
 #include "vivid-ctrls.h"
 #include "vivid-kthread-out.h"
 
-static void vivid_thread_vid_out_tick(struct vivid_dev *dev)
+void vivid_thread_vid_out_tick(struct vivid_dev *dev)
 {
 	struct vivid_buffer *vid_out_buf = NULL;
 	struct vivid_buffer *vbi_out_buf = NULL;
@@ -101,6 +101,8 @@ static void vivid_thread_vid_out_tick(struct vivid_dev *dev)
 				VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 		dprintk(dev, 2, "vid_out buffer %d done\n",
 			vid_out_buf->vb.vb2_buf.index);
+		vivid_trace_single_msg(dev->v4l2_dev.name, "buf_dequeue_output",
+			vid_out_buf->vb.vb2_buf.index);
 	}
 
 	if (vbi_out_buf) {
@@ -129,25 +131,39 @@ static int vivid_thread_vid_out(void *data)
 	unsigned wait_jiffies;
 	unsigned numerator;
 	unsigned denominator;
+	bool is_loop = false;
 
 	dprintk(dev, 1, "Video Output Thread Start\n");
 
 	set_freezable();
 
+	mutex_lock(&dev->mutex);
 	/* Resets frame counters */
-	dev->out_seq_offset = 0;
 	if (dev->seq_wrap)
 		dev->out_seq_count = 0xffffff80U;
-	dev->jiffies_vid_out = jiffies;
+	if (dev->cap_thread_active) {
+		dev->out_seq_offset = dev->cap_seq_count;
+		dev->jiffies_vid_out = dev->next_jiffies_vid_cap;
+	} else {
+		dev->out_seq_offset = 0;
+		dev->jiffies_vid_out = jiffies;
+	}
 	dev->vid_out_seq_start = dev->vbi_out_seq_start = 0;
 	dev->out_seq_resync = false;
+	dev->next_jiffies_vid_out = dev->jiffies_vid_out;
+	dev->out_thread_active = true;
+	mutex_unlock(&dev->mutex);
 
 	for (;;) {
 		try_to_freeze();
 		if (kthread_should_stop())
 			break;
 
-		mutex_lock(&dev->mutex);
+		if (!mutex_trylock(&dev->mutex)) {
+			schedule_timeout_uninterruptible(1);
+			continue;
+		}
+
 		cur_jiffies = jiffies;
 		if (dev->out_seq_resync) {
 			dev->jiffies_vid_out = cur_jiffies;
@@ -155,8 +171,14 @@ static int vivid_thread_vid_out(void *data)
 			dev->out_seq_count = 0;
 			dev->out_seq_resync = false;
 		}
+		mutex_lock(&dev->mutex_framerate);
 		numerator = dev->timeperframe_vid_out.numerator;
 		denominator = dev->timeperframe_vid_out.denominator;
+		mutex_unlock(&dev->mutex_framerate);
+
+		if (dev->loop_video && dev->can_loop_video &&
+			(vivid_is_svid_cap(dev) || vivid_is_hdmi_cap(dev)))
+			is_loop = true;
 
 		if (dev->field_out == V4L2_FIELD_ALTERNATE)
 			denominator *= 2;
@@ -183,8 +205,12 @@ static int vivid_thread_vid_out(void *data)
 		dev->vid_out_seq_count = dev->out_seq_count - dev->vid_out_seq_start;
 		dev->vbi_out_seq_count = dev->out_seq_count - dev->vbi_out_seq_start;
 
-		vivid_thread_vid_out_tick(dev);
-		mutex_unlock(&dev->mutex);
+		/*
+		 * Do not release buffers in loopback mode and capture device
+		 * is active, instead rely on capture device for release.
+		 */
+		if (!(is_loop && dev->cap_thread_active))
+			vivid_thread_vid_out_tick(dev);
 
 		/*
 		 * Calculate the number of 'numerators' streamed since we started,
@@ -208,8 +234,13 @@ static int vivid_thread_vid_out(void *data)
 		if (next_jiffies_since_start < jiffies_since_start)
 			next_jiffies_since_start = jiffies_since_start;
 
+		dev->next_jiffies_vid_out = next_jiffies_since_start;
+		mutex_unlock(&dev->mutex);
+
 		wait_jiffies = next_jiffies_since_start - jiffies_since_start;
 		schedule_timeout_interruptible(wait_jiffies ? wait_jiffies : 1);
+		vivid_trace_double_index(dev->v4l2_dev.name, "output",
+			wait_jiffies, next_jiffies_since_start);
 	}
 	dprintk(dev, 1, "Video Output Thread End\n");
 	return 0;
@@ -248,8 +279,11 @@ int vivid_start_generating_vid_out(struct vivid_dev *dev, bool *pstreaming)
 			"%s-vid-out", dev->v4l2_dev.name);
 
 	if (IS_ERR(dev->kthread_vid_out)) {
+		int err = PTR_ERR(dev->kthread_vid_out);
+
+		dev->kthread_vid_out = NULL;
 		v4l2_err(&dev->v4l2_dev, "kernel_thread() failed\n");
-		return PTR_ERR(dev->kthread_vid_out);
+		return err;
 	}
 	*pstreaming = true;
 	vivid_grab_controls(dev, true);
@@ -298,8 +332,7 @@ void vivid_stop_generating_vid_out(struct vivid_dev *dev, bool *pstreaming)
 
 	/* shutdown control thread */
 	vivid_grab_controls(dev, false);
-	mutex_unlock(&dev->mutex);
 	kthread_stop(dev->kthread_vid_out);
 	dev->kthread_vid_out = NULL;
-	mutex_lock(&dev->mutex);
+	dev->out_thread_active = false;
 }

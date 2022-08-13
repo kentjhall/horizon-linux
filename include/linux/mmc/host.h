@@ -1,6 +1,8 @@
 /*
  *  linux/include/linux/mmc/host.h
  *
+ *  Copyright (c) 2013-2017, NVIDIA CORPORATION. All Rights Reserved.
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
@@ -16,11 +18,13 @@
 #include <linux/sched.h>
 #include <linux/device.h>
 #include <linux/fault-inject.h>
+#include <linux/blkdev.h>
 
 #include <linux/mmc/core.h>
 #include <linux/mmc/card.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/pm.h>
+#include <linux/semaphore.h>
 
 struct mmc_ios {
 	unsigned int	clock;			/* clock rate */
@@ -65,6 +69,7 @@ struct mmc_ios {
 #define MMC_TIMING_MMC_DDR52	8
 #define MMC_TIMING_MMC_HS200	9
 #define MMC_TIMING_MMC_HS400	10
+#define MMC_TIMING_COUNTER	11
 
 	unsigned char	signal_voltage;		/* signalling voltage (1.8V or 3.3V) */
 
@@ -80,6 +85,17 @@ struct mmc_ios {
 #define MMC_SET_DRIVER_TYPE_D	3
 
 	bool enhanced_strobe;			/* hs400es selection */
+};
+
+struct mmc_cmdq_host_ops {
+	int (*enable)(struct mmc_host *host);
+	void (*disable)(struct mmc_host *host, bool soft);
+	int (*request)(struct mmc_host *host, struct mmc_request *mrq);
+	int (*halt)(struct mmc_host *host, bool halt);
+	void (*post_req)(struct mmc_host *host, struct mmc_request *mrq,
+			int err);
+	int (*discard_task)(struct mmc_host *mmc, u32 tag, bool all);
+	void (*wait_cq_empty)(struct mmc_host *mmc);
 };
 
 struct mmc_host_ops {
@@ -161,10 +177,37 @@ struct mmc_host_ops {
 	 */
 	int	(*multi_io_quirk)(struct mmc_card *card,
 				  unsigned int direction, int blk_size);
+	void	(*post_init)(struct mmc_host *host);
+	void	(*clear_cqe_intr)(struct mmc_host *host, u32 intmask);
+	void	(*discard_cqe_task)(struct mmc_host *host, u8 tag, bool all);
+	void	(*enable_host_int)(struct mmc_host *host, bool enable);
+	void	(*pre_regulator_config)(struct mmc_host *host, int vdd,
+					bool flag);
+	void	(*voltage_switch_req)(struct mmc_host *host, bool req);
 };
 
 struct mmc_card;
 struct device;
+
+struct mmc_cmdq_req {
+	unsigned int cmd_flags;
+	u32 blk_addr;
+	/* active mmc request */
+	struct mmc_request	mrq;
+	struct mmc_command	task_mgmt;
+	struct mmc_data		data;
+	struct mmc_command	cmd;
+#define DCMD	(1 << 0)
+#define QBR	(1 << 1)
+#define DIR	(1 << 2)
+#define PRIO	(1 << 3)
+#define REL_WR	(1 << 4)
+#define DAT_TAG	(1 << 5)
+#define FORCED_PRG (1 << 6)
+	unsigned int		cmdq_req_flags;
+	int			tag; /* used for command queuing */
+	u8			ctx_id;
+};
 
 struct mmc_async_req {
 	/* active mmc request */
@@ -208,6 +251,36 @@ struct mmc_context_info {
 	spinlock_t		lock;
 };
 
+enum cmdq_states {
+		CMDQ_STATE_HALT = 1,
+		CMDQ_STATE_ERR,
+};
+
+/**
+ * mmc_cmdq_context_info - describes the contexts of cmdq
+ * @active_reqs		requests being processed
+ * @active_dcmd		dcmd in progress, don't issue any
+ *			more dcmd requests
+ * @rpmb_in_wait	do not pull any more reqs till rpmb is handled
+ * @cmdq_state		state of cmdq engine
+ * @req_starved		completion should invoke the request_fn since
+ *			no tags were available
+ * @cmdq_ctx_lock	acquire this before accessing this structure
+ */
+struct mmc_cmdq_context_info {
+	unsigned long	active_reqs; /* in-flight requests */
+	bool		active_dcmd;
+	bool		rpmb_in_wait;
+	bool		active_ncqcmd; /* Non CQ command like CMD8 */
+	bool		active_qbr;
+	enum cmdq_states curr_state;
+
+	/* no free tag available */
+	unsigned long	req_starved;
+	spinlock_t	cmdq_ctx_lock;
+	struct semaphore	thread_sem;
+};
+
 struct regulator;
 struct mmc_pwrseq;
 
@@ -222,6 +295,7 @@ struct mmc_host {
 	int			index;
 	const struct mmc_host_ops *ops;
 	struct mmc_pwrseq	*pwrseq;
+	const struct mmc_cmdq_host_ops *cmdq_ops;
 	unsigned int		f_min;
 	unsigned int		f_max;
 	unsigned int		f_init;
@@ -254,6 +328,12 @@ struct mmc_host {
 #define MMC_VDD_34_35		0x00400000	/* VDD voltage 3.4 ~ 3.5 */
 #define MMC_VDD_35_36		0x00800000	/* VDD voltage 3.5 ~ 3.6 */
 
+#define MMC_VDD_27_36	(MMC_VDD_26_27 | MMC_VDD_27_28 |	\
+	MMC_VDD_28_29 | MMC_VDD_29_30 | MMC_VDD_30_31 |	\
+	MMC_VDD_31_32 | MMC_VDD_32_33 | MMC_VDD_33_34 |	\
+	MMC_VDD_34_35 | MMC_VDD_35_36)
+
+
 	u32			caps;		/* Host capabilities */
 
 #define MMC_CAP_4_BIT_DATA	(1 << 0)	/* Can the host do 4 bit transfers */
@@ -278,6 +358,7 @@ struct mmc_host {
 #define MMC_CAP_UHS_SDR50	(1 << 17)	/* Host supports UHS SDR50 mode */
 #define MMC_CAP_UHS_SDR104	(1 << 18)	/* Host supports UHS SDR104 mode */
 #define MMC_CAP_UHS_DDR50	(1 << 19)	/* Host supports UHS DDR50 mode */
+#define MMC_CAP_RUNTIME_RESUME	(1 << 20)	/* Resume at runtime_resume. */
 #define MMC_CAP_DRIVER_TYPE_A	(1 << 23)	/* Host supports Driver Type A */
 #define MMC_CAP_DRIVER_TYPE_C	(1 << 24)	/* Host supports Driver Type C */
 #define MMC_CAP_DRIVER_TYPE_D	(1 << 25)	/* Host supports Driver Type D */
@@ -288,6 +369,7 @@ struct mmc_host {
 	u32			caps2;		/* More host capabilities */
 
 #define MMC_CAP2_BOOTPART_NOACC	(1 << 0)	/* Boot partition no access */
+#define MMC_CAP2_SLOT_REG_ALWAYS_ON (1 << 1)    /* Card slot regulator always on */
 #define MMC_CAP2_FULL_PWR_CYCLE	(1 << 2)	/* Can do full power cycle */
 #define MMC_CAP2_HS200_1_8V_SDR	(1 << 5)        /* can support */
 #define MMC_CAP2_HS200_1_2V_SDR	(1 << 6)        /* can support */
@@ -312,6 +394,15 @@ struct mmc_host {
 #define MMC_CAP2_HS400_ES	(1 << 20)	/* Host supports enhanced strobe */
 #define MMC_CAP2_NO_SD		(1 << 21)	/* Do not send SD commands during initialization */
 #define MMC_CAP2_NO_MMC		(1 << 22)	/* Do not send (e)MMC commands during initialization */
+#define MMC_CAP2_HS533		(1 << 23)	/* Can support HS533 */
+#define MMC_CAP2_NO_EXTENDED_GP	(1 << 24)	/* Do not support extended GP */
+#define MMC_CAP2_HW_CQ		(1 << 25)	/* support eMMC command queue */
+#define MMC_CAP2_CMDQ_QBR	(1 << 26)	/* CMDQ Queue barrier supported */
+#define MMC_CAP2_ONLY_1V8_SIGNAL_VOLTAGE	(1 << 27)	/* Supports only 1V8 voltage */
+#define MMC_CAP2_NO_SLEEP_CMD	(1 << 28)	/* cannot support sleep mode */
+#define MMC_CAP2_PERIODIC_CACHE_FLUSH	(1 << 29)
+#define MMC_CAP2_EN_CLK_TO_ACCESS_REG		(1 << 30) /* Enable clock to access register */
+#define MMC_CAP2_FORCE_RESCAN	(1 << 31) /* Force rescan requests for the device if this cap is set */
 
 	mmc_pm_flag_t		pm_caps;	/* supported pm features */
 
@@ -350,6 +441,10 @@ struct mmc_host {
 	struct timer_list	retune_timer;	/* for periodic re-tuning */
 
 	bool			trigger_card_event; /* card_event necessary */
+	bool			skip_host_clkgate; /* Skip host clock gating */
+	bool			is_host_clk_enabled; /* Is host clock gated */
+	bool			rem_card_present;	/* Removable card status */
+	bool			cd_cap_invert;		/* invert capability status */
 
 	struct mmc_card		*card;		/* device attached to this host */
 
@@ -394,9 +489,38 @@ struct mmc_host {
 
 	unsigned int		slotno;	/* used for sdio acpi binding */
 
+	unsigned int	cmdq_slots;
+	struct mmc_cmdq_context_info	cmdq_ctx;
+	/*
+	 * several cmdq supporting host controllers are extensions
+	 * of legacy controllers. This variable can be used to store
+	 * a reference to the cmdq extension of the existing host
+	 * controller.
+	 */
+	void *cmdq_private;
+
 	int			dsr_req;	/* DSR value is valid */
 	u32			dsr;	/* optional driver stage (DSR) value */
 
+#ifdef CONFIG_MMC_EMBEDDED_SDIO
+	struct {
+		struct sdio_cis			*cis;
+		struct sdio_cccr		*cccr;
+		struct sdio_embedded_func	*funcs;
+		int				num_funcs;
+	} embedded_sdio_data;
+#endif
+
+#ifdef CONFIG_BLOCK
+	int			latency_hist_enabled;
+	struct io_latency_state io_lat_read;
+	struct io_latency_state io_lat_write;
+#endif
+
+	bool			cache_flush_needed;
+	bool			en_periodic_cflush;
+	unsigned int		flush_timeout;
+	struct timer_list	flush_timer;
 	unsigned long		private[0] ____cacheline_aligned;
 };
 
@@ -405,6 +529,19 @@ int mmc_add_host(struct mmc_host *);
 void mmc_remove_host(struct mmc_host *);
 void mmc_free_host(struct mmc_host *);
 int mmc_of_parse(struct mmc_host *host);
+
+#ifdef CONFIG_MMC_EMBEDDED_SDIO
+extern void mmc_set_embedded_sdio_data(struct mmc_host *host,
+				       struct sdio_cis *cis,
+				       struct sdio_cccr *cccr,
+				       struct sdio_embedded_func *funcs,
+				       int num_funcs);
+#endif
+
+static inline void *mmc_cmdq_private(struct mmc_host *host)
+{
+	return host->cmdq_private;
+}
 
 static inline void *mmc_priv(struct mmc_host *host)
 {

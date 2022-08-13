@@ -17,12 +17,160 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <linux/errno.h>
 #include <linux/linkage.h>
 #include <linux/init.h>
 #include <asm/assembler.h>
 #include <asm/cpufeature.h>
 #include <asm/alternative.h>
+#include <asm/errno.h>
+#include <asm/uaccess.h>
+
+/*
+ *	v8_op_dcache_all op
+ *
+ * op=cisw, Flush the whole D-cache.
+ * op=csw, Clean the whole D-cache.
+ *
+ *	Corrupted registers: x0-x7, x9-x11
+ */
+.macro v8_op_dcache_all op			// op=csw clean, op=cisw flush
+	cbz	x3, 5f			// if loc is 0, then no need to clean
+	mov	x10, #0				// start clean at cache level 0
+1:
+	add	x2, x10, x10, lsr #1		// work out 3x current cache level
+	lsr	x1, x0, x2			// extract cache type bits from clidr
+	and	x1, x1, #7			// mask of the bits for current cache only
+	cmp	x1, #2				// see what cache we have at this level
+	b.lt	4f				// skip if no cache, or just i-cache
+	save_and_disable_irq x9			// make CSSELR and CCSIDR access atomic
+	msr	csselr_el1, x10			// select current cache level in csselr
+	isb					// isb to sych the new cssr&csidr
+	mrs	x1, ccsidr_el1			// read the new ccsidr
+	restore_irq x9
+	and	x2, x1, #7			// extract the length of the cache lines
+	add	x2, x2, #4			// add 4 (line length offset)
+	mov	x4, #0x3ff
+	and	x4, x4, x1, lsr #3		// find maximum number on the way size
+	clz	w5, w4				// find bit position of way size increment
+	mov	x7, #0x7fff
+	and	x7, x7, x1, lsr #13		// extract max number of the index size
+2:
+	mov	x9, x4				// create working copy of max way size
+3:
+	lsl	x6, x9, x5
+	orr	x11, x10, x6			// factor way and cache number into x11
+	lsl	x6, x7, x2
+	orr	x11, x11, x6			// factor index number into x11
+	dc	\op, x11			// op=csw/cisw, clean/flush by set/way
+	subs	x9, x9, #1			// decrement the way
+	b.ge	3b
+	subs	x7, x7, #1			// decrement the index
+	b.ge	2b
+4:
+	add	x10, x10, #2			// increment cache number
+	cmp	x3, x10
+	b.gt	1b
+5:
+	mov	x10, #0				// swith back to cache level 0
+	msr	csselr_el1, x10			// select current cache level in csselr
+	dsb	sy
+	isb
+	ret
+.endm
+
+/*
+ *	__flush_dcache_all()
+ *
+ *	Flush the whole D-cache.
+ *
+ *	Corrupted registers: x0-x7, x9-x11
+ */
+ENTRY(__flush_dcache_all)
+	.weak	__flush_dcache_all
+	dmb	sy				// ensure ordering with previous memory accesses
+	mrs	x0, clidr_el1			// read clidr
+	and	x3, x0, #0x7000000		// extract loc from clidr
+	lsr	x3, x3, #23			// left align loc bit field
+
+	v8_op_dcache_all cisw
+ENDPROC(__flush_dcache_all)
+
+/*
+ *	__clean_dcache_all()
+ *
+ *	Clean the whole D-cache.
+ *
+ *	Corrupted registers: x0-x7, x9-x11
+ */
+ENTRY(__clean_dcache_all)
+	.weak	__clean_dcache_all
+	dmb	sy				// ensure ordering with previous memory accesses
+	mrs	x0, clidr_el1			// read clidr
+	and	x3, x0, #0x7000000		// extract loc from clidr
+	lsr	x3, x3, #23			// left align loc bit field
+
+	v8_op_dcache_all csw
+ENDPROC(__clean_dcache_all)
+
+/*
+ *	__flush_dcache_louis()
+ *
+ *	Flush D-cache to the level of unification inner shareable
+ *
+ *	Corrupted registers: x0-x7, x9-x11
+ */
+ENTRY(__flush_dcache_louis)
+	dmb	sy				// ensure ordering with previous memory accesses
+	mrs	x0, clidr_el1			// read clidr
+	and	x3, x0, #0xe00000		// extract louis from clidr
+	lsr	x3, x3, #20			// left align louis bit field
+	v8_op_dcache_all cisw
+ENDPROC(__flush_dcache_louis)
+
+/*
+ *	__clean_dcache_louis()
+ *
+ *	Clean D-cache to the level of unification inner shareable
+ *
+ *	Corrupted registers: x0-x7, x9-x11
+ */
+ENTRY(__clean_dcache_louis)
+	dsb	sy				// ensure ordering with previous memory accesses
+	mrs	x0, clidr_el1			// read clidr
+	and	x3, x0, #0xe00000		// extract louis from clidr
+	lsr	x3, x3, #20			// left align louis bit field
+	v8_op_dcache_all csw
+ENDPROC(__clean_dcache_louis)
+
+/*
+ *	flush_cache_all()
+ *
+ *	Flush the entire cache system.  The data cache flush is now achieved
+ *	using atomic clean / invalidates working outwards from L1 cache. This
+ *	is done using Set/Way based cache maintainance instructions.  The
+ *	instruction cache can still be invalidated back to the point of
+ *	unification in a single instruction.
+ */
+ENTRY(flush_cache_all)
+	.weak	flush_cache_all
+	mov	x12, lr
+	bl	__flush_dcache_all
+	mov	x0, #0
+	ic	ialluis				// I+BTB cache invalidate
+	ret	x12
+ENDPROC(flush_cache_all)
+
+/*
+ *	flush_cache_louis()
+ *
+ *	Actually a clean should be sufficient for PG entry
+ */
+ENTRY(flush_dcache_louis)
+	mov	x12, lr
+	bl	__flush_dcache_louis
+	mov	x0, #0
+	ret	x12
+ENDPROC(flush_dcache_louis)
 
 /*
  *	flush_icache_range(start,end)
@@ -48,6 +196,7 @@ ENTRY(flush_icache_range)
  *	- end     - virtual end address of region
  */
 ENTRY(__flush_cache_user_range)
+	uaccess_ttbr0_enable x2, x3, x4
 	dcache_line_size x2, x3
 	sub	x3, x2, #1
 	bic	x4, x0, x3
@@ -69,10 +218,12 @@ USER(9f, ic	ivau, x4	)		// invalidate I line PoU
 	dsb	ish
 	isb
 	mov	x0, #0
+1:
+	uaccess_ttbr0_disable x1, x2
 	ret
 9:
 	mov	x0, #-EFAULT
-	ret
+	b	1b
 ENDPROC(flush_icache_range)
 ENDPROC(__flush_cache_user_range)
 
@@ -140,6 +291,40 @@ ENDPIPROC(__inval_cache_range)
 ENDPROC(__dma_inv_area)
 
 /*
+ *      __dma_inv_area_no_dsb(start, size)
+ *      - start   - virtual start address of region
+ *      - size    - size in question
+ */
+__dma_inv_area_no_dsb:
+        add     x1, x1, x0
+        /* FALLTHROUGH */
+
+/*
+ *      __inval_cache_range(start, end)
+ *      - start   - start address of region
+ *      - end     - end address of region
+ */
+ENTRY(__inval_cache_range_no_dsb)
+        dcache_line_size x2, x3
+        sub     x3, x2, #1
+        tst     x1, x3                          // end cache line aligned?
+        bic     x1, x1, x3
+        b.eq    1f
+        dc      civac, x1                       // clean & invalidate D / U line
+1:      tst     x0, x3                          // start cache line aligned?
+        bic     x0, x0, x3
+        b.eq    2f
+        dc      civac, x0                       // clean & invalidate D / U line
+        b       3f
+2:      dc      ivac, x0                        // invalidate D / U line
+3:      add     x0, x0, x2
+        cmp     x0, x1
+        b.lo    2b
+        ret
+ENDPIPROC(__inval_cache_range_no_dsb)
+ENDPROC(__dma_inv_area_no_dsb)
+
+/*
  *	__clean_dcache_area_poc(kaddr, size)
  *
  * 	Ensure that any D-cache lines for the interval [kaddr, kaddr+size)
@@ -163,6 +348,30 @@ ENDPIPROC(__clean_dcache_area_poc)
 ENDPROC(__dma_clean_area)
 
 /*
+ *      __clean_dcache_area_poc_no_dsb(kaddr, size)
+ *
+ *      Ensure that any D-cache lines for the interval [kaddr, kaddr+size)
+ *      are cleaned to the PoC.
+ *
+ *      - kaddr   - kernel address
+ *      - size    - size in question
+ */
+ENTRY(__clean_dcache_area_poc_no_dsb)
+        /* FALLTHROUGH */
+
+/*
+ *      __dma_clean_area_no_dsb(start, size)
+ *      - start   - virtual start address of region
+ *      - size    - size in question
+ */
+__dma_clean_area_no_dsb:
+        dcache_by_line_op_no_dsb cvac, x0, x1, x2, x3
+        ret
+ENDPIPROC(__clean_dcache_area_poc_no_dsb)
+ENDPROC(__dma_clean_area_no_dsb)
+
+
+/*
  *	__dma_flush_area(start, size)
  *
  *	clean & invalidate D / U line
@@ -176,6 +385,18 @@ ENTRY(__dma_flush_area)
 ENDPIPROC(__dma_flush_area)
 
 /*
+ *	__dma_map_area_no_dsb(start, size, dir)
+ *	- start	- kernel virtual start address
+ *	- size	- size of region
+ *	- dir	- DMA direction
+ */
+ENTRY(__dma_map_area_no_dsb)
+	cmp	w2, #DMA_FROM_DEVICE
+	b.eq	__dma_inv_area_no_dsb
+	b	__dma_clean_area_no_dsb
+ENDPIPROC(__dma_map_area_no_dsb)
+
+/*
  *	__dma_map_area(start, size, dir)
  *	- start	- kernel virtual start address
  *	- size	- size of region
@@ -186,6 +407,18 @@ ENTRY(__dma_map_area)
 	b.eq	__dma_inv_area
 	b	__dma_clean_area
 ENDPIPROC(__dma_map_area)
+
+/*
+ *	__dma_unmap_area_no_dsb(start, size, dir)
+ *	- start	- kernel virtual start address
+ *	- size	- size of region
+ *	- dir	- DMA direction
+ */
+ENTRY(__dma_unmap_area_no_dsb)
+	cmp	w2, #DMA_TO_DEVICE
+	b.ne	__dma_inv_area_no_dsb
+	ret
+ENDPIPROC(__dma_unmap_area_no_dsb)
 
 /*
  *	__dma_unmap_area(start, size, dir)

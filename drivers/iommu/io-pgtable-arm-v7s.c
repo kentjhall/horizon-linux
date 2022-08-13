@@ -207,7 +207,8 @@ static void *__arm_v7s_alloc_table(int lvl, gfp_t gfp,
 		if (dma != virt_to_phys(table))
 			goto out_unmap;
 	}
-	kmemleak_ignore(table);
+	if (lvl == 2)
+		kmemleak_ignore(table);
 	return table;
 
 out_unmap:
@@ -418,8 +419,12 @@ static int __arm_v7s_map(struct arm_v7s_io_pgtable *data, unsigned long iova,
 			pte |= ARM_V7S_ATTR_NS_TABLE;
 
 		__arm_v7s_set_pte(ptep, pte, 1, cfg);
-	} else {
+	} else if (ARM_V7S_PTE_IS_TABLE(pte, lvl)) {
 		cptep = iopte_deref(pte, lvl);
+	} else {
+		/* We require an unmap first */
+		WARN_ON(!selftest_running);
+		return -EEXIST;
 	}
 
 	/* Rinse, repeat */

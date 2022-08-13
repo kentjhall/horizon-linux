@@ -1056,7 +1056,6 @@ struct sony_sc {
 	u8 battery_charging;
 	u8 battery_capacity;
 	u8 led_state[MAX_LEDS];
-	u8 resume_led_state[MAX_LEDS];
 	u8 led_delay_on[MAX_LEDS];
 	u8 led_delay_off[MAX_LEDS];
 	u8 led_count;
@@ -1444,10 +1443,16 @@ static int sixaxis_set_operational_usb(struct hid_device *hdev)
 		goto out;
 	}
 
-	ret = hid_hw_output_report(hdev, buf, 1);
-	if (ret < 0) {
-		hid_info(hdev, "can't set operational mode: step 3, ignoring\n");
-		ret = 0;
+	/*
+	 * But the USB interrupt would cause SHANWAN controllers to
+	 * start rumbling non-stop.
+	 */
+	if (strcmp(hdev->name, "SHANWAN PS3 GamePad")) {
+		ret = hid_hw_output_report(hdev, buf, 1);
+		if (ret < 0) {
+			hid_info(hdev, "can't set operational mode: step 3, ignoring\n");
+			ret = 0;
+		}
 	}
 
 out:
@@ -1458,18 +1463,10 @@ out:
 
 static int sixaxis_set_operational_bt(struct hid_device *hdev)
 {
-	static const u8 report[] = { 0xf4, 0x42, 0x03, 0x00, 0x00 };
-	u8 *buf;
+	static u8 report[] = { 0xf4, 0x42, 0x03, 0x00, 0x00 };
 	int ret;
 
-	buf = kmemdup(report, sizeof(report), GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	ret = hid_hw_raw_request(hdev, buf[0], buf, sizeof(report),
-				  HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
-
-	kfree(buf);
+	ret = uhid_hid_output_raw(hdev, report, sizeof(report), HID_FEATURE_REPORT);
 
 	return ret;
 }
@@ -1793,6 +1790,7 @@ static int sony_leds_init(struct sony_sc *sc)
 		led->name = name;
 		led->brightness = sc->led_state[n];
 		led->max_brightness = max_brightness[n];
+		led->flags = LED_CORE_SUSPENDRESUME;
 		led->brightness_get = sony_led_get_brightness;
 		led->brightness_set = sony_led_set_brightness;
 
@@ -1818,7 +1816,7 @@ error_leds:
 	return ret;
 }
 
-static void sixaxis_send_output_report(struct sony_sc *sc)
+static void sixaxis_send_output_report(struct sony_sc *sc, bool is_bt)
 {
 	static const union sixaxis_output_report_01 default_report = {
 		.buf = {
@@ -1869,9 +1867,27 @@ static void sixaxis_send_output_report(struct sony_sc *sc)
 		}
 	}
 
-	hid_hw_raw_request(sc->hdev, report->report_id, (u8 *)report,
-			sizeof(struct sixaxis_output_report),
-			HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+	if (!is_bt) {
+		hid_hw_raw_request(sc->hdev, report->report_id, (u8 *)report,
+				sizeof(struct sixaxis_output_report),
+				HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+	} else {
+		/* BT layer does not handle response from request so we have to
+		 * output_report instead
+		 */
+		hid_hw_output_report(sc->hdev, (u8 *)report,
+			sizeof(struct sixaxis_output_report));
+	}
+}
+
+static void sixaxis_send_output_report_usb(struct sony_sc *sc)
+{
+	sixaxis_send_output_report(sc, false);
+}
+
+static void sixaxis_send_output_report_bt(struct sony_sc *sc)
+{
+	sixaxis_send_output_report(sc, true);
 }
 
 static void dualshock4_send_output_report(struct sony_sc *sc)
@@ -2008,9 +2024,15 @@ static int sony_play_effect(struct input_dev *dev, void *data,
 
 static int sony_init_ff(struct sony_sc *sc)
 {
-	struct hid_input *hidinput = list_entry(sc->hdev->inputs.next,
-						struct hid_input, list);
-	struct input_dev *input_dev = hidinput->input;
+	struct hid_input *hidinput;
+	struct input_dev *input_dev;
+
+	if (list_empty(&sc->hdev->inputs)) {
+		hid_err(sc->hdev, "no inputs found\n");
+		return -ENODEV;
+	}
+	hidinput = list_entry(sc->hdev->inputs.next, struct hid_input, list);
+	input_dev = hidinput->input;
 
 	input_set_capability(input_dev, EV_FF, FF_RUMBLE);
 	return input_ff_create_memless(input_dev, NULL, sony_play_effect);
@@ -2403,7 +2425,7 @@ static int sony_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		hdev->quirks |= HID_QUIRK_SKIP_OUTPUT_REPORT_ID;
 		sc->defer_initialization = 1;
 		ret = sixaxis_set_operational_usb(hdev);
-		sony_init_output_report(sc, sixaxis_send_output_report);
+		sony_init_output_report(sc, sixaxis_send_output_report_usb);
 	} else if ((sc->quirks & SIXAXIS_CONTROLLER_BT) ||
 			(sc->quirks & NAVIGATION_CONTROLLER_BT)) {
 		/*
@@ -2412,7 +2434,7 @@ static int sony_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		 */
 		hdev->quirks |= HID_QUIRK_NO_OUTPUT_REPORTS_ON_INTR_EP;
 		ret = sixaxis_set_operational_bt(hdev);
-		sony_init_output_report(sc, sixaxis_send_output_report);
+		sony_init_output_report(sc, sixaxis_send_output_report_bt);
 	} else if (sc->quirks & DUALSHOCK4_CONTROLLER) {
 		if (sc->quirks & DUALSHOCK4_CONTROLLER_BT) {
 			/*
@@ -2509,47 +2531,32 @@ static void sony_remove(struct hid_device *hdev)
 
 static int sony_suspend(struct hid_device *hdev, pm_message_t message)
 {
-	/*
-	 * On suspend save the current LED state,
-	 * stop running force-feedback and blank the LEDS.
-	 */
-	if (SONY_LED_SUPPORT || SONY_FF_SUPPORT) {
+#ifdef CONFIG_SONY_FF
+
+	/* On suspend stop any running force-feedback events */
+	if (SONY_FF_SUPPORT) {
 		struct sony_sc *sc = hid_get_drvdata(hdev);
 
-#ifdef CONFIG_SONY_FF
 		sc->left = sc->right = 0;
-#endif
-
-		memcpy(sc->resume_led_state, sc->led_state,
-			sizeof(sc->resume_led_state));
-		memset(sc->led_state, 0, sizeof(sc->led_state));
-
 		sony_send_output_report(sc);
 	}
 
+#endif
 	return 0;
 }
 
 static int sony_resume(struct hid_device *hdev)
 {
-	/* Restore the state of controller LEDs on resume */
-	if (SONY_LED_SUPPORT) {
-		struct sony_sc *sc = hid_get_drvdata(hdev);
+	struct sony_sc *sc = hid_get_drvdata(hdev);
 
-		memcpy(sc->led_state, sc->resume_led_state,
-			sizeof(sc->led_state));
-
-		/*
-		 * The Sixaxis and navigation controllers on USB need to be
-		 * reinitialized on resume or they won't behave properly.
-		 */
-		if ((sc->quirks & SIXAXIS_CONTROLLER_USB) ||
-			(sc->quirks & NAVIGATION_CONTROLLER_USB)) {
-			sixaxis_set_operational_usb(sc->hdev);
-			sc->defer_initialization = 1;
-		}
-
-		sony_set_leds(sc);
+	/*
+	 * The Sixaxis and navigation controllers on USB need to be
+	 * reinitialized on resume or they won't behave properly.
+	 */
+	if ((sc->quirks & SIXAXIS_CONTROLLER_USB) ||
+		(sc->quirks & NAVIGATION_CONTROLLER_USB)) {
+		sixaxis_set_operational_usb(sc->hdev);
+		sc->defer_initialization = 1;
 	}
 
 	return 0;
@@ -2594,11 +2601,20 @@ static const struct hid_device_id sony_devices[] = {
 	/* Sony Dualshock 4 controllers for PS4 */
 	{ HID_USB_DEVICE(USB_VENDOR_ID_SONY, USB_DEVICE_ID_SONY_PS4_CONTROLLER),
 		.driver_data = DUALSHOCK4_CONTROLLER_USB },
-	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_SONY, USB_DEVICE_ID_SONY_PS4_CONTROLLER),
-		.driver_data = DUALSHOCK4_CONTROLLER_BT },
+/*	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_SONY, USB_DEVICE_ID_SONY_PS4_CONTROLLER),
+		.driver_data = DUALSHOCK4_CONTROLLER_BT },*/
+	{ HID_USB_DEVICE(USB_VENDOR_ID_SONY, USB_DEVICE_ID_SONY_PS4_CONTROLLER_2),
+		.driver_data = DUALSHOCK4_CONTROLLER_USB },
+/*	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_SONY, USB_DEVICE_ID_SONY_PS4_CONTROLLER_2),
+		.driver_data = DUALSHOCK4_CONTROLLER_BT },*/
+	{ HID_USB_DEVICE(USB_VENDOR_ID_SONY, USB_DEVICE_ID_SONY_PS4_CONTROLLER_DONGLE),
+		.driver_data = DUALSHOCK4_CONTROLLER_USB },
 	/* Nyko Core Controller for PS3 */
 	{ HID_USB_DEVICE(USB_VENDOR_ID_SINO_LITE, USB_DEVICE_ID_SINO_LITE_CONTROLLER),
 		.driver_data = SIXAXIS_CONTROLLER_USB | SINO_LITE_CONTROLLER },
+	/* Genesis PV65 seems to be DS3 clone with different VID/PID */
+	{ HID_USB_DEVICE(USB_VENDOR_ID_SHANWAN, USB_DEVICE_ID_SHANWAN_GENESIS_PV65),
+		.driver_data = SIXAXIS_CONTROLLER_USB },
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, sony_devices);

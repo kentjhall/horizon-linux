@@ -3,6 +3,7 @@
 #
 
 ccflags-$(CONFIG_SPI_DEBUG) := -DDEBUG
+subdir-ccflags-y += -Werror
 
 # small core, mostly translating board-specific
 # config declarations into driver model code
@@ -90,8 +91,10 @@ obj-$(CONFIG_SPI_ST_SSC4)		+= spi-st-ssc4.o
 obj-$(CONFIG_SPI_SUN4I)			+= spi-sun4i.o
 obj-$(CONFIG_SPI_SUN6I)			+= spi-sun6i.o
 obj-$(CONFIG_SPI_TEGRA114)		+= spi-tegra114.o
+obj-$(CONFIG_SPI_TEGRA124_SLAVE)	+= spi-tegra124-slave.o
 obj-$(CONFIG_SPI_TEGRA20_SFLASH)	+= spi-tegra20-sflash.o
 obj-$(CONFIG_SPI_TEGRA20_SLINK)		+= spi-tegra20-slink.o
+obj-$(CONFIG_QSPI_TEGRA210)		+= spi-tegra210-qspi.o
 obj-$(CONFIG_SPI_TLE62X0)		+= spi-tle62x0.o
 spi-thunderx-objs			:= spi-cavium.o spi-cavium-thunderx.o
 obj-$(CONFIG_SPI_THUNDERX)		+= spi-thunderx.o
@@ -102,3 +105,4 @@ obj-$(CONFIG_SPI_XILINX)		+= spi-xilinx.o
 obj-$(CONFIG_SPI_XLP)			+= spi-xlp.o
 obj-$(CONFIG_SPI_XTENSA_XTFPGA)		+= spi-xtensa-xtfpga.o
 obj-$(CONFIG_SPI_ZYNQMP_GQSPI)		+= spi-zynqmp-gqspi.o
+obj-$(CONFIG_SPI_IM501) 		+= spi-im501.o

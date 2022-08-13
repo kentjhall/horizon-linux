@@ -29,6 +29,9 @@ Required properties:
 	onsemi,pca9654
 	exar,xra1202
 
+Optional Properties:
+- wakeup-source: Boolean, device can wake-up the system.
+
 Example:
 
 

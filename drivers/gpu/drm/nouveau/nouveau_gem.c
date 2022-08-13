@@ -42,8 +42,10 @@ nouveau_gem_object_del(struct drm_gem_object *gem)
 	int ret;
 
 	ret = pm_runtime_get_sync(dev);
-	if (WARN_ON(ret < 0 && ret != -EACCES))
+	if (WARN_ON(ret < 0 && ret != -EACCES)) {
+		pm_runtime_put_autosuspend(dev);
 		return;
+	}
 
 	if (gem->import_attach)
 		drm_prime_gem_destroy(gem, nvbo->bo.sg);
@@ -369,7 +371,7 @@ validate_init(struct nouveau_channel *chan, struct drm_file *file_priv,
 {
 	struct nouveau_cli *cli = nouveau_cli(file_priv);
 	int trycnt = 0;
-	int ret, i;
+	int ret = -EINVAL, i;
 	struct nouveau_bo *res_bo = NULL;
 	LIST_HEAD(gart_list);
 	LIST_HEAD(vram_list);
@@ -601,7 +603,7 @@ nouveau_gem_pushbuf_reloc_apply(struct nouveau_cli *cli,
 		struct nouveau_bo *nvbo;
 		uint32_t data;
 
-		if (unlikely(r->bo_index > req->nr_buffers)) {
+		if (unlikely(r->bo_index >= req->nr_buffers)) {
 			NV_PRINTK(err, cli, "reloc bo index invalid\n");
 			ret = -EINVAL;
 			break;
@@ -611,7 +613,7 @@ nouveau_gem_pushbuf_reloc_apply(struct nouveau_cli *cli,
 		if (b->presumed.valid)
 			continue;
 
-		if (unlikely(r->reloc_bo_index > req->nr_buffers)) {
+		if (unlikely(r->reloc_bo_index >= req->nr_buffers)) {
 			NV_PRINTK(err, cli, "reloc container bo index invalid\n");
 			ret = -EINVAL;
 			break;

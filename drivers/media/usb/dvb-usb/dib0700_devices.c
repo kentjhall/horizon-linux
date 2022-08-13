@@ -292,7 +292,7 @@ static int stk7700P2_frontend_attach(struct dvb_usb_adapter *adap)
 					     stk7700d_dib7000p_mt2266_config)
 		    != 0) {
 			err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-			dvb_detach(&state->dib7000p_ops);
+			dvb_detach(state->dib7000p_ops.set_wbd_ref);
 			return -ENODEV;
 		}
 	}
@@ -326,7 +326,7 @@ static int stk7700d_frontend_attach(struct dvb_usb_adapter *adap)
 					     stk7700d_dib7000p_mt2266_config)
 		    != 0) {
 			err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-			dvb_detach(&state->dib7000p_ops);
+			dvb_detach(state->dib7000p_ops.set_wbd_ref);
 			return -ENODEV;
 		}
 	}
@@ -431,6 +431,7 @@ static int stk7700ph_xc3028_callback(void *ptr, int component,
 		state->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 1);
 		break;
 	case XC2028_RESET_CLK:
+	case XC2028_I2C_FLUSH:
 		break;
 	default:
 		err("%s: unknown command %d, arg %d\n", __func__,
@@ -479,7 +480,7 @@ static int stk7700ph_frontend_attach(struct dvb_usb_adapter *adap)
 				     &stk7700ph_dib7700_xc3028_config) != 0) {
 		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
 		    __func__);
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 
@@ -1011,7 +1012,7 @@ static int stk7070p_frontend_attach(struct dvb_usb_adapter *adap)
 				     &dib7070p_dib7000p_config) != 0) {
 		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
 		    __func__);
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 
@@ -1069,7 +1070,7 @@ static int stk7770p_frontend_attach(struct dvb_usb_adapter *adap)
 				     &dib7770p_dib7000p_config) != 0) {
 		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
 		    __func__);
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 
@@ -2437,9 +2438,13 @@ static int dib9090_tuner_attach(struct dvb_usb_adapter *adap)
 		8, 0x0486,
 	};
 
+	if (!IS_ENABLED(CONFIG_DVB_DIB9000))
+		return -ENODEV;
 	if (dvb_attach(dib0090_fw_register, adap->fe_adap[0].fe, i2c, &dib9090_dib0090_config) == NULL)
 		return -ENODEV;
 	i2c = dib9000_get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_GPIO_1_2, 0);
+	if (!i2c)
+		return -ENODEV;
 	if (dib01x0_pmu_update(i2c, data_dib190, 10) != 0)
 		return -ENODEV;
 	dib0700_set_i2c_speed(adap->dev, 1500);
@@ -2515,10 +2520,14 @@ static int nim9090md_tuner_attach(struct dvb_usb_adapter *adap)
 		0, 0x00ef,
 		8, 0x0406,
 	};
+	if (!IS_ENABLED(CONFIG_DVB_DIB9000))
+		return -ENODEV;
 	i2c = dib9000_get_tuner_interface(adap->fe_adap[0].fe);
 	if (dvb_attach(dib0090_fw_register, adap->fe_adap[0].fe, i2c, &nim9090md_dib0090_config[0]) == NULL)
 		return -ENODEV;
 	i2c = dib9000_get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_GPIO_1_2, 0);
+	if (!i2c)
+		return -ENODEV;
 	if (dib01x0_pmu_update(i2c, data_dib190, 10) < 0)
 		return -ENODEV;
 
@@ -3056,7 +3065,7 @@ static int nim7090_frontend_attach(struct dvb_usb_adapter *adap)
 
 	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 0x10, &nim7090_dib7000p_config) != 0) {
 		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x80, &nim7090_dib7000p_config);
@@ -3109,7 +3118,7 @@ static int tfe7090pvr_frontend0_attach(struct dvb_usb_adapter *adap)
 	/* initialize IC 0 */
 	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 0x20, &tfe7090pvr_dib7000p_config[0]) != 0) {
 		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 
@@ -3139,7 +3148,7 @@ static int tfe7090pvr_frontend1_attach(struct dvb_usb_adapter *adap)
 	i2c = state->dib7000p_ops.get_i2c_master(adap->dev->adapter[0].fe_adap[0].fe, DIBX000_I2C_INTERFACE_GPIO_6_7, 1);
 	if (state->dib7000p_ops.i2c_enumeration(i2c, 1, 0x10, &tfe7090pvr_dib7000p_config[1]) != 0) {
 		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 
@@ -3214,7 +3223,7 @@ static int tfe7790p_frontend_attach(struct dvb_usb_adapter *adap)
 				1, 0x10, &tfe7790p_dib7000p_config) != 0) {
 		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
 				__func__);
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap,
@@ -3309,7 +3318,7 @@ static int stk7070pd_frontend_attach0(struct dvb_usb_adapter *adap)
 				     stk7070pd_dib7000p_config) != 0) {
 		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
 		    __func__);
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 
@@ -3384,7 +3393,7 @@ static int novatd_frontend_attach(struct dvb_usb_adapter *adap)
 					     stk7070pd_dib7000p_config) != 0) {
 			err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
 			    __func__);
-			dvb_detach(&state->dib7000p_ops);
+			dvb_detach(state->dib7000p_ops.set_wbd_ref);
 			return -ENODEV;
 		}
 	}
@@ -3620,7 +3629,7 @@ static int pctv340e_frontend_attach(struct dvb_usb_adapter *adap)
 
 	if (state->dib7000p_ops.dib7000pc_detection(&adap->dev->i2c_adap) == 0) {
 		/* Demodulator not found for some reason? */
-		dvb_detach(&state->dib7000p_ops);
+		dvb_detach(state->dib7000p_ops.set_wbd_ref);
 		return -ENODEV;
 	}
 

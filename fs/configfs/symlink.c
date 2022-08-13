@@ -64,7 +64,7 @@ static void fill_item_path(struct config_item * item, char * buffer, int length)
 
 		/* back up enough to print this bus id with '/' */
 		length -= cur;
-		strncpy(buffer + length,config_item_name(p),cur);
+		memcpy(buffer + length, config_item_name(p), cur);
 		*(buffer + --length) = '/';
 	}
 }
@@ -83,14 +83,13 @@ static int create_link(struct config_item *parent_item,
 	ret = -ENOMEM;
 	sl = kmalloc(sizeof(struct configfs_symlink), GFP_KERNEL);
 	if (sl) {
-		sl->sl_target = config_item_get(item);
 		spin_lock(&configfs_dirent_lock);
 		if (target_sd->s_type & CONFIGFS_USET_DROPPING) {
 			spin_unlock(&configfs_dirent_lock);
-			config_item_put(item);
 			kfree(sl);
 			return -ENOENT;
 		}
+		sl->sl_target = config_item_get(item);
 		list_add(&sl->sl_list, &target_sd->s_links);
 		spin_unlock(&configfs_dirent_lock);
 		ret = configfs_create_link(sl, parent_item->ci_dentry,
@@ -158,11 +157,42 @@ int configfs_symlink(struct inode *dir, struct dentry *dentry, const char *symna
 	    !type->ct_item_ops->allow_link)
 		goto out_put;
 
+	/*
+	 * This is really sick.  What they wanted was a hybrid of
+	 * link(2) and symlink(2) - they wanted the target resolved
+	 * at syscall time (as link(2) would've done), be a directory
+	 * (which link(2) would've refused to do) *AND* be a deep
+	 * fucking magic, making the target busy from rmdir POV.
+	 * symlink(2) is nothing of that sort, and the locking it
+	 * gets matches the normal symlink(2) semantics.  Without
+	 * attempts to resolve the target (which might very well
+	 * not even exist yet) done prior to locking the parent
+	 * directory.  This perversion, OTOH, needs to resolve
+	 * the target, which would lead to obvious deadlocks if
+	 * attempted with any directories locked.
+	 *
+	 * Unfortunately, that garbage is userland ABI and we should've
+	 * said "no" back in 2005.  Too late now, so we get to
+	 * play very ugly games with locking.
+	 *
+	 * Try *ANYTHING* of that sort in new code, and you will
+	 * really regret it.  Just ask yourself - what could a BOFH
+	 * do to me and do I want to find it out first-hand?
+	 *
+	 *  AV, a thoroughly annoyed bastard.
+	 */
+	inode_unlock(dir);
 	ret = get_target(symname, &path, &target_item, dentry->d_sb);
+	inode_lock(dir);
 	if (ret)
 		goto out_put;
 
-	ret = type->ct_item_ops->allow_link(parent_item, target_item);
+	if (dentry->d_inode || d_unhashed(dentry))
+		ret = -EEXIST;
+	else
+		ret = inode_permission(dir, MAY_WRITE | MAY_EXEC);
+	if (!ret)
+		ret = type->ct_item_ops->allow_link(parent_item, target_item);
 	if (!ret) {
 		mutex_lock(&configfs_symlink_mutex);
 		ret = create_link(parent_item, target_item, dentry);

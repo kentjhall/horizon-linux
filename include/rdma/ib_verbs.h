@@ -63,6 +63,7 @@
 
 extern struct workqueue_struct *ib_wq;
 extern struct workqueue_struct *ib_comp_wq;
+extern struct workqueue_struct *ib_comp_unbound_wq;
 
 union ib_gid {
 	u8	raw[16];
@@ -1025,7 +1026,7 @@ struct ib_qp_init_attr {
 	struct ib_qp_cap	cap;
 	enum ib_sig_type	sq_sig_type;
 	enum ib_qp_type		qp_type;
-	enum ib_qp_create_flags	create_flags;
+	u32			create_flags;
 
 	/*
 	 * Only needed for special QP types, or when using the RW API.
@@ -1415,9 +1416,10 @@ struct ib_ah {
 typedef void (*ib_comp_handler)(struct ib_cq *cq, void *cq_context);
 
 enum ib_poll_context {
-	IB_POLL_DIRECT,		/* caller context, no hw completions */
-	IB_POLL_SOFTIRQ,	/* poll from softirq context */
-	IB_POLL_WORKQUEUE,	/* poll from workqueue */
+	IB_POLL_DIRECT,		   /* caller context, no hw completions */
+	IB_POLL_SOFTIRQ,	   /* poll from softirq context */
+	IB_POLL_WORKQUEUE,	   /* poll from workqueue */
+	IB_POLL_UNBOUND_WORKQUEUE, /* poll from unbound workqueue */
 };
 
 struct ib_cq {
@@ -1434,6 +1436,7 @@ struct ib_cq {
 		struct irq_poll		iop;
 		struct work_struct	work;
 	};
+	struct workqueue_struct *comp_wq;
 };
 
 struct ib_srq {
@@ -3306,6 +3309,20 @@ static inline int ib_check_mr_access(int flags)
 		return -EINVAL;
 
 	return 0;
+}
+
+static inline bool ib_access_writable(int access_flags)
+{
+	/*
+	 * We have writable memory backing the MR if any of the following
+	 * access flags are set.  "Local write" and "remote write" obviously
+	 * require write access.  "Remote atomic" can do things like fetch and
+	 * add, which will modify memory, and "MW bind" can change permissions
+	 * by binding a window.
+	 */
+	return access_flags &
+		(IB_ACCESS_LOCAL_WRITE   | IB_ACCESS_REMOTE_WRITE |
+		 IB_ACCESS_REMOTE_ATOMIC | IB_ACCESS_MW_BIND);
 }
 
 /**

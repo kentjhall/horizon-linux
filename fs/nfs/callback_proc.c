@@ -175,9 +175,9 @@ static u32 pnfs_check_callback_stateid(struct pnfs_layout_hdr *lo,
 {
 	u32 oldseq, newseq;
 
-	/* Is the stateid still not initialised? */
+	/* Is the stateid not initialised? */
 	if (!pnfs_layout_is_valid(lo))
-		return NFS4ERR_DELAY;
+		return NFS4ERR_NOMATCHING_LAYOUT;
 
 	/* Mismatched stateid? */
 	if (!nfs4_stateid_match_other(&lo->plh_stateid, new))
@@ -402,11 +402,8 @@ validate_seqid(const struct nfs4_slot_table *tbl, const struct nfs4_slot *slot,
 		return htonl(NFS4ERR_SEQ_FALSE_RETRY);
 	}
 
-	/* Wraparound */
-	if (unlikely(slot->seq_nr == 0xFFFFFFFFU)) {
-		if (args->csa_sequenceid == 1)
-			return htonl(NFS4_OK);
-	} else if (likely(args->csa_sequenceid == slot->seq_nr + 1))
+	/* Note: wraparound relies on seq_nr being of type u32 */
+	if (likely(args->csa_sequenceid == slot->seq_nr + 1))
 		return htonl(NFS4_OK);
 
 	/* Misordered request */
@@ -422,7 +419,7 @@ static bool referring_call_exists(struct nfs_client *clp,
 				  uint32_t nrclists,
 				  struct referring_call_list *rclists)
 {
-	bool status = 0;
+	bool status = false;
 	int i, j;
 	struct nfs4_session *session;
 	struct nfs4_slot_table *tbl;

@@ -2,10 +2,14 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 
+#include <asm/kaiser.h>
 #include <asm/perf_event.h>
 #include <asm/insn.h>
 
 #include "../perf_event.h"
+
+static
+DEFINE_PER_CPU_SHARED_ALIGNED_USER_MAPPED(struct debug_store, cpu_debug_store);
 
 /* The size of a BTS record in bytes: */
 #define BTS_RECORD_SIZE		24
@@ -268,6 +272,39 @@ void fini_debug_store_on_cpu(int cpu)
 
 static DEFINE_PER_CPU(void *, insn_buffer);
 
+static void *dsalloc(size_t size, gfp_t flags, int node)
+{
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	unsigned int order = get_order(size);
+	struct page *page;
+	unsigned long addr;
+
+	page = __alloc_pages_node(node, flags | __GFP_ZERO, order);
+	if (!page)
+		return NULL;
+	addr = (unsigned long)page_address(page);
+	if (kaiser_add_mapping(addr, size, __PAGE_KERNEL) < 0) {
+		__free_pages(page, order);
+		addr = 0;
+	}
+	return (void *)addr;
+#else
+	return kmalloc_node(size, flags | __GFP_ZERO, node);
+#endif
+}
+
+static void dsfree(const void *buffer, size_t size)
+{
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	if (!buffer)
+		return;
+	kaiser_remove_mapping((unsigned long)buffer, size);
+	free_pages((unsigned long)buffer, get_order(size));
+#else
+	kfree(buffer);
+#endif
+}
+
 static int alloc_pebs_buffer(int cpu)
 {
 	struct debug_store *ds = per_cpu(cpu_hw_events, cpu).ds;
@@ -278,7 +315,7 @@ static int alloc_pebs_buffer(int cpu)
 	if (!x86_pmu.pebs)
 		return 0;
 
-	buffer = kzalloc_node(x86_pmu.pebs_buffer_size, GFP_KERNEL, node);
+	buffer = dsalloc(x86_pmu.pebs_buffer_size, GFP_KERNEL, node);
 	if (unlikely(!buffer))
 		return -ENOMEM;
 
@@ -289,7 +326,7 @@ static int alloc_pebs_buffer(int cpu)
 	if (x86_pmu.intel_cap.pebs_format < 2) {
 		ibuffer = kzalloc_node(PEBS_FIXUP_SIZE, GFP_KERNEL, node);
 		if (!ibuffer) {
-			kfree(buffer);
+			dsfree(buffer, x86_pmu.pebs_buffer_size);
 			return -ENOMEM;
 		}
 		per_cpu(insn_buffer, cpu) = ibuffer;
@@ -315,7 +352,8 @@ static void release_pebs_buffer(int cpu)
 	kfree(per_cpu(insn_buffer, cpu));
 	per_cpu(insn_buffer, cpu) = NULL;
 
-	kfree((void *)(unsigned long)ds->pebs_buffer_base);
+	dsfree((void *)(unsigned long)ds->pebs_buffer_base,
+			x86_pmu.pebs_buffer_size);
 	ds->pebs_buffer_base = 0;
 }
 
@@ -329,7 +367,7 @@ static int alloc_bts_buffer(int cpu)
 	if (!x86_pmu.bts)
 		return 0;
 
-	buffer = kzalloc_node(BTS_BUFFER_SIZE, GFP_KERNEL | __GFP_NOWARN, node);
+	buffer = dsalloc(BTS_BUFFER_SIZE, GFP_KERNEL | __GFP_NOWARN, node);
 	if (unlikely(!buffer)) {
 		WARN_ONCE(1, "%s: BTS buffer allocation failure\n", __func__);
 		return -ENOMEM;
@@ -355,19 +393,15 @@ static void release_bts_buffer(int cpu)
 	if (!ds || !x86_pmu.bts)
 		return;
 
-	kfree((void *)(unsigned long)ds->bts_buffer_base);
+	dsfree((void *)(unsigned long)ds->bts_buffer_base, BTS_BUFFER_SIZE);
 	ds->bts_buffer_base = 0;
 }
 
 static int alloc_ds_buffer(int cpu)
 {
-	int node = cpu_to_node(cpu);
-	struct debug_store *ds;
+	struct debug_store *ds = per_cpu_ptr(&cpu_debug_store, cpu);
 
-	ds = kzalloc_node(sizeof(*ds), GFP_KERNEL, node);
-	if (unlikely(!ds))
-		return -ENOMEM;
-
+	memset(ds, 0, sizeof(*ds));
 	per_cpu(cpu_hw_events, cpu).ds = ds;
 
 	return 0;
@@ -381,7 +415,6 @@ static void release_ds_buffer(int cpu)
 		return;
 
 	per_cpu(cpu_hw_events, cpu).ds = NULL;
-	kfree(ds);
 }
 
 void release_ds_buffers(void)
@@ -622,7 +655,7 @@ struct event_constraint intel_core2_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x1fc7, 0x1), /* SIMD_INST_RETURED.ANY */
 	INTEL_FLAGS_EVENT_CONSTRAINT(0xcb, 0x1),    /* MEM_LOAD_RETIRED.* */
 	/* INST_RETIRED.ANY_P, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108000c0, 0x01),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108000c0, 0x01),
 	EVENT_CONSTRAINT_END
 };
 
@@ -631,7 +664,7 @@ struct event_constraint intel_atom_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x00c5, 0x1), /* MISPREDICTED_BRANCH_RETIRED */
 	INTEL_FLAGS_EVENT_CONSTRAINT(0xcb, 0x1),    /* MEM_LOAD_RETIRED.* */
 	/* INST_RETIRED.ANY_P, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108000c0, 0x01),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108000c0, 0x01),
 	/* Allow all events as PEBS with no flags */
 	INTEL_ALL_EVENT_CONSTRAINT(0, 0x1),
 	EVENT_CONSTRAINT_END
@@ -639,7 +672,7 @@ struct event_constraint intel_atom_pebs_event_constraints[] = {
 
 struct event_constraint intel_slm_pebs_event_constraints[] = {
 	/* INST_RETIRED.ANY_P, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108000c0, 0x1),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108000c0, 0x1),
 	/* Allow all events as PEBS with no flags */
 	INTEL_ALL_EVENT_CONSTRAINT(0, 0x1),
 	EVENT_CONSTRAINT_END
@@ -664,7 +697,7 @@ struct event_constraint intel_nehalem_pebs_event_constraints[] = {
 	INTEL_FLAGS_EVENT_CONSTRAINT(0xcb, 0xf),    /* MEM_LOAD_RETIRED.* */
 	INTEL_FLAGS_EVENT_CONSTRAINT(0xf7, 0xf),    /* FP_ASSIST.* */
 	/* INST_RETIRED.ANY_P, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108000c0, 0x0f),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108000c0, 0x0f),
 	EVENT_CONSTRAINT_END
 };
 
@@ -681,7 +714,7 @@ struct event_constraint intel_westmere_pebs_event_constraints[] = {
 	INTEL_FLAGS_EVENT_CONSTRAINT(0xcb, 0xf),    /* MEM_LOAD_RETIRED.* */
 	INTEL_FLAGS_EVENT_CONSTRAINT(0xf7, 0xf),    /* FP_ASSIST.* */
 	/* INST_RETIRED.ANY_P, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108000c0, 0x0f),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108000c0, 0x0f),
 	EVENT_CONSTRAINT_END
 };
 
@@ -690,7 +723,7 @@ struct event_constraint intel_snb_pebs_event_constraints[] = {
 	INTEL_PLD_CONSTRAINT(0x01cd, 0x8),    /* MEM_TRANS_RETIRED.LAT_ABOVE_THR */
 	INTEL_PST_CONSTRAINT(0x02cd, 0x8),    /* MEM_TRANS_RETIRED.PRECISE_STORES */
 	/* UOPS_RETIRED.ALL, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c2, 0xf),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108001c2, 0xf),
         INTEL_EXCLEVT_CONSTRAINT(0xd0, 0xf),    /* MEM_UOP_RETIRED.* */
         INTEL_EXCLEVT_CONSTRAINT(0xd1, 0xf),    /* MEM_LOAD_UOPS_RETIRED.* */
         INTEL_EXCLEVT_CONSTRAINT(0xd2, 0xf),    /* MEM_LOAD_UOPS_LLC_HIT_RETIRED.* */
@@ -705,9 +738,9 @@ struct event_constraint intel_ivb_pebs_event_constraints[] = {
         INTEL_PLD_CONSTRAINT(0x01cd, 0x8),    /* MEM_TRANS_RETIRED.LAT_ABOVE_THR */
 	INTEL_PST_CONSTRAINT(0x02cd, 0x8),    /* MEM_TRANS_RETIRED.PRECISE_STORES */
 	/* UOPS_RETIRED.ALL, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c2, 0xf),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108001c2, 0xf),
 	/* INST_RETIRED.PREC_DIST, inv=1, cmask=16 (cycles:ppp). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c0, 0x2),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108001c0, 0x2),
 	INTEL_EXCLEVT_CONSTRAINT(0xd0, 0xf),    /* MEM_UOP_RETIRED.* */
 	INTEL_EXCLEVT_CONSTRAINT(0xd1, 0xf),    /* MEM_LOAD_UOPS_RETIRED.* */
 	INTEL_EXCLEVT_CONSTRAINT(0xd2, 0xf),    /* MEM_LOAD_UOPS_LLC_HIT_RETIRED.* */
@@ -721,9 +754,9 @@ struct event_constraint intel_hsw_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x01c0, 0x2), /* INST_RETIRED.PRECDIST */
 	INTEL_PLD_CONSTRAINT(0x01cd, 0xf),    /* MEM_TRANS_RETIRED.* */
 	/* UOPS_RETIRED.ALL, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c2, 0xf),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108001c2, 0xf),
 	/* INST_RETIRED.PREC_DIST, inv=1, cmask=16 (cycles:ppp). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c0, 0x2),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108001c0, 0x2),
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_NA(0x01c2, 0xf), /* UOPS_RETIRED.ALL */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_XLD(0x11d0, 0xf), /* MEM_UOPS_RETIRED.STLB_MISS_LOADS */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_XLD(0x21d0, 0xf), /* MEM_UOPS_RETIRED.LOCK_LOADS */
@@ -744,9 +777,9 @@ struct event_constraint intel_bdw_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x01c0, 0x2), /* INST_RETIRED.PRECDIST */
 	INTEL_PLD_CONSTRAINT(0x01cd, 0xf),    /* MEM_TRANS_RETIRED.* */
 	/* UOPS_RETIRED.ALL, inv=1, cmask=16 (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c2, 0xf),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108001c2, 0xf),
 	/* INST_RETIRED.PREC_DIST, inv=1, cmask=16 (cycles:ppp). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c0, 0x2),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108001c0, 0x2),
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_NA(0x01c2, 0xf), /* UOPS_RETIRED.ALL */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x11d0, 0xf), /* MEM_UOPS_RETIRED.STLB_MISS_LOADS */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x21d0, 0xf), /* MEM_UOPS_RETIRED.LOCK_LOADS */
@@ -767,9 +800,9 @@ struct event_constraint intel_bdw_pebs_event_constraints[] = {
 struct event_constraint intel_skl_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x1c0, 0x2),	/* INST_RETIRED.PREC_DIST */
 	/* INST_RETIRED.PREC_DIST, inv=1, cmask=16 (cycles:ppp). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c0, 0x2),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108001c0, 0x2),
 	/* INST_RETIRED.TOTAL_CYCLES_PS (inv=1, cmask=16) (cycles:p). */
-	INTEL_FLAGS_EVENT_CONSTRAINT(0x108000c0, 0x0f),
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x108000c0, 0x0f),
 	INTEL_PLD_CONSTRAINT(0x1cd, 0xf),		      /* MEM_TRANS_RETIRED.* */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x11d0, 0xf), /* MEM_INST_RETIRED.STLB_MISS_LOADS */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x12d0, 0xf), /* MEM_INST_RETIRED.STLB_MISS_STORES */
@@ -1077,6 +1110,7 @@ static void setup_pebs_sample_data(struct perf_event *event,
 	if (pebs == NULL)
 		return;
 
+	regs->flags &= ~PERF_EFLAGS_EXACT;
 	sample_type = event->attr.sample_type;
 	dsrc = sample_type & PERF_SAMPLE_DATA_SRC;
 
@@ -1121,7 +1155,6 @@ static void setup_pebs_sample_data(struct perf_event *event,
 	 */
 	*regs = *iregs;
 	regs->flags = pebs->flags;
-	set_linear_ip(regs, pebs->ip);
 
 	if (sample_type & PERF_SAMPLE_REGS_INTR) {
 		regs->ax = pebs->ax;
@@ -1157,13 +1190,22 @@ static void setup_pebs_sample_data(struct perf_event *event,
 #endif
 	}
 
-	if (event->attr.precise_ip > 1 && x86_pmu.intel_cap.pebs_format >= 2) {
-		regs->ip = pebs->real_ip;
-		regs->flags |= PERF_EFLAGS_EXACT;
-	} else if (event->attr.precise_ip > 1 && intel_pmu_pebs_fixup_ip(regs))
-		regs->flags |= PERF_EFLAGS_EXACT;
-	else
-		regs->flags &= ~PERF_EFLAGS_EXACT;
+	if (event->attr.precise_ip > 1) {
+		/* Haswell and later have the eventing IP, so use it: */
+		if (x86_pmu.intel_cap.pebs_format >= 2) {
+			set_linear_ip(regs, pebs->real_ip);
+			regs->flags |= PERF_EFLAGS_EXACT;
+		} else {
+			/* Otherwise use PEBS off-by-1 IP: */
+			set_linear_ip(regs, pebs->ip);
+
+			/* ... and try to fix it up using the LBR entries: */
+			if (intel_pmu_pebs_fixup_ip(regs))
+				regs->flags |= PERF_EFLAGS_EXACT;
+		}
+	} else
+		set_linear_ip(regs, pebs->ip);
+
 
 	if ((sample_type & PERF_SAMPLE_ADDR) &&
 	    x86_pmu.intel_cap.pebs_format >= 1)
@@ -1230,17 +1272,86 @@ get_next_pebs_record_by_bit(void *base, void *top, int bit)
 	return NULL;
 }
 
+/*
+ * Special variant of intel_pmu_save_and_restart() for auto-reload.
+ */
+static int
+intel_pmu_save_and_restart_reload(struct perf_event *event, int count)
+{
+	struct hw_perf_event *hwc = &event->hw;
+	int shift = 64 - x86_pmu.cntval_bits;
+	u64 period = hwc->sample_period;
+	u64 prev_raw_count, new_raw_count;
+	s64 new, old;
+
+	WARN_ON(!period);
+
+	/*
+	 * drain_pebs() only happens when the PMU is disabled.
+	 */
+	WARN_ON(this_cpu_read(cpu_hw_events.enabled));
+
+	prev_raw_count = local64_read(&hwc->prev_count);
+	rdpmcl(hwc->event_base_rdpmc, new_raw_count);
+	local64_set(&hwc->prev_count, new_raw_count);
+
+	/*
+	 * Since the counter increments a negative counter value and
+	 * overflows on the sign switch, giving the interval:
+	 *
+	 *   [-period, 0]
+	 *
+	 * the difference between two consequtive reads is:
+	 *
+	 *   A) value2 - value1;
+	 *      when no overflows have happened in between,
+	 *
+	 *   B) (0 - value1) + (value2 - (-period));
+	 *      when one overflow happened in between,
+	 *
+	 *   C) (0 - value1) + (n - 1) * (period) + (value2 - (-period));
+	 *      when @n overflows happened in between.
+	 *
+	 * Here A) is the obvious difference, B) is the extension to the
+	 * discrete interval, where the first term is to the top of the
+	 * interval and the second term is from the bottom of the next
+	 * interval and C) the extension to multiple intervals, where the
+	 * middle term is the whole intervals covered.
+	 *
+	 * An equivalent of C, by reduction, is:
+	 *
+	 *   value2 - value1 + n * period
+	 */
+	new = ((s64)(new_raw_count << shift) >> shift);
+	old = ((s64)(prev_raw_count << shift) >> shift);
+	local64_add(new - old + count * period, &event->count);
+
+	local64_set(&hwc->period_left, -new);
+
+	perf_event_update_userpage(event);
+
+	return 0;
+}
+
 static void __intel_pmu_pebs_event(struct perf_event *event,
 				   struct pt_regs *iregs,
 				   void *base, void *top,
 				   int bit, int count)
 {
+	struct hw_perf_event *hwc = &event->hw;
 	struct perf_sample_data data;
 	struct pt_regs regs;
 	void *at = get_next_pebs_record_by_bit(base, top, bit);
 
-	if (!intel_pmu_save_and_restart(event) &&
-	    !(event->hw.flags & PERF_X86_EVENT_AUTO_RELOAD))
+	if (hwc->flags & PERF_X86_EVENT_AUTO_RELOAD) {
+		/*
+		 * Now, auto-reload is only enabled in fixed period mode.
+		 * The reload value is always hwc->sample_period.
+		 * May need to change it, if auto-reload is enabled in
+		 * freq mode later.
+		 */
+		intel_pmu_save_and_restart_reload(event, count);
+	} else if (!intel_pmu_save_and_restart(event))
 		return;
 
 	while (count > 1) {
@@ -1292,8 +1403,11 @@ static void intel_pmu_drain_pebs_core(struct pt_regs *iregs)
 		return;
 
 	n = top - at;
-	if (n <= 0)
+	if (n <= 0) {
+		if (event->hw.flags & PERF_X86_EVENT_AUTO_RELOAD)
+			intel_pmu_save_and_restart_reload(event, 0);
 		return;
+	}
 
 	__intel_pmu_pebs_event(event, iregs, at, top, 0, n);
 }
@@ -1316,8 +1430,22 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
 
 	ds->pebs_index = ds->pebs_buffer_base;
 
-	if (unlikely(base >= top))
+	if (unlikely(base >= top)) {
+		/*
+		 * The drain_pebs() could be called twice in a short period
+		 * for auto-reload event in pmu::read(). There are no
+		 * overflows have happened in between.
+		 * It needs to call intel_pmu_save_and_restart_reload() to
+		 * update the event->count for this case.
+		 */
+		for_each_set_bit(bit, (unsigned long *)&cpuc->pebs_enabled,
+				 x86_pmu.max_pebs_events) {
+			event = cpuc->events[bit];
+			if (event->hw.flags & PERF_X86_EVENT_AUTO_RELOAD)
+				intel_pmu_save_and_restart_reload(event, 0);
+		}
 		return;
+	}
 
 	for (at = base; at < top; at += x86_pmu.pebs_record_size) {
 		struct pebs_record_nhm *p = at;
@@ -1389,8 +1517,12 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
 			continue;
 
 		/* log dropped samples number */
-		if (error[bit])
+		if (error[bit]) {
 			perf_log_lost_samples(event, error[bit]);
+
+			if (perf_event_account_interrupt(event))
+				x86_pmu_stop(event, 0);
+		}
 
 		if (counts[bit]) {
 			__intel_pmu_pebs_event(event, iregs, base,

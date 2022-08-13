@@ -42,6 +42,7 @@
 #include <linux/of_fdt.h>
 #include <linux/efi.h>
 #include <linux/psci.h>
+#include <linux/mm.h>
 
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
@@ -199,10 +200,10 @@ static void __init request_standard_resources(void)
 	struct memblock_region *region;
 	struct resource *res;
 
-	kernel_code.start   = virt_to_phys(_text);
-	kernel_code.end     = virt_to_phys(__init_begin - 1);
-	kernel_data.start   = virt_to_phys(_sdata);
-	kernel_data.end     = virt_to_phys(_end - 1);
+	kernel_code.start   = __pa_symbol(_text);
+	kernel_code.end     = __pa_symbol(__init_begin - 1);
+	kernel_data.start   = __pa_symbol(_sdata);
+	kernel_data.end     = __pa_symbol(_end - 1);
 
 	for_each_memblock(memory, region) {
 		res = alloc_bootmem_low(sizeof(*res));
@@ -228,6 +229,7 @@ static void __init request_standard_resources(void)
 }
 
 u64 __cpu_logical_map[NR_CPUS] = { [0 ... NR_CPUS-1] = INVALID_HWID };
+EXPORT_SYMBOL_GPL(__cpu_logical_map);
 
 void __init setup_arch(char **cmdline_p)
 {
@@ -291,6 +293,15 @@ void __init setup_arch(char **cmdline_p)
 	smp_init_cpus();
 	smp_build_mpidr_hash();
 
+#ifdef CONFIG_ARM64_SW_TTBR0_PAN
+	/*
+	 * Make sure init_thread_info.ttbr0 always generates translation
+	 * faults in case uaccess_enable() is inadvertently called by the init
+	 * thread.
+	 */
+	init_task.thread_info.ttbr0 = __pa_symbol(empty_zero_page);
+#endif
+
 #ifdef CONFIG_VT
 #if defined(CONFIG_VGA_CONSOLE)
 	conswitchp = &vga_con;
@@ -329,11 +340,11 @@ subsys_initcall(topology_init);
 static int dump_kernel_offset(struct notifier_block *self, unsigned long v,
 			      void *p)
 {
-	u64 const kaslr_offset = kimage_vaddr - KIMAGE_VADDR;
+	const unsigned long offset = kaslr_offset();
 
-	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE) && kaslr_offset > 0) {
-		pr_emerg("Kernel Offset: 0x%llx from 0x%lx\n",
-			 kaslr_offset, KIMAGE_VADDR);
+	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE) && offset > 0) {
+		pr_emerg("Kernel Offset: 0x%lx from 0x%lx\n",
+			 offset, KIMAGE_VADDR);
 	} else {
 		pr_emerg("Kernel Offset: disabled\n");
 	}

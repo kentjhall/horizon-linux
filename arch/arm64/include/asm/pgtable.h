@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2012 ARM Ltd.
+ * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -52,7 +53,7 @@ extern void __pgd_error(const char *file, int line, unsigned long val);
  * for zero-mapped memory areas etc..
  */
 extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
-#define ZERO_PAGE(vaddr)	pfn_to_page(PHYS_PFN(__pa(empty_zero_page)))
+#define ZERO_PAGE(vaddr)	phys_to_page(__pa_symbol(empty_zero_page))
 
 #define pte_ERROR(pte)		__pte_error(__FILE__, __LINE__, pte_val(pte))
 
@@ -71,9 +72,8 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 #define pte_young(pte)		(!!(pte_val(pte) & PTE_AF))
 #define pte_special(pte)	(!!(pte_val(pte) & PTE_SPECIAL))
 #define pte_write(pte)		(!!(pte_val(pte) & PTE_WRITE))
-#define pte_exec(pte)		(!(pte_val(pte) & PTE_UXN))
+#define pte_user_exec(pte)	(!(pte_val(pte) & PTE_UXN))
 #define pte_cont(pte)		(!!(pte_val(pte) & PTE_CONT))
-#define pte_ng(pte)		(!!(pte_val(pte) & PTE_NG))
 
 #ifdef CONFIG_ARM64_HW_AFDBM
 #define pte_hw_dirty(pte)	(pte_write(pte) && !(pte_val(pte) & PTE_RDONLY))
@@ -84,18 +84,41 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 #define pte_dirty(pte)		(pte_sw_dirty(pte) || pte_hw_dirty(pte))
 
 #define pte_valid(pte)		(!!(pte_val(pte) & PTE_VALID))
-#define pte_valid_global(pte) \
-	((pte_val(pte) & (PTE_VALID | PTE_NG)) == PTE_VALID)
+#define pte_valid_not_user(pte) \
+	((pte_val(pte) & (PTE_VALID | PTE_USER)) == PTE_VALID)
 #define pte_valid_young(pte) \
 	((pte_val(pte) & (PTE_VALID | PTE_AF)) == (PTE_VALID | PTE_AF))
+#define pte_valid_user(pte) \
+	((pte_val(pte) & (PTE_VALID | PTE_USER)) == (PTE_VALID | PTE_USER))
 
 /*
  * Could the pte be present in the TLB? We must check mm_tlb_flush_pending
  * so that we don't erroneously return false for pages that have been
  * remapped as PROT_NONE but are yet to be flushed from the TLB.
+ * Note that we can't make any assumptions based on the state of the access
+ * flag, since ptep_clear_flush_young() elides a DSB when invalidating the
+ * TLB.
  */
 #define pte_accessible(mm, pte)	\
-	(mm_tlb_flush_pending(mm) ? pte_present(pte) : pte_valid_young(pte))
+	(mm_tlb_flush_pending(mm) ? pte_present(pte) : pte_valid(pte))
+
+/*
+ * p??_access_permitted() is true for valid user mappings (subject to the
+ * write permission check). PROT_NONE mappings do not have the PTE_VALID bit
+ * set.
+ */
+#define pte_access_permitted(pte, write) \
+	(pte_valid_user(pte) && (!(write) || pte_write(pte)))
+#define pmd_access_permitted(pmd, write) \
+	(pte_access_permitted(pmd_pte(pmd), (write)))
+#define pud_access_permitted(pud, write) \
+	(pte_access_permitted(pud_pte(pud), (write)))
+
+#ifdef CONFIG_ARM64_NON_SHARED_TLBI
+#define __DSB_FOR_PGTABLE()	dsb(nshst)
+#else
+#define __DSB_FOR_PGTABLE()	dsb(ishst)
+#endif
 
 static inline pte_t clear_pte_bit(pte_t pte, pgprot_t prot)
 {
@@ -144,6 +167,8 @@ static inline pte_t pte_mkspecial(pte_t pte)
 	return set_pte_bit(pte, __pgprot(PTE_SPECIAL));
 }
 
+#define pte_mkdevmap pte_mkspecial
+
 static inline pte_t pte_mkcont(pte_t pte)
 {
 	pte = set_pte_bit(pte, __pgprot(PTE_CONT));
@@ -178,8 +203,8 @@ static inline void set_pte(pte_t *ptep, pte_t pte)
 	 * Only if the new pte is valid and kernel, otherwise TLB maintenance
 	 * or update_mmu_cache() have the necessary barriers.
 	 */
-	if (pte_valid_global(pte)) {
-		dsb(ishst);
+	if (pte_valid_not_user(pte)) {
+		__DSB_FOR_PGTABLE();
 		isb();
 	}
 }
@@ -212,7 +237,7 @@ static inline void set_pte_at(struct mm_struct *mm, unsigned long addr,
 			pte_val(pte) &= ~PTE_RDONLY;
 		else
 			pte_val(pte) |= PTE_RDONLY;
-		if (pte_ng(pte) && pte_exec(pte) && !pte_special(pte))
+		if (pte_user_exec(pte) && !pte_special(pte))
 			__sync_icache_dcache(pte, addr);
 	}
 
@@ -340,6 +365,7 @@ static inline int pmd_protnone(pmd_t pmd)
 
 #define pud_write(pud)		pte_write(pud_pte(pud))
 #define pud_pfn(pud)		(((pud_val(pud) & PUD_MASK) & PHYS_MASK) >> PAGE_SHIFT)
+#define pfn_pud(pfn,prot)	(__pud(((phys_addr_t)(pfn) << PAGE_SHIFT) | pgprot_val(prot)))
 
 #define set_pmd_at(mm, addr, pmdp, pmd)	set_pte_at(mm, addr, (pte_t *)pmdp, pmd_pte(pmd))
 
@@ -370,8 +396,8 @@ extern pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
 				 PMD_TYPE_SECT)
 
 #if defined(CONFIG_ARM64_64K_PAGES) || CONFIG_PGTABLE_LEVELS < 3
-#define pud_sect(pud)		(0)
-#define pud_table(pud)		(1)
+static inline bool pud_sect(pud_t pud) { return false; }
+static inline bool pud_table(pud_t pud) { return true; }
 #else
 #define pud_sect(pud)		((pud_val(pud) & PUD_TYPE_MASK) == \
 				 PUD_TYPE_SECT)
@@ -382,7 +408,7 @@ extern pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
 static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
 	*pmdp = pmd;
-	dsb(ishst);
+	__DSB_FOR_PGTABLE();
 	isb();
 }
 
@@ -396,6 +422,13 @@ static inline phys_addr_t pmd_page_paddr(pmd_t pmd)
 	return pmd_val(pmd) & PHYS_MASK & (s32)PAGE_MASK;
 }
 
+static inline pte_t *pmd_page_vaddr(pmd_t pmd)
+{
+	return __va(pmd_page_paddr(pmd));
+}
+
+static inline void pte_unmap(pte_t *pte) { }
+
 /* Find an entry in the third-level page table. */
 #define pte_index(addr)		(((addr) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1))
 
@@ -404,7 +437,6 @@ static inline phys_addr_t pmd_page_paddr(pmd_t pmd)
 
 #define pte_offset_map(dir,addr)	pte_offset_kernel((dir), (addr))
 #define pte_offset_map_nested(dir,addr)	pte_offset_kernel((dir), (addr))
-#define pte_unmap(pte)			do { } while (0)
 #define pte_unmap_nested(pte)		do { } while (0)
 
 #define pte_set_fixmap(addr)		((pte_t *)set_fixmap_offset(FIX_PTE, addr))
@@ -433,7 +465,7 @@ static inline phys_addr_t pmd_page_paddr(pmd_t pmd)
 static inline void set_pud(pud_t *pudp, pud_t pud)
 {
 	*pudp = pud;
-	dsb(ishst);
+	__DSB_FOR_PGTABLE();
 	isb();
 }
 
@@ -445,6 +477,11 @@ static inline void pud_clear(pud_t *pudp)
 static inline phys_addr_t pud_page_paddr(pud_t pud)
 {
 	return pud_val(pud) & PHYS_MASK & (s32)PAGE_MASK;
+}
+
+static inline unsigned long pud_page_vaddr(pud_t pud)
+{
+	return (unsigned long) __va(pud_page_paddr(pud));
 }
 
 /* Find an entry in the second-level page table. */
@@ -486,7 +523,7 @@ static inline phys_addr_t pud_page_paddr(pud_t pud)
 static inline void set_pgd(pgd_t *pgdp, pgd_t pgd)
 {
 	*pgdp = pgd;
-	dsb(ishst);
+	__DSB_FOR_PGTABLE();
 }
 
 static inline void pgd_clear(pgd_t *pgdp)
@@ -497,6 +534,11 @@ static inline void pgd_clear(pgd_t *pgdp)
 static inline phys_addr_t pgd_page_paddr(pgd_t pgd)
 {
 	return pgd_val(pgd) & PHYS_MASK & (s32)PAGE_MASK;
+}
+
+static inline unsigned long pgd_page_vaddr(pgd_t pgd)
+{
+	return (unsigned long) __va(pgd_page_paddr(pgd));
 }
 
 /* Find an entry in the frst-level page table. */
@@ -602,6 +644,12 @@ static inline int ptep_test_and_clear_young(struct vm_area_struct *vma,
 {
 	return __ptep_test_and_clear_young(ptep);
 }
+#define __HAVE_ARCH_PTEP_CLEAR_YOUNG_FLUSH
+static inline int ptep_clear_flush_young(struct vm_area_struct *vma,
+					 unsigned long address, pte_t *ptep)
+{
+	return ptep_test_and_clear_young(vma, address, ptep);
+}
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 #define __HAVE_ARCH_PMDP_TEST_AND_CLEAR_YOUNG
@@ -675,6 +723,7 @@ static inline void pmdp_set_wrprotect(struct mm_struct *mm,
 
 extern pgd_t swapper_pg_dir[PTRS_PER_PGD];
 extern pgd_t idmap_pg_dir[PTRS_PER_PGD];
+extern pgd_t tramp_pg_dir[PTRS_PER_PGD];
 
 /*
  * Encode and decode a swap entry:

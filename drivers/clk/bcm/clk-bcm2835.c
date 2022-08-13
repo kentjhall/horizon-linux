@@ -401,17 +401,17 @@ struct bcm2835_pll_ana_bits {
 static const struct bcm2835_pll_ana_bits bcm2835_ana_default = {
 	.mask0 = 0,
 	.set0 = 0,
-	.mask1 = (u32)~(A2W_PLL_KI_MASK | A2W_PLL_KP_MASK),
+	.mask1 = A2W_PLL_KI_MASK | A2W_PLL_KP_MASK,
 	.set1 = (2 << A2W_PLL_KI_SHIFT) | (8 << A2W_PLL_KP_SHIFT),
-	.mask3 = (u32)~A2W_PLL_KA_MASK,
+	.mask3 = A2W_PLL_KA_MASK,
 	.set3 = (2 << A2W_PLL_KA_SHIFT),
 	.fb_prediv_mask = BIT(14),
 };
 
 static const struct bcm2835_pll_ana_bits bcm2835_ana_pllh = {
-	.mask0 = (u32)~(A2W_PLLH_KA_MASK | A2W_PLLH_KI_LOW_MASK),
+	.mask0 = A2W_PLLH_KA_MASK | A2W_PLLH_KI_LOW_MASK,
 	.set0 = (2 << A2W_PLLH_KA_SHIFT) | (2 << A2W_PLLH_KI_LOW_SHIFT),
-	.mask1 = (u32)~(A2W_PLLH_KI_HIGH_MASK | A2W_PLLH_KP_MASK),
+	.mask1 = A2W_PLLH_KI_HIGH_MASK | A2W_PLLH_KP_MASK,
 	.set1 = (6 << A2W_PLLH_KP_SHIFT),
 	.mask3 = 0,
 	.set3 = 0,
@@ -545,9 +545,7 @@ static void bcm2835_pll_off(struct clk_hw *hw)
 	const struct bcm2835_pll_data *data = pll->data;
 
 	spin_lock(&cprman->regs_lock);
-	cprman_write(cprman, data->cm_ctrl_reg,
-		     cprman_read(cprman, data->cm_ctrl_reg) |
-		     CM_PLL_ANARST);
+	cprman_write(cprman, data->cm_ctrl_reg, CM_PLL_ANARST);
 	cprman_write(cprman, data->a2w_ctrl_reg,
 		     cprman_read(cprman, data->a2w_ctrl_reg) |
 		     A2W_PLL_CTRL_PWRDN);
@@ -566,8 +564,10 @@ static int bcm2835_pll_on(struct clk_hw *hw)
 		     ~A2W_PLL_CTRL_PWRDN);
 
 	/* Take the PLL out of reset. */
+	spin_lock(&cprman->regs_lock);
 	cprman_write(cprman, data->cm_ctrl_reg,
 		     cprman_read(cprman, data->cm_ctrl_reg) & ~CM_PLL_ANARST);
+	spin_unlock(&cprman->regs_lock);
 
 	/* Wait for the PLL to lock. */
 	timeout = ktime_add_ns(ktime_get(), LOCK_TIMEOUT_NS);
@@ -580,6 +580,10 @@ static int bcm2835_pll_on(struct clk_hw *hw)
 
 		cpu_relax();
 	}
+
+	cprman_write(cprman, data->a2w_ctrl_reg,
+		     cprman_read(cprman, data->a2w_ctrl_reg) |
+		     A2W_PLL_CTRL_PRST_DISABLE);
 
 	return 0;
 }
@@ -644,9 +648,11 @@ static int bcm2835_pll_set_rate(struct clk_hw *hw,
 	}
 
 	/* Unmask the reference clock from the oscillator. */
+	spin_lock(&cprman->regs_lock);
 	cprman_write(cprman, A2W_XOSC_CTRL,
 		     cprman_read(cprman, A2W_XOSC_CTRL) |
 		     data->reference_enable_mask);
+	spin_unlock(&cprman->regs_lock);
 
 	if (do_ana_setup_first)
 		bcm2835_pll_write_ana(cprman, data->ana_reg_base, ana);
@@ -751,7 +757,9 @@ static void bcm2835_pll_divider_off(struct clk_hw *hw)
 	cprman_write(cprman, data->cm_reg,
 		     (cprman_read(cprman, data->cm_reg) &
 		      ~data->load_mask) | data->hold_mask);
-	cprman_write(cprman, data->a2w_reg, A2W_PLL_CHANNEL_DISABLE);
+	cprman_write(cprman, data->a2w_reg,
+		     cprman_read(cprman, data->a2w_reg) |
+		     A2W_PLL_CHANNEL_DISABLE);
 	spin_unlock(&cprman->regs_lock);
 }
 
@@ -1169,8 +1177,10 @@ static struct clk_hw *bcm2835_register_pll(struct bcm2835_cprman *cprman,
 	pll->hw.init = &init;
 
 	ret = devm_clk_hw_register(cprman->dev, &pll->hw);
-	if (ret)
+	if (ret) {
+		kfree(pll);
 		return NULL;
+	}
 	return &pll->hw;
 }
 
@@ -1287,13 +1297,13 @@ static struct clk_hw *bcm2835_register_clock(struct bcm2835_cprman *cprman,
 	return &clock->hw;
 }
 
-static struct clk *bcm2835_register_gate(struct bcm2835_cprman *cprman,
+static struct clk_hw *bcm2835_register_gate(struct bcm2835_cprman *cprman,
 					 const struct bcm2835_gate_data *data)
 {
-	return clk_register_gate(cprman->dev, data->name, data->parent,
-				 CLK_IGNORE_UNUSED | CLK_SET_RATE_GATE,
-				 cprman->regs + data->ctl_reg,
-				 CM_GATE_BIT, 0, &cprman->regs_lock);
+	return clk_hw_register_gate(cprman->dev, data->name, data->parent,
+				    CLK_IGNORE_UNUSED | CLK_SET_RATE_GATE,
+				    cprman->regs + data->ctl_reg,
+				    CM_GATE_BIT, 0, &cprman->regs_lock);
 }
 
 typedef struct clk_hw *(*bcm2835_clk_register)(struct bcm2835_cprman *cprman,
@@ -1596,7 +1606,7 @@ static const struct bcm2835_clk_desc clk_desc_array[] = {
 		.a2w_reg = A2W_PLLH_AUX,
 		.load_mask = CM_PLLH_LOADAUX,
 		.hold_mask = 0,
-		.fixed_divider = 10),
+		.fixed_divider = 1),
 	[BCM2835_PLLH_PIX]	= REGISTER_PLL_DIV(
 		.name = "pllh_pix",
 		.source_pll = "pllh",

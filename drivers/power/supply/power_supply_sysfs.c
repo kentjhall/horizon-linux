@@ -84,7 +84,8 @@ static ssize_t power_supply_show_property(struct device *dev,
 				dev_dbg(dev, "driver has no data for `%s' property\n",
 					attr->attr.name);
 			else if (ret != -ENODEV && ret != -EAGAIN)
-				dev_err(dev, "driver failed to report `%s' property: %zd\n",
+				dev_err_ratelimited(dev,
+					"driver failed to report `%s' property: %zd\n",
 					attr->attr.name, ret);
 			return ret;
 		}
@@ -107,7 +108,10 @@ static ssize_t power_supply_show_property(struct device *dev,
 	else if (off >= POWER_SUPPLY_PROP_MODEL_NAME)
 		return sprintf(buf, "%s\n", value.strval);
 
-	return sprintf(buf, "%d\n", value.intval);
+	if (off == POWER_SUPPLY_PROP_CHARGE_COUNTER_EXT)
+		return sprintf(buf, "%lld\n", value.int64val);
+	else
+		return sprintf(buf, "%d\n", value.intval);
 }
 
 static ssize_t power_supply_store_property(struct device *dev,
@@ -198,10 +202,18 @@ static struct device_attribute power_supply_attrs[] = {
 	POWER_SUPPLY_ATTR(scope),
 	POWER_SUPPLY_ATTR(charge_term_current),
 	POWER_SUPPLY_ATTR(calibrate),
+	/* Local extensions */
+	POWER_SUPPLY_ATTR(usb_hc),
+	POWER_SUPPLY_ATTR(usb_otg),
+	POWER_SUPPLY_ATTR(charge_enabled),
+	/* Local extensions of type int64_t */
+	POWER_SUPPLY_ATTR(charge_counter_ext),
 	/* Properties of type `const char *' */
 	POWER_SUPPLY_ATTR(model_name),
 	POWER_SUPPLY_ATTR(manufacturer),
 	POWER_SUPPLY_ATTR(serial_number),
+	POWER_SUPPLY_ATTR(charger_standard),
+	POWER_SUPPLY_ATTR(charger_type),
 };
 
 static struct attribute *
@@ -278,14 +290,10 @@ int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
 	char *prop_buf;
 	char *attrname;
 
-	dev_dbg(dev, "uevent\n");
-
 	if (!psy || !psy->desc) {
 		dev_dbg(dev, "No power supply yet\n");
 		return ret;
 	}
-
-	dev_dbg(dev, "POWER_SUPPLY_NAME=%s\n", psy->desc->name);
 
 	ret = add_uevent_var(env, "POWER_SUPPLY_NAME=%s", psy->desc->name);
 	if (ret)
@@ -321,8 +329,6 @@ int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
 			ret = -ENOMEM;
 			goto out;
 		}
-
-		dev_dbg(dev, "prop %s=%s\n", attrname, prop_buf);
 
 		ret = add_uevent_var(env, "POWER_SUPPLY_%s=%s", attrname, prop_buf);
 		kfree(attrname);

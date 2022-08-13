@@ -1,0 +1,56 @@
+#!/bin/bash
+
+set -e
+
+IFACE1=ntb0
+IFACE2=ntb1
+
+IFACE1_ADDR=172.18.1.1
+IFACE1_VADDR=172.18.11.1
+
+IFACE2_ADDR=172.18.2.1
+IFACE2_VADDR=172.18.12.1
+
+IFACE1_MAC_ADDR=$(cat /sys/class/net/$IFACE1/address)
+IFACE2_MAC_ADDR=$(cat /sys/class/net/$IFACE2/address)
+
+function iptables_add()
+{
+	if ! iptables -t nat -C "$@" 2> /dev/null; then
+		iptables -t nat -A "$@"
+	fi
+}
+
+ip addr add $IFACE1_ADDR dev $IFACE1
+ip addr add $IFACE2_ADDR dev $IFACE2
+
+ip link set dev $IFACE1 up
+ip link set dev $IFACE2 up
+
+ip link set dev $IFACE1 group 1
+ip link set dev $IFACE2 group 1
+
+# nat source IP 10.50.0.1 -> 10.60.0.1 when going to 10.60.1.1
+iptables_add POSTROUTING -s $IFACE1_ADDR -d $IFACE2_VADDR -j SNAT \
+    --to-source $IFACE1_VADDR
+
+# nat inbound 10.60.0.1 -> 10.50.0.1
+iptables_add PREROUTING -d $IFACE1_VADDR -j DNAT \
+    --to-destination $IFACE1_ADDR
+
+# nat source IP 10.50.1.1 -> 10.60.1.1 when going to 10.60.0.1
+iptables_add POSTROUTING -s $IFACE2_ADDR -d $IFACE1_VADDR -j SNAT \
+    --to-source $IFACE2_VADDR
+
+# nat inbound 10.60.1.1 -> 10.50.1.1
+iptables_add PREROUTING -d $IFACE2_VADDR -j DNAT \
+    --to-destination $IFACE2_ADDR
+
+ip route add $IFACE2_VADDR dev $IFACE1
+arp -i $IFACE1 -s $IFACE2_VADDR $IFACE2_MAC_ADDR
+
+ip route add $IFACE1_VADDR dev $IFACE2
+arp -i $IFACE2 -s $IFACE1_VADDR $IFACE1_MAC_ADDR
+
+echo 1 > /proc/sys/net/ipv4/conf/all/proxy_arp
+echo 1 > /proc/sys/net/ipv4/ip_forward

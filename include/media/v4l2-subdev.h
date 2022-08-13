@@ -137,6 +137,10 @@ struct v4l2_subdev_io_pin_config {
 	u8 strength;
 };
 
+#define V4L2_SYNC_EVENT_FOCUS_POS		(1 << 0)
+#define V4L2_SYNC_EVENT_IRIS_POS		(1 << 1)
+#define V4L2_SYNC_EVENT_SUBDEV_ERROR_RECOVER	(1 << 2)
+
 /**
  * struct v4l2_subdev_core_ops - Define core ops callbacks for subdevs
  *
@@ -184,6 +188,13 @@ struct v4l2_subdev_io_pin_config {
  *		     for it to be warned when the value of a control changes.
  *
  * @unsubscribe_event: remove event subscription from the control framework.
+ *
+ * @sync: some sub devices can only make certain changes at certain times.
+ *	For example, a sensor can change the focus only during the blanking period.
+ *	This callback can be used to perform these changes when a certain event occurs.
+ *	A master device (usually the bridge driver) will call this callback with the
+ *	event(s) that occurred and the sub device checks the event mask for the event(s)
+ *	on which they have to synchronize their pending changes.
  */
 struct v4l2_subdev_core_ops {
 	int (*log_status)(struct v4l2_subdev *sd);
@@ -209,6 +220,7 @@ struct v4l2_subdev_core_ops {
 			       struct v4l2_event_subscription *sub);
 	int (*unsubscribe_event)(struct v4l2_subdev *sd, struct v4l2_fh *fh,
 				 struct v4l2_event_subscription *sub);
+	int (*sync)(struct v4l2_subdev *sd, unsigned int sync_events);
 };
 
 /**

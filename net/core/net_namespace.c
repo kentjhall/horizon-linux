@@ -263,7 +263,7 @@ struct net *get_net_ns_by_id(struct net *net, int id)
 	spin_lock_irqsave(&net->nsid_lock, flags);
 	peer = idr_find(&net->netns_ids, id);
 	if (peer)
-		get_net(peer);
+		peer = maybe_get_net(peer);
 	spin_unlock_irqrestore(&net->nsid_lock, flags);
 	rcu_read_unlock();
 
@@ -282,6 +282,7 @@ static __net_init int setup_net(struct net *net, struct user_namespace *user_ns)
 
 	atomic_set(&net->count, 1);
 	atomic_set(&net->passive, 1);
+	get_random_bytes(&net->hash_mix, sizeof(u32));
 	net->dev_base_seq = 1;
 	net->user_ns = user_ns;
 	idr_init(&net->netns_ids);
@@ -312,6 +313,25 @@ out_undo:
 	goto out;
 }
 
+static int __net_init net_defaults_init_net(struct net *net)
+{
+	net->core.sysctl_somaxconn = SOMAXCONN;
+	return 0;
+}
+
+static struct pernet_operations net_defaults_ops = {
+	.init = net_defaults_init_net,
+};
+
+static __init int net_defaults_init(void)
+{
+	if (register_pernet_subsys(&net_defaults_ops))
+		panic("Cannot initialize net default settings");
+
+	return 0;
+}
+
+core_initcall(net_defaults_init);
 
 #ifdef CONFIG_NET_NS
 static struct ucounts *inc_net_namespaces(struct user_namespace *ns)
@@ -782,7 +802,8 @@ static int __init net_ns_init(void)
 
 	mutex_unlock(&net_mutex);
 
-	register_pernet_subsys(&net_ns_ops);
+	if (register_pernet_subsys(&net_ns_ops))
+		panic("Could not register network namespace subsystems");
 
 	rtnl_register(PF_UNSPEC, RTM_NEWNSID, rtnl_net_newid, NULL, NULL);
 	rtnl_register(PF_UNSPEC, RTM_GETNSID, rtnl_net_getid, rtnl_net_dumpid,

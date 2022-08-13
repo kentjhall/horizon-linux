@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -38,6 +39,7 @@ static int ehset_probe(struct usb_interface *intf,
 
 	switch (test_pid) {
 	case TEST_SE0_NAK_PID:
+		dev_info(&intf->dev, "TEST_SE0_NAK, sending request\n");
 		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
 					USB_REQ_SET_FEATURE, USB_RT_PORT,
 					USB_PORT_FEAT_TEST,
@@ -45,6 +47,7 @@ static int ehset_probe(struct usb_interface *intf,
 					NULL, 0, 1000);
 		break;
 	case TEST_J_PID:
+		dev_info(&intf->dev, "TEST_J, sending request\n");
 		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
 					USB_REQ_SET_FEATURE, USB_RT_PORT,
 					USB_PORT_FEAT_TEST,
@@ -52,6 +55,7 @@ static int ehset_probe(struct usb_interface *intf,
 					NULL, 0, 1000);
 		break;
 	case TEST_K_PID:
+		dev_info(&intf->dev, "TEST_K, sending request\n");
 		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
 					USB_REQ_SET_FEATURE, USB_RT_PORT,
 					USB_PORT_FEAT_TEST,
@@ -59,6 +63,7 @@ static int ehset_probe(struct usb_interface *intf,
 					NULL, 0, 1000);
 		break;
 	case TEST_PACKET_PID:
+		dev_info(&intf->dev, "TEST_PACKET, sending request\n");
 		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
 					USB_REQ_SET_FEATURE, USB_RT_PORT,
 					USB_PORT_FEAT_TEST,
@@ -67,7 +72,10 @@ static int ehset_probe(struct usb_interface *intf,
 		break;
 	case TEST_HS_HOST_PORT_SUSPEND_RESUME:
 		/* Test: wait for 15secs -> suspend -> 15secs delay -> resume */
+		dev_info(&intf->dev,
+			"TEST_HS_HOST_PORT_SUSPEND_RESUME, delay 15 secs\n");
 		msleep(15 * 1000);
+		dev_info(&intf->dev, "sending suspend request\n");
 		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
 					USB_REQ_SET_FEATURE, USB_RT_PORT,
 					USB_PORT_FEAT_SUSPEND, portnum,
@@ -75,7 +83,9 @@ static int ehset_probe(struct usb_interface *intf,
 		if (ret < 0)
 			break;
 
+		dev_info(&intf->dev, "delay 15 secs\n");
 		msleep(15 * 1000);
+		dev_info(&intf->dev, "sending resume request\n");
 		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
 					USB_REQ_CLEAR_FEATURE, USB_RT_PORT,
 					USB_PORT_FEAT_SUSPEND, portnum,
@@ -83,11 +93,14 @@ static int ehset_probe(struct usb_interface *intf,
 		break;
 	case TEST_SINGLE_STEP_GET_DEV_DESC:
 		/* Test: wait for 15secs -> GetDescriptor request */
+		dev_info(&intf->dev,
+			"TEST_SINGLE_STEP_GET_DEV_DESC, delay 15 secs\n");
 		msleep(15 * 1000);
 		buf = kmalloc(USB_DT_DEVICE_SIZE, GFP_KERNEL);
 		if (!buf)
 			return -ENOMEM;
 
+		dev_info(&intf->dev, "sending GET_DEV_DESC request\n");
 		ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
 					USB_REQ_GET_DESCRIPTOR, USB_DIR_IN,
 					USB_DT_DEVICE << 8, 0,
@@ -108,18 +121,34 @@ static int ehset_probe(struct usb_interface *intf,
 			break;
 		}
 
-		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
-					USB_REQ_SET_FEATURE, USB_RT_PORT,
-					USB_PORT_FEAT_TEST,
-					(6 << 8) | portnum,
-					NULL, 0, 60 * 1000);
+		buf = kmalloc(USB_DT_DEVICE_SIZE, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
 
+		dev_info(&intf->dev,
+			"SINGLE_STEP_SET_FEATURE, sending GET_DEV_DESC request\n");
+		ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
+					USB_REQ_GET_DESCRIPTOR, USB_DIR_IN,
+					USB_DT_DEVICE << 8, 0,
+					buf, USB_DT_DEVICE_SIZE,
+					USB_CTRL_GET_TIMEOUT);
+
+		dev_info(&intf->dev, "delay 15 secs\n");
+		mdelay(15000);
+		dev_info(&intf->dev, "sending GET_DEV_DESC request\n");
+		ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
+					USB_REQ_GET_DESCRIPTOR, USB_DIR_IN,
+					USB_DT_DEVICE << 8, 0,
+					buf, USB_DT_DEVICE_SIZE,
+					USB_CTRL_GET_TIMEOUT);
+		kfree(buf);
 		break;
 	default:
 		dev_err(&intf->dev, "%s: unsupported PID: 0x%x\n",
 			__func__, test_pid);
 	}
 
+	dev_info(&intf->dev, "done\n");
 	return (ret < 0) ? ret : 0;
 }
 

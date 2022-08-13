@@ -316,7 +316,7 @@ static int xenbus_write_transaction(unsigned msg_type,
 			rc = -ENOMEM;
 			goto out;
 		}
-	} else if (msg_type == XS_TRANSACTION_END) {
+	} else if (u->u.msg.tx_id != 0) {
 		list_for_each_entry(trans, &u->transactions, list)
 			if (trans->handle.id == u->u.msg.tx_id)
 				break;
@@ -536,7 +536,7 @@ static int xenbus_file_open(struct inode *inode, struct file *filp)
 	if (xen_store_evtchn == 0)
 		return -ENOENT;
 
-	nonseekable_open(inode, filp);
+	stream_open(inode, filp);
 
 	u = kzalloc(sizeof(*u), GFP_KERNEL);
 	if (u == NULL)

@@ -3,6 +3,7 @@
  *
  * Copyright (C) 2007 Atmel Corporation
  * Copyright (C) 2013 Intel Corporation
+ * Copyright (c) 2016-2017, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -84,6 +85,10 @@ static bool verbose;
 module_param(verbose, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(verbose, "Enable \"success\" result messages (default: off)");
 
+static int error;
+module_param(error, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(error, "Show error count");
+
 /**
  * struct dmatest_params - test parameters.
  * @buf_size:		size of the memcpy test buffer
@@ -158,6 +163,12 @@ MODULE_PARM_DESC(run, "Run the test (default: false)");
 #define PATTERN_OVERWRITE	0x20
 #define PATTERN_COUNT_MASK	0x1f
 
+/* poor man's completion - we want to use wait_event_freezable() on it */
+struct dmatest_done {
+	bool			done;
+	wait_queue_head_t	*wait;
+};
+
 struct dmatest_thread {
 	struct list_head	node;
 	struct dmatest_info	*info;
@@ -166,6 +177,8 @@ struct dmatest_thread {
 	u8			**srcs;
 	u8			**dsts;
 	enum dma_transaction_type type;
+	wait_queue_head_t done_wait;
+	struct dmatest_done test_done;
 	bool			done;
 };
 
@@ -326,18 +339,25 @@ static unsigned int dmatest_verify(u8 **bufs, unsigned int start,
 	return error_count;
 }
 
-/* poor man's completion - we want to use wait_event_freezable() on it */
-struct dmatest_done {
-	bool			done;
-	wait_queue_head_t	*wait;
-};
 
 static void dmatest_callback(void *arg)
 {
 	struct dmatest_done *done = arg;
-
-	done->done = true;
-	wake_up_all(done->wait);
+	struct dmatest_thread *thread =
+		container_of(done, struct dmatest_thread, test_done);
+	if (!thread->done) {
+		done->done = true;
+		wake_up_all(done->wait);
+	} else {
+		/*
+		 * If thread->done, it means that this callback occurred
+		 * after the parent thread has cleaned up. This can
+		 * happen in the case that driver doesn't implement
+		 * the terminate_all() functionality and a dma operation
+		 * did not occur within the timeout period
+		 */
+		WARN(1, "dmatest: Kernel memory may be corrupted!!\n");
+	}
 }
 
 static unsigned int min_odd(unsigned int x, unsigned int y)
@@ -352,6 +372,9 @@ static void result(const char *err, unsigned int n, unsigned int src_off,
 {
 	pr_info("%s: result #%u: '%s' with src_off=0x%x dst_off=0x%x len=0x%x (%lu)\n",
 		current->comm, n, err, src_off, dst_off, len, data);
+
+	if (strcmp(err, "test passed") != 0)
+		error++;
 }
 
 static void dbg_result(const char *err, unsigned int n, unsigned int src_off,
@@ -408,9 +431,8 @@ static unsigned long long dmatest_KBs(s64 runtime, unsigned long long len)
  */
 static int dmatest_func(void *data)
 {
-	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(done_wait);
 	struct dmatest_thread	*thread = data;
-	struct dmatest_done	done = { .wait = &done_wait };
+	struct dmatest_done	*done = &thread->test_done;
 	struct dmatest_info	*info;
 	struct dmatest_params	*params;
 	struct dma_chan		*chan;
@@ -491,8 +513,8 @@ static int dmatest_func(void *data)
 	flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
 
 	ktime = ktime_get();
-	while (!kthread_should_stop()
-	       && !(params->iterations && total_tests >= params->iterations)) {
+	while (!(kthread_should_stop() ||
+	       (params->iterations && total_tests >= params->iterations))) {
 		struct dma_async_tx_descriptor *tx = NULL;
 		struct dmaengine_unmap_data *um;
 		dma_addr_t srcs[src_cnt];
@@ -569,11 +591,9 @@ static int dmatest_func(void *data)
 			srcs[i] = um->addr[i] + src_off;
 			ret = dma_mapping_error(dev->dev, um->addr[i]);
 			if (ret) {
-				dmaengine_unmap_put(um);
 				result("src mapping error", total_tests,
 				       src_off, dst_off, len, ret);
-				failed_tests++;
-				continue;
+				goto error_unmap_continue;
 			}
 			um->to_cnt++;
 		}
@@ -588,11 +608,9 @@ static int dmatest_func(void *data)
 					       DMA_BIDIRECTIONAL);
 			ret = dma_mapping_error(dev->dev, dsts[i]);
 			if (ret) {
-				dmaengine_unmap_put(um);
 				result("dst mapping error", total_tests,
 				       src_off, dst_off, len, ret);
-				failed_tests++;
-				continue;
+				goto error_unmap_continue;
 			}
 			um->bidi_cnt++;
 		}
@@ -629,56 +647,42 @@ static int dmatest_func(void *data)
 		}
 
 		if (!tx) {
-			dmaengine_unmap_put(um);
 			result("prep error", total_tests, src_off,
 			       dst_off, len, ret);
 			msleep(100);
-			failed_tests++;
-			continue;
+			goto error_unmap_continue;
 		}
 
-		done.done = false;
+		done->done = false;
 		tx->callback = dmatest_callback;
-		tx->callback_param = &done;
+		tx->callback_param = done;
 		cookie = tx->tx_submit(tx);
 
 		if (dma_submit_error(cookie)) {
-			dmaengine_unmap_put(um);
 			result("submit error", total_tests, src_off,
 			       dst_off, len, ret);
 			msleep(100);
-			failed_tests++;
-			continue;
+			goto error_unmap_continue;
 		}
 		dma_async_issue_pending(chan);
 
-		wait_event_freezable_timeout(done_wait, done.done,
+		wait_event_freezable_timeout(thread->done_wait, done->done,
 					     msecs_to_jiffies(params->timeout));
 
 		status = dma_async_is_tx_complete(chan, cookie, NULL, NULL);
 
-		if (!done.done) {
-			/*
-			 * We're leaving the timed out dma operation with
-			 * dangling pointer to done_wait.  To make this
-			 * correct, we'll need to allocate wait_done for
-			 * each test iteration and perform "who's gonna
-			 * free it this time?" dancing.  For now, just
-			 * leave it dangling.
-			 */
+		if (!done->done) {
 			dmaengine_unmap_put(um);
 			result("test timed out", total_tests, src_off, dst_off,
 			       len, 0);
-			failed_tests++;
-			continue;
+			goto error_unmap_continue;
 		} else if (status != DMA_COMPLETE) {
 			dmaengine_unmap_put(um);
 			result(status == DMA_ERROR ?
 			       "completion error status" :
 			       "completion busy status", total_tests, src_off,
 			       dst_off, len, ret);
-			failed_tests++;
-			continue;
+			goto error_unmap_continue;
 		}
 
 		dmaengine_unmap_put(um);
@@ -721,6 +725,12 @@ static int dmatest_func(void *data)
 			verbose_result("test passed", total_tests, src_off,
 				       dst_off, len, 0);
 		}
+
+		continue;
+
+error_unmap_continue:
+		dmaengine_unmap_put(um);
+		failed_tests++;
 	}
 	ktime = ktime_sub(ktime_get(), ktime);
 	ktime = ktime_sub(ktime, comparetime);
@@ -746,7 +756,7 @@ err_thread_type:
 		dmatest_KBs(runtime, total_len), ret);
 
 	/* terminate all transfers on specified channels */
-	if (ret)
+	if (ret || failed_tests)
 		dmaengine_terminate_all(chan);
 
 	thread->done = true;
@@ -806,6 +816,8 @@ static int dmatest_add_threads(struct dmatest_info *info,
 		thread->info = info;
 		thread->chan = dtc->chan;
 		thread->type = type;
+		thread->test_done.wait = &thread->done_wait;
+		init_waitqueue_head(&thread->done_wait);
 		smp_wmb();
 		thread->task = kthread_create(dmatest_func, thread, "%s-%s%u",
 				dma_chan_name(chan), op, i);
@@ -925,6 +937,8 @@ static void run_threaded_test(struct dmatest_info *info)
 	params->pq_sources = pq_sources;
 	params->timeout = timeout;
 	params->noverify = noverify;
+
+	error = 0;
 
 	request_channels(info, DMA_MEMCPY);
 	request_channels(info, DMA_XOR);

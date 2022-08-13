@@ -1548,6 +1548,7 @@ static struct s390_insn opcode_e7[] = {
 	{ "vfsq", 0xce, INSTR_VRR_VV000MM },
 	{ "vfs", 0xe2, INSTR_VRR_VVV00MM },
 	{ "vftci", 0x4a, INSTR_VRI_VVIMM },
+	{ "", 0, INSTR_INVALID }
 };
 
 static struct s390_insn opcode_eb[] = {
@@ -1929,10 +1930,11 @@ static int print_insn(char *buffer, unsigned char *code, unsigned long addr)
 				ptr += sprintf(ptr, "%%c%i", value);
 			else if (operand->flags & OPERAND_VR)
 				ptr += sprintf(ptr, "%%v%i", value);
-			else if (operand->flags & OPERAND_PCREL)
-				ptr += sprintf(ptr, "%lx", (signed int) value
-								      + addr);
-			else if (operand->flags & OPERAND_SIGNED)
+			else if (operand->flags & OPERAND_PCREL) {
+				void *pcrel = (void *)((int)value + addr);
+
+				ptr += sprintf(ptr, "%px", pcrel);
+			} else if (operand->flags & OPERAND_SIGNED)
 				ptr += sprintf(ptr, "%i", value);
 			else
 				ptr += sprintf(ptr, "%u", value);
@@ -1953,7 +1955,7 @@ void show_code(struct pt_regs *regs)
 {
 	char *mode = user_mode(regs) ? "User" : "Krnl";
 	unsigned char code[64];
-	char buffer[64], *ptr;
+	char buffer[128], *ptr;
 	mm_segment_t old_fs;
 	unsigned long addr;
 	int start, end, opsize, hops, i;
@@ -2004,7 +2006,7 @@ void show_code(struct pt_regs *regs)
 		else
 			*ptr++ = ' ';
 		addr = regs->psw.addr + start - 32;
-		ptr += sprintf(ptr, "%016lx: ", addr);
+		ptr += sprintf(ptr, "%px: ", (void *)addr);
 		if (start + opsize >= end)
 			break;
 		for (i = 0; i < opsize; i++)
@@ -2016,7 +2018,7 @@ void show_code(struct pt_regs *regs)
 		start += opsize;
 		pr_cont("%s", buffer);
 		ptr = buffer;
-		ptr += sprintf(ptr, "\n          ");
+		ptr += sprintf(ptr, "\n\t  ");
 		hops++;
 	}
 	pr_cont("\n");
@@ -2032,7 +2034,7 @@ void print_fn_code(unsigned char *code, unsigned long len)
 		opsize = insn_length(*code);
 		if (opsize > len)
 			break;
-		ptr += sprintf(ptr, "%p: ", code);
+		ptr += sprintf(ptr, "%px: ", code);
 		for (i = 0; i < opsize; i++)
 			ptr += sprintf(ptr, "%02x", code[i]);
 		*ptr++ = '\t';

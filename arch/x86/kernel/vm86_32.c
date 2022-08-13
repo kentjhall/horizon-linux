@@ -160,11 +160,12 @@ void save_v86_state(struct kernel_vm86_regs *regs, int retval)
 
 static void mark_screen_rdonly(struct mm_struct *mm)
 {
+	struct vm_area_struct *vma;
+	spinlock_t *ptl;
 	pgd_t *pgd;
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
-	spinlock_t *ptl;
 	int i;
 
 	down_write(&mm->mmap_sem);
@@ -177,7 +178,7 @@ static void mark_screen_rdonly(struct mm_struct *mm)
 	pmd = pmd_offset(pud, 0xA0000);
 
 	if (pmd_trans_huge(*pmd)) {
-		struct vm_area_struct *vma = find_vma(mm, 0xA0000);
+		vma = find_vma(mm, 0xA0000);
 		split_huge_pmd(vma, pmd, 0xA0000);
 	}
 	if (pmd_none_or_clear_bad(pmd))
@@ -191,7 +192,7 @@ static void mark_screen_rdonly(struct mm_struct *mm)
 	pte_unmap_unlock(pte, ptl);
 out:
 	up_write(&mm->mmap_sem);
-	flush_tlb();
+	flush_tlb_mm_range(mm, 0xA0000, 0xA0000 + 32*PAGE_SIZE, 0UL);
 }
 
 
@@ -718,7 +719,8 @@ void handle_vm86_fault(struct kernel_vm86_regs *regs, long error_code)
 	return;
 
 check_vip:
-	if (VEFLAGS & X86_EFLAGS_VIP) {
+	if ((VEFLAGS & (X86_EFLAGS_VIP | X86_EFLAGS_VIF)) ==
+	    (X86_EFLAGS_VIP | X86_EFLAGS_VIF)) {
 		save_v86_state(regs, VM86_STI);
 		return;
 	}

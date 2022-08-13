@@ -513,6 +513,7 @@ nfs_setattr(struct dentry *dentry, struct iattr *attr)
 	struct inode *inode = d_inode(dentry);
 	struct nfs_fattr *fattr;
 	int error = 0;
+	int err = 0;
 
 	nfs_inc_stats(inode, NFSIOS_VFSSETATTR);
 
@@ -539,9 +540,11 @@ nfs_setattr(struct dentry *dentry, struct iattr *attr)
 	trace_nfs_setattr_enter(inode);
 
 	/* Write all dirty data */
-	if (S_ISREG(inode->i_mode))
-		nfs_sync_inode(inode);
-
+	if (S_ISREG(inode->i_mode)) {
+		err = nfs_sync_inode(inode);
+		if (err < 0)
+			dprintk("nfs_sync_inode failed : %d\n", err);
+	}
 	fattr = nfs_alloc_fattr();
 	if (fattr == NULL) {
 		error = -ENOMEM;
@@ -950,6 +953,7 @@ int nfs_open(struct inode *inode, struct file *filp)
 	nfs_fscache_open_file(inode, filp);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(nfs_open);
 
 /*
  * This function is called whenever some part of NFS notices that
@@ -1278,9 +1282,9 @@ static int nfs_check_inode_attributes(struct inode *inode, struct nfs_fattr *fat
 		return 0;
 	/* Has the inode gone and changed behind our back? */
 	if ((fattr->valid & NFS_ATTR_FATTR_FILEID) && nfsi->fileid != fattr->fileid)
-		return -EIO;
+		return -ESTALE;
 	if ((fattr->valid & NFS_ATTR_FATTR_TYPE) && (inode->i_mode & S_IFMT) != (fattr->mode & S_IFMT))
-		return -EIO;
+		return -ESTALE;
 
 	if (!nfs_file_has_buffered_writers(nfsi)) {
 		/* Verify a few of the more important attributes */
@@ -1994,7 +1998,7 @@ static int nfsiod_start(void)
 {
 	struct workqueue_struct *wq;
 	dprintk("RPC:       creating workqueue nfsiod\n");
-	wq = alloc_workqueue("nfsiod", WQ_MEM_RECLAIM, 0);
+	wq = alloc_workqueue("nfsiod", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 	if (wq == NULL)
 		return -ENOMEM;
 	nfsiod_workqueue = wq;

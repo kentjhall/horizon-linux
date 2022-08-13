@@ -1,0 +1,26 @@
+kernel driver gpio-tachometer:
+===================================
+To measure cpu fan/motor speed using GPIO pin, this driver can be used.
+The driver does not rely on any specific peripheral like input capture.
+
+Author: Vishruth Jain <vishruthj@nvidia.com>
+
+Description:
+------------
+
+In platforms where the motor speed input pin is NOT connected to input capture
+pin or any other peripheral capable of measuring the frequency of external
+signal, this driver can be used to measure motor speed.
+The driver works by using GPIO IRQ.
+
+Driver makes following assumptions:
+-> The pin to which is motor tach output is connected is IRQ capable.
+-> Motor speed indicator(tachometer output from motor) has default state high
+and is pulled to ground level, 1 or more times for every full rotation.
+
+Speed is calculated based on the number of times GPIO IRQ is triggered in a
+time window. Speed in RPM(rotations per minute) is derived from the count
+captured using IRQ.
+Optionally driver supports creating a delayed worker, which monitors the motor
+speed periodically. If the motor is stopped, indicated by speed being 0, the
+delayed worker initiates system shutdown.

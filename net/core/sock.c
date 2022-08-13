@@ -138,10 +138,7 @@
 
 #include <trace/events/sock.h>
 
-#ifdef CONFIG_INET
 #include <net/tcp.h>
-#endif
-
 #include <net/busy_poll.h>
 
 static DEFINE_MUTEX(proto_list_mutex);
@@ -222,7 +219,7 @@ static const char *const af_family_key_strings[AF_MAX+1] = {
   "sk_lock-AF_RXRPC" , "sk_lock-AF_ISDN"     , "sk_lock-AF_PHONET"   ,
   "sk_lock-AF_IEEE802154", "sk_lock-AF_CAIF" , "sk_lock-AF_ALG"      ,
   "sk_lock-AF_NFC"   , "sk_lock-AF_VSOCK"    , "sk_lock-AF_KCM"      ,
-  "sk_lock-AF_MAX"
+  "sk_lock-AF_QIPCRTR", "sk_lock-AF_MAX"
 };
 static const char *const af_family_slock_key_strings[AF_MAX+1] = {
   "slock-AF_UNSPEC", "slock-AF_UNIX"     , "slock-AF_INET"     ,
@@ -239,7 +236,7 @@ static const char *const af_family_slock_key_strings[AF_MAX+1] = {
   "slock-AF_RXRPC" , "slock-AF_ISDN"     , "slock-AF_PHONET"   ,
   "slock-AF_IEEE802154", "slock-AF_CAIF" , "slock-AF_ALG"      ,
   "slock-AF_NFC"   , "slock-AF_VSOCK"    ,"slock-AF_KCM"       ,
-  "slock-AF_MAX"
+  "slock-AF_QIPCRTR", "slock-AF_MAX"
 };
 static const char *const af_family_clock_key_strings[AF_MAX+1] = {
   "clock-AF_UNSPEC", "clock-AF_UNIX"     , "clock-AF_INET"     ,
@@ -256,7 +253,7 @@ static const char *const af_family_clock_key_strings[AF_MAX+1] = {
   "clock-AF_RXRPC" , "clock-AF_ISDN"     , "clock-AF_PHONET"   ,
   "clock-AF_IEEE802154", "clock-AF_CAIF" , "clock-AF_ALG"      ,
   "clock-AF_NFC"   , "clock-AF_VSOCK"    , "clock-AF_KCM"      ,
-  "clock-AF_MAX"
+  "clock-AF_QIPCRTR", "clock-AF_MAX"
 };
 
 /*
@@ -702,6 +699,7 @@ int sock_setsockopt(struct socket *sock, int level, int optname,
 		break;
 	case SO_DONTROUTE:
 		sock_valbool_flag(sk, SOCK_LOCALROUTE, valbool);
+		sk_dst_reset(sk);
 		break;
 	case SO_BROADCAST:
 		sock_valbool_flag(sk, SOCK_BROADCAST, valbool);
@@ -1034,6 +1032,7 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 
 	union {
 		int val;
+		u64 val64;
 		struct linger ling;
 		struct timeval tm;
 	} v;
@@ -1264,6 +1263,13 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 		v.val = sk->sk_incoming_cpu;
 		break;
 
+
+	case SO_COOKIE:
+		lv = sizeof(u64);
+		if (len < lv)
+			return -EINVAL;
+		v.val64 = sock_gen_cookie(sk);
+		break;
 	default:
 		/* We implement the SO_SNDLOWAT etc to not be settable
 		 * (1003.1g 7).
@@ -1405,6 +1411,7 @@ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 		cgroup_sk_alloc(&sk->sk_cgrp_data);
 		sock_update_classid(&sk->sk_cgrp_data);
 		sock_update_netprioidx(&sk->sk_cgrp_data);
+		sk_tx_queue_clear(sk);
 	}
 
 	return sk;
@@ -1428,14 +1435,17 @@ static void __sk_destruct(struct rcu_head *head)
 		sk_filter_uncharge(sk, filter);
 		RCU_INIT_POINTER(sk->sk_filter, NULL);
 	}
-	if (rcu_access_pointer(sk->sk_reuseport_cb))
-		reuseport_detach_sock(sk);
 
 	sock_disable_timestamp(sk, SK_FLAGS_TIMESTAMP);
 
 	if (atomic_read(&sk->sk_omem_alloc))
 		pr_debug("%s: optmem leakage (%d bytes) detected\n",
 			 __func__, atomic_read(&sk->sk_omem_alloc));
+
+	if (sk->sk_frag.page) {
+		put_page(sk->sk_frag.page);
+		sk->sk_frag.page = NULL;
+	}
 
 	if (sk->sk_peer_cred)
 		put_cred(sk->sk_peer_cred);
@@ -1447,7 +1457,14 @@ static void __sk_destruct(struct rcu_head *head)
 
 void sk_destruct(struct sock *sk)
 {
-	if (sock_flag(sk, SOCK_RCU_FREE))
+	bool use_call_rcu = sock_flag(sk, SOCK_RCU_FREE);
+
+	if (rcu_access_pointer(sk->sk_reuseport_cb)) {
+		reuseport_detach_sock(sk);
+		use_call_rcu = true;
+	}
+
+	if (use_call_rcu)
 		call_rcu(&sk->sk_rcu, __sk_destruct);
 	else
 		__sk_destruct(&sk->sk_rcu);
@@ -1455,7 +1472,7 @@ void sk_destruct(struct sock *sk)
 
 static void __sk_free(struct sock *sk)
 {
-	if (unlikely(sock_diag_has_destroy_listeners(sk) && sk->sk_net_refcnt))
+	if (unlikely(sk->sk_net_refcnt && sock_diag_has_destroy_listeners(sk)))
 		sock_diag_broadcast_destroy(sk);
 	else
 		sk_destruct(sk);
@@ -1491,6 +1508,8 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 
 		sock_copy(newsk, sk);
 
+		newsk->sk_prot_creator = sk->sk_prot;
+
 		/* SANITY */
 		if (likely(newsk->sk_net_refcnt))
 			get_net(sock_net(newsk));
@@ -1522,6 +1541,7 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 		newsk->sk_userlocks	= sk->sk_userlocks & ~SOCK_BINDPORT_LOCK;
 
 		sock_reset_flag(newsk, SOCK_DONE);
+		cgroup_sk_clone(&newsk->sk_cgrp_data);
 		skb_queue_head_init(&newsk->sk_error_queue);
 
 		filter = rcu_dereference_protected(newsk->sk_filter, 1);
@@ -1533,6 +1553,12 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 			is_charged = sk_filter_charge(newsk, filter);
 
 		if (unlikely(!is_charged || xfrm_sk_clone_policy(newsk, sk))) {
+			/* We need to make sure that we don't uncharge the new
+			 * socket if we couldn't charge it in the first place
+			 * as otherwise we uncharge the parent's filter.
+			 */
+			if (!is_charged)
+				RCU_INIT_POINTER(newsk->sk_filter, NULL);
 			/* It is still raw copy of parent, so invalidate
 			 * destructor and make plain sk_free() */
 			newsk->sk_destruct = NULL;
@@ -1550,8 +1576,6 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 		atomic64_set(&newsk->sk_cookie, 0);
 
 		mem_cgroup_sk_alloc(newsk);
-		cgroup_sk_alloc(&newsk->sk_cgrp_data);
-
 		/*
 		 * Before updating sk_refcnt, we must commit prior changes to memory
 		 * (Documentation/RCU/rculist_nulls.txt for details)
@@ -1572,6 +1596,7 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 		 */
 		sk_refcnt_debug_inc(newsk);
 		sk_set_socket(newsk, NULL);
+		sk_tx_queue_clear(newsk);
 		newsk->sk_wq = NULL;
 
 		if (newsk->sk_prot->sockets_allocated)
@@ -1676,28 +1701,24 @@ EXPORT_SYMBOL(skb_set_owner_w);
  * delay queue. We want to allow the owner socket to send more
  * packets, as if they were already TX completed by a typical driver.
  * But we also want to keep skb->sk set because some packet schedulers
- * rely on it (sch_fq for example). So we set skb->truesize to a small
- * amount (1) and decrease sk_wmem_alloc accordingly.
+ * rely on it (sch_fq for example).
  */
 void skb_orphan_partial(struct sk_buff *skb)
 {
-	/* If this skb is a TCP pure ACK or already went here,
-	 * we have nothing to do. 2 is already a very small truesize.
-	 */
-	if (skb->truesize <= 2)
+	if (skb_is_tcp_pure_ack(skb))
 		return;
 
-	/* TCP stack sets skb->ooo_okay based on sk_wmem_alloc,
-	 * so we do not completely orphan skb, but transfert all
-	 * accounted bytes but one, to avoid unexpected reorders.
-	 */
 	if (skb->destructor == sock_wfree
 #ifdef CONFIG_INET
 	    || skb->destructor == tcp_wfree
 #endif
 		) {
-		atomic_sub(skb->truesize - 1, &skb->sk->sk_wmem_alloc);
-		skb->truesize = 1;
+		struct sock *sk = skb->sk;
+
+		if (atomic_inc_not_zero(&sk->sk_refcnt)) {
+			atomic_sub(skb->truesize, &sk->sk_wmem_alloc);
+			skb->destructor = sock_efree;
+		}
 	} else {
 		skb_orphan(skb);
 	}
@@ -2145,7 +2166,7 @@ int __sk_mem_schedule(struct sock *sk, int size, int kind)
 	}
 
 	if (sk_has_memory_pressure(sk)) {
-		int alloc;
+		u64 alloc;
 
 		if (!sk_under_memory_pressure(sk))
 			return 1;
@@ -2310,6 +2331,27 @@ int sock_no_mmap(struct file *file, struct socket *sock, struct vm_area_struct *
 }
 EXPORT_SYMBOL(sock_no_mmap);
 
+/*
+ * When a file is received (via SCM_RIGHTS, etc), we must bump the
+ * various sock-based usage counts.
+ */
+void __receive_sock(struct file *file)
+{
+	struct socket *sock;
+	int error;
+
+	/*
+	 * The resulting value of "error" is ignored here since we only
+	 * need to take action when the file is a socket and testing
+	 * "sock" for NULL is sufficient.
+	 */
+	sock = sock_from_file(file, &error);
+	if (sock) {
+		sock_update_netprioidx(&sock->sk->sk_cgrp_data);
+		sock_update_classid(&sock->sk->sk_cgrp_data);
+	}
+}
+
 ssize_t sock_no_sendpage(struct socket *sock, struct page *page, int offset, size_t size, int flags)
 {
 	ssize_t res;
@@ -2436,8 +2478,11 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 		sk->sk_type	=	sock->type;
 		sk->sk_wq	=	sock->wq;
 		sock->sk	=	sk;
-	} else
+		sk->sk_uid	=	SOCK_INODE(sock)->i_uid;
+	} else {
 		sk->sk_wq	=	NULL;
+		sk->sk_uid	=	make_kuid(sock_net(sk)->user_ns, 0);
+	}
 
 	rwlock_init(&sk->sk_callback_lock);
 	lockdep_set_class_and_name(&sk->sk_callback_lock,
@@ -2462,6 +2507,9 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 	sk->sk_sndtimeo		=	MAX_SCHEDULE_TIMEOUT;
 
 	sk->sk_stamp = ktime_set(-1L, 0);
+#if BITS_PER_LONG==32
+	seqlock_init(&sk->sk_stamp_seq);
+#endif
 
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	sk->sk_napi_id		=	0;
@@ -2737,11 +2785,6 @@ void sk_common_release(struct sock *sk)
 	xfrm_sk_free_policy(sk);
 
 	sk_refcnt_debug_release(sk);
-
-	if (sk->sk_frag.page) {
-		put_page(sk->sk_frag.page);
-		sk->sk_frag.page = NULL;
-	}
 
 	sock_put(sk);
 }

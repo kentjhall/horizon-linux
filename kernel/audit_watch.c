@@ -316,8 +316,6 @@ static void audit_update_watch(struct audit_parent *parent,
 			if (oentry->rule.exe)
 				audit_remove_mark(oentry->rule.exe);
 
-			audit_watch_log_rule_change(r, owatch, "updated_rules");
-
 			call_rcu(&oentry->rcu, audit_free_rule_rcu);
 		}
 
@@ -365,12 +363,12 @@ static int audit_get_nd(struct audit_watch *watch, struct path *parent)
 	struct dentry *d = kern_path_locked(watch->path, parent);
 	if (IS_ERR(d))
 		return PTR_ERR(d);
-	inode_unlock(d_backing_inode(parent->dentry));
 	if (d_is_positive(d)) {
 		/* update watch filter fields */
 		watch->dev = d->d_sb->s_dev;
 		watch->ino = d_backing_inode(d)->i_ino;
 	}
+	inode_unlock(d_backing_inode(parent->dentry));
 	dput(d);
 	return 0;
 }
@@ -419,6 +417,13 @@ int audit_add_watch(struct audit_krule *krule, struct list_head **list)
 	struct path parent_path;
 	int h, ret = 0;
 
+	/*
+	 * When we will be calling audit_add_to_parent, krule->watch might have
+	 * been updated and watch might have been freed.
+	 * So we need to keep a reference of watch.
+	 */
+	audit_get_watch(watch);
+
 	mutex_unlock(&audit_filter_mutex);
 
 	/* Avoid calling path_lookup under audit_filter_mutex. */
@@ -427,8 +432,10 @@ int audit_add_watch(struct audit_krule *krule, struct list_head **list)
 	/* caller expects mutex locked */
 	mutex_lock(&audit_filter_mutex);
 
-	if (ret)
+	if (ret) {
+		audit_put_watch(watch);
 		return ret;
+	}
 
 	/* either find an old parent or attach a new one */
 	parent = audit_find_parent(d_backing_inode(parent_path.dentry));
@@ -446,6 +453,7 @@ int audit_add_watch(struct audit_krule *krule, struct list_head **list)
 	*list = &audit_inode_hash[h];
 error:
 	path_put(&parent_path);
+	audit_put_watch(watch);
 	return ret;
 }
 
@@ -457,13 +465,15 @@ void audit_remove_watch_rule(struct audit_krule *krule)
 	list_del(&krule->rlist);
 
 	if (list_empty(&watch->rules)) {
+		/*
+		 * audit_remove_watch() drops our reference to 'parent' which
+		 * can get freed. Grab our own reference to be safe.
+		 */
+		audit_get_parent(parent);
 		audit_remove_watch(watch);
-
-		if (list_empty(&parent->watches)) {
-			audit_get_parent(parent);
+		if (list_empty(&parent->watches))
 			fsnotify_destroy_mark(&parent->mark, audit_watch_group);
-			audit_put_parent(parent);
-		}
+		audit_put_parent(parent);
 	}
 }
 

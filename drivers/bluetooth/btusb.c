@@ -23,6 +23,7 @@
 
 #include <linux/module.h>
 #include <linux/usb.h>
+#include <linux/usb/quirks.h>
 #include <linux/firmware.h>
 #include <asm/unaligned.h>
 
@@ -209,6 +210,7 @@ static const struct usb_device_id blacklist_table[] = {
 	{ USB_DEVICE(0x04ca, 0x300f), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x04ca, 0x3010), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x04ca, 0x3014), .driver_info = BTUSB_ATH3012 },
+	{ USB_DEVICE(0x04ca, 0x3018), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x0930, 0x0219), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x0930, 0x021c), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x0930, 0x0220), .driver_info = BTUSB_ATH3012 },
@@ -327,6 +329,10 @@ static const struct usb_device_id blacklist_table[] = {
 	{ USB_VENDOR_AND_INTERFACE_INFO(0x8087, 0xe0, 0x01, 0x01),
 	  .driver_info = BTUSB_IGNORE },
 
+	/* Realtek 8822CE Bluetooth devices */
+	{ USB_DEVICE(0x0bda, 0xc822), .driver_info = BTUSB_IGNORE },
+	{ USB_DEVICE(0x13d3, 0x3549), .driver_info = BTUSB_IGNORE },
+
 	/* Realtek Bluetooth devices */
 	{ USB_VENDOR_AND_INTERFACE_INFO(0x0bda, 0xe0, 0x01, 0x01),
 	  .driver_info = BTUSB_REALTEK },
@@ -341,6 +347,14 @@ static const struct usb_device_id blacklist_table[] = {
 	{ USB_DEVICE(0x13d3, 0x3410), .driver_info = BTUSB_REALTEK },
 	{ USB_DEVICE(0x13d3, 0x3416), .driver_info = BTUSB_REALTEK },
 	{ USB_DEVICE(0x13d3, 0x3459), .driver_info = BTUSB_REALTEK },
+	{ USB_DEVICE(0x13d3, 0x3494), .driver_info = BTUSB_REALTEK },
+
+	/* Additional Realtek 8723BU Bluetooth devices */
+	{ USB_DEVICE(0x7392, 0xa611), .driver_info = BTUSB_REALTEK },
+
+	/* Additional Realtek 8723DE Bluetooth devices */
+	{ USB_DEVICE(0x0bda, 0xb009), .driver_info = BTUSB_REALTEK },
+	{ USB_DEVICE(0x2ff8, 0xb011), .driver_info = BTUSB_REALTEK },
 
 	/* Additional Realtek 8821AE Bluetooth devices */
 	{ USB_DEVICE(0x0b05, 0x17dc), .driver_info = BTUSB_REALTEK },
@@ -348,6 +362,12 @@ static const struct usb_device_id blacklist_table[] = {
 	{ USB_DEVICE(0x13d3, 0x3458), .driver_info = BTUSB_REALTEK },
 	{ USB_DEVICE(0x13d3, 0x3461), .driver_info = BTUSB_REALTEK },
 	{ USB_DEVICE(0x13d3, 0x3462), .driver_info = BTUSB_REALTEK },
+
+	/* Additional Realtek 8822BE Bluetooth devices */
+	{ USB_DEVICE(0x0b05, 0x185c), .driver_info = BTUSB_REALTEK },
+
+	/* Additional Realtek 8822CE Bluetooth devices */
+	{ USB_DEVICE(0x04ca, 0x4005), .driver_info = BTUSB_REALTEK },
 
 	/* Silicon Wave based devices */
 	{ USB_DEVICE(0x0c10, 0x0000), .driver_info = BTUSB_SWAVE },
@@ -367,8 +387,8 @@ static const struct usb_device_id blacklist_table[] = {
 #define BTUSB_FIRMWARE_LOADED	7
 #define BTUSB_FIRMWARE_FAILED	8
 #define BTUSB_BOOTING		9
-#define BTUSB_RESET_RESUME	10
-#define BTUSB_DIAG_RUNNING	11
+#define BTUSB_DIAG_RUNNING	10
+#define BTUSB_OOB_WAKE_ENABLED	11
 
 struct btusb_data {
 	struct hci_dev       *hdev;
@@ -1053,7 +1073,7 @@ static int btusb_open(struct hci_dev *hdev)
 	if (data->setup_on_usb) {
 		err = data->setup_on_usb(hdev);
 		if (err < 0)
-			return err;
+			goto setup_fail;
 	}
 
 	data->intf->needs_remote_wakeup = 1;
@@ -1085,6 +1105,7 @@ done:
 
 failed:
 	clear_bit(BTUSB_INTR_RUNNING, &data->flags);
+setup_fail:
 	usb_autopm_put_interface(data->intf);
 	return err;
 }
@@ -2923,6 +2944,12 @@ static int btusb_probe(struct usb_interface *intf,
 	if (id->driver_info & BTUSB_QCA_ROME) {
 		data->setup_on_usb = btusb_setup_qca;
 		hdev->set_bdaddr = btusb_set_bdaddr_ath3012;
+
+		/* QCA Rome devices lose their updated firmware over suspend,
+		 * but the USB hub doesn't notice any status change.
+		 * explicitly request a device reset on resume.
+		 */
+		interface_to_usbdev(intf)->quirks |= USB_QUIRK_RESET_RESUME;
 	}
 
 #ifdef CONFIG_BT_HCIBTUSB_RTL
@@ -2933,7 +2960,7 @@ static int btusb_probe(struct usb_interface *intf,
 		 * but the USB hub doesn't notice any status change.
 		 * Explicitly request a device reset on resume.
 		 */
-		set_bit(BTUSB_RESET_RESUME, &data->flags);
+		interface_to_usbdev(intf)->quirks |= USB_QUIRK_RESET_RESUME;
 	}
 #endif
 
@@ -3089,14 +3116,6 @@ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
 
 	btusb_stop_traffic(data);
 	usb_kill_anchored_urbs(&data->tx_anchor);
-
-	/* Optionally request a device reset on resume, but only when
-	 * wakeups are disabled. If wakeups are enabled we assume the
-	 * device will stay powered up throughout suspend.
-	 */
-	if (test_bit(BTUSB_RESET_RESUME, &data->flags) &&
-	    !device_may_wakeup(&data->udev->dev))
-		data->udev->reset_resume = 1;
 
 	return 0;
 }

@@ -118,11 +118,31 @@ config CRYPTO_DH
 	help
 	  Generic implementation of the Diffie-Hellman algorithm.
 
+config CRYPTO_ECC
+	tristate "ECC functions"
+	help
+	  Implementation of ECC functions. This includes different
+	  kinds of ECC functionalities that can be also used as
+	  helper functions for the other implementations that
+	  build upon the basic ECC features.
+
+
 config CRYPTO_ECDH
 	tristate "ECDH algorithm"
 	select CRYTPO_KPP
+	select CRYPTO_ECC
 	help
 	  Generic implementation of the ECDH algorithm
+
+config CRYPTO_ECDSA
+	tristate "ECDSA algorithm"
+	select CRYPTO_AKCIPHER
+	select CRYPTO_ECC
+	help
+	  Generic implementation of the ECDSA algorithm. This
+	  is SW implementation use case that internally makes
+	  use of HW blocks like ECC Shamir feature, ECC point
+	  multiplication feature, etc.
 
 config CRYPTO_MANAGER
 	tristate "Cryptographic algorithm manager"
@@ -1443,6 +1463,20 @@ config CRYPTO_SERPENT_AVX2_X86_64
 
 	  See also:
 	  <http://www.cl.cam.ac.uk/~rja14/serpent.html>
+
+config CRYPTO_SPECK
+	tristate "Speck cipher algorithm"
+	select CRYPTO_ALGAPI
+	help
+	  Speck is a lightweight block cipher that is tuned for optimal
+	  performance in software (rather than hardware).
+
+	  Speck may not be as secure as AES, and should only be used on systems
+	  where AES is not fast enough.
+
+	  See also: <https://eprint.iacr.org/2013/404.pdf>
+
+	  If unsure, say N.
 
 config CRYPTO_TEA
 	tristate "TEA, XTEA and XETA cipher algorithms"

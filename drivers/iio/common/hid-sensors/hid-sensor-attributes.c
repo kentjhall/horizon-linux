@@ -58,6 +58,10 @@ static struct {
 
 	{HID_USAGE_SENSOR_PRESSURE, 0, 100, 0},
 	{HID_USAGE_SENSOR_PRESSURE, HID_USAGE_SENSOR_UNITS_PASCAL, 0, 1000000},
+
+	{HID_USAGE_SENSOR_TIME_TIMESTAMP, 0, 1000000000, 0},
+	{HID_USAGE_SENSOR_TIME_TIMESTAMP, HID_USAGE_SENSOR_UNITS_MILLISECOND,
+		1000000, 0},
 };
 
 static int pow_10(unsigned power)
@@ -215,9 +219,17 @@ int hid_sensor_write_samp_freq_value(struct hid_sensor_common *st,
 	ret = sensor_hub_set_feature(st->hsdev, st->poll.report_id,
 				     st->poll.index, sizeof(value), &value);
 	if (ret < 0 || value < 0)
-		ret = -EINVAL;
+		return -EINVAL;
 
-	return ret;
+	ret = sensor_hub_get_feature(st->hsdev,
+				     st->poll.report_id,
+				     st->poll.index, sizeof(value), &value);
+	if (ret < 0 || value < 0)
+		return -EINVAL;
+
+	st->poll_interval = value;
+
+	return 0;
 }
 EXPORT_SYMBOL(hid_sensor_write_samp_freq_value);
 
@@ -257,9 +269,18 @@ int hid_sensor_write_raw_hyst_value(struct hid_sensor_common *st,
 				     st->sensitivity.index, sizeof(value),
 				     &value);
 	if (ret < 0 || value < 0)
-		ret = -EINVAL;
+		return -EINVAL;
 
-	return ret;
+	ret = sensor_hub_get_feature(st->hsdev,
+				     st->sensitivity.report_id,
+				     st->sensitivity.index, sizeof(value),
+				     &value);
+	if (ret < 0 || value < 0)
+		return -EINVAL;
+
+	st->raw_hystersis = value;
+
+	return 0;
 }
 EXPORT_SYMBOL(hid_sensor_write_raw_hyst_value);
 
@@ -343,6 +364,13 @@ int hid_sensor_format_scale(u32 usage_id,
 }
 EXPORT_SYMBOL(hid_sensor_format_scale);
 
+int64_t hid_sensor_convert_timestamp(struct hid_sensor_common *st,
+				     int64_t raw_value)
+{
+	return st->timestamp_ns_scale * raw_value;
+}
+EXPORT_SYMBOL(hid_sensor_convert_timestamp);
+
 static
 int hid_sensor_get_reporting_interval(struct hid_sensor_hub_device *hsdev,
 					u32 usage_id,
@@ -355,6 +383,9 @@ int hid_sensor_get_reporting_interval(struct hid_sensor_hub_device *hsdev,
 	/* Default unit of measure is milliseconds */
 	if (st->poll.units == 0)
 		st->poll.units = HID_USAGE_SENSOR_UNITS_MILLISECOND;
+
+	st->poll_interval = -1;
+
 	return 0;
 
 }
@@ -364,6 +395,7 @@ int hid_sensor_parse_common_attributes(struct hid_sensor_hub_device *hsdev,
 					struct hid_sensor_common *st)
 {
 
+	struct hid_sensor_hub_attribute_info timestamp;
 
 	hid_sensor_get_reporting_interval(hsdev, usage_id, st);
 
@@ -377,16 +409,32 @@ int hid_sensor_parse_common_attributes(struct hid_sensor_hub_device *hsdev,
 					HID_USAGE_SENSOR_PROY_POWER_STATE,
 					&st->power_state);
 
+	st->raw_hystersis = -1;
+
 	sensor_hub_input_get_attribute_info(hsdev,
 			HID_FEATURE_REPORT, usage_id,
 			HID_USAGE_SENSOR_PROP_SENSITIVITY_ABS,
 			 &st->sensitivity);
 
-	hid_dbg(hsdev->hdev, "common attributes: %x:%x, %x:%x, %x:%x %x:%x\n",
-			st->poll.index, st->poll.report_id,
-			st->report_state.index, st->report_state.report_id,
-			st->power_state.index, st->power_state.report_id,
-			st->sensitivity.index, st->sensitivity.report_id);
+	sensor_hub_input_get_attribute_info(hsdev,
+					    HID_INPUT_REPORT, usage_id,
+					    HID_USAGE_SENSOR_TIME_TIMESTAMP,
+					    &timestamp);
+	if (timestamp.index >= 0 && timestamp.report_id) {
+		int val0, val1;
+
+		hid_sensor_format_scale(HID_USAGE_SENSOR_TIME_TIMESTAMP,
+					&timestamp, &val0, &val1);
+		st->timestamp_ns_scale = val0;
+	} else
+		st->timestamp_ns_scale = 1000000000;
+
+	hid_dbg(hsdev->hdev, "common attributes: %x:%x, %x:%x, %x:%x %x:%x %x:%x\n",
+		st->poll.index, st->poll.report_id,
+		st->report_state.index, st->report_state.report_id,
+		st->power_state.index, st->power_state.report_id,
+		st->sensitivity.index, st->sensitivity.report_id,
+		timestamp.index, timestamp.report_id);
 
 	return 0;
 }

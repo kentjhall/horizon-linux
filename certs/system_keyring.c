@@ -14,6 +14,7 @@
 #include <linux/sched.h>
 #include <linux/cred.h>
 #include <linux/err.h>
+#include <linux/verification.h>
 #include <keys/asymmetric-type.h>
 #include <keys/system_keyring.h>
 #include <crypto/pkcs7.h>
@@ -207,7 +208,7 @@ int verify_pkcs7_signature(const void *data, size_t len,
 
 	if (!trusted_keys) {
 		trusted_keys = builtin_trusted_keys;
-	} else if (trusted_keys == (void *)1UL) {
+	} else if (trusted_keys == VERIFY_USE_SECONDARY_KEYRING) {
 #ifdef CONFIG_SECONDARY_TRUSTED_KEYRING
 		trusted_keys = secondary_trusted_keys;
 #else
@@ -240,5 +241,46 @@ error:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(verify_pkcs7_signature);
-
 #endif /* CONFIG_SYSTEM_DATA_VERIFICATION */
+
+/**
+ * verify_signature_one - Verify a signature with keys from given keyring
+ * @sig: The signature to be verified
+ * @trusted_keys: Trusted keys to use (NULL for builtin trusted keys only,
+ *					(void *)1UL for all trusted keys).
+ * @keyid: key description (not partial)
+ */
+int verify_signature_one(const struct public_key_signature *sig,
+			   struct key *trusted_keys, const char *keyid)
+{
+	key_ref_t ref;
+	struct key *key;
+	int ret;
+
+	if (!sig)
+		return -EBADMSG;
+	if (!trusted_keys) {
+		trusted_keys = builtin_trusted_keys;
+	} else if (trusted_keys == (void *)1UL) {
+#ifdef CONFIG_SECONDARY_TRUSTED_KEYRING
+		trusted_keys = secondary_trusted_keys;
+#else
+		trusted_keys = builtin_trusted_keys;
+#endif
+	}
+
+	ref = keyring_search(make_key_ref(trusted_keys, 1),
+				&key_type_asymmetric, keyid);
+	if (IS_ERR(ref)) {
+		pr_err("Asymmetric key (%s) not found in keyring(%s)\n",
+				keyid, trusted_keys->description);
+		return -ENOKEY;
+	}
+
+	key = key_ref_to_ptr(ref);
+	ret = verify_signature(key, sig);
+	key_put(key);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(verify_signature_one);
+

@@ -28,6 +28,13 @@
  */
 #define kern_hyp_va(kva)	(kva)
 
+/* Contrary to arm64, there is no need to generate a PC-relative address */
+#define hyp_symbol_addr(s)						\
+	({								\
+		typeof(s) *addr = &(s);					\
+		addr;							\
+	})
+
 /*
  * KVM_MMU_CACHE_MIN_PAGES is the number of stage2 page table translation levels.
  */
@@ -150,18 +157,12 @@ static inline void __coherent_cache_guest_page(struct kvm_vcpu *vcpu,
 	 * and iterate over the range.
 	 */
 
-	bool need_flush = !vcpu_has_cache_enabled(vcpu) || ipa_uncached;
-
 	VM_BUG_ON(size & ~PAGE_MASK);
-
-	if (!need_flush && !icache_is_pipt())
-		goto vipt_cache;
 
 	while (size) {
 		void *va = kmap_atomic_pfn(pfn);
 
-		if (need_flush)
-			kvm_flush_dcache_to_poc(va, PAGE_SIZE);
+		kvm_flush_dcache_to_poc(va, PAGE_SIZE);
 
 		if (icache_is_pipt())
 			__cpuc_coherent_user_range((unsigned long)va,
@@ -173,7 +174,6 @@ static inline void __coherent_cache_guest_page(struct kvm_vcpu *vcpu,
 		kunmap_atomic(va);
 	}
 
-vipt_cache:
 	if (!icache_is_pipt() && !icache_is_vivt_asid_tagged()) {
 		/* any kind of VIPT cache */
 		__flush_icache_all();
@@ -228,6 +228,58 @@ static inline void __kvm_extend_hypmap(pgd_t *boot_hyp_pgd,
 static inline unsigned int kvm_get_vmid_bits(void)
 {
 	return 8;
+}
+
+/*
+ * We are not in the kvm->srcu critical section most of the time, so we take
+ * the SRCU read lock here. Since we copy the data from the user page, we
+ * can immediately drop the lock again.
+ */
+static inline int kvm_read_guest_lock(struct kvm *kvm,
+				      gpa_t gpa, void *data, unsigned long len)
+{
+	int srcu_idx = srcu_read_lock(&kvm->srcu);
+	int ret = kvm_read_guest(kvm, gpa, data, len);
+
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+
+	return ret;
+}
+
+static inline void *kvm_get_hyp_vector(void)
+{
+	switch(read_cpuid_part()) {
+#ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
+	case ARM_CPU_PART_CORTEX_A12:
+	case ARM_CPU_PART_CORTEX_A17:
+	{
+		extern char __kvm_hyp_vector_bp_inv[];
+		return kvm_ksym_ref(__kvm_hyp_vector_bp_inv);
+	}
+
+	case ARM_CPU_PART_BRAHMA_B15:
+	case ARM_CPU_PART_CORTEX_A15:
+	{
+		extern char __kvm_hyp_vector_ic_inv[];
+		return kvm_ksym_ref(__kvm_hyp_vector_ic_inv);
+	}
+#endif
+	default:
+	{
+		extern char __kvm_hyp_vector[];
+		return kvm_ksym_ref(__kvm_hyp_vector);
+	}
+	}
+}
+
+static inline int kvm_map_vectors(void)
+{
+	return 0;
+}
+
+static inline int hyp_map_aux_data(void)
+{
+	return 0;
 }
 
 #endif	/* !__ASSEMBLY__ */

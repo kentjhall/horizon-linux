@@ -56,7 +56,8 @@ void squashfs_decompressor_destroy(struct squashfs_sb_info *msblk)
 	struct squashfs_stream *stream = msblk->stream;
 
 	if (stream) {
-		msblk->decompressor->free(stream->stream);
+		if (msblk->decompressor)
+			msblk->decompressor->free(stream->stream);
 		kfree(stream);
 	}
 }

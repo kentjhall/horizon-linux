@@ -8,11 +8,17 @@ config ARM_GIC
 	select IRQ_DOMAIN_HIERARCHY
 	select MULTI_IRQ_HANDLER
 
+config FIQ
+	bool "Enable FIQ"
+	default n
+	help
+	  Enable fiq interrupts to be enabled on gics which allow control
+	  fiqs in the kernel space
+
 config ARM_GIC_PM
 	bool
 	depends on PM
 	select ARM_GIC
-	select PM_CLK
 
 config ARM_GIC_MAX_NR
 	int
@@ -258,6 +264,7 @@ config IRQ_MXS
 
 config MVEBU_ODMI
 	bool
+	select GENERIC_MSI_IRQ_DOMAIN
 
 config MVEBU_PIC
 	bool
@@ -279,3 +286,6 @@ config EZNPS_GIC
 config STM32_EXTI
 	bool
 	select IRQ_DOMAIN
+
+config MINIMAL_GIC_INIT
+	def_bool n

@@ -68,3 +68,45 @@ config MMC_TEST
 
 	  This driver is only of interest to those developing or
 	  testing a host driver. Most people should say N here.
+
+config MMC_SIMULATE_MAX_SPEED
+	bool "Turn on maximum speed control per block device"
+	depends on MMC_BLOCK
+	help
+	  Say Y here to enable MMC device speed limiting. Used to test and
+	  simulate the behavior of the system when confronted with a slow MMC.
+
+	  Enables max_read_speed, max_write_speed and cache_size attributes to
+	  control the write or read maximum KB/second speed behaviors.
+
+	  If unsure, say N here.
+
+config MMC_FFU
+             bool "FFU SUPPORT"
+             depends on MMC != n
+             help
+               This is an option to run firmware update on eMMC 5.0.
+               Field firmware updates (FFU) enables features enhancment
+               in the field.
+
+config MMCQD_CPU_AFFINITY
+	bool "mmcqd cpu affinity"
+	depends on SMP
+	default n
+	help
+		Define the cpu affinity mask for the mmcqd thread.
+
+config MMCQD_CPU_AFFINITY_VALUE
+	string "mmcqd cpu affinity value"
+	depends on MMCQD_CPU_AFFINITY
+	default "f"
+	help
+		When MMCQD_CPU_AFFINITY is defined, this config is used to set the value.
+		On top of power benefits, limiting the mmcqd thread to certain
+		cpu's can provide a perf benefit due to less disturbances to fg and
+		other threads of importance by reducing potential migrations and also
+		mmcqd itself getting preempted by other threads.
+		The cpu affinity mask is basically a hex string which represents the
+		bitmask of the affinity, each bit represents a cpu core. For e.g.
+		to limit mmcqd to 0'th core, use the following:
+		CONFIG_MMCQD_CPU_AFFINITY_VALUE='1'

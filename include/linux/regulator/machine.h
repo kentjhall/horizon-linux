@@ -33,6 +33,7 @@ struct regulator;
  * STATUS:   Regulator can be enabled and disabled.
  * DRMS:     Dynamic Regulator Mode Switching is enabled for this regulator.
  * BYPASS:   Regulator can be put into bypass mode
+ * CONTROL:  Dynamic change control mode of Regulator i.e I2C or PWM.
  */
 
 #define REGULATOR_CHANGE_VOLTAGE	0x1
@@ -41,6 +42,7 @@ struct regulator;
 #define REGULATOR_CHANGE_STATUS		0x8
 #define REGULATOR_CHANGE_DRMS		0x10
 #define REGULATOR_CHANGE_BYPASS		0x20
+#define REGULATOR_CHANGE_CONTROL	0x40
 
 /* Regulator active discharge flags */
 enum regulator_active_discharge {
@@ -77,6 +79,7 @@ struct regulator_state {
  *
  * @min_uV: Smallest voltage consumers may set.
  * @max_uV: Largest voltage consumers may set.
+ * @init_uV: Initial voltage consumers may set.
  * @uV_offset: Offset applied to voltages from consumer to compensate for
  *             voltage drops.
  *
@@ -108,6 +111,8 @@ struct regulator_state {
  * @initial_state: Suspend state to set by default.
  * @initial_mode: Mode to set at startup.
  * @ramp_delay: Time to settle down after voltage change (unit: uV/us)
+ * @settling_time: Time to settle down after voltage change when voltage
+ *		   change is non-linear (unit: microseconds).
  * @active_discharge: Enable/disable active discharge. The enum
  *		      regulator_active_discharge values are used for
  *		      initialisation.
@@ -120,6 +125,7 @@ struct regulation_constraints {
 	/* voltage output range (inclusive) - for voltage control */
 	int min_uV;
 	int max_uV;
+	int init_uV;
 
 	int uV_offset;
 
@@ -148,7 +154,11 @@ struct regulation_constraints {
 	/* mode to set on startup */
 	unsigned int initial_mode;
 
+	/* mode to be set on sleep mode */
+	unsigned int sleep_mode;
+
 	unsigned int ramp_delay;
+	unsigned int settling_time;
 	unsigned int enable_time;
 
 	unsigned int active_discharge;
@@ -161,6 +171,7 @@ struct regulation_constraints {
 	unsigned soft_start:1;	/* ramp voltage slowly */
 	unsigned pull_down:1;	/* pull down resistor when regulator off */
 	unsigned over_current_protection:1; /* auto disable on over current */
+	unsigned bypass_on:1;	/* Bypass ON */
 };
 
 /**

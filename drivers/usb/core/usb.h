@@ -31,6 +31,9 @@ extern void usb_deauthorize_interface(struct usb_interface *);
 extern void usb_authorize_interface(struct usb_interface *);
 extern void usb_detect_quirks(struct usb_device *udev);
 extern void usb_detect_interface_quirks(struct usb_device *udev);
+extern bool usb_endpoint_is_blacklisted(struct usb_device *udev,
+		struct usb_host_interface *intf,
+		struct usb_endpoint_descriptor *epd);
 extern int usb_remove_device(struct usb_device *udev);
 
 extern int usb_get_device_descriptor(struct usb_device *dev,
@@ -54,8 +57,6 @@ extern void usb_kick_hub_wq(struct usb_device *dev);
 extern int usb_match_one_id_intf(struct usb_device *dev,
 				 struct usb_host_interface *intf,
 				 const struct usb_device_id *id);
-extern int usb_match_device(struct usb_device *dev,
-			    const struct usb_device_id *id);
 extern void usb_forced_unbind_intf(struct usb_interface *intf);
 extern void usb_unbind_and_rebind_marked_interfaces(struct usb_device *udev);
 
@@ -84,7 +85,8 @@ extern int usb_remote_wakeup(struct usb_device *dev);
 extern int usb_runtime_suspend(struct device *dev);
 extern int usb_runtime_resume(struct device *dev);
 extern int usb_runtime_idle(struct device *dev);
-extern int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable);
+extern int usb_enable_usb2_hardware_lpm(struct usb_device *udev);
+extern int usb_disable_usb2_hardware_lpm(struct usb_device *udev);
 
 #else
 
@@ -104,7 +106,12 @@ static inline int usb_autoresume_device(struct usb_device *udev)
 	return 0;
 }
 
-static inline int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable)
+static inline int usb_enable_usb2_hardware_lpm(struct usb_device *udev)
+{
+	return 0;
+}
+
+static inline int usb_disable_usb2_hardware_lpm(struct usb_device *udev)
 {
 	return 0;
 }
@@ -155,7 +162,6 @@ extern const struct attribute_group *usb_device_groups[];
 extern const struct attribute_group *usb_interface_groups[];
 
 /* usbfs stuff */
-extern struct mutex usbfs_mutex;
 extern struct usb_driver usbfs_driver;
 extern const struct file_operations usbfs_devices_fops;
 extern const struct file_operations usbdev_file_operations;

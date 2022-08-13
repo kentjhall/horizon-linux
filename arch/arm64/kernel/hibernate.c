@@ -50,9 +50,6 @@
  */
 extern int in_suspend;
 
-/* Find a symbols alias in the linear map */
-#define LMADDR(x)	phys_to_virt(virt_to_phys(x))
-
 /* Do we need to reset el2? */
 #define el2_reset_needed() (is_hyp_mode_available() && !is_kernel_in_hyp_mode())
 
@@ -102,8 +99,8 @@ static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
 
 int pfn_is_nosave(unsigned long pfn)
 {
-	unsigned long nosave_begin_pfn = virt_to_pfn(&__nosave_begin);
-	unsigned long nosave_end_pfn = virt_to_pfn(&__nosave_end - 1);
+	unsigned long nosave_begin_pfn = sym_to_pfn(&__nosave_begin);
+	unsigned long nosave_end_pfn = sym_to_pfn(&__nosave_end - 1);
 
 	return (pfn >= nosave_begin_pfn) && (pfn <= nosave_end_pfn);
 }
@@ -125,12 +122,12 @@ int arch_hibernation_header_save(void *addr, unsigned int max_size)
 		return -EOVERFLOW;
 
 	arch_hdr_invariants(&hdr->invariants);
-	hdr->ttbr1_el1		= virt_to_phys(swapper_pg_dir);
+	hdr->ttbr1_el1		= __pa_symbol(swapper_pg_dir);
 	hdr->reenter_kernel	= _cpu_resume;
 
 	/* We can't use __hyp_get_vectors() because kvm may still be loaded */
 	if (el2_reset_needed())
-		hdr->__hyp_stub_vectors = virt_to_phys(__hyp_stub_vectors);
+		hdr->__hyp_stub_vectors = __pa_symbol(__hyp_stub_vectors);
 	else
 		hdr->__hyp_stub_vectors = 0;
 
@@ -247,8 +244,7 @@ static int create_safe_exec_page(void *src_start, size_t length,
 	}
 
 	pte = pte_offset_kernel(pmd, dst_addr);
-	set_pte(pte, __pte(virt_to_phys((void *)dst) |
-			 pgprot_val(PAGE_KERNEL_EXEC)));
+	set_pte(pte, pfn_pte(virt_to_pfn(dst), PAGE_KERNEL_EXEC));
 
 	/*
 	 * Load our new page tables. A strict BBM approach requires that we
@@ -297,8 +293,10 @@ int swsusp_arch_suspend(void)
 		dcache_clean_range(__idmap_text_start, __idmap_text_end);
 
 		/* Clean kvm setup code to PoC? */
-		if (el2_reset_needed())
+		if (el2_reset_needed()) {
 			dcache_clean_range(__hyp_idmap_text_start, __hyp_idmap_text_end);
+			dcache_clean_range(__hyp_text_start, __hyp_text_end);
+		}
 
 		/*
 		 * Tell the hibernation core that we've just restored
@@ -308,6 +306,17 @@ int swsusp_arch_suspend(void)
 
 		sleep_cpu = -EINVAL;
 		__cpu_suspend_exit();
+
+		/*
+		 * Just in case the boot kernel did turn the SSBD
+		 * mitigation off behind our back, let's set the state
+		 * to what we expect it to be.
+		 */
+		switch (arm64_get_ssbd_state()) {
+		case ARM64_SSBD_FORCE_ENABLE:
+		case ARM64_SSBD_KERNEL:
+			arm64_set_ssbd_mitigation(true);
+		}
 	}
 
 	local_dbg_restore(flags);
@@ -460,7 +469,6 @@ int swsusp_arch_resume(void)
 	void *zero_page;
 	size_t exit_size;
 	pgd_t *tmp_pg_dir;
-	void *lm_restore_pblist;
 	phys_addr_t phys_hibernate_exit;
 	void __noreturn (*hibernate_exit)(phys_addr_t, phys_addr_t, void *,
 					  void *, phys_addr_t, phys_addr_t);
@@ -479,12 +487,6 @@ int swsusp_arch_resume(void)
 	rc = copy_page_tables(tmp_pg_dir, PAGE_OFFSET, 0);
 	if (rc)
 		goto out;
-
-	/*
-	 * Since we only copied the linear map, we need to find restore_pblist's
-	 * linear map address.
-	 */
-	lm_restore_pblist = LMADDR(restore_pblist);
 
 	/*
 	 * We need a zero page that is zero before & after resume in order to
@@ -537,7 +539,7 @@ int swsusp_arch_resume(void)
 	}
 
 	hibernate_exit(virt_to_phys(tmp_pg_dir), resume_hdr.ttbr1_el1,
-		       resume_hdr.reenter_kernel, lm_restore_pblist,
+		       resume_hdr.reenter_kernel, restore_pblist,
 		       resume_hdr.__hyp_stub_vectors, virt_to_phys(zero_page));
 
 out:

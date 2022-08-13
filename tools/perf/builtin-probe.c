@@ -344,6 +344,9 @@ static int perf_add_probe_events(struct perf_probe_event *pevs, int npevs)
 
 		for (k = 0; k < pev->ntevs; k++) {
 			struct probe_trace_event *tev = &pev->tevs[k];
+			/* Skipped events have no event name */
+			if (!tev->event)
+				continue;
 
 			/* We use tev's name for showing new events */
 			show_perf_probe_event(tev->group, tev->event, pev,
@@ -442,9 +445,9 @@ static int perf_del_probe_events(struct strfilter *filter)
 	}
 
 	if (ret == -ENOENT && ret2 == -ENOENT)
-		pr_debug("\"%s\" does not hit any event.\n", str);
-		/* Note that this is silently ignored */
-	ret = 0;
+		pr_warning("\"%s\" does not hit any event.\n", str);
+	else
+		ret = 0;
 
 error:
 	if (kfd >= 0)
@@ -675,6 +678,16 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
 
 		ret = perf_add_probe_events(params.events, params.nevents);
 		if (ret < 0) {
+
+			/*
+			 * When perf_add_probe_events() fails it calls
+			 * cleanup_perf_probe_events(pevs, npevs), i.e.
+			 * cleanup_perf_probe_events(params.events, params.nevents), which
+			 * will call clear_perf_probe_event(), so set nevents to zero
+			 * to avoid cleanup_params() to call clear_perf_probe_event() again
+			 * on the same pevs.
+			 */
+			params.nevents = 0;
 			pr_err_with_code("  Error: Failed to add events.", ret);
 			return ret;
 		}

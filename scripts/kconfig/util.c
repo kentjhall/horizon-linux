@@ -11,21 +11,23 @@
 #include "lkc.h"
 
 /* file already present in list? If not add it */
-struct file *file_lookup(const char *name)
+struct file *file_lookup(const char *name, int overlay_id, const char *logical_name)
 {
 	struct file *file;
-	const char *file_name = sym_expand_string_value(name);
 
 	for (file = file_list; file; file = file->next) {
-		if (!strcmp(name, file->name)) {
-			free((void *)file_name);
+		if (!strcmp(name, file->name) && overlay_id == file->overlay_id) {
+			free((void *)name);
+			free((void *)logical_name);
 			return file;
 		}
 	}
 
 	file = xmalloc(sizeof(*file));
 	memset(file, 0, sizeof(*file));
-	file->name = file_name;
+	file->name = name;
+	file->overlay_id = overlay_id;
+	file->logical_name = logical_name;
 	file->next = file_list;
 	file_list = file;
 	return file;
@@ -140,6 +142,24 @@ void *xmalloc(size_t size)
 void *xcalloc(size_t nmemb, size_t size)
 {
 	void *p = calloc(nmemb, size);
+	if (p)
+		return p;
+	fprintf(stderr, "Out of memory.\n");
+	exit(1);
+}
+
+void *xrealloc(void *ptr, size_t size)
+{
+	void *p = realloc(ptr, size);
+	if (p)
+		return p;
+	fprintf(stderr, "Out of memory.\n");
+	exit(1);
+}
+
+char *xstrdup(const char *s)
+{
+	char *p = strdup(s);
 	if (p)
 		return p;
 	fprintf(stderr, "Out of memory.\n");

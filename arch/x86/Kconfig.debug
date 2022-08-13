@@ -192,7 +192,7 @@ config HAVE_MMIOTRACE_SUPPORT
 
 config X86_DECODER_SELFTEST
 	bool "x86 instruction decoder selftest"
-	depends on DEBUG_KERNEL && KPROBES
+	depends on DEBUG_KERNEL && INSTRUCTION_DECODER
 	depends on !COMPILE_TEST
 	---help---
 	 Perform x86 instruction decoder selftests at build time.
@@ -352,6 +352,7 @@ config X86_DEBUG_FPU
 
 config PUNIT_ATOM_DEBUG
 	tristate "ATOM Punit debug driver"
+	depends on PCI
 	select DEBUG_FS
 	select IOSF_MBI
 	---help---

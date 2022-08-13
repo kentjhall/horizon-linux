@@ -102,6 +102,11 @@ Optional properties:
 					will not change device state when FPS
 					event get cleared.
 
+- maxim,enable-rtc2-alarm-wakeup: enable rtc alarm2 and rtc periodic second
+					timer interrupt, to wake up device if
+					rtc2 timer expired, wake up on alarm2
+					from sleep by EN1 input signal.
+
 Here supported time periods by device in microseconds are as follows:
 MAX77620 supports 40, 80, 160, 320, 640, 1280, 2560 and 5120 microseconds.
 MAX20024 supports 20, 40, 80, 160, 320, 640, 1280 and 2540 microseconds.
@@ -109,6 +114,63 @@ MAX20024 supports 20, 40, 80, 160, 320, 640, 1280 and 2540 microseconds.
 For DT binding details of different sub modules like GPIO, pincontrol,
 regulator, power, please refer respective device-tree binding document
 under their respective sub-system directories.
+
+There is another name of these properties to reduce the property name
+length to meet ePAPR specs. The another name is without vendor as
+follows:
+	maxim,fps-event-source -> fps-event-source
+	maxim,shutdown-fps-time-period-us -> shutdown-fps-time-period-us
+	maxim,suspend-fps-time-period-us -> suspend-fps-time-period-us
+	maxim,device-state-on-disabled-event -> device-state-on-disabled-event
+
+Backup Battery:
+==============
+This sub-node configure charging backup battery of the device. Device has
+support of charging the backup battery. The subnode name is "backup-battery".
+The property for backup-battery child nodes as:
+Presence of this child node will enable the backup battery charging.
+
+Optional properties:
+	-maxim,backup-battery-charging-current: Charging current setting.
+			The device supports 50/100/200/400/600/800uA.
+			If this property is unavailable then it will
+			charge with 50uA.
+	-maxim,backup-battery-charging-voltage: Charging Voltage Limit Setting.
+			Device supports 2500000/3000000/3300000/350000uV.
+			Default will be set to 2500mV. The voltage will be roundoff
+			to nearest lower side if other than above is configured.
+	-maxim,backup-battery-output-resister: Output resistor on Ohm.
+			Device supports 100/1000/3000/6000 Ohms.
+There is another name of these properties to reduce the property name
+length to meet ePAPR specs. The another name is without vendor as
+follows:
+	maxim,backup-battery-charging-current ->backup-battery-charging-current
+	maxim,backup-battery-charging-voltage -> backup-battery-charging-voltage
+	maxim,backup-battery-output-resister->backup-battery-output-resister
+
+Low-Battery Monitor:
+==================
+This sub-node configure low battery monitor configuration registers. Device has
+support for low-battery monitor configuration through child DT node
+"low-battery-monitor".
+
+Optional properties:
+	- maxim,low-battery-dac-enable: Enable low battery DAC.
+	- maxim,low-battery-dac-disable: Disable low battery DAC.
+	- maxim,low-battery-shutdown-enable: Enable low battery shutdown.
+	- maxim,low-battery-shutdown-disable: Disable low battery shutdown.
+	- maxim,low-battery-reset-enable: Enable low battery reset.
+	- maxim,low-battery-reset-disable: Disable low battery reset.
+
+There is another name of these properties to reduce the property name
+length to meet ePAPR specs. The another name is without vendor as
+follows:
+	maxim,low-battery-dac-enable->low-battery-dac-enable
+	maxim,low-battery-dac-disable->low-battery-dac-disable
+	maxim,low-battery-shutdown-enable->low-battery-shutdown-enable
+	maxim,low-battery-shutdown-disable->low-battery-shutdown-disable
+	maxim,low-battery-reset-enable->low-battery-reset-enable
+	maxim,low-battery-reset-disable->low-battery-reset-disable
 
 Example:
 --------

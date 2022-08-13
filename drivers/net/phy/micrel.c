@@ -28,6 +28,7 @@
 #include <linux/micrel_phy.h>
 #include <linux/of.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 
 /* Operation Mode Strap Override */
 #define MII_KSZPHY_OMSO				0x16
@@ -341,6 +342,17 @@ static int ksz8041_config_aneg(struct phy_device *phydev)
 	return genphy_config_aneg(phydev);
 }
 
+static int ksz8061_config_init(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = phy_write_mmd(phydev, MDIO_MMD_PMAPMD, MDIO_DEVID1, 0xB61A);
+	if (ret)
+		return ret;
+
+	return kszphy_config_init(phydev);
+}
+
 static int ksz9021_load_values_from_of(struct phy_device *phydev,
 				       const struct device_node *of_node,
 				       u16 reg,
@@ -622,6 +634,9 @@ static int ksz9031_read_status(struct phy_device *phydev)
 	if ((regval & 0xFF) == 0xFF) {
 		phy_init_hw(phydev);
 		phydev->link = 0;
+		if (phydev->drv->config_intr && phy_interrupt_is_valid(phydev))
+			phydev->drv->config_intr(phydev);
+		return genphy_config_aneg(phydev);
 	}
 
 	return 0;
@@ -662,8 +677,8 @@ static void kszphy_get_strings(struct phy_device *phydev, u8 *data)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(kszphy_hw_stats); i++) {
-		memcpy(data + i * ETH_GSTRING_LEN,
-		       kszphy_hw_stats[i].string, ETH_GSTRING_LEN);
+		strlcpy(data + i * ETH_GSTRING_LEN,
+			kszphy_hw_stats[i].string, ETH_GSTRING_LEN);
 	}
 }
 
@@ -713,6 +728,12 @@ static int kszphy_suspend(struct phy_device *phydev)
 static int kszphy_resume(struct phy_device *phydev)
 {
 	genphy_resume(phydev);
+
+	/* After switching from power-down to normal mode, an internal global
+	 * reset is automatically generated. Wait a minimum of 1 ms before
+	 * read/write access to the PHY registers.
+	 */
+	usleep_range(1000, 2000);
 
 	/* Enable PHY Interrupts */
 	if (phy_interrupt_is_valid(phydev)) {
@@ -798,9 +819,6 @@ static struct phy_driver ksphy_driver[] = {
 	.read_status	= genphy_read_status,
 	.ack_interrupt	= kszphy_ack_interrupt,
 	.config_intr	= kszphy_config_intr,
-	.get_sset_count = kszphy_get_sset_count,
-	.get_strings	= kszphy_get_strings,
-	.get_stats	= kszphy_get_stats,
 	.suspend	= genphy_suspend,
 	.resume		= genphy_resume,
 }, {
@@ -940,14 +958,11 @@ static struct phy_driver ksphy_driver[] = {
 	.phy_id_mask	= MICREL_PHY_ID_MASK,
 	.features	= (PHY_BASIC_FEATURES | SUPPORTED_Pause),
 	.flags		= PHY_HAS_MAGICANEG | PHY_HAS_INTERRUPT,
-	.config_init	= kszphy_config_init,
+	.config_init	= ksz8061_config_init,
 	.config_aneg	= genphy_config_aneg,
 	.read_status	= genphy_read_status,
 	.ack_interrupt	= kszphy_ack_interrupt,
 	.config_intr	= kszphy_config_intr,
-	.get_sset_count = kszphy_get_sset_count,
-	.get_strings	= kszphy_get_strings,
-	.get_stats	= kszphy_get_stats,
 	.suspend	= genphy_suspend,
 	.resume		= genphy_resume,
 }, {
@@ -957,6 +972,7 @@ static struct phy_driver ksphy_driver[] = {
 	.features	= (PHY_GBIT_FEATURES | SUPPORTED_Pause),
 	.flags		= PHY_HAS_MAGICANEG | PHY_HAS_INTERRUPT,
 	.driver_data	= &ksz9021_type,
+	.probe		= kszphy_probe,
 	.config_init	= ksz9021_config_init,
 	.config_aneg	= genphy_config_aneg,
 	.read_status	= genphy_read_status,
@@ -976,6 +992,7 @@ static struct phy_driver ksphy_driver[] = {
 	.features	= (PHY_GBIT_FEATURES | SUPPORTED_Pause),
 	.flags		= PHY_HAS_MAGICANEG | PHY_HAS_INTERRUPT,
 	.driver_data	= &ksz9021_type,
+	.probe		= kszphy_probe,
 	.config_init	= ksz9031_config_init,
 	.config_aneg	= genphy_config_aneg,
 	.read_status	= ksz9031_read_status,
@@ -995,9 +1012,6 @@ static struct phy_driver ksphy_driver[] = {
 	.config_init	= kszphy_config_init,
 	.config_aneg	= ksz8873mll_config_aneg,
 	.read_status	= ksz8873mll_read_status,
-	.get_sset_count = kszphy_get_sset_count,
-	.get_strings	= kszphy_get_strings,
-	.get_stats	= kszphy_get_stats,
 	.suspend	= genphy_suspend,
 	.resume		= genphy_resume,
 }, {
@@ -1009,9 +1023,17 @@ static struct phy_driver ksphy_driver[] = {
 	.config_init	= kszphy_config_init,
 	.config_aneg	= genphy_config_aneg,
 	.read_status	= genphy_read_status,
-	.get_sset_count = kszphy_get_sset_count,
-	.get_strings	= kszphy_get_strings,
-	.get_stats	= kszphy_get_stats,
+	.suspend	= genphy_suspend,
+	.resume		= genphy_resume,
+}, {
+	.phy_id		= PHY_ID_KSZ8795,
+	.phy_id_mask	= MICREL_PHY_ID_MASK,
+	.name		= "Micrel KSZ8795",
+	.features	= PHY_BASIC_FEATURES,
+	.flags		= PHY_HAS_MAGICANEG | PHY_HAS_INTERRUPT,
+	.config_init	= kszphy_config_init,
+	.config_aneg	= ksz8873mll_config_aneg,
+	.read_status	= ksz8873mll_read_status,
 	.suspend	= genphy_suspend,
 	.resume		= genphy_resume,
 } };

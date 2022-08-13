@@ -1,0 +1,20 @@
+TEGRA SE ELLIPTIC PKA1/RNG1 Crypto Module
+
+Required properties:
+
+- compatible : Should contain entries for this and backward compatible
+  - "nvidia,tegra186-se-elp" or "nvidia,tegra210b01-se-elp" for SE-PKA1/RNG1
+  - This supports PKA1 features that include RSA/ECC internally and RNG1
+- reg : Offset and length of the register set for the module
+- clock-names: clocks required for Tegra SE to function
+- interrupts: Interrupt numbers
+
+Example:
+	se: se_pka1@3ad0000 {
+		compatible = "nvidia,tegra186-se-elp";
+		reg = <0x0 0x03ad0000 0x0 0x10000>,
+		      <0x0 0x03ae0000 0x0 0x10000>;
+		interrupts = <0 283 0x04>;
+		clocks = <&tegra_car TEGRA186_CLK_SE>;
+		clock-names = "se";
+	};

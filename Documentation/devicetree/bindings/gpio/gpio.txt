@@ -188,9 +188,9 @@ gpio-controller's driver probe function.
 Each GPIO hog definition is represented as a child node of the GPIO controller.
 Required properties:
 - gpio-hog:   A property specifying that this child node represent a GPIO hog.
-- gpios:      Store the GPIO information (id, flags, ...). Shall contain the
-	      number of cells specified in its parent node (GPIO controller
-	      node).
+- gpios:      Store the GPIO information (id, flags, ...). Multiple GPIOs are
+	      possible to list here. Shall contain the number of cells
+	      specified in its parent node (GPIO controller node) per GPIOs.
 Only one of the following properties scanned in the order shown below.
 This means that when multiple properties are present they will be searched
 in the order presented below and the first match is taken as the intended
@@ -203,6 +203,11 @@ configuration.
 
 Optional properties:
 - line-name:  The GPIO label name. If not present the node name is used.
+- label:      The GPIO lable name. This can have multiple string for GPIO
+	      label names to match with the GPIOs in "gpios" properties.
+	      If line-name is prosent than name is taken from line-name. If
+	      it is not then the name will be taken from label. If both are
+	      not available then node name is used for GPIO label name.
 
 Example of two SOC GPIO banks defined as gpio-controller nodes:
 

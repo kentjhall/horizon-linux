@@ -65,7 +65,8 @@
  * @enable_gpio: Enable GPIO. If EN pin is controlled through GPIO from host
  *		then GPIO number can be provided. If no GPIO controlled then
  *		it should be -1.
- * @dvs_gpio: GPIO for dvs. It should be -1 if this is tied with fixed logic.
+ * @enable_dvs_sleep_control: Enable sleep control of the rail through the
+ * 		DVS pin.
  * @dvs_def_state: Default state of dvs. 1 if it is high else 0.
  */
 struct max8973_regulator_platform_data {
@@ -73,6 +74,7 @@ struct max8973_regulator_platform_data {
 	unsigned long control_flags;
 	unsigned long junction_temp_warning;
 	bool enable_ext_control;
+	bool enable_dvs_sleep_control;
 	int enable_gpio;
 	int dvs_gpio;
 	unsigned dvs_def_state:1;

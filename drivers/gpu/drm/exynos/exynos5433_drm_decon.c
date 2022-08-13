@@ -46,7 +46,8 @@ enum decon_flag_bits {
 	BIT_CLKS_ENABLED,
 	BIT_IRQS_ENABLED,
 	BIT_WIN_UPDATED,
-	BIT_SUSPENDED
+	BIT_SUSPENDED,
+	BIT_REQUEST_UPDATE
 };
 
 struct decon_context {
@@ -198,7 +199,7 @@ static void decon_win_set_pixfmt(struct decon_context *ctx, unsigned int win,
 	unsigned long val;
 
 	val = readl(ctx->addr + DECON_WINCONx(win));
-	val &= ~WINCONx_BPPMODE_MASK;
+	val &= WINCONx_ENWIN_F;
 
 	switch (fb->pixel_format) {
 	case DRM_FORMAT_XRGB1555:
@@ -290,8 +291,8 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 		COORDINATE_Y(state->crtc.y + state->crtc.h - 1);
 	writel(val, ctx->addr + DECON_VIDOSDxB(win));
 
-	val = VIDOSD_Wx_ALPHA_R_F(0x0) | VIDOSD_Wx_ALPHA_G_F(0x0) |
-		VIDOSD_Wx_ALPHA_B_F(0x0);
+	val = VIDOSD_Wx_ALPHA_R_F(0xff) | VIDOSD_Wx_ALPHA_G_F(0xff) |
+		VIDOSD_Wx_ALPHA_B_F(0xff);
 	writel(val, ctx->addr + DECON_VIDOSDxC(win));
 
 	val = VIDOSD_Wx_ALPHA_R_F(0x0) | VIDOSD_Wx_ALPHA_G_F(0x0) |
@@ -315,6 +316,7 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 
 	/* window enable */
 	decon_set_bits(ctx, DECON_WINCONx(win), WINCONx_ENWIN_F, ~0);
+	set_bit(BIT_REQUEST_UPDATE, &ctx->flags);
 }
 
 static void decon_disable_plane(struct exynos_drm_crtc *crtc,
@@ -327,6 +329,7 @@ static void decon_disable_plane(struct exynos_drm_crtc *crtc,
 		return;
 
 	decon_set_bits(ctx, DECON_WINCONx(win), WINCONx_ENWIN_F, 0);
+	set_bit(BIT_REQUEST_UPDATE, &ctx->flags);
 }
 
 static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
@@ -340,8 +343,8 @@ static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
 	for (i = ctx->first_win; i < WINDOWS_NR; i++)
 		decon_shadow_protect_win(ctx, i, false);
 
-	/* standalone update */
-	decon_set_bits(ctx, DECON_UPDATE, STANDALONE_UPDATE_F, ~0);
+	if (test_and_clear_bit(BIT_REQUEST_UPDATE, &ctx->flags))
+		decon_set_bits(ctx, DECON_UPDATE, STANDALONE_UPDATE_F, ~0);
 
 	if (ctx->out_type & IFTYPE_I80)
 		set_bit(BIT_WIN_UPDATED, &ctx->flags);

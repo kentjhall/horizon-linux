@@ -1,0 +1,30 @@
+* BQ40Z50 fuel gauge devicetree bindings
+~~~~~~~~~~
+
+Required properties :
+ - compatible : "ti,bq40z50-battery"
+ - reg: I2C slave address
+
+Required properties:
+ - ti,design-capacity: battery capacity in mah
+ - ti,design-voltage: battery charging terminate voltage in uV
+
+Optional properties :
+ - ti,btp-discharge-set: battery trip point set threshold for
+   discharge mode for next btp interrupt
+ - ti,btp-charge-set: btp set threshold for charge mode
+   for next btp interrupt
+ - ti,kernel-threshold-soc: kernel threshold soc value
+   adjust battery soc value 0 to kernel threshold value
+ - ti,kernel-maximum-soc: kernel maximum threshold soc value
+   adjust battery soc value 100 to kernel max soc value
+Example:
+
+	bq40z50@0b {
+		compatible = "ti,bq40z50-battery";
+		reg = <0x0b>;
+		ti,design-capacity = <7800>;
+		ti,design-voltage = <4300000>;
+		ti,kernel-threshold-soc = <2>;
+		ti,kernel-maximum-soc = <98>;
+	}

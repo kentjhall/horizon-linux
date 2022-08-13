@@ -80,10 +80,12 @@
 #define SMB2_SET_INFO		cpu_to_le16(SMB2_SET_INFO_HE)
 #define SMB2_OPLOCK_BREAK	cpu_to_le16(SMB2_OPLOCK_BREAK_HE)
 
+#define SMB2_INTERNAL_CMD	cpu_to_le16(0xFFFF)
+
 #define NUMBER_OF_SMB2_COMMANDS	0x0013
 
-/* BB FIXME - analyze following length BB */
-#define MAX_SMB2_HDR_SIZE 0x78 /* 4 len + 64 hdr + (2*24 wct) + 2 bct + 2 pad */
+/* 52 transform hdr + 64 hdr + 88 create rsp */
+#define MAX_SMB2_HDR_SIZE 204
 
 #define SMB2_PROTO_NUMBER cpu_to_le32(0x424d53fe)
 #define SMB2_TRANSFORM_PROTO_NUM cpu_to_le32(0x424d53fd)
@@ -1023,7 +1025,7 @@ struct smb2_oplock_break {
 struct smb2_lease_break {
 	struct smb2_hdr hdr;
 	__le16 StructureSize; /* Must be 44 */
-	__le16 Reserved;
+	__le16 Epoch;
 	__le32 Flags;
 	__u8   LeaseKey[16];
 	__le32 CurrentLeaseState;

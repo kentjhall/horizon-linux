@@ -288,8 +288,12 @@ static inline void tvp5150_selmux(struct v4l2_subdev *sd)
 	tvp5150_write(sd, TVP5150_OP_MODE_CTL, opmode);
 	tvp5150_write(sd, TVP5150_VD_IN_SRC_SEL_1, input);
 
-	/* Svideo should enable YCrCb output and disable GPCL output
-	 * For Composite and TV, it should be the reverse
+	/*
+	 * Setup the FID/GLCO/VLK/HVLK and INTREQ/GPCL/VBLK output signals. For
+	 * S-Video we output the vertical lock (VLK) signal on FID/GLCO/VLK/HVLK
+	 * and set INTREQ/GPCL/VBLK to logic 0. For composite we output the
+	 * field indicator (FID) signal on FID/GLCO/VLK/HVLK and set
+	 * INTREQ/GPCL/VBLK to logic 1.
 	 */
 	val = tvp5150_read(sd, TVP5150_MISC_CTL);
 	if (val < 0) {
@@ -298,9 +302,9 @@ static inline void tvp5150_selmux(struct v4l2_subdev *sd)
 	}
 
 	if (decoder->input == TVP5150_SVIDEO)
-		val = (val & ~0x40) | 0x10;
+		val = (val & ~TVP5150_MISC_CTL_GPCL) | TVP5150_MISC_CTL_HVLK;
 	else
-		val = (val & ~0x10) | 0x40;
+		val = (val & ~TVP5150_MISC_CTL_HVLK) | TVP5150_MISC_CTL_GPCL;
 	tvp5150_write(sd, TVP5150_MISC_CTL, val);
 };
 
@@ -452,7 +456,12 @@ static const struct i2c_reg_value tvp5150_init_enable[] = {
 	},{	/* Automatic offset and AGC enabled */
 		TVP5150_ANAL_CHL_CTL, 0x15
 	},{	/* Activate YCrCb output 0x9 or 0xd ? */
-		TVP5150_MISC_CTL, 0x6f
+		TVP5150_MISC_CTL, TVP5150_MISC_CTL_GPCL |
+				  TVP5150_MISC_CTL_INTREQ_OE |
+				  TVP5150_MISC_CTL_YCBCR_OE |
+				  TVP5150_MISC_CTL_SYNC_OE |
+				  TVP5150_MISC_CTL_VBLANK |
+				  TVP5150_MISC_CTL_CLOCK_OE,
 	},{	/* Activates video std autodetection for all standards */
 		TVP5150_AUTOSW_MSK, 0x0
 	},{	/* Default format: 0x47. For 4:2:2: 0x40 */
@@ -815,6 +824,7 @@ static int tvp5150_s_ctrl(struct v4l2_ctrl *ctrl)
 		return 0;
 	case V4L2_CID_HUE:
 		tvp5150_write(sd, TVP5150_HUE_CTL, ctrl->val);
+		return 0;
 	case V4L2_CID_TEST_PATTERN:
 		decoder->enable = ctrl->val ? false : true;
 		tvp5150_selmux(sd);
@@ -857,8 +867,6 @@ static int tvp5150_fill_fmt(struct v4l2_subdev *sd,
 
 	f = &format->format;
 
-	tvp5150_reset(sd, 0);
-
 	f->width = decoder->rect.width;
 	f->height = decoder->rect.height / 2;
 
@@ -889,9 +897,6 @@ static int tvp5150_set_selection(struct v4l2_subdev *sd,
 
 	/* tvp5150 has some special limits */
 	rect.left = clamp(rect.left, 0, TVP5150_MAX_CROP_LEFT);
-	rect.width = clamp_t(unsigned int, rect.width,
-			     TVP5150_H_MAX - TVP5150_MAX_CROP_LEFT - rect.left,
-			     TVP5150_H_MAX - rect.left);
 	rect.top = clamp(rect.top, 0, TVP5150_MAX_CROP_TOP);
 
 	/* Calculate height based on current standard */
@@ -905,9 +910,16 @@ static int tvp5150_set_selection(struct v4l2_subdev *sd,
 	else
 		hmax = TVP5150_V_MAX_OTHERS;
 
-	rect.height = clamp_t(unsigned int, rect.height,
+	/*
+	 * alignments:
+	 *  - width = 2 due to UYVY colorspace
+	 *  - height, image = no special alignment
+	 */
+	v4l_bound_align_image(&rect.width,
+			      TVP5150_H_MAX - TVP5150_MAX_CROP_LEFT - rect.left,
+			      TVP5150_H_MAX - rect.left, 1, &rect.height,
 			      hmax - TVP5150_MAX_CROP_TOP - rect.top,
-			      hmax - rect.top);
+			      hmax - rect.top, 0, 0);
 
 	tvp5150_write(sd, TVP5150_VERT_BLANKING_START, rect.top);
 	tvp5150_write(sd, TVP5150_VERT_BLANKING_STOP,
@@ -1047,21 +1059,27 @@ static const struct media_entity_operations tvp5150_sd_media_ops = {
 static int tvp5150_s_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct tvp5150 *decoder = to_tvp5150(sd);
-	/* Output format: 8-bit ITU-R BT.656 with embedded syncs */
-	int val = 0x09;
+	int val;
 
-	/* Output format: 8-bit 4:2:2 YUV with discrete sync */
-	if (decoder->mbus_type == V4L2_MBUS_PARALLEL)
-		val = 0x0d;
+	/* Enable or disable the video output signals. */
+	val = tvp5150_read(sd, TVP5150_MISC_CTL);
+	if (val < 0)
+		return val;
 
-	/* Initializes TVP5150 to its default values */
-	/* # set PCLK (27MHz) */
-	tvp5150_write(sd, TVP5150_CONF_SHARED_PIN, 0x00);
+	val &= ~(TVP5150_MISC_CTL_YCBCR_OE | TVP5150_MISC_CTL_SYNC_OE |
+		 TVP5150_MISC_CTL_CLOCK_OE);
 
-	if (enable)
-		tvp5150_write(sd, TVP5150_MISC_CTL, val);
-	else
-		tvp5150_write(sd, TVP5150_MISC_CTL, 0x00);
+	if (enable) {
+		/*
+		 * Enable the YCbCr and clock outputs. In discrete sync mode
+		 * (non-BT.656) additionally enable the the sync outputs.
+		 */
+		val |= TVP5150_MISC_CTL_YCBCR_OE | TVP5150_MISC_CTL_CLOCK_OE;
+		if (decoder->mbus_type == V4L2_MBUS_PARALLEL)
+			val |= TVP5150_MISC_CTL_SYNC_OE;
+	}
+
+	tvp5150_write(sd, TVP5150_MISC_CTL, val);
 
 	return 0;
 }
@@ -1513,14 +1531,13 @@ static int tvp5150_probe(struct i2c_client *c,
 			27000000, 1, 27000000);
 	v4l2_ctrl_new_std_menu_items(&core->hdl, &tvp5150_ctrl_ops,
 				     V4L2_CID_TEST_PATTERN,
-				     ARRAY_SIZE(tvp5150_test_patterns),
+				     ARRAY_SIZE(tvp5150_test_patterns) - 1,
 				     0, 0, tvp5150_test_patterns);
 	sd->ctrl_handler = &core->hdl;
 	if (core->hdl.error) {
 		res = core->hdl.error;
 		goto err;
 	}
-	v4l2_ctrl_handler_setup(&core->hdl);
 
 	/* Default is no cropping */
 	core->rect.top = 0;
@@ -1530,6 +1547,8 @@ static int tvp5150_probe(struct i2c_client *c,
 		core->rect.height = TVP5150_V_MAX_OTHERS;
 	core->rect.left = 0;
 	core->rect.width = TVP5150_H_MAX;
+
+	tvp5150_reset(sd, 0);	/* Calls v4l2_ctrl_handler_setup() */
 
 	res = v4l2_async_register_subdev(sd);
 	if (res < 0)

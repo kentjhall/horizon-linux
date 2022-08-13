@@ -277,6 +277,7 @@ struct device_driver {
 	int (*probe) (struct device *dev);
 	int (*remove) (struct device *dev);
 	void (*shutdown) (struct device *dev);
+	void (*late_shutdown) (struct device *dev);
 	int (*suspend) (struct device *dev, pm_message_t state);
 	int (*resume) (struct device *dev);
 	const struct attribute_group **groups;
@@ -294,6 +295,7 @@ extern struct device_driver *driver_find(const char *name,
 					 struct bus_type *bus);
 extern int driver_probe_done(void);
 extern void wait_for_device_probe(void);
+extern void device_unblock_probing(void);
 
 
 /* sysfs interface for exporting driver attributes */
@@ -373,6 +375,7 @@ int subsys_virtual_register(struct bus_type *subsys,
  * @suspend:	Used to put the device to sleep mode, usually to a low power
  *		state.
  * @resume:	Used to bring the device from the sleep mode.
+ * @shutdown:	Called at shut-down time to quiesce the device.
  * @ns_type:	Callbacks so sysfs can detemine namespaces.
  * @namespace:	Namespace of the device belongs to this class.
  * @pm:		The default device power management operations of this class.
@@ -401,6 +404,7 @@ struct class {
 
 	int (*suspend)(struct device *dev, pm_message_t state);
 	int (*resume)(struct device *dev);
+	int (*shutdown)(struct device *dev);
 
 	const struct kobj_ns_type_operations *ns_type;
 	const void *(*namespace)(struct device *dev);
@@ -680,7 +684,8 @@ extern unsigned long devm_get_free_pages(struct device *dev,
 					 gfp_t gfp_mask, unsigned int order);
 extern void devm_free_pages(struct device *dev, unsigned long addr);
 
-void __iomem *devm_ioremap_resource(struct device *dev, struct resource *res);
+void __iomem *devm_ioremap_resource(struct device *dev,
+				    const struct resource *res);
 
 /* allows to add/remove a custom action to devres stack */
 int devm_add_action(struct device *dev, void (*action)(void *), void *data);
@@ -853,8 +858,18 @@ struct device {
 	struct iommu_group	*iommu_group;
 	struct iommu_fwspec	*iommu_fwspec;
 
+	/* dma-buf stashing is optimized for host1x context device. Adding
+	 * flag to find out whether device is context device or not.
+	 * To iterate over all dma-bufs attached to dev for stashing, we need
+	 * dev to dma-buf mappings list stored in dev node, adding attachments
+	 * for that purpose.
+	 */
+	bool			context_dev;
+	struct list_head	attachments;
+
 	bool			offline_disabled:1;
 	bool			offline:1;
+	bool			no_dmabuf_defer_unmap:1;
 };
 
 static inline struct device *kobj_to_dev(struct kobject *kobj)

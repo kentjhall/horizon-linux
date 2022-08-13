@@ -1671,10 +1671,11 @@ static int mxt_get_object_table(struct mxt_data *data)
 			break;
 		case MXT_TOUCH_MULTI_T9:
 			data->multitouch = MXT_TOUCH_MULTI_T9;
+			/* Only handle messages from first T9 instance */
 			data->T9_reportid_min = min_id;
-			data->T9_reportid_max = max_id;
-			data->num_touchids = object->num_report_ids
-						* mxt_obj_instances(object);
+			data->T9_reportid_max = min_id +
+						object->num_report_ids - 1;
+			data->num_touchids = object->num_report_ids;
 			break;
 		case MXT_SPT_MESSAGECOUNT_T44:
 			data->T44_address = object->start_address;
@@ -3028,6 +3029,15 @@ static const struct dmi_system_id mxt_dmi_table[] = {
 		.driver_data = samus_platform_data,
 	},
 	{
+		/* Samsung Chromebook Pro */
+		.ident = "Samsung Chromebook Pro",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Google"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "Caroline"),
+		},
+		.driver_data = samus_platform_data,
+	},
+	{
 		/* Other Google Chromebooks */
 		.ident = "Chromebook",
 		.matches = {
@@ -3196,6 +3206,8 @@ static int __maybe_unused mxt_suspend(struct device *dev)
 
 	mutex_unlock(&input_dev->mutex);
 
+	disable_irq(data->irq);
+
 	return 0;
 }
 
@@ -3207,6 +3219,8 @@ static int __maybe_unused mxt_resume(struct device *dev)
 
 	if (!input_dev)
 		return 0;
+
+	enable_irq(data->irq);
 
 	mutex_lock(&input_dev->mutex);
 

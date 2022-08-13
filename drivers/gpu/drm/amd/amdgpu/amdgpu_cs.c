@@ -83,6 +83,13 @@ int amdgpu_cs_get_ring(struct amdgpu_device *adev, u32 ip_type,
 		}
 		break;
 	}
+
+	if (!(*out_ring && (*out_ring)->adev)) {
+		DRM_ERROR("Ring %d is not initialized on IP %d\n",
+			  ring, ip_type);
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -233,6 +240,8 @@ free_partial_kdata:
 	for (; i >= 0; i--)
 		drm_free_large(p->chunks[i].kdata);
 	kfree(p->chunks);
+	p->chunks = NULL;
+	p->nchunks = 0;
 put_ctx:
 	amdgpu_ctx_put(p->ctx);
 free_chunk:
@@ -407,6 +416,10 @@ static bool amdgpu_cs_try_evict(struct amdgpu_cs_parser *p,
 		if (candidate == lobj)
 			break;
 
+		/* We can't move pinned BOs here */
+		if (bo->pin_count)
+			continue;
+
 		other = amdgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
 
 		/* Check if this BO is in one of the domains we need space for */
@@ -506,7 +519,7 @@ static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
 	INIT_LIST_HEAD(&duplicates);
 	amdgpu_vm_get_pd_bo(&fpriv->vm, &p->validated, &p->vm_pd);
 
-	if (p->uf_entry.robj)
+	if (p->uf_entry.robj && !p->uf_entry.robj->parent)
 		list_add(&p->uf_entry.tv.head, &p->validated);
 
 	if (need_mmap_lock)

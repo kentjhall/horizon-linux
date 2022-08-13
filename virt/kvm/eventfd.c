@@ -119,7 +119,11 @@ irqfd_shutdown(struct work_struct *work)
 {
 	struct kvm_kernel_irqfd *irqfd =
 		container_of(work, struct kvm_kernel_irqfd, shutdown);
+	struct kvm *kvm = irqfd->kvm;
 	u64 cnt;
+
+	/* Make sure irqfd has been initalized in assign path. */
+	synchronize_srcu(&kvm->irq_srcu);
 
 	/*
 	 * Synchronize with the wait-queue and unhook ourselves to prevent
@@ -387,7 +391,6 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 
 	idx = srcu_read_lock(&kvm->irq_srcu);
 	irqfd_update(kvm, irqfd);
-	srcu_read_unlock(&kvm->irq_srcu, idx);
 
 	list_add_tail(&irqfd->list, &kvm->irqfds.items);
 
@@ -402,11 +405,6 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 	if (events & POLLIN)
 		schedule_work(&irqfd->inject);
 
-	/*
-	 * do not drop the file until the irqfd is fully initialized, otherwise
-	 * we might race against the POLLHUP
-	 */
-	fdput(f);
 #ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
 	if (kvm_arch_has_irq_bypass()) {
 		irqfd->consumer.token = (void *)irqfd->eventfd;
@@ -421,6 +419,13 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 	}
 #endif
 
+	srcu_read_unlock(&kvm->irq_srcu, idx);
+
+	/*
+	 * do not drop the file until the irqfd is fully initialized, otherwise
+	 * we might race against the POLLHUP
+	 */
+	fdput(f);
 	return 0;
 
 fail:
@@ -870,7 +875,8 @@ kvm_deassign_ioeventfd_idx(struct kvm *kvm, enum kvm_bus bus_idx,
 			continue;
 
 		kvm_io_bus_unregister_dev(kvm, bus_idx, &p->dev);
-		kvm->buses[bus_idx]->ioeventfd_count--;
+		if (kvm->buses[bus_idx])
+			kvm->buses[bus_idx]->ioeventfd_count--;
 		ioeventfd_release(p);
 		ret = 0;
 		break;

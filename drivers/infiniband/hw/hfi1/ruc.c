@@ -1,5 +1,5 @@
 /*
- * Copyright(c) 2015, 2016 Intel Corporation.
+ * Copyright(c) 2015 - 2017 Intel Corporation.
  *
  * This file is provided under a dual BSD/GPLv2 license.  When using or
  * redistributing this file, you may do so under either license.
@@ -471,6 +471,8 @@ send:
 			goto op_err;
 		if (!ret)
 			goto rnr_nak;
+		if (wqe->length > qp->r_len)
+			goto inv_err;
 		break;
 
 	case IB_WR_RDMA_WRITE_WITH_IMM:
@@ -638,7 +640,10 @@ op_err:
 	goto err;
 
 inv_err:
-	send_status = IB_WC_REM_INV_REQ_ERR;
+	send_status =
+		sqp->ibqp.qp_type == IB_QPT_RC ?
+			IB_WC_REM_INV_REQ_ERR :
+			IB_WC_SUCCESS;
 	wc.status = IB_WC_LOC_QP_OP_ERR;
 	goto err;
 
@@ -833,23 +838,29 @@ void hfi1_make_ruc_header(struct rvt_qp *qp, struct ib_other_headers *ohdr,
 /* when sending, force a reschedule every one of these periods */
 #define SEND_RESCHED_TIMEOUT (5 * HZ)  /* 5s in jiffies */
 
+void hfi1_do_send_from_rvt(struct rvt_qp *qp)
+{
+	hfi1_do_send(qp, false);
+}
+
 void _hfi1_do_send(struct work_struct *work)
 {
 	struct iowait *wait = container_of(work, struct iowait, iowork);
 	struct rvt_qp *qp = iowait_to_qp(wait);
 
-	hfi1_do_send(qp);
+	hfi1_do_send(qp, true);
 }
 
 /**
  * hfi1_do_send - perform a send on a QP
  * @work: contains a pointer to the QP
+ * @in_thread: true if in a workqueue thread
  *
  * Process entries in the send work queue until credit or queue is
  * exhausted.  Only allow one CPU to send a packet per QP.
  * Otherwise, two threads could send packets out of order.
  */
-void hfi1_do_send(struct rvt_qp *qp)
+void hfi1_do_send(struct rvt_qp *qp, bool in_thread)
 {
 	struct hfi1_pkt_state ps;
 	struct hfi1_qp_priv *priv = qp->priv;
@@ -917,8 +928,10 @@ void hfi1_do_send(struct rvt_qp *qp)
 			qp->s_hdrwords = 0;
 			/* allow other tasks to run */
 			if (unlikely(time_after(jiffies, timeout))) {
-				if (workqueue_congested(cpu,
-							ps.ppd->hfi1_wq)) {
+				if (!in_thread ||
+				    workqueue_congested(
+						cpu,
+						ps.ppd->hfi1_wq)) {
 					spin_lock_irqsave(
 						&qp->s_lock,
 						ps.flags);
@@ -931,11 +944,9 @@ void hfi1_do_send(struct rvt_qp *qp)
 						*ps.ppd->dd->send_schedule);
 					return;
 				}
-				if (!irqs_disabled()) {
-					cond_resched();
-					this_cpu_inc(
-					   *ps.ppd->dd->send_schedule);
-				}
+				cond_resched();
+				this_cpu_inc(
+					*ps.ppd->dd->send_schedule);
 				timeout = jiffies + (timeout_int) / 8;
 			}
 			spin_lock_irqsave(&qp->s_lock, ps.flags);

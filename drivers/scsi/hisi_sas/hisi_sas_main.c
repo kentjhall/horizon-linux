@@ -10,6 +10,7 @@
  */
 
 #include "hisi_sas.h"
+#include "../libsas/sas_internal.h"
 #define DRV_NAME "hisi_sas"
 
 #define DEV_IS_GONE(dev) \
@@ -842,7 +843,7 @@ static int hisi_sas_abort_task(struct sas_task *task)
 						     HISI_SAS_INT_ABT_DEV, 0);
 			rc = TMF_RESP_FUNC_COMPLETE;
 		}
-	} else if (task->task_proto & SAS_PROTOCOL_SMP) {
+	} else if ((task->task_proto & SAS_PROTOCOL_SMP) && (task->lldd_task)) {
 		/* SMP */
 		struct hisi_sas_slot *slot = task->lldd_task;
 		u32 tag = slot->idx;
@@ -1128,9 +1129,18 @@ static void hisi_sas_port_deformed(struct asd_sas_phy *sas_phy)
 
 static void hisi_sas_phy_disconnected(struct hisi_sas_phy *phy)
 {
+	struct asd_sas_phy *sas_phy = &phy->sas_phy;
+	struct sas_phy *sphy = sas_phy->phy;
+	struct sas_phy_data *d = sphy->hostdata;
+
 	phy->phy_attached = 0;
 	phy->phy_type = 0;
 	phy->port = NULL;
+
+	if (d->enable)
+		sphy->negotiated_linkrate = SAS_LINK_RATE_UNKNOWN;
+	else
+		sphy->negotiated_linkrate = SAS_PHY_DISABLED;
 }
 
 void hisi_sas_phy_down(struct hisi_hba *hisi_hba, int phy_no, int rdy)

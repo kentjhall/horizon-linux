@@ -930,6 +930,7 @@ err_destroy_groups:
 	ft->g[ft->num_groups] = NULL;
 	mlx5e_destroy_groups(ft);
 	kvfree(in);
+	kfree(ft->g);
 
 	return err;
 }
@@ -1081,7 +1082,7 @@ int mlx5e_create_flow_steering(struct mlx5e_priv *priv)
 					       MLX5_FLOW_NAMESPACE_KERNEL);
 
 	if (!priv->fs.ns)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 
 	err = mlx5e_arfs_create_tables(priv);
 	if (err) {

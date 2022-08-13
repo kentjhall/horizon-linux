@@ -80,6 +80,15 @@ config AD7280
 	  To compile this driver as a module, choose M here: the
 	  module will be called ad7280a
 
+config ADS1015
+	tristate "TI ADS1015 ADC with internal reference"
+	depends on I2C
+	help
+	 TI ADS1015 is Ultra-Small, Low-Power, 12-Bit Analog-to-Digital
+	 Converter with Internal Reference. ADS1015 ADC is used in
+	 smartphones and tablets which supports four channel ADC.
+	 Add iio driver to read the different channel of ADCs.
+
 config LPC32XX_ADC
 	tristate "NXP LPC32XX ADC"
 	depends on ARCH_LPC32XX || COMPILE_TEST

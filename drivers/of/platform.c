@@ -81,6 +81,15 @@ void of_device_make_bus_id(struct device *dev)
 
 	/* Construct the name, using parent nodes if necessary to ensure uniqueness */
 	while (node->parent) {
+		const char *pname;
+
+		/* Try to get name from node */
+		if (!of_property_read_string(node, "aux-device-name", &pname)) {
+			dev_set_name(dev, dev_name(dev) ? "%s:%s" : "%s",
+				     pname, dev_name(dev));
+			return;
+		}
+
 		/*
 		 * If the address can be translated, then that is as much
 		 * uniqueness as we need. Make it the first component and return
@@ -144,7 +153,7 @@ struct platform_device *of_device_alloc(struct device_node *np,
 
 	dev->dev.of_node = of_node_get(np);
 	dev->dev.fwnode = &np->fwnode;
-	dev->dev.parent = parent ? : &platform_bus;
+	dev->dev.parent = parent;
 
 	if (bus_id)
 		dev_set_name(&dev->dev, "%s", bus_id);
@@ -244,7 +253,7 @@ static struct amba_device *of_amba_device_create(struct device_node *node,
 	/* setup generic device info */
 	dev->dev.of_node = of_node_get(node);
 	dev->dev.fwnode = &node->fwnode;
-	dev->dev.parent = parent ? : &platform_bus;
+	dev->dev.parent = parent;
 	dev->dev.platform_data = platform_data;
 	if (bus_id)
 		dev_set_name(&dev->dev, "%s", bus_id);

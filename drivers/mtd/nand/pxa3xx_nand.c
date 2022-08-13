@@ -950,6 +950,7 @@ static void prepare_start_command(struct pxa3xx_nand_info *info, int command)
 
 	switch (command) {
 	case NAND_CMD_READ0:
+	case NAND_CMD_READOOB:
 	case NAND_CMD_PAGEPROG:
 		info->use_ecc = 1;
 		break;
@@ -1906,7 +1907,7 @@ static int pxa3xx_nand_remove(struct platform_device *pdev)
 	clk_disable_unprepare(info->clk);
 
 	for (cs = 0; cs < pdata->num_cs; cs++)
-		nand_release(nand_to_mtd(&info->host[cs]->chip));
+		nand_release(&info->host[cs]->chip);
 	return 0;
 }
 

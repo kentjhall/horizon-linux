@@ -271,6 +271,7 @@ struct kvm_arch {
 #ifdef CONFIG_PPC_BOOK3S_64
 	struct list_head spapr_tce_tables;
 	struct list_head rtas_tokens;
+	struct mutex rtas_token_lock;
 	DECLARE_BITMAP(enabled_hcalls, MAX_HCALL_OPCODE/4 + 1);
 #endif
 #ifdef CONFIG_KVM_MPIC
@@ -546,6 +547,7 @@ struct kvm_vcpu_arch {
 	u64 tfiar;
 
 	u32 cr_tm;
+	u64 xer_tm;
 	u64 lr_tm;
 	u64 ctr_tm;
 	u64 amr_tm;

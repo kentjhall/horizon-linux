@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2002 ARM Limited, All Rights Reserved.
+ * Copyright (C) 2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -20,6 +21,8 @@
 #include <linux/irqchip/arm-gic.h>
 
 #include "irq-gic-common.h"
+
+static DEFINE_RAW_SPINLOCK(irq_controller_lock);
 
 static const struct gic_kvm_info *gic_kvm_info;
 
@@ -52,11 +55,13 @@ int gic_configure_irq(unsigned int irq, unsigned int type,
 	u32 confoff = (irq / 16) * 4;
 	u32 val, oldval;
 	int ret = 0;
+	unsigned long flags;
 
 	/*
 	 * Read current configuration register, and insert the config
 	 * for "irq", depending on "type".
 	 */
+	raw_spin_lock_irqsave(&irq_controller_lock, flags);
 	val = oldval = readl_relaxed(base + GIC_DIST_CONFIG + confoff);
 	if (type & IRQ_TYPE_LEVEL_MASK)
 		val &= ~confmask;
@@ -64,8 +69,10 @@ int gic_configure_irq(unsigned int irq, unsigned int type,
 		val |= confmask;
 
 	/* If the current configuration is the same, then we are done */
-	if (val == oldval)
+	if (val == oldval) {
+		raw_spin_unlock_irqrestore(&irq_controller_lock, flags);
 		return 0;
+	}
 
 	/*
 	 * Write back the new configuration, and possibly re-enable
@@ -83,6 +90,7 @@ int gic_configure_irq(unsigned int irq, unsigned int type,
 			pr_warn("GIC: PPI%d is secure or misconfigured\n",
 				irq - 16);
 	}
+	raw_spin_unlock_irqrestore(&irq_controller_lock, flags);
 
 	if (sync_access)
 		sync_access();
@@ -105,9 +113,10 @@ void gic_dist_config(void __iomem *base, int gic_irqs,
 	/*
 	 * Set priority on all global interrupts.
 	 */
+#ifndef CONFIG_MINIMAL_GIC_INIT
 	for (i = 32; i < gic_irqs; i += 4)
 		writel_relaxed(GICD_INT_DEF_PRI_X4, base + GIC_DIST_PRI + i);
-
+#endif
 	/*
 	 * Deactivate and disable all SPIs. Leave the PPI and SGIs
 	 * alone as they are in the redistributor registers on GICv3.

@@ -235,14 +235,19 @@ done:
 
 static inline void hub_descriptor(struct usb_hub_descriptor *desc)
 {
+	int width;
+
 	memset(desc, 0, sizeof(*desc));
 	desc->bDescriptorType = USB_DT_HUB;
-	desc->bDescLength = 9;
 	desc->wHubCharacteristics = cpu_to_le16(
 		HUB_CHAR_INDV_PORT_LPSM | HUB_CHAR_COMMON_OCPM);
+
 	desc->bNbrPorts = VHCI_HC_PORTS;
-	desc->u.hs.DeviceRemovable[0] = 0xff;
-	desc->u.hs.DeviceRemovable[1] = 0xff;
+	BUILD_BUG_ON(VHCI_HC_PORTS > USB_MAXCHILDREN);
+	width = desc->bNbrPorts / 8 + 1;
+	desc->bDescLength = USB_DT_HUB_NONVAR_SIZE + 2 * width;
+	memset(&desc->u.hs.DeviceRemovable[0], 0, width);
+	memset(&desc->u.hs.DeviceRemovable[width], 0xff, width);
 }
 
 static int vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
@@ -295,7 +300,7 @@ static int vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		case USB_PORT_FEAT_POWER:
 			usbip_dbg_vhci_rh(
 				" ClearPortFeature: USB_PORT_FEAT_POWER\n");
-			dum->port_status[rhport] = 0;
+			dum->port_status[rhport] &= ~USB_PORT_STAT_POWER;
 			dum->resuming = 0;
 			break;
 		case USB_PORT_FEAT_C_RESET:
@@ -313,6 +318,7 @@ static int vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 			default:
 				break;
 			}
+			break;
 		default:
 			usbip_dbg_vhci_rh(" ClearPortFeature: default %x\n",
 					  wValue);
@@ -460,13 +466,14 @@ static void vhci_tx_urb(struct urb *urb)
 {
 	struct vhci_device *vdev = get_vdev(urb->dev);
 	struct vhci_priv *priv;
-	struct vhci_hcd *vhci = vdev_to_vhci(vdev);
+	struct vhci_hcd *vhci;
 	unsigned long flags;
 
 	if (!vdev) {
 		pr_err("could not get virtual device");
 		return;
 	}
+	vhci = vdev_to_vhci(vdev);
 
 	priv = kzalloc(sizeof(struct vhci_priv), GFP_ATOMIC);
 	if (!priv) {
@@ -501,17 +508,16 @@ static int vhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
 	struct vhci_device *vdev;
 	unsigned long flags;
 
-	usbip_dbg_vhci_hc("enter, usb_hcd %p urb %p mem_flags %d\n",
-			  hcd, urb, mem_flags);
-
 	if (portnum > VHCI_HC_PORTS) {
 		pr_err("invalid port number %d\n", portnum);
 		return -ENODEV;
 	}
 	vdev = &vhci->vdev[portnum-1];
 
-	/* patch to usb_sg_init() is in 2.5.60 */
-	BUG_ON(!urb->transfer_buffer && urb->transfer_buffer_length);
+	if (!urb->transfer_buffer && urb->transfer_buffer_length) {
+		dev_dbg(dev, "Null URB transfer buffer\n");
+		return -EINVAL;
+	}
 
 	spin_lock_irqsave(&vhci->lock, flags);
 
@@ -666,8 +672,6 @@ static int vhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	struct vhci_device *vdev;
 	unsigned long flags;
 
-	pr_info("dequeue a urb %p\n", urb);
-
 	spin_lock_irqsave(&vhci->lock, flags);
 
 	priv = urb->hcpriv;
@@ -695,7 +699,6 @@ static int vhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		/* tcp connection is closed */
 		spin_lock(&vdev->priv_lock);
 
-		pr_info("device %p seems to be disconnected\n", vdev);
 		list_del(&priv->list);
 		kfree(priv);
 		urb->hcpriv = NULL;
@@ -707,8 +710,6 @@ static int vhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		 * vhci_rx will receive RET_UNLINK and give back the URB.
 		 * Otherwise, we give back it here.
 		 */
-		pr_info("gives back urb %p\n", urb);
-
 		usb_hcd_unlink_urb_from_ep(hcd, urb);
 
 		spin_unlock_irqrestore(&vhci->lock, flags);
@@ -735,8 +736,6 @@ static int vhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 			pr_info("seqnum max\n");
 
 		unlink->unlink_seqnum = priv->seqnum;
-
-		pr_info("device %p seems to be still connected\n", vdev);
 
 		/* send cmd_unlink and try to cancel the pending URB in the
 		 * peer */
@@ -818,7 +817,7 @@ static void vhci_shutdown_connection(struct usbip_device *ud)
 
 	/* need this? see stub_dev.c */
 	if (ud->tcp_socket) {
-		pr_debug("shutdown tcp_socket %p\n", ud->tcp_socket);
+		pr_debug("shutdown tcp_socket\n");
 		kernel_sock_shutdown(ud->tcp_socket, SHUT_RDWR);
 	}
 
@@ -837,6 +836,7 @@ static void vhci_shutdown_connection(struct usbip_device *ud)
 	if (vdev->ud.tcp_socket) {
 		sockfd_put(vdev->ud.tcp_socket);
 		vdev->ud.tcp_socket = NULL;
+		vdev->ud.sockfd = -1;
 	}
 	pr_info("release socket\n");
 
@@ -884,6 +884,7 @@ static void vhci_device_reset(struct usbip_device *ud)
 	if (ud->tcp_socket) {
 		sockfd_put(ud->tcp_socket);
 		ud->tcp_socket = NULL;
+		ud->sockfd = -1;
 	}
 	ud->status = VDEV_ST_NULL;
 

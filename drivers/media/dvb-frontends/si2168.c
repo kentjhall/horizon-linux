@@ -14,6 +14,8 @@
  *    GNU General Public License for more details.
  */
 
+#include <linux/delay.h>
+
 #include "si2168_priv.h"
 
 static const struct dvb_frontend_ops si2168_ops;
@@ -80,12 +82,37 @@ err_mutex_unlock:
 	return ret;
 }
 
+static int si2168_ts_bus_ctrl(struct dvb_frontend *fe, int acquire)
+{
+	struct i2c_client *client = fe->demodulator_priv;
+	struct si2168_dev *dev = i2c_get_clientdata(client);
+	struct si2168_cmd cmd;
+	int ret = 0;
+
+	dev_dbg(&client->dev, "%s acquire: %d\n", __func__, acquire);
+
+	/* set TS_MODE property */
+	memcpy(cmd.args, "\x14\x00\x01\x10\x10\x00", 6);
+	if (acquire)
+		cmd.args[4] |= dev->ts_mode;
+	else
+		cmd.args[4] |= SI2168_TS_TRISTATE;
+	if (dev->ts_clock_gapped)
+		cmd.args[4] |= 0x40;
+	cmd.wlen = 6;
+	cmd.rlen = 4;
+	ret = si2168_cmd_execute(client, &cmd);
+
+	return ret;
+}
+
 static int si2168_read_status(struct dvb_frontend *fe, enum fe_status *status)
 {
 	struct i2c_client *client = fe->demodulator_priv;
 	struct si2168_dev *dev = i2c_get_clientdata(client);
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 	int ret;
+	int sys;
 	struct si2168_cmd cmd;
 
 	*status = 0;
@@ -95,7 +122,22 @@ static int si2168_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		goto err;
 	}
 
-	switch (c->delivery_system) {
+	memcpy(cmd.args, "\x87\x01", 2);
+	cmd.wlen = 2;
+	cmd.rlen = 8;
+	ret = si2168_cmd_execute(client, &cmd);
+	if (ret)
+		goto err;
+
+	sys = c->delivery_system;
+	/* check if we found DVBT2 during DVBT tuning */
+	if (sys == SYS_DVBT) {
+		if ((cmd.args[3] & 0x0f) == 7) {
+			sys = SYS_DVBT2;
+		}
+	}
+
+	switch (sys) {
 	case SYS_DVBT:
 		memcpy(cmd.args, "\xa0\x01", 2);
 		cmd.wlen = 2;
@@ -172,7 +214,9 @@ static int si2168_set_frontend(struct dvb_frontend *fe)
 
 	switch (c->delivery_system) {
 	case SYS_DVBT:
-		delivery_system = 0x20;
+		delivery_system = 0xf0;
+		/* was 0x20 (DVB-T) but DVB-T/T2 auto-detect */
+		/* is more user friendly */
 		break;
 	case SYS_DVBC_ANNEX_A:
 		delivery_system = 0x30;
@@ -242,6 +286,16 @@ static int si2168_set_frontend(struct dvb_frontend *fe)
 		ret = si2168_cmd_execute(client, &cmd);
 		if (ret)
 			goto err;
+	} else if (c->delivery_system == SYS_DVBT) {
+		/* select Auto PLP */
+		cmd.args[0] = 0x52;
+		cmd.args[1] = 0;
+		cmd.args[2] = 0; /* Auto PLP */
+		cmd.wlen = 3;
+		cmd.rlen = 1;
+		ret = si2168_cmd_execute(client, &cmd);
+		if (ret)
+			goto err;
 	}
 
 	memcpy(cmd.args, "\x51\x03", 2);
@@ -281,6 +335,10 @@ static int si2168_set_frontend(struct dvb_frontend *fe)
 
 	memcpy(cmd.args, "\x14\x00\x0a\x10\x00\x00", 6);
 	cmd.args[4] = delivery_system | bandwidth;
+	if (delivery_system == 0xf0)
+		cmd.args[5] |= 2; /* Auto detect DVB-T/T2 */
+	if (dev->spectral_inversion)
+		cmd.args[5] |= 1;
 	cmd.wlen = 6;
 	cmd.rlen = 4;
 	ret = si2168_cmd_execute(client, &cmd);
@@ -300,6 +358,7 @@ static int si2168_set_frontend(struct dvb_frontend *fe)
 	}
 
 	memcpy(cmd.args, "\x14\x00\x0f\x10\x10\x00", 6);
+	cmd.args[5] = 0x1e; /* set parameter to 30 (0x1e) */
 	cmd.wlen = 6;
 	cmd.rlen = 4;
 	ret = si2168_cmd_execute(client, &cmd);
@@ -345,6 +404,11 @@ static int si2168_set_frontend(struct dvb_frontend *fe)
 
 	dev->delivery_system = c->delivery_system;
 
+	/* enable ts bus */
+	ret = si2168_ts_bus_ctrl(fe, 1);
+	if (ret)
+		goto err;
+
 	return 0;
 err:
 	dev_dbg(&client->dev, "failed=%d\n", ret);
@@ -378,6 +442,7 @@ static int si2168_init(struct dvb_frontend *fe)
 		if (ret)
 			goto err;
 
+		udelay(100);
 		memcpy(cmd.args, "\x85", 1);
 		cmd.wlen = 1;
 		cmd.rlen = 1;
@@ -481,13 +546,7 @@ static int si2168_init(struct dvb_frontend *fe)
 		 dev->version >> 8 & 0xff, dev->version >> 0 & 0xff);
 
 	/* set ts mode */
-	memcpy(cmd.args, "\x14\x00\x01\x10\x10\x00", 6);
-	cmd.args[4] |= dev->ts_mode;
-	if (dev->ts_clock_gapped)
-		cmd.args[4] |= 0x40;
-	cmd.wlen = 6;
-	cmd.rlen = 4;
-	ret = si2168_cmd_execute(client, &cmd);
+	ret = si2168_ts_bus_ctrl(fe, 1);
 	if (ret)
 		goto err;
 
@@ -514,6 +573,11 @@ static int si2168_sleep(struct dvb_frontend *fe)
 	dev_dbg(&client->dev, "\n");
 
 	dev->active = false;
+
+	/* tri-state data bus */
+	ret = si2168_ts_bus_ctrl(fe, 0);
+	if (ret)
+		goto err;
 
 	/* Firmware B 4.0-11 or later loses warm state during sleep */
 	if (dev->version > ('B' << 24 | 4 << 16 | 0 << 8 | 11 << 0))
@@ -705,6 +769,7 @@ static int si2168_probe(struct i2c_client *client,
 	dev->ts_mode = config->ts_mode;
 	dev->ts_clock_inv = config->ts_clock_inv;
 	dev->ts_clock_gapped = config->ts_clock_gapped;
+	dev->spectral_inversion = config->spectral_inversion;
 
 	dev_info(&client->dev, "Silicon Labs Si2168-%c%d%d successfully identified\n",
 		 dev->version >> 24 & 0xff, dev->version >> 16 & 0xff,
@@ -717,7 +782,7 @@ static int si2168_probe(struct i2c_client *client,
 err_kfree:
 	kfree(dev);
 err:
-	dev_dbg(&client->dev, "failed=%d\n", ret);
+	dev_warn(&client->dev, "probe failed = %d\n", ret);
 	return ret;
 }
 

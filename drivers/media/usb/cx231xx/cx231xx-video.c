@@ -870,6 +870,8 @@ static struct videobuf_queue_ops cx231xx_video_qops = {
 
 void video_mux(struct cx231xx *dev, int index)
 {
+	if (is_model_avermedia_h837_series(dev->model))
+		return;
 	dev->video_input = index;
 	dev->ctl_ainput = INPUT(index)->amux;
 
@@ -1389,7 +1391,7 @@ int cx231xx_g_register(struct file *file, void *priv,
 		ret = cx231xx_read_ctrl_reg(dev, VRT_GET_REGISTER,
 				(u16)reg->reg, value, 4);
 		reg->val = value[0] | value[1] << 8 |
-			value[2] << 16 | value[3] << 24;
+			value[2] << 16 | (u32)value[3] << 24;
 		reg->size = 4;
 		break;
 	case 1:	/* AFE - read byte */
@@ -1740,7 +1742,7 @@ static int radio_s_tuner(struct file *file, void *priv, const struct v4l2_tuner 
  */
 static int cx231xx_v4l2_open(struct file *filp)
 {
-	int radio = 0;
+	int radio = 0, errCode = 0;
 	struct video_device *vdev = video_devdata(filp);
 	struct cx231xx *dev = video_drvdata(filp);
 	struct cx231xx_fh *fh;
@@ -1762,14 +1764,12 @@ static int cx231xx_v4l2_open(struct file *filp)
 			 video_device_node_name(vdev), v4l2_type_names[fh_type],
 			 dev->users);
 
-#if 0
 	errCode = cx231xx_set_mode(dev, CX231XX_ANALOG_MODE);
 	if (errCode < 0) {
 		dev_err(dev->dev,
 			"Device locked on digital mode. Can't open analog\n");
 		return -EBUSY;
 	}
-#endif
 
 	fh = kzalloc(sizeof(struct cx231xx_fh), GFP_KERNEL);
 	if (!fh)

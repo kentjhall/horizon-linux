@@ -88,7 +88,7 @@ struct cpuinfo_x86 {
 	__u8			x86;		/* CPU family */
 	__u8			x86_vendor;	/* CPU vendor */
 	__u8			x86_model;
-	__u8			x86_mask;
+	__u8			x86_stepping;
 #ifdef CONFIG_X86_32
 	char			wp_works_ok;	/* It doesn't on 386's */
 
@@ -104,6 +104,7 @@ struct cpuinfo_x86 {
 	__u8			x86_phys_bits;
 	/* CPUID returned core id bits: */
 	__u8			x86_coreid_bits;
+	__u8			cu_id;
 	/* Max extended CPUID function supported: */
 	__u32			extended_cpuid_level;
 	/* Maximum supported CPUID level, -1=no CPUID: */
@@ -112,7 +113,7 @@ struct cpuinfo_x86 {
 	char			x86_vendor_id[16];
 	char			x86_model_id[64];
 	/* in KB - valid for CPUS which support this call: */
-	int			x86_cache_size;
+	unsigned int		x86_cache_size;
 	int			x86_cache_alignment;	/* In bytes */
 	/* Cache QoS architectural values: */
 	int			x86_cache_max_rmid;	/* max index */
@@ -135,6 +136,8 @@ struct cpuinfo_x86 {
 	/* Index into per_cpu list: */
 	u16			cpu_index;
 	u32			microcode;
+	/* Address space bits used by the cache internally */
+	u8			x86_cache_bits;
 };
 
 #define X86_VENDOR_INTEL	0
@@ -155,8 +158,8 @@ extern struct cpuinfo_x86	boot_cpu_data;
 extern struct cpuinfo_x86	new_cpu_data;
 
 extern struct tss_struct	doublefault_tss;
-extern __u32			cpu_caps_cleared[NCAPINTS];
-extern __u32			cpu_caps_set[NCAPINTS];
+extern __u32			cpu_caps_cleared[NCAPINTS + NBUGINTS];
+extern __u32			cpu_caps_set[NCAPINTS + NBUGINTS];
 
 #ifdef CONFIG_SMP
 DECLARE_PER_CPU_READ_MOSTLY(struct cpuinfo_x86, cpu_info);
@@ -171,6 +174,11 @@ extern const struct seq_operations cpuinfo_op;
 #define cache_line_size()	(boot_cpu_data.x86_cache_alignment)
 
 extern void cpu_detect(struct cpuinfo_x86 *c);
+
+static inline unsigned long long l1tf_pfn_limit(void)
+{
+	return BIT_ULL(boot_cpu_data.x86_cache_bits - 1 - PAGE_SHIFT);
+}
 
 extern void early_cpu_init(void);
 extern void identify_boot_cpu(void);
@@ -204,6 +212,24 @@ static inline void native_cpuid(unsigned int *eax, unsigned int *ebx,
 	    : "0" (*eax), "2" (*ecx)
 	    : "memory");
 }
+
+#define native_cpuid_reg(reg)					\
+static inline unsigned int native_cpuid_##reg(unsigned int op)	\
+{								\
+	unsigned int eax = op, ebx, ecx = 0, edx;		\
+								\
+	native_cpuid(&eax, &ebx, &ecx, &edx);			\
+								\
+	return reg;						\
+}
+
+/*
+ * Native CPUID functions returning a single datum.
+ */
+native_cpuid_reg(eax)
+native_cpuid_reg(ebx)
+native_cpuid_reg(ecx)
+native_cpuid_reg(edx)
 
 static inline void load_cr3(pgd_t *pgdir)
 {
@@ -307,7 +333,7 @@ struct tss_struct {
 
 } ____cacheline_aligned;
 
-DECLARE_PER_CPU_SHARED_ALIGNED(struct tss_struct, cpu_tss);
+DECLARE_PER_CPU_SHARED_ALIGNED_USER_MAPPED(struct tss_struct, cpu_tss);
 
 #ifdef CONFIG_X86_32
 DECLARE_PER_CPU(unsigned long, cpu_current_top_of_stack);
@@ -389,8 +415,6 @@ struct thread_struct {
 	unsigned short		fsindex;
 	unsigned short		gsindex;
 #endif
-
-	u32			status;		/* thread synchronous flags */
 
 #ifdef CONFIG_X86_64
 	unsigned long		fsbase;
@@ -595,7 +619,7 @@ static inline void sync_core(void)
 {
 	int tmp;
 
-#ifdef CONFIG_M486
+#ifdef CONFIG_X86_32
 	/*
 	 * Do a CPUID if available, otherwise do a jump.  The jump
 	 * can conveniently enough be the jump around CPUID.
@@ -856,4 +880,29 @@ bool xen_set_default_idle(void);
 
 void stop_this_cpu(void *dummy);
 void df_debug(struct pt_regs *regs, long error_code);
+
+enum l1tf_mitigations {
+	L1TF_MITIGATION_OFF,
+	L1TF_MITIGATION_FLUSH_NOWARN,
+	L1TF_MITIGATION_FLUSH,
+	L1TF_MITIGATION_FLUSH_NOSMT,
+	L1TF_MITIGATION_FULL,
+	L1TF_MITIGATION_FULL_FORCE
+};
+
+extern enum l1tf_mitigations l1tf_mitigation;
+
+enum mds_mitigations {
+	MDS_MITIGATION_OFF,
+	MDS_MITIGATION_FULL,
+	MDS_MITIGATION_VMWERV,
+};
+
+enum taa_mitigations {
+	TAA_MITIGATION_OFF,
+	TAA_MITIGATION_UCODE_NEEDED,
+	TAA_MITIGATION_VERW,
+	TAA_MITIGATION_TSX_DISABLED,
+};
+
 #endif /* _ASM_X86_PROCESSOR_H */

@@ -25,13 +25,6 @@
 #include <asm/cachetype.h>
 #include <asm/tlbflush.h>
 
-void flush_cache_range(struct vm_area_struct *vma, unsigned long start,
-		       unsigned long end)
-{
-	if (vma->vm_flags & VM_EXEC)
-		__flush_icache_all();
-}
-
 static void sync_icache_aliases(void *kaddr, unsigned long len)
 {
 	unsigned long addr = (unsigned long)kaddr;
@@ -65,9 +58,18 @@ void copy_to_user_page(struct vm_area_struct *vma, struct page *page,
 	flush_ptrace_access(vma, page, uaddr, dst, len);
 }
 
+void __clean_dcache_page(struct page *page)
+{
+	__clean_dcache_area_poc(page_address(page), PAGE_SIZE);
+}
+
 void __sync_icache_dcache(pte_t pte, unsigned long addr)
 {
 	struct page *page = pte_page(pte);
+	unsigned long pfn = pte_pfn(pte);
+
+	if (!pfn_valid(pfn))
+		return;
 
 	if (!test_and_set_bit(PG_dcache_clean, &page->flags))
 		sync_icache_aliases(page_address(page),
@@ -92,3 +94,11 @@ EXPORT_SYMBOL(flush_dcache_page);
  * Additional functions defined in assembly.
  */
 EXPORT_SYMBOL(flush_icache_range);
+EXPORT_SYMBOL(flush_cache_all);
+EXPORT_SYMBOL(__flush_dcache_area);
+EXPORT_SYMBOL(__flush_dcache_all);
+EXPORT_SYMBOL(__clean_dcache_all);
+EXPORT_SYMBOL(__clean_dcache_louis);
+EXPORT_SYMBOL(__clean_dcache_page);
+EXPORT_SYMBOL(__clean_dcache_area_poc);
+EXPORT_SYMBOL(flush_dcache_louis);

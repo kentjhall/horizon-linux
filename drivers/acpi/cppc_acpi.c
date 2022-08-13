@@ -360,8 +360,10 @@ static int acpi_get_psd(struct cpc_desc *cpc_ptr, acpi_handle handle)
 	union acpi_object  *psd = NULL;
 	struct acpi_psd_package *pdomain;
 
-	status = acpi_evaluate_object_typed(handle, "_PSD", NULL, &buffer,
-			ACPI_TYPE_PACKAGE);
+	status = acpi_evaluate_object_typed(handle, "_PSD", NULL,
+					    &buffer, ACPI_TYPE_PACKAGE);
+	if (status == AE_NOT_FOUND)	/* _PSD is optional */
+		return 0;
 	if (ACPI_FAILURE(status))
 		return -ENODEV;
 
@@ -784,13 +786,17 @@ int acpi_cppc_processor_probe(struct acpi_processor *pr)
 
 	/* Add per logical CPU nodes for reading its feedback counters. */
 	cpu_dev = get_cpu_device(pr->id);
-	if (!cpu_dev)
+	if (!cpu_dev) {
+		ret = -EINVAL;
 		goto out_free;
+	}
 
 	ret = kobject_init_and_add(&cpc_ptr->kobj, &cppc_ktype, &cpu_dev->kobj,
 			"acpi_cppc");
-	if (ret)
+	if (ret) {
+		kobject_put(&cpc_ptr->kobj);
 		goto out_free;
+	}
 
 	kfree(output.pointer);
 	return 0;

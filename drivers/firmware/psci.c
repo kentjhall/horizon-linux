@@ -9,6 +9,8 @@
  * GNU General Public License for more details.
  *
  * Copyright (C) 2015 ARM Limited
+ *
+ * Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
  */
 
 #define pr_fmt(fmt) "psci: " fmt
@@ -22,6 +24,7 @@
 #include <linux/pm.h>
 #include <linux/printk.h>
 #include <linux/psci.h>
+#include <linux/power/reset/system-pmic.h>
 #include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
@@ -33,6 +36,9 @@
 #include <asm/system_misc.h>
 #include <asm/smp_plat.h>
 #include <asm/suspend.h>
+
+void (*psci_handle_reboot_cmd)(const char *cmd);
+void (*psci_prepare_poweroff)(void);
 
 /*
  * While a 64-bit OS can make calls with SMC32 calling conventions, for some
@@ -53,13 +59,18 @@
  * require cooperation with a Trusted OS driver.
  */
 static int resident_cpu = -1;
+static bool system_lp0_disable;
 
 bool psci_tos_resident_on(int cpu)
 {
 	return cpu == resident_cpu;
 }
 
-struct psci_operations psci_ops;
+struct psci_operations psci_ops = {
+	.conduit = PSCI_CONDUIT_NONE,
+	.smccc_version = SMCCC_VERSION_1_0,
+};
+struct extended_psci_operations extended_ops;
 
 typedef unsigned long (psci_fn)(unsigned long, unsigned long,
 				unsigned long, unsigned long);
@@ -210,6 +221,22 @@ static unsigned long psci_migrate_info_up_cpu(void)
 			      0, 0, 0);
 }
 
+static void set_conduit(enum psci_conduit conduit)
+{
+	switch (conduit) {
+	case PSCI_CONDUIT_HVC:
+		invoke_psci_fn = __invoke_psci_fn_hvc;
+		break;
+	case PSCI_CONDUIT_SMC:
+		invoke_psci_fn = __invoke_psci_fn_smc;
+		break;
+	default:
+		WARN(1, "Unexpected PSCI conduit %d\n", conduit);
+	}
+
+	psci_ops.conduit = conduit;
+}
+
 static int get_set_conduit_method(struct device_node *np)
 {
 	const char *method;
@@ -222,9 +249,9 @@ static int get_set_conduit_method(struct device_node *np)
 	}
 
 	if (!strcmp("hvc", method)) {
-		invoke_psci_fn = __invoke_psci_fn_hvc;
+		set_conduit(PSCI_CONDUIT_HVC);
 	} else if (!strcmp("smc", method)) {
-		invoke_psci_fn = __invoke_psci_fn_smc;
+		set_conduit(PSCI_CONDUIT_SMC);
 	} else {
 		pr_warn("invalid \"method\" property: %s\n", method);
 		return -EINVAL;
@@ -234,6 +261,10 @@ static int get_set_conduit_method(struct device_node *np)
 
 static void psci_sys_reset(enum reboot_mode reboot_mode, const char *cmd)
 {
+	if (psci_handle_reboot_cmd)
+		psci_handle_reboot_cmd(cmd);
+	if (psci_prepare_poweroff)
+		psci_prepare_poweroff();
 	invoke_psci_fn(PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0);
 }
 
@@ -381,8 +412,11 @@ int psci_cpu_init_idle(unsigned int cpu)
 static int psci_suspend_finisher(unsigned long index)
 {
 	u32 *state = __this_cpu_read(psci_power_state);
+	u32 suspend_state = state[index-1];
 
-	return psci_ops.cpu_suspend(state[index - 1],
+	if (extended_ops.make_power_state)
+		suspend_state = extended_ops.make_power_state(suspend_state);
+	return psci_ops.cpu_suspend(suspend_state,
 				    virt_to_phys(cpu_resume));
 }
 
@@ -390,6 +424,7 @@ int psci_cpu_suspend_enter(unsigned long index)
 {
 	int ret;
 	u32 *state = __this_cpu_read(psci_power_state);
+	u32 suspend_state = state[index-1];
 	/*
 	 * idle state index 0 corresponds to wfi, should never be called
 	 * from the cpu_suspend operations
@@ -397,9 +432,11 @@ int psci_cpu_suspend_enter(unsigned long index)
 	if (WARN_ON_ONCE(!index))
 		return -EINVAL;
 
-	if (!psci_power_state_loses_context(state[index - 1]))
-		ret = psci_ops.cpu_suspend(state[index - 1], 0);
-	else
+	if (!psci_power_state_loses_context(suspend_state)) {
+		if (extended_ops.make_power_state)
+			suspend_state = extended_ops.make_power_state(suspend_state);
+		ret = psci_ops.cpu_suspend(suspend_state, 0);
+	} else
 		ret = cpu_suspend(index, psci_suspend_finisher);
 
 	return ret;
@@ -436,7 +473,7 @@ static void __init psci_init_system_suspend(void)
 {
 	int ret;
 
-	if (!IS_ENABLED(CONFIG_SUSPEND))
+	if (!IS_ENABLED(CONFIG_SUSPEND) || system_lp0_disable)
 		return;
 
 	ret = psci_features(PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND));
@@ -493,9 +530,36 @@ static void __init psci_init_migrate(void)
 	pr_info("Trusted OS resident on physical CPU 0x%lx\n", cpuid);
 }
 
+static void __init psci_init_smccc(void)
+{
+	u32 ver = ARM_SMCCC_VERSION_1_0;
+	int feature;
+
+	feature = psci_features(ARM_SMCCC_VERSION_FUNC_ID);
+
+	if (feature != PSCI_RET_NOT_SUPPORTED) {
+		u32 ret;
+		ret = invoke_psci_fn(ARM_SMCCC_VERSION_FUNC_ID, 0, 0, 0);
+		if (ret == ARM_SMCCC_VERSION_1_1) {
+			psci_ops.smccc_version = SMCCC_VERSION_1_1;
+			ver = ret;
+		}
+	}
+
+	/*
+	 * Conveniently, the SMCCC and PSCI versions are encoded the
+	 * same way. No, this isn't accidental.
+	 */
+	pr_info("SMC Calling Convention v%d.%d\n",
+		PSCI_VERSION_MAJOR(ver), PSCI_VERSION_MINOR(ver));
+
+}
+
 static void __init psci_0_2_set_functions(void)
 {
 	pr_info("Using standard PSCI v0.2 function IDs\n");
+	psci_ops.get_version = psci_get_version;
+
 	psci_function_id[PSCI_FN_CPU_SUSPEND] =
 					PSCI_FN_NATIVE(0_2, CPU_SUSPEND);
 	psci_ops.cpu_suspend = psci_cpu_suspend;
@@ -516,6 +580,7 @@ static void __init psci_0_2_set_functions(void)
 	arm_pm_restart = psci_sys_reset;
 
 	pm_power_off = psci_sys_poweroff;
+	set_system_pmic_post_power_off_handler(psci_sys_poweroff);
 }
 
 /*
@@ -539,6 +604,7 @@ static int __init psci_probe(void)
 	psci_init_migrate();
 
 	if (PSCI_VERSION_MAJOR(ver) >= 1) {
+		psci_init_smccc();
 		psci_init_cpu_suspend();
 		psci_init_system_suspend();
 	}
@@ -561,6 +627,10 @@ static int __init psci_0_2_init(struct device_node *np)
 
 	if (err)
 		goto out_put_node;
+
+	if (of_property_read_bool(np, "nvidia,system-lp0-disable"))
+		system_lp0_disable = 1;
+
 	/*
 	 * Starting with v0.2, the PSCI specification introduced a call
 	 * (PSCI_VERSION) that allows probing the firmware version, so
@@ -652,9 +722,9 @@ int __init psci_acpi_init(void)
 	pr_info("probing for conduit method from ACPI.\n");
 
 	if (acpi_psci_use_hvc())
-		invoke_psci_fn = __invoke_psci_fn_hvc;
+		set_conduit(PSCI_CONDUIT_HVC);
 	else
-		invoke_psci_fn = __invoke_psci_fn_smc;
+		set_conduit(PSCI_CONDUIT_SMC);
 
 	return psci_probe();
 }

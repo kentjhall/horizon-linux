@@ -12,13 +12,19 @@ struct scatterlist {
 	unsigned long	sg_magic;
 #endif
 	unsigned long	page_link;
-	unsigned int	offset;
-	unsigned int	length;
+	unsigned long 	offset;
+	size_t		length;
 	dma_addr_t	dma_address;
 #ifdef CONFIG_NEED_SG_DMA_LENGTH
-	unsigned int	dma_length;
+	size_t		dma_length;
 #endif
 };
+
+/*
+ * Since the above length field is an unsigned int, below we define the maximum
+ * length in bytes that can be stored in one scatterlist entry.
+ */
+#define SCATTERLIST_MAX_SEGMENT (UINT_MAX & PAGE_MASK)
 
 /*
  * These macros should be used after a dma_map_sg call has been done
@@ -110,7 +116,7 @@ static inline void sg_assign_page(struct scatterlist *sg, struct page *page)
  *
  **/
 static inline void sg_set_page(struct scatterlist *sg, struct page *page,
-			       unsigned int len, unsigned int offset)
+			       size_t len, unsigned long offset)
 {
 	sg_assign_page(sg, page);
 	sg->offset = offset;

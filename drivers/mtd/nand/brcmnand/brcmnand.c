@@ -101,6 +101,9 @@ struct brcm_nand_dma_desc {
 #define BRCMNAND_MIN_BLOCKSIZE	(8 * 1024)
 #define BRCMNAND_MIN_DEVSIZE	(4ULL * 1024 * 1024)
 
+#define NAND_CTRL_RDY			(INTFC_CTLR_READY | INTFC_FLASH_READY)
+#define NAND_POLL_STATUS_TIMEOUT_MS	100
+
 /* Controller feature flags */
 enum {
 	BRCMNAND_HAS_1K_SECTORS			= BIT(0),
@@ -488,8 +491,9 @@ static int brcmnand_revision_init(struct brcmnand_controller *ctrl)
 	} else {
 		ctrl->cs_offsets = brcmnand_cs_offsets;
 
-		/* v5.0 and earlier has a different CS0 offset layout */
-		if (ctrl->nand_version <= 0x0500)
+		/* v3.3-5.0 have a different CS0 offset layout */
+		if (ctrl->nand_version >= 0x0303 &&
+		    ctrl->nand_version <= 0x0500)
 			ctrl->cs0_offsets = brcmnand_cs_offsets_cs0;
 	}
 
@@ -765,6 +769,31 @@ enum {
 	CS_SELECT_AUTO_DEVICE_ID_CFG		= BIT(30),
 };
 
+static int bcmnand_ctrl_poll_status(struct brcmnand_controller *ctrl,
+				    u32 mask, u32 expected_val,
+				    unsigned long timeout_ms)
+{
+	unsigned long limit;
+	u32 val;
+
+	if (!timeout_ms)
+		timeout_ms = NAND_POLL_STATUS_TIMEOUT_MS;
+
+	limit = jiffies + msecs_to_jiffies(timeout_ms);
+	do {
+		val = brcmnand_read_reg(ctrl, BRCMNAND_INTFC_STATUS);
+		if ((val & mask) == expected_val)
+			return 0;
+
+		cpu_relax();
+	} while (time_after(limit, jiffies));
+
+	dev_warn(ctrl->dev, "timeout on status poll (expected %x got %x)\n",
+		 expected_val, val & mask);
+
+	return -ETIMEDOUT;
+}
+
 static inline void brcmnand_set_wp(struct brcmnand_controller *ctrl, bool en)
 {
 	u32 val = en ? CS_SELECT_NAND_WP : 0;
@@ -883,11 +912,14 @@ static int brcmnand_hamming_ooblayout_free(struct mtd_info *mtd, int section,
 		if (!section) {
 			/*
 			 * Small-page NAND use byte 6 for BBI while large-page
-			 * NAND use byte 0.
+			 * NAND use bytes 0 and 1.
 			 */
-			if (cfg->page_size > 512)
-				oobregion->offset++;
-			oobregion->length--;
+			if (cfg->page_size > 512) {
+				oobregion->offset += 2;
+				oobregion->length -= 2;
+			} else {
+				oobregion->length--;
+			}
 		}
 	}
 
@@ -1024,12 +1056,39 @@ static void brcmnand_wp(struct mtd_info *mtd, int wp)
 
 	if ((ctrl->features & BRCMNAND_HAS_WP) && wp_on == 1) {
 		static int old_wp = -1;
+		int ret;
 
 		if (old_wp != wp) {
 			dev_dbg(ctrl->dev, "WP %s\n", wp ? "on" : "off");
 			old_wp = wp;
 		}
+
+		/*
+		 * make sure ctrl/flash ready before and after
+		 * changing state of #WP pin
+		 */
+		ret = bcmnand_ctrl_poll_status(ctrl, NAND_CTRL_RDY |
+					       NAND_STATUS_READY,
+					       NAND_CTRL_RDY |
+					       NAND_STATUS_READY, 0);
+		if (ret)
+			return;
+
 		brcmnand_set_wp(ctrl, wp);
+		chip->cmdfunc(mtd, NAND_CMD_STATUS, -1, -1);
+		/* NAND_STATUS_WP 0x00 = protected, 0x80 = not protected */
+		ret = bcmnand_ctrl_poll_status(ctrl,
+					       NAND_CTRL_RDY |
+					       NAND_STATUS_READY |
+					       NAND_STATUS_WP,
+					       NAND_CTRL_RDY |
+					       NAND_STATUS_READY |
+					       (wp ? 0 : NAND_STATUS_WP), 0);
+
+		if (ret)
+			dev_err_ratelimited(&host->pdev->dev,
+					    "nand #WP expected %s\n",
+					    wp ? "on" : "off");
 	}
 }
 
@@ -1157,15 +1216,15 @@ static irqreturn_t brcmnand_dma_irq(int irq, void *data)
 static void brcmnand_send_cmd(struct brcmnand_host *host, int cmd)
 {
 	struct brcmnand_controller *ctrl = host->ctrl;
-	u32 intfc;
+	int ret;
 
 	dev_dbg(ctrl->dev, "send native cmd %d addr_lo 0x%x\n", cmd,
 		brcmnand_read_reg(ctrl, BRCMNAND_CMD_ADDRESS));
 	BUG_ON(ctrl->cmd_pending != 0);
 	ctrl->cmd_pending = cmd;
 
-	intfc = brcmnand_read_reg(ctrl, BRCMNAND_INTFC_STATUS);
-	WARN_ON(!(intfc & INTFC_CTLR_READY));
+	ret = bcmnand_ctrl_poll_status(ctrl, NAND_CTRL_RDY, NAND_CTRL_RDY, 0);
+	WARN_ON(ret);
 
 	mb(); /* flush previous writes */
 	brcmnand_write_reg(ctrl, BRCMNAND_CMD_START,
@@ -1708,7 +1767,7 @@ try_dmaread:
 			err = brcmstb_nand_verify_erased_page(mtd, chip, buf,
 							      addr);
 			/* erased page bitflips corrected */
-			if (err > 0)
+			if (err >= 0)
 				return err;
 		}
 
@@ -2138,16 +2197,9 @@ static int brcmnand_setup_dev(struct brcmnand_host *host)
 	if (ctrl->nand_version >= 0x0702)
 		tmp |= ACC_CONTROL_RD_ERASED;
 	tmp &= ~ACC_CONTROL_FAST_PGM_RDIN;
-	if (ctrl->features & BRCMNAND_HAS_PREFETCH) {
-		/*
-		 * FIXME: Flash DMA + prefetch may see spurious erased-page ECC
-		 * errors
-		 */
-		if (has_flash_dma(ctrl))
-			tmp &= ~ACC_CONTROL_PREFETCH;
-		else
-			tmp |= ACC_CONTROL_PREFETCH;
-	}
+	if (ctrl->features & BRCMNAND_HAS_PREFETCH)
+		tmp &= ~ACC_CONTROL_PREFETCH;
+
 	nand_writereg(ctrl, offs, tmp);
 
 	return 0;
@@ -2544,7 +2596,7 @@ int brcmnand_remove(struct platform_device *pdev)
 	struct brcmnand_host *host;
 
 	list_for_each_entry(host, &ctrl->host_list, node)
-		nand_release(nand_to_mtd(&host->chip));
+		nand_release(&host->chip);
 
 	clk_disable_unprepare(ctrl->clk);
 

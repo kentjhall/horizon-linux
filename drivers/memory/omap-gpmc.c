@@ -951,7 +951,7 @@ static int gpmc_cs_remap(int cs, u32 base)
 	int ret;
 	u32 old_base, size;
 
-	if (cs > gpmc_cs_num) {
+	if (cs >= gpmc_cs_num) {
 		pr_err("%s: requested chip-select is disabled\n", __func__);
 		return -ENODEV;
 	}
@@ -986,7 +986,7 @@ int gpmc_cs_request(int cs, unsigned long size, unsigned long *base)
 	struct resource *res = &gpmc->mem;
 	int r = -1;
 
-	if (cs > gpmc_cs_num) {
+	if (cs >= gpmc_cs_num) {
 		pr_err("%s: requested chip-select is disabled\n", __func__);
 		return -ENODEV;
 	}
@@ -1947,9 +1947,7 @@ static int gpmc_probe_onenand_child(struct platform_device *pdev,
 	if (!of_property_read_u32(child, "dma-channel", &val))
 		gpmc_onenand_data->dma_channel = val;
 
-	gpmc_onenand_init(gpmc_onenand_data);
-
-	return 0;
+	return gpmc_onenand_init(gpmc_onenand_data);
 }
 #else
 static int gpmc_probe_onenand_child(struct platform_device *pdev,

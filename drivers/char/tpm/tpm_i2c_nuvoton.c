@@ -49,9 +49,10 @@
  */
 #define TPM_I2C_MAX_BUF_SIZE           32
 #define TPM_I2C_RETRY_COUNT            32
-#define TPM_I2C_BUS_DELAY              1       /* msec */
-#define TPM_I2C_RETRY_DELAY_SHORT      2       /* msec */
-#define TPM_I2C_RETRY_DELAY_LONG       10      /* msec */
+#define TPM_I2C_BUS_DELAY              1000      	/* usec */
+#define TPM_I2C_RETRY_DELAY_SHORT      (2 * 1000)	/* usec */
+#define TPM_I2C_RETRY_DELAY_LONG       (10 * 1000) 	/* usec */
+#define TPM_I2C_DELAY_RANGE            300		/* usec */
 
 #define OF_IS_TPM2 ((void *)1)
 #define I2C_IS_TPM2 1
@@ -123,7 +124,9 @@ static s32 i2c_nuvoton_write_status(struct i2c_client *client, u8 data)
 	/* this causes the current command to be aborted */
 	for (i = 0, status = -1; i < TPM_I2C_RETRY_COUNT && status < 0; i++) {
 		status = i2c_nuvoton_write_buf(client, TPM_STS, 1, &data);
-		msleep(TPM_I2C_BUS_DELAY);
+		if (status < 0)
+			usleep_range(TPM_I2C_BUS_DELAY, TPM_I2C_BUS_DELAY
+				     + TPM_I2C_DELAY_RANGE);
 	}
 	return status;
 }
@@ -160,7 +163,8 @@ static int i2c_nuvoton_get_burstcount(struct i2c_client *client,
 			burst_count = min_t(u8, TPM_I2C_MAX_BUF_SIZE, data);
 			break;
 		}
-		msleep(TPM_I2C_BUS_DELAY);
+		usleep_range(TPM_I2C_BUS_DELAY, TPM_I2C_BUS_DELAY
+			     + TPM_I2C_DELAY_RANGE);
 	} while (time_before(jiffies, stop));
 
 	return burst_count;
@@ -203,13 +207,17 @@ static int i2c_nuvoton_wait_for_stat(struct tpm_chip *chip, u8 mask, u8 value,
 			return 0;
 
 		/* use polling to wait for the event */
-		ten_msec = jiffies + msecs_to_jiffies(TPM_I2C_RETRY_DELAY_LONG);
+		ten_msec = jiffies + usecs_to_jiffies(TPM_I2C_RETRY_DELAY_LONG);
 		stop = jiffies + timeout;
 		do {
 			if (time_before(jiffies, ten_msec))
-				msleep(TPM_I2C_RETRY_DELAY_SHORT);
+				usleep_range(TPM_I2C_RETRY_DELAY_SHORT,
+					     TPM_I2C_RETRY_DELAY_SHORT
+					     + TPM_I2C_DELAY_RANGE);
 			else
-				msleep(TPM_I2C_RETRY_DELAY_LONG);
+				usleep_range(TPM_I2C_RETRY_DELAY_LONG,
+					     TPM_I2C_RETRY_DELAY_LONG
+					     + TPM_I2C_DELAY_RANGE);
 			status_valid = i2c_nuvoton_check_status(chip, mask,
 								value);
 			if (status_valid)
@@ -273,7 +281,11 @@ static int i2c_nuvoton_recv(struct tpm_chip *chip, u8 *buf, size_t count)
 	struct device *dev = chip->dev.parent;
 	struct i2c_client *client = to_i2c_client(dev);
 	s32 rc;
-	int expected, status, burst_count, retries, size = 0;
+	int status;
+	int burst_count;
+	int retries;
+	int size = 0;
+	u32 expected;
 
 	if (count < TPM_HEADER_SIZE) {
 		i2c_nuvoton_ready(chip);    /* return to idle */
@@ -315,7 +327,7 @@ static int i2c_nuvoton_recv(struct tpm_chip *chip, u8 *buf, size_t count)
 		 * to machine native
 		 */
 		expected = be32_to_cpu(*(__be32 *) (buf + 2));
-		if (expected > count) {
+		if (expected > count || expected < size) {
 			dev_err(dev, "%s() expected > count\n", __func__);
 			size = -EIO;
 			continue;
@@ -357,6 +369,7 @@ static int i2c_nuvoton_send(struct tpm_chip *chip, u8 *buf, size_t len)
 	struct device *dev = chip->dev.parent;
 	struct i2c_client *client = to_i2c_client(dev);
 	u32 ordinal;
+	unsigned long duration;
 	size_t count = 0;
 	int burst_count, bytes2write, retries, rc = -EIO;
 
@@ -443,10 +456,12 @@ static int i2c_nuvoton_send(struct tpm_chip *chip, u8 *buf, size_t len)
 		return rc;
 	}
 	ordinal = be32_to_cpu(*((__be32 *) (buf + 6)));
-	rc = i2c_nuvoton_wait_for_data_avail(chip,
-					     tpm_calc_ordinal_duration(chip,
-								       ordinal),
-					     &priv->read_queue);
+	if (chip->flags & TPM_CHIP_FLAG_TPM2)
+		duration = tpm2_calc_ordinal_duration(chip, ordinal);
+	else
+		duration = tpm_calc_ordinal_duration(chip, ordinal);
+
+	rc = i2c_nuvoton_wait_for_data_avail(chip, duration, &priv->read_queue);
 	if (rc) {
 		dev_err(dev, "%s() timeout command duration\n", __func__);
 		i2c_nuvoton_ready(chip);

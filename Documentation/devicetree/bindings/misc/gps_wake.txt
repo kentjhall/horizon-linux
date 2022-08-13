@@ -1,0 +1,21 @@
+This driver is implemented to parse the gps_en gpio from device tree
+and create a sysfs to control the gpio in gpsd binary. Also it
+registers a irq to enable the HW geofencing feature.
+
+SYSFS: This interface is used to toggle gps_en gpio in userspace.
+
+Required Properties:
+- compatible: Must be "gps-wake";
+- gps-enable-gpio is resource name for gpio which power ON gps
+
+Optional Properties:
+- gps-wakeup-gpio is resource name for gps host wake irq line
+
+Example:
+gps_wake {
+	compatible = "gps-wake";
+	id = <0>;
+	gps-enable-gpio = <&gpio_i2c_1_20 10 0>;
+	gps-wakeup-gpio = <&gpio TEGRA_GPIO(Q, 5) 0>;
+	status = "okay";
+};

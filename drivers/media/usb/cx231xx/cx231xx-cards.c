@@ -841,6 +841,108 @@ struct cx231xx_board cx231xx_boards[] = {
 			.gpio = NULL,
 		} },
 	},
+	[CX231XX_BOARD_AVERMEDIA_H837A] = {
+		.name = "AVerMedia H837-A USB Hybrid ATSC/QAM",
+		.tuner_type = TUNER_ABSENT,
+		.tuner_addr = 0x60,
+		.tuner_sif_gpio = 0x05,
+		.decoder = CX231XX_AVDECODER,
+		.demod_xfer_mode = 0,
+		.ctl_pin_status_mask = 0xFFFFFFC4,
+		.agc_analog_digital_select_gpio = 0x1c,
+		.gpio_pin_status_mask = 0x4001000,
+		.tuner_i2c_master = 2,
+		.demod_i2c_master = 1,
+		.has_dvb = 1,
+		.norm = V4L2_STD_NTSC,
+
+		.input = {{
+			.type = CX231XX_VMUX_TELEVISION,
+			.vmux = CX231XX_VIN_3_1,
+			.amux = CX231XX_AMUX_VIDEO,
+			.gpio = 0,
+		}, {
+			.type = CX231XX_VMUX_COMPOSITE1,
+			.vmux = CX231XX_VIN_2_1,
+			.amux = CX231XX_AMUX_LINE_IN,
+			.gpio = 0,
+		}, {
+			.type = CX231XX_VMUX_SVIDEO,
+			.vmux = CX231XX_VIN_1_1 |
+				(CX231XX_VIN_1_2 << 8) |
+				CX25840_SVIDEO_ON,
+			.amux = CX231XX_AMUX_LINE_IN,
+			.gpio = 0,
+		} },
+	},
+	[CX231XX_BOARD_AVERMEDIA_H837B] = {
+		.name = "AVerMedia H837-B USB Hybrid ATSC/QAM",
+		.tuner_type = TUNER_ABSENT,
+		.tuner_addr = 0x60,
+		.tuner_sif_gpio = 0x05,
+		.decoder = CX231XX_AVDECODER,
+		.demod_xfer_mode = 0,
+		.ctl_pin_status_mask = 0xFFFFFFC4,
+		.agc_analog_digital_select_gpio = 0x1c,
+		.gpio_pin_status_mask = 0x4001000,
+		.tuner_i2c_master = 2,
+		.demod_i2c_master = 1,
+		.has_dvb = 1,
+		.norm = V4L2_STD_NTSC,
+
+		.input = {{
+			.type = CX231XX_VMUX_TELEVISION,
+			.vmux = CX231XX_VIN_3_1,
+			.amux = CX231XX_AMUX_VIDEO,
+			.gpio = 0,
+		}, {
+			.type = CX231XX_VMUX_COMPOSITE1,
+			.vmux = CX231XX_VIN_2_1,
+			.amux = CX231XX_AMUX_LINE_IN,
+			.gpio = 0,
+		}, {
+			.type = CX231XX_VMUX_SVIDEO,
+			.vmux = CX231XX_VIN_1_1 |
+				(CX231XX_VIN_1_2 << 8) |
+				CX25840_SVIDEO_ON,
+			.amux = CX231XX_AMUX_LINE_IN,
+			.gpio = 0,
+		} },
+	},
+	[CX231XX_BOARD_AVERMEDIA_H837M] = {
+		.name = "AVerMedia H837-M USB Hybrid ATSC/QAM",
+		.tuner_type = TUNER_ABSENT,
+		.tuner_addr = 0x60,
+		.tuner_sif_gpio = 0x05,
+		.decoder = CX231XX_AVDECODER,
+		.demod_xfer_mode = 0,
+		.ctl_pin_status_mask = 0xFFFFFFC4,
+		.agc_analog_digital_select_gpio = 0x1c,
+		.gpio_pin_status_mask = 0x4001000,
+		.tuner_i2c_master = 2,
+		.demod_i2c_master = 1,
+		.has_dvb = 1,
+		.norm = V4L2_STD_NTSC,
+
+		.input = {{
+			.type = CX231XX_VMUX_TELEVISION,
+			.vmux = CX231XX_VIN_3_1,
+			.amux = CX231XX_AMUX_VIDEO,
+			.gpio = 0,
+		}, {
+			.type = CX231XX_VMUX_COMPOSITE1,
+			.vmux = CX231XX_VIN_2_1,
+			.amux = CX231XX_AMUX_LINE_IN,
+			.gpio = 0,
+		}, {
+			.type = CX231XX_VMUX_SVIDEO,
+			.vmux = CX231XX_VIN_1_1 |
+				(CX231XX_VIN_1_2 << 8) |
+				CX25840_SVIDEO_ON,
+			.amux = CX231XX_AMUX_LINE_IN,
+			.gpio = 0,
+		} },
+	},
 };
 const unsigned int cx231xx_bcount = ARRAY_SIZE(cx231xx_boards);
 
@@ -864,6 +966,9 @@ struct usb_device_id cx231xx_id_table[] = {
 	 .driver_info = CX231XX_BOARD_CNXT_RDE_250},
 	{USB_DEVICE(0x0572, 0x58A0),
 	 .driver_info = CX231XX_BOARD_CNXT_RDU_250},
+	/* AverMedia DVD EZMaker 7 */
+	{USB_DEVICE(0x07ca, 0xc039),
+	 .driver_info = CX231XX_BOARD_CNXT_VIDEO_GRABBER},
 	{USB_DEVICE(0x2040, 0xb110),
 	 .driver_info = CX231XX_BOARD_HAUPPAUGE_USB2_FM_PAL},
 	{USB_DEVICE(0x2040, 0xb111),
@@ -908,6 +1013,12 @@ struct usb_device_id cx231xx_id_table[] = {
 	 .driver_info = CX231XX_BOARD_OTG102},
 	{USB_DEVICE(USB_VID_TERRATEC, 0x00a6),
 	 .driver_info = CX231XX_BOARD_TERRATEC_GRABBY},
+	{USB_DEVICE(0x07ca, 0x0837),
+	 .driver_info = CX231XX_BOARD_AVERMEDIA_H837A},
+	{USB_DEVICE(0x07ca, 0x0837),
+	 .driver_info = CX231XX_BOARD_AVERMEDIA_H837B},
+	{USB_DEVICE(0x07ca, 0x1837),
+	 .driver_info = CX231XX_BOARD_AVERMEDIA_H837M},
 	{},
 };
 
@@ -1397,6 +1508,9 @@ static int cx231xx_init_v4l2(struct cx231xx *dev,
 
 	uif = udev->actconfig->interface[idx];
 
+	if (uif->altsetting[0].desc.bNumEndpoints < isoc_pipe + 1)
+		return -ENODEV;
+
 	dev->video_mode.end_point_addr = uif->altsetting[0].endpoint[isoc_pipe].desc.bEndpointAddress;
 	dev->video_mode.num_alt = uif->num_altsetting;
 
@@ -1410,7 +1524,12 @@ static int cx231xx_init_v4l2(struct cx231xx *dev,
 		return -ENOMEM;
 
 	for (i = 0; i < dev->video_mode.num_alt; i++) {
-		u16 tmp = le16_to_cpu(uif->altsetting[i].endpoint[isoc_pipe].desc.wMaxPacketSize);
+		u16 tmp;
+
+		if (uif->altsetting[i].desc.bNumEndpoints < isoc_pipe + 1)
+			return -ENODEV;
+
+		tmp = le16_to_cpu(uif->altsetting[i].endpoint[isoc_pipe].desc.wMaxPacketSize);
 		dev->video_mode.alt_max_pkt_size[i] = (tmp & 0x07ff) * (((tmp & 0x1800) >> 11) + 1);
 		dev_dbg(dev->dev,
 			"Alternate setting %i, max size= %i\n", i,
@@ -1426,6 +1545,9 @@ static int cx231xx_init_v4l2(struct cx231xx *dev,
 		return -ENODEV;
 	}
 	uif = udev->actconfig->interface[idx];
+
+	if (uif->altsetting[0].desc.bNumEndpoints < isoc_pipe + 1)
+		return -ENODEV;
 
 	dev->vbi_mode.end_point_addr =
 	    uif->altsetting[0].endpoint[isoc_pipe].desc.
@@ -1443,8 +1565,12 @@ static int cx231xx_init_v4l2(struct cx231xx *dev,
 		return -ENOMEM;
 
 	for (i = 0; i < dev->vbi_mode.num_alt; i++) {
-		u16 tmp =
-		    le16_to_cpu(uif->altsetting[i].endpoint[isoc_pipe].
+		u16 tmp;
+
+		if (uif->altsetting[i].desc.bNumEndpoints < isoc_pipe + 1)
+			return -ENODEV;
+
+		tmp = le16_to_cpu(uif->altsetting[i].endpoint[isoc_pipe].
 				desc.wMaxPacketSize);
 		dev->vbi_mode.alt_max_pkt_size[i] =
 		    (tmp & 0x07ff) * (((tmp & 0x1800) >> 11) + 1);
@@ -1464,6 +1590,9 @@ static int cx231xx_init_v4l2(struct cx231xx *dev,
 	}
 	uif = udev->actconfig->interface[idx];
 
+	if (uif->altsetting[0].desc.bNumEndpoints < isoc_pipe + 1)
+		return -ENODEV;
+
 	dev->sliced_cc_mode.end_point_addr =
 	    uif->altsetting[0].endpoint[isoc_pipe].desc.
 			bEndpointAddress;
@@ -1478,7 +1607,12 @@ static int cx231xx_init_v4l2(struct cx231xx *dev,
 		return -ENOMEM;
 
 	for (i = 0; i < dev->sliced_cc_mode.num_alt; i++) {
-		u16 tmp = le16_to_cpu(uif->altsetting[i].endpoint[isoc_pipe].
+		u16 tmp;
+
+		if (uif->altsetting[i].desc.bNumEndpoints < isoc_pipe + 1)
+			return -ENODEV;
+
+		tmp = le16_to_cpu(uif->altsetting[i].endpoint[isoc_pipe].
 				desc.wMaxPacketSize);
 		dev->sliced_cc_mode.alt_max_pkt_size[i] =
 		    (tmp & 0x07ff) * (((tmp & 0x1800) >> 11) + 1);
@@ -1551,7 +1685,8 @@ static int cx231xx_usb_probe(struct usb_interface *interface,
 	dev->gpio_dir = 0;
 	dev->gpio_val = 0;
 	dev->xc_fw_load_done = 0;
-	dev->has_alsa_audio = 1;
+	if (!is_model_avermedia_h837_series(dev->model))
+		dev->has_alsa_audio = 1;
 	dev->power_mode = -1;
 	atomic_set(&dev->devlist_count, 0);
 
@@ -1599,7 +1734,7 @@ static int cx231xx_usb_probe(struct usb_interface *interface,
 	nr = dev->devno;
 
 	assoc_desc = udev->actconfig->intf_assoc[0];
-	if (assoc_desc->bFirstInterface != ifnum) {
+	if (!assoc_desc || assoc_desc->bFirstInterface != ifnum) {
 		dev_err(d, "Not found matching IAD interface\n");
 		retval = -ENODEV;
 		goto err_if;
@@ -1647,6 +1782,11 @@ static int cx231xx_usb_probe(struct usb_interface *interface,
 		}
 		uif = udev->actconfig->interface[idx];
 
+		if (uif->altsetting[0].desc.bNumEndpoints < isoc_pipe + 1) {
+			retval = -ENODEV;
+			goto err_video_alt;
+		}
+
 		dev->ts1_mode.end_point_addr =
 		    uif->altsetting[0].endpoint[isoc_pipe].
 				desc.bEndpointAddress;
@@ -1664,7 +1804,14 @@ static int cx231xx_usb_probe(struct usb_interface *interface,
 		}
 
 		for (i = 0; i < dev->ts1_mode.num_alt; i++) {
-			u16 tmp = le16_to_cpu(uif->altsetting[i].
+			u16 tmp;
+
+			if (uif->altsetting[i].desc.bNumEndpoints < isoc_pipe + 1) {
+				retval = -ENODEV;
+				goto err_video_alt;
+			}
+
+			tmp = le16_to_cpu(uif->altsetting[i].
 						endpoint[isoc_pipe].desc.
 						wMaxPacketSize);
 			dev->ts1_mode.alt_max_pkt_size[i] =

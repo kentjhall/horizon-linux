@@ -57,6 +57,7 @@ struct fib_nh_exception {
 	int				fnhe_genid;
 	__be32				fnhe_daddr;
 	u32				fnhe_pmtu;
+	bool				fnhe_mtu_locked;
 	__be32				fnhe_gw;
 	unsigned long			fnhe_expires;
 	struct rtable __rcu		*fnhe_rth_input;
@@ -114,11 +115,11 @@ struct fib_info {
 	__be32			fib_prefsrc;
 	u32			fib_tb_id;
 	u32			fib_priority;
-	u32			*fib_metrics;
-#define fib_mtu fib_metrics[RTAX_MTU-1]
-#define fib_window fib_metrics[RTAX_WINDOW-1]
-#define fib_rtt fib_metrics[RTAX_RTT-1]
-#define fib_advmss fib_metrics[RTAX_ADVMSS-1]
+	struct dst_metrics	*fib_metrics;
+#define fib_mtu fib_metrics->metrics[RTAX_MTU-1]
+#define fib_window fib_metrics->metrics[RTAX_WINDOW-1]
+#define fib_rtt fib_metrics->metrics[RTAX_RTT-1]
+#define fib_advmss fib_metrics->metrics[RTAX_ADVMSS-1]
 	int			fib_nhs;
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 	int			fib_weight;
@@ -241,7 +242,7 @@ int fib_table_insert(struct net *, struct fib_table *, struct fib_config *);
 int fib_table_delete(struct net *, struct fib_table *, struct fib_config *);
 int fib_table_dump(struct fib_table *table, struct sk_buff *skb,
 		   struct netlink_callback *cb);
-int fib_table_flush(struct net *net, struct fib_table *table);
+int fib_table_flush(struct net *net, struct fib_table *table, bool flush_all);
 struct fib_table *fib_trie_unmerge(struct fib_table *main_tb);
 void fib_table_flush_external(struct fib_table *table);
 void fib_free_table(struct fib_table *tb);
@@ -362,6 +363,7 @@ int ip_fib_check_default(__be32 gw, struct net_device *dev);
 int fib_sync_down_dev(struct net_device *dev, unsigned long event, bool force);
 int fib_sync_down_addr(struct net_device *dev, __be32 local);
 int fib_sync_up(struct net_device *dev, unsigned int nh_flags);
+void fib_sync_mtu(struct net_device *dev, u32 orig_mtu);
 
 extern u32 fib_multipath_secret __read_mostly;
 

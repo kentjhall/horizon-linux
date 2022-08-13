@@ -50,7 +50,7 @@ struct dm_io_client *dm_io_client_create(void)
 	struct dm_io_client *client;
 	unsigned min_ios = dm_get_reserved_bio_based_ios();
 
-	client = kmalloc(sizeof(*client), GFP_KERNEL);
+	client = kzalloc(sizeof(*client), GFP_KERNEL);
 	if (!client)
 		return ERR_PTR(-ENOMEM);
 
@@ -302,6 +302,7 @@ static void do_region(int op, int op_flags, unsigned region,
 		special_cmd_max_sectors = q->limits.max_write_same_sectors;
 	if ((op == REQ_OP_DISCARD || op == REQ_OP_WRITE_SAME) &&
 	    special_cmd_max_sectors == 0) {
+		atomic_inc(&io->count);
 		dec_count(io, region, -EOPNOTSUPP);
 		return;
 	}

@@ -255,12 +255,12 @@ drm_gem_object_release_handle(int id, void *ptr, void *data)
 	struct drm_gem_object *obj = ptr;
 	struct drm_device *dev = obj->dev;
 
+	if (dev->driver->gem_close_object)
+		dev->driver->gem_close_object(obj, file_priv);
+
 	if (drm_core_check_feature(dev, DRIVER_PRIME))
 		drm_gem_remove_prime_handles(obj, file_priv);
 	drm_vma_node_revoke(&obj->vma_node, file_priv);
-
-	if (dev->driver->gem_close_object)
-		dev->driver->gem_close_object(obj, file_priv);
 
 	drm_gem_object_handle_unreference_unlocked(obj);
 
@@ -694,9 +694,6 @@ err:
  * @file_priv: drm file-private structure
  *
  * Open an object using the global name, returning a handle and the size.
- *
- * This handle (of course) holds a reference to the object, so the object
- * will not go away until the handle is deleted.
  */
 int
 drm_gem_open_ioctl(struct drm_device *dev, void *data,
@@ -721,14 +718,15 @@ drm_gem_open_ioctl(struct drm_device *dev, void *data,
 
 	/* drm_gem_handle_create_tail unlocks dev->object_name_lock. */
 	ret = drm_gem_handle_create_tail(file_priv, obj, &handle);
-	drm_gem_object_unreference_unlocked(obj);
 	if (ret)
-		return ret;
+		goto err;
 
 	args->handle = handle;
 	args->size = obj->size;
 
-	return 0;
+err:
+	drm_gem_object_unreference_unlocked(obj);
+	return ret;
 }
 
 /**
@@ -994,6 +992,15 @@ int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	if (!drm_vma_node_is_allowed(node, priv)) {
 		drm_gem_object_unreference_unlocked(obj);
 		return -EACCES;
+	}
+
+	if (node->readonly) {
+		if (vma->vm_flags & VM_WRITE) {
+			drm_gem_object_unreference_unlocked(obj);
+			return -EINVAL;
+		}
+
+		vma->vm_flags &= ~VM_MAYWRITE;
 	}
 
 	ret = drm_gem_mmap_obj(obj, drm_vma_node_size(node) << PAGE_SHIFT,

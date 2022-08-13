@@ -163,7 +163,11 @@ STATIC int INIT __gunzip(unsigned char *buf, long len,
 		}
 	}
 
-	zlib_inflateEnd(strm);
+	rc = zlib_inflateEnd(strm);
+	if (rc != Z_OK) {
+		error("z stream error");
+	}
+
 	if (pos)
 		/* add + 8 to skip over trailer */
 		*pos = strm->next_in - zbuf+8;

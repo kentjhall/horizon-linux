@@ -747,6 +747,7 @@ isert_connect_error(struct rdma_cm_id *cma_id)
 {
 	struct isert_conn *isert_conn = cma_id->qp->qp_context;
 
+	ib_drain_qp(isert_conn->qp);
 	list_del_init(&isert_conn->node);
 	isert_conn->cm_id = NULL;
 	isert_put_conn(isert_conn);
@@ -878,15 +879,9 @@ isert_login_post_send(struct isert_conn *isert_conn, struct iser_tx_desc *tx_des
 }
 
 static void
-isert_create_send_desc(struct isert_conn *isert_conn,
-		       struct isert_cmd *isert_cmd,
-		       struct iser_tx_desc *tx_desc)
+__isert_create_send_desc(struct isert_device *device,
+			 struct iser_tx_desc *tx_desc)
 {
-	struct isert_device *device = isert_conn->device;
-	struct ib_device *ib_dev = device->ib_device;
-
-	ib_dma_sync_single_for_cpu(ib_dev, tx_desc->dma_addr,
-				   ISER_HEADERS_LEN, DMA_TO_DEVICE);
 
 	memset(&tx_desc->iser_header, 0, sizeof(struct iser_ctrl));
 	tx_desc->iser_header.flags = ISCSI_CTRL;
@@ -897,6 +892,20 @@ isert_create_send_desc(struct isert_conn *isert_conn,
 		tx_desc->tx_sg[0].lkey = device->pd->local_dma_lkey;
 		isert_dbg("tx_desc %p lkey mismatch, fixing\n", tx_desc);
 	}
+}
+
+static void
+isert_create_send_desc(struct isert_conn *isert_conn,
+		       struct isert_cmd *isert_cmd,
+		       struct iser_tx_desc *tx_desc)
+{
+	struct isert_device *device = isert_conn->device;
+	struct ib_device *ib_dev = device->ib_device;
+
+	ib_dma_sync_single_for_cpu(ib_dev, tx_desc->dma_addr,
+				   ISER_HEADERS_LEN, DMA_TO_DEVICE);
+
+	__isert_create_send_desc(device, tx_desc);
 }
 
 static int
@@ -986,7 +995,7 @@ isert_put_login_tx(struct iscsi_conn *conn, struct iscsi_login *login,
 	struct iser_tx_desc *tx_desc = &isert_conn->login_tx_desc;
 	int ret;
 
-	isert_create_send_desc(isert_conn, NULL, tx_desc);
+	__isert_create_send_desc(device, tx_desc);
 
 	memcpy(&tx_desc->iscsi_header, &login->rsp[0],
 	       sizeof(struct iscsi_hdr));
@@ -1447,7 +1456,7 @@ static void
 isert_login_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct isert_conn *isert_conn = wc->qp->qp_context;
-	struct ib_device *ib_dev = isert_conn->cm_id->device;
+	struct ib_device *ib_dev = isert_conn->device->ib_device;
 
 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
 		isert_print_wc(wc, "login recv");
@@ -2081,7 +2090,7 @@ isert_set_sig_attrs(struct se_cmd *se_cmd, struct ib_sig_attrs *sig_attrs)
 
 	sig_attrs->check_mask =
 	       (se_cmd->prot_checks & TARGET_DIF_CHECK_GUARD  ? 0xc0 : 0) |
-	       (se_cmd->prot_checks & TARGET_DIF_CHECK_REFTAG ? 0x30 : 0) |
+	       (se_cmd->prot_checks & TARGET_DIF_CHECK_APPTAG ? 0x30 : 0) |
 	       (se_cmd->prot_checks & TARGET_DIF_CHECK_REFTAG ? 0x0f : 0);
 	return 0;
 }
@@ -2096,6 +2105,9 @@ isert_rdma_rw_ctx_post(struct isert_cmd *cmd, struct isert_conn *conn,
 	u64 addr;
 	u32 rkey, offset;
 	int ret;
+
+	if (cmd->ctx_init_done)
+		goto rdma_ctx_post;
 
 	if (dir == DMA_FROM_DEVICE) {
 		addr = cmd->write_va;
@@ -2124,11 +2136,15 @@ isert_rdma_rw_ctx_post(struct isert_cmd *cmd, struct isert_conn *conn,
 				se_cmd->t_data_sg, se_cmd->t_data_nents,
 				offset, addr, rkey, dir);
 	}
+
 	if (ret < 0) {
 		isert_err("Cmd: %p failed to prepare RDMA res\n", cmd);
 		return ret;
 	}
 
+	cmd->ctx_init_done = true;
+
+rdma_ctx_post:
 	ret = rdma_rw_ctx_post(&cmd->rw, conn->qp, port_num, cqe, chain_wr);
 	if (ret < 0)
 		isert_err("Cmd: %p failed to post RDMA res\n", cmd);
@@ -2539,17 +2555,6 @@ isert_wait4logout(struct isert_conn *isert_conn)
 	}
 }
 
-static void
-isert_wait4cmds(struct iscsi_conn *conn)
-{
-	isert_info("iscsi_conn %p\n", conn);
-
-	if (conn->sess) {
-		target_sess_cmd_list_set_waiting(conn->sess->se_sess);
-		target_wait_for_sess_cmds(conn->sess->se_sess);
-	}
-}
-
 /**
  * isert_put_unsol_pending_cmds() - Drop commands waiting for
  *     unsolicitate dataout
@@ -2597,7 +2602,6 @@ static void isert_wait_conn(struct iscsi_conn *conn)
 
 	ib_drain_qp(isert_conn->qp);
 	isert_put_unsol_pending_cmds(conn);
-	isert_wait4cmds(conn);
 	isert_wait4logout(isert_conn);
 
 	queue_work(isert_release_wq, &isert_conn->release_work);

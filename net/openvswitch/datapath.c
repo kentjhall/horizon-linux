@@ -383,7 +383,7 @@ static int queue_gso_packets(struct datapath *dp, struct sk_buff *skb,
 }
 
 static size_t upcall_msg_size(const struct dp_upcall_info *upcall_info,
-			      unsigned int hdrlen)
+			      unsigned int hdrlen, int actions_attrlen)
 {
 	size_t size = NLMSG_ALIGN(sizeof(struct ovs_header))
 		+ nla_total_size(hdrlen) /* OVS_PACKET_ATTR_PACKET */
@@ -400,7 +400,7 @@ static size_t upcall_msg_size(const struct dp_upcall_info *upcall_info,
 
 	/* OVS_PACKET_ATTR_ACTIONS */
 	if (upcall_info->actions_len)
-		size += nla_total_size(upcall_info->actions_len);
+		size += nla_total_size(actions_attrlen);
 
 	/* OVS_PACKET_ATTR_MRU */
 	if (upcall_info->mru)
@@ -467,7 +467,8 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
 	else
 		hlen = skb->len;
 
-	len = upcall_msg_size(upcall_info, hlen - cutlen);
+	len = upcall_msg_size(upcall_info, hlen - cutlen,
+			      OVS_CB(skb)->acts_origlen);
 	user_skb = genlmsg_new(len, GFP_ATOMIC);
 	if (!user_skb) {
 		err = -ENOMEM;
@@ -737,9 +738,13 @@ static size_t ovs_flow_cmd_msg_size(const struct sw_flow_actions *acts,
 {
 	size_t len = NLMSG_ALIGN(sizeof(struct ovs_header));
 
-	/* OVS_FLOW_ATTR_UFID */
+	/* OVS_FLOW_ATTR_UFID, or unmasked flow key as fallback
+	 * see ovs_nla_put_identifier()
+	 */
 	if (sfid && ovs_identifier_is_ufid(sfid))
 		len += nla_total_size(sfid->ufid_len);
+	else
+		len += nla_total_size(ovs_key_attr_size());
 
 	/* OVS_FLOW_ATTR_KEY */
 	if (!sfid || should_fill_key(sfid, ufid_flags))
@@ -915,7 +920,10 @@ static struct sk_buff *ovs_flow_cmd_build_info(const struct sw_flow *flow,
 	retval = ovs_flow_cmd_fill_info(flow, dp_ifindex, skb,
 					info->snd_portid, info->snd_seq, 0,
 					cmd, ufid_flags);
-	BUG_ON(retval < 0);
+	if (WARN_ON_ONCE(retval < 0)) {
+		kfree_skb(skb);
+		skb = ERR_PTR(retval);
+	}
 	return skb;
 }
 
@@ -1342,7 +1350,10 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
 						     OVS_FLOW_CMD_DEL,
 						     ufid_flags);
 			rcu_read_unlock();
-			BUG_ON(err < 0);
+			if (WARN_ON_ONCE(err < 0)) {
+				kfree_skb(reply);
+				goto out_free;
+			}
 
 			ovs_notify(&dp_flow_genl_family, reply, info);
 		} else {
@@ -1350,6 +1361,7 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
 		}
 	}
 
+out_free:
 	ovs_flow_free(flow, true);
 	return 0;
 unlock:
@@ -2217,7 +2229,7 @@ static const struct nla_policy vport_policy[OVS_VPORT_ATTR_MAX + 1] = {
 	[OVS_VPORT_ATTR_STATS] = { .len = sizeof(struct ovs_vport_stats) },
 	[OVS_VPORT_ATTR_PORT_NO] = { .type = NLA_U32 },
 	[OVS_VPORT_ATTR_TYPE] = { .type = NLA_U32 },
-	[OVS_VPORT_ATTR_UPCALL_PID] = { .type = NLA_U32 },
+	[OVS_VPORT_ATTR_UPCALL_PID] = { .type = NLA_UNSPEC },
 	[OVS_VPORT_ATTR_OPTIONS] = { .type = NLA_NESTED },
 };
 

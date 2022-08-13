@@ -345,7 +345,7 @@ struct mlx5_ib_qp {
 	struct mlx5_ib_wq	rq;
 
 	u8			sq_signal_bits;
-	u8			fm_cache;
+	u8			next_fence;
 	struct mlx5_ib_wq	sq;
 
 	/* serialize qp state modifications
@@ -643,6 +643,7 @@ struct mlx5_ib_dev {
 	struct list_head	qp_list;
 	/* Array with num_ports elements */
 	struct mlx5_ib_port	*port;
+	u8			umr_fence;
 };
 
 static inline struct mlx5_ib_cq *to_mibcq(struct mlx5_core_cq *mcq)
@@ -892,6 +893,8 @@ int mlx5_ib_set_vf_guid(struct ib_device *device, int vf, u8 port,
 
 __be16 mlx5_get_roce_udp_sport(struct mlx5_ib_dev *dev, u8 port_num,
 			       int index);
+int mlx5_get_roce_gid_type(struct mlx5_ib_dev *dev, u8 port_num,
+			   int index, enum ib_gid_type *gid_type);
 
 /* GSI QP helper functions */
 struct ib_qp *mlx5_ib_gsi_create_qp(struct ib_pd *pd,

@@ -36,9 +36,9 @@
 /*****************************************************************************/
 
 /* Timeout in micro-sec */
-#define ADMIN_CMD_TIMEOUT_US (1000000)
+#define ADMIN_CMD_TIMEOUT_US (3000000)
 
-#define ENA_ASYNC_QUEUE_DEPTH 4
+#define ENA_ASYNC_QUEUE_DEPTH 16
 #define ENA_ADMIN_QUEUE_DEPTH 32
 
 #define MIN_ENA_VER (((ENA_COMMON_SPEC_VERSION_MAJOR) << \
@@ -60,6 +60,8 @@
 #define ENA_DMA_ADDR_TO_UINT32_HIGH(x)	((u32)(((u64)(x)) >> 32))
 
 #define ENA_MMIO_READ_TIMEOUT 0xFFFFFFFF
+
+#define ENA_REGS_ADMIN_INTR_MASK 1
 
 /*****************************************************************************/
 /*****************************************************************************/
@@ -197,6 +199,11 @@ static inline void comp_ctxt_release(struct ena_com_admin_queue *queue,
 static struct ena_comp_ctx *get_comp_ctxt(struct ena_com_admin_queue *queue,
 					  u16 command_id, bool capture)
 {
+	if (unlikely(!queue->comp_ctx)) {
+		pr_err("Completion context is NULL\n");
+		return NULL;
+	}
+
 	if (unlikely(command_id >= queue->q_depth)) {
 		pr_err("command id is larger than the queue size. cmd_id: %u queue size %d\n",
 		       command_id, queue->q_depth);
@@ -232,11 +239,9 @@ static struct ena_comp_ctx *__ena_com_submit_admin_cmd(struct ena_com_admin_queu
 	tail_masked = admin_queue->sq.tail & queue_size_mask;
 
 	/* In case of queue FULL */
-	cnt = admin_queue->sq.tail - admin_queue->sq.head;
+	cnt = atomic_read(&admin_queue->outstanding_cmds);
 	if (cnt >= admin_queue->q_depth) {
-		pr_debug("admin queue is FULL (tail %d head %d depth: %d)\n",
-			 admin_queue->sq.tail, admin_queue->sq.head,
-			 admin_queue->q_depth);
+		pr_debug("admin queue is full.\n");
 		admin_queue->stats.out_of_space++;
 		return ERR_PTR(-ENOSPC);
 	}
@@ -331,6 +336,7 @@ static int ena_com_init_io_sq(struct ena_com_dev *ena_dev,
 
 	memset(&io_sq->desc_addr, 0x0, sizeof(struct ena_com_io_desc_addr));
 
+	io_sq->dma_addr_bits = ena_dev->dma_addr_bits;
 	io_sq->desc_entry_size =
 		(io_sq->direction == ENA_COM_IO_QUEUE_DIRECTION_TX) ?
 		sizeof(struct ena_eth_io_tx_desc) :
@@ -508,15 +514,20 @@ static int ena_com_comp_status_to_errno(u8 comp_status)
 static int ena_com_wait_and_process_admin_cq_polling(struct ena_comp_ctx *comp_ctx,
 						     struct ena_com_admin_queue *admin_queue)
 {
-	unsigned long flags;
-	u32 start_time;
+	unsigned long flags, timeout;
 	int ret;
 
-	start_time = ((u32)jiffies_to_usecs(jiffies));
+	timeout = jiffies + ADMIN_CMD_TIMEOUT_US;
 
-	while (comp_ctx->status == ENA_CMD_SUBMITTED) {
-		if ((((u32)jiffies_to_usecs(jiffies)) - start_time) >
-		    ADMIN_CMD_TIMEOUT_US) {
+	while (1) {
+		spin_lock_irqsave(&admin_queue->q_lock, flags);
+		ena_com_handle_admin_completion(admin_queue);
+		spin_unlock_irqrestore(&admin_queue->q_lock, flags);
+
+		if (comp_ctx->status != ENA_CMD_SUBMITTED)
+			break;
+
+		if (time_is_before_jiffies(timeout)) {
 			pr_err("Wait for completion (polling) timeout\n");
 			/* ENA didn't have any completion */
 			spin_lock_irqsave(&admin_queue->q_lock, flags);
@@ -527,10 +538,6 @@ static int ena_com_wait_and_process_admin_cq_polling(struct ena_comp_ctx *comp_c
 			ret = -ETIME;
 			goto err;
 		}
-
-		spin_lock_irqsave(&admin_queue->q_lock, flags);
-		ena_com_handle_admin_completion(admin_queue);
-		spin_unlock_irqrestore(&admin_queue->q_lock, flags);
 
 		msleep(100);
 	}
@@ -835,6 +842,24 @@ static int ena_com_get_feature(struct ena_com_dev *ena_dev,
 				      feature_id,
 				      0,
 				      0);
+}
+
+static void ena_com_hash_key_fill_default_key(struct ena_com_dev *ena_dev)
+{
+	struct ena_admin_feature_rss_flow_hash_control *hash_key =
+		(ena_dev->rss).hash_key;
+
+	netdev_rss_key_fill(&hash_key->key, sizeof(hash_key->key));
+	/* The key is stored in the device in u32 array
+	 * as well as the API requires the key to be passed in this
+	 * format. Thus the size of our array should be divided by 4
+	 */
+	hash_key->keys_num = sizeof(hash_key->key) / sizeof(u32);
+}
+
+int ena_com_get_current_hash_function(struct ena_com_dev *ena_dev)
+{
+	return ena_dev->rss.hash_func;
 }
 
 static int ena_com_hash_key_allocate(struct ena_com_dev *ena_dev)
@@ -1449,6 +1474,12 @@ void ena_com_admin_destroy(struct ena_com_dev *ena_dev)
 
 void ena_com_set_admin_polling_mode(struct ena_com_dev *ena_dev, bool polling)
 {
+	u32 mask_value = 0;
+
+	if (polling)
+		mask_value = ENA_REGS_ADMIN_INTR_MASK;
+
+	writel(mask_value, ena_dev->reg_bar + ENA_REGS_INTR_MASK_OFF);
 	ena_dev->admin_queue.polling = polling;
 }
 
@@ -1959,7 +1990,7 @@ int ena_com_set_hash_function(struct ena_com_dev *ena_dev)
 	if (unlikely(ret))
 		return ret;
 
-	if (get_resp.u.flow_hash_func.supported_func & (1 << rss->hash_func)) {
+	if (!(get_resp.u.flow_hash_func.supported_func & BIT(rss->hash_func))) {
 		pr_err("Func hash %d isn't supported by device, abort\n",
 		       rss->hash_func);
 		return -EPERM;
@@ -2026,15 +2057,16 @@ int ena_com_fill_hash_function(struct ena_com_dev *ena_dev,
 
 	switch (func) {
 	case ENA_ADMIN_TOEPLITZ:
-		if (key_len > sizeof(hash_key->key)) {
-			pr_err("key len (%hu) is bigger than the max supported (%zu)\n",
-			       key_len, sizeof(hash_key->key));
-			return -EINVAL;
+		if (key) {
+			if (key_len != sizeof(hash_key->key)) {
+				pr_err("key len (%hu) doesn't equal the supported size (%zu)\n",
+				       key_len, sizeof(hash_key->key));
+				return -EINVAL;
+			}
+			memcpy(hash_key->key, key, key_len);
+			rss->hash_init_val = init_val;
+			hash_key->keys_num = key_len >> 2;
 		}
-
-		memcpy(hash_key->key, key, key_len);
-		rss->hash_init_val = init_val;
-		hash_key->keys_num = key_len >> 2;
 		break;
 	case ENA_ADMIN_CRC32:
 		rss->hash_init_val = init_val;
@@ -2044,6 +2076,7 @@ int ena_com_fill_hash_function(struct ena_com_dev *ena_dev,
 		return -EINVAL;
 	}
 
+	rss->hash_func = func;
 	rc = ena_com_set_hash_function(ena_dev);
 
 	/* Restore the old function */
@@ -2063,6 +2096,9 @@ int ena_com_get_hash_function(struct ena_com_dev *ena_dev,
 		rss->hash_key;
 	int rc;
 
+	if (unlikely(!func))
+		return -EINVAL;
+
 	rc = ena_com_get_feature_ex(ena_dev, &get_resp,
 				    ENA_ADMIN_RSS_HASH_FUNCTION,
 				    rss->hash_key_dma_addr,
@@ -2070,9 +2106,12 @@ int ena_com_get_hash_function(struct ena_com_dev *ena_dev,
 	if (unlikely(rc))
 		return rc;
 
-	rss->hash_func = get_resp.u.flow_hash_func.selected_func;
-	if (func)
-		*func = rss->hash_func;
+	/* ffs() returns 1 in case the lsb is set */
+	rss->hash_func = ffs(get_resp.u.flow_hash_func.selected_func);
+	if (rss->hash_func)
+		rss->hash_func--;
+
+	*func = rss->hash_func;
 
 	if (key)
 		memcpy(key, hash_key->key, (size_t)(hash_key->keys_num) << 2);
@@ -2356,6 +2395,8 @@ int ena_com_rss_init(struct ena_com_dev *ena_dev, u16 indr_tbl_log_size)
 	rc = ena_com_hash_key_allocate(ena_dev);
 	if (unlikely(rc))
 		goto err_hash_key;
+
+	ena_com_hash_key_fill_default_key(ena_dev);
 
 	rc = ena_com_hash_ctrl_init(ena_dev);
 	if (unlikely(rc))

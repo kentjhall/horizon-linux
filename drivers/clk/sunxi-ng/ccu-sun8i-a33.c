@@ -362,10 +362,10 @@ static SUNXI_CCU_MP_WITH_MUX_GATE(spi1_clk, "spi1", mod0_default_parents, 0x0a4,
 static const char * const i2s_parents[] = { "pll-audio-8x", "pll-audio-4x",
 					    "pll-audio-2x", "pll-audio" };
 static SUNXI_CCU_MUX_WITH_GATE(i2s0_clk, "i2s0", i2s_parents,
-			       0x0b0, 16, 2, BIT(31), 0);
+			       0x0b0, 16, 2, BIT(31), CLK_SET_RATE_PARENT);
 
 static SUNXI_CCU_MUX_WITH_GATE(i2s1_clk, "i2s1", i2s_parents,
-			       0x0b4, 16, 2, BIT(31), 0);
+			       0x0b4, 16, 2, BIT(31), CLK_SET_RATE_PARENT);
 
 /* TODO: the parent for most of the USB clocks is not known */
 static SUNXI_CCU_GATE(usb_phy0_clk,	"usb-phy0",	"osc24M",
@@ -442,7 +442,7 @@ static SUNXI_CCU_M_WITH_GATE(ve_clk, "ve", "pll-ve",
 static SUNXI_CCU_GATE(ac_dig_clk,	"ac-dig",	"pll-audio",
 		      0x140, BIT(31), 0);
 static SUNXI_CCU_GATE(ac_dig_4x_clk,	"ac-dig-4x",	"pll-audio-4x",
-		      0x140, BIT(30), 0);
+		      0x140, BIT(30), CLK_SET_RATE_PARENT);
 static SUNXI_CCU_GATE(avs_clk,		"avs",		"osc24M",
 		      0x144, BIT(31), 0);
 
@@ -752,6 +752,13 @@ static const struct sunxi_ccu_desc sun8i_a33_ccu_desc = {
 	.num_resets	= ARRAY_SIZE(sun8i_a33_ccu_resets),
 };
 
+static struct ccu_mux_nb sun8i_a33_cpu_nb = {
+	.common		= &cpux_clk.common,
+	.cm		= &cpux_clk.mux,
+	.delay_us	= 1, /* > 8 clock cycles at 24 MHz */
+	.bypass_index	= 1, /* index of 24 MHz oscillator */
+};
+
 static void __init sun8i_a33_ccu_setup(struct device_node *node)
 {
 	void __iomem *reg;
@@ -775,6 +782,9 @@ static void __init sun8i_a33_ccu_setup(struct device_node *node)
 	writel(val, reg + SUN8I_A33_PLL_MIPI_REG);
 
 	sunxi_ccu_probe(node, reg, &sun8i_a33_ccu_desc);
+
+	ccu_mux_notifier_register(pll_cpux_clk.common.hw.clk,
+				  &sun8i_a33_cpu_nb);
 }
 CLK_OF_DECLARE(sun8i_a33_ccu, "allwinner,sun8i-a33-ccu",
 	       sun8i_a33_ccu_setup);

@@ -274,7 +274,7 @@ static void dcb_tx_queue_prio_enable(struct net_device *dev, int enable)
 				"Can't %s DCB Priority on port %d, TX Queue %d: err=%d\n",
 				enable ? "set" : "unset", pi->port_id, i, -err);
 		else
-			txq->dcb_prio = value;
+			txq->dcb_prio = enable ? value : 0;
 	}
 }
 
@@ -836,8 +836,6 @@ static int setup_fw_sge_queues(struct adapter *adap)
 
 	err = t4_sge_alloc_rxq(adap, &s->fw_evtq, true, adap->port[0],
 			       adap->msi_idx, NULL, fwevtq_handler, NULL, -1);
-	if (err)
-		t4_free_sge_resources(adap);
 	return err;
 }
 
@@ -2201,9 +2199,10 @@ static int cxgb_up(struct adapter *adap)
 {
 	int err;
 
+	mutex_lock(&uld_mutex);
 	err = setup_sge_queues(adap);
 	if (err)
-		goto out;
+		goto rel_lock;
 	err = setup_rss(adap);
 	if (err)
 		goto freeq;
@@ -2226,23 +2225,26 @@ static int cxgb_up(struct adapter *adap)
 		if (err)
 			goto irq_err;
 	}
+
 	enable_rx(adap);
 	t4_sge_start(adap);
 	t4_intr_enable(adap);
 	adap->flags |= FULL_INIT_DONE;
+	mutex_unlock(&uld_mutex);
+
 	notify_ulds(adap, CXGB4_STATE_UP);
 #if IS_ENABLED(CONFIG_IPV6)
 	update_clip(adap);
 #endif
-	/* Initialize hash mac addr list*/
-	INIT_LIST_HEAD(&adap->mac_hlist);
- out:
 	return err;
+
  irq_err:
 	dev_err(adap->pdev_dev, "request_irq failed, err %d\n", err);
  freeq:
 	t4_free_sge_resources(adap);
-	goto out;
+ rel_lock:
+	mutex_unlock(&uld_mutex);
+	return err;
 }
 
 static void cxgb_down(struct adapter *adapter)
@@ -2255,6 +2257,7 @@ static void cxgb_down(struct adapter *adapter)
 
 	t4_sge_stop(adapter);
 	t4_free_sge_resources(adapter);
+
 	adapter->flags &= ~FULL_INIT_DONE;
 }
 
@@ -2736,6 +2739,16 @@ static int cxgb_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
 	return -EOPNOTSUPP;
 }
 
+static netdev_features_t cxgb_fix_features(struct net_device *dev,
+					   netdev_features_t features)
+{
+	/* Disable GRO, if RX_CSUM is disabled */
+	if (!(features & NETIF_F_RXCSUM))
+		features &= ~NETIF_F_GRO;
+
+	return features;
+}
+
 static const struct net_device_ops cxgb4_netdev_ops = {
 	.ndo_open             = cxgb_open,
 	.ndo_stop             = cxgb_close,
@@ -2760,6 +2773,7 @@ static const struct net_device_ops cxgb4_netdev_ops = {
 #endif
 	.ndo_set_tx_maxrate   = cxgb_set_tx_maxrate,
 	.ndo_setup_tc         = cxgb_setup_tc,
+	.ndo_fix_features     = cxgb_fix_features,
 };
 
 #ifdef CONFIG_PCI_IOV
@@ -4774,6 +4788,9 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 			     (is_t5(adapter->params.chip) ? STATMODE_V(0) :
 			      T6_STATMODE_V(0)));
 
+	/* Initialize hash mac addr list */
+	INIT_LIST_HEAD(&adapter->mac_hlist);
+
 	for_each_port(adapter, i) {
 		netdev = alloc_etherdev_mq(sizeof(struct port_info),
 					   MAX_ETH_QSETS);
@@ -4923,6 +4940,13 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (err)
 		goto out_free_dev;
 
+	err = setup_fw_sge_queues(adapter);
+	if (err) {
+		dev_err(adapter->pdev_dev,
+			"FW sge queue allocation failed, err %d", err);
+		goto out_free_dev;
+	}
+
 	/*
 	 * The card is now ready to go.  If any errors occur during device
 	 * registration we do not fail the whole card but rather proceed only
@@ -4966,7 +4990,6 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	print_adapter_info(adapter);
-	setup_fw_sge_queues(adapter);
 	return 0;
 
 sriov:
@@ -5018,6 +5041,7 @@ sriov:
 #endif
 
  out_free_dev:
+	t4_free_sge_resources(adapter);
 	free_some_resources(adapter);
 	if (adapter->flags & USING_MSIX)
 		free_msix_info(adapter);
@@ -5045,6 +5069,7 @@ sriov:
 static void remove_one(struct pci_dev *pdev)
 {
 	struct adapter *adapter = pci_get_drvdata(pdev);
+	struct hash_mac_addr *entry, *tmp;
 
 	if (!adapter) {
 		pci_release_regions(pdev);
@@ -5083,6 +5108,12 @@ static void remove_one(struct pci_dev *pdev)
 		if (adapter->num_uld || adapter->num_ofld_uld)
 			t4_uld_mem_free(adapter);
 		free_some_resources(adapter);
+		list_for_each_entry_safe(entry, tmp, &adapter->mac_hlist,
+					 list) {
+			list_del(&entry->list);
+			kfree(entry);
+		}
+
 #if IS_ENABLED(CONFIG_IPV6)
 		t4_cleanup_clip_tbl(adapter);
 #endif
@@ -5181,14 +5212,23 @@ static int __init cxgb4_init_module(void)
 
 	ret = pci_register_driver(&cxgb4_driver);
 	if (ret < 0)
-		debugfs_remove(cxgb4_debugfs_root);
+		goto err_pci;
 
 #if IS_ENABLED(CONFIG_IPV6)
 	if (!inet6addr_registered) {
-		register_inet6addr_notifier(&cxgb4_inet6addr_notifier);
-		inet6addr_registered = true;
+		ret = register_inet6addr_notifier(&cxgb4_inet6addr_notifier);
+		if (ret)
+			pci_unregister_driver(&cxgb4_driver);
+		else
+			inet6addr_registered = true;
 	}
 #endif
+
+	if (ret == 0)
+		return ret;
+
+err_pci:
+	debugfs_remove(cxgb4_debugfs_root);
 
 	return ret;
 }

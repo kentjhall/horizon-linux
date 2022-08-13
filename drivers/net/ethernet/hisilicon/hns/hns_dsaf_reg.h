@@ -173,7 +173,7 @@
 #define DSAF_INODE_IN_DATA_STP_DISC_0_REG	0x1A50
 #define DSAF_INODE_GE_FC_EN_0_REG		0x1B00
 #define DSAF_INODE_VC0_IN_PKT_NUM_0_REG		0x1B50
-#define DSAF_INODE_VC1_IN_PKT_NUM_0_REG		0x1C00
+#define DSAF_INODE_VC1_IN_PKT_NUM_0_REG		0x103C
 #define DSAF_INODE_IN_PRIO_PAUSE_BASE_REG	0x1C00
 #define DSAF_INODE_IN_PRIO_PAUSE_BASE_OFFSET	0x100
 #define DSAF_INODE_IN_PRIO_PAUSE_OFFSET		0x50
@@ -400,11 +400,11 @@
 #define RCB_ECC_ERR_ADDR4_REG			0x460
 #define RCB_ECC_ERR_ADDR5_REG			0x464
 
-#define RCB_COM_SF_CFG_INTMASK_RING		0x480
-#define RCB_COM_SF_CFG_RING_STS			0x484
-#define RCB_COM_SF_CFG_RING			0x488
-#define RCB_COM_SF_CFG_INTMASK_BD		0x48C
-#define RCB_COM_SF_CFG_BD_RINT_STS		0x470
+#define RCB_COM_SF_CFG_INTMASK_RING		0x470
+#define RCB_COM_SF_CFG_RING_STS			0x474
+#define RCB_COM_SF_CFG_RING			0x478
+#define RCB_COM_SF_CFG_INTMASK_BD		0x47C
+#define RCB_COM_SF_CFG_BD_RINT_STS		0x480
 #define RCB_COM_RCB_RD_BD_BUSY			0x490
 #define RCB_COM_RCB_FBD_CRT_EN			0x494
 #define RCB_COM_AXI_WR_ERR_INTMASK		0x498
@@ -528,6 +528,7 @@
 #define GMAC_LD_LINK_COUNTER_REG		0x01D0UL
 #define GMAC_LOOP_REG				0x01DCUL
 #define GMAC_RECV_CONTROL_REG			0x01E0UL
+#define GMAC_PCS_RX_EN_REG			0x01E4UL
 #define GMAC_VLAN_CODE_REG			0x01E8UL
 #define GMAC_RX_OVERRUN_CNT_REG			0x01ECUL
 #define GMAC_RX_LENGTHFIELD_ERR_CNT_REG		0x01F4UL
@@ -1007,9 +1008,7 @@
 
 static inline void dsaf_write_reg(void __iomem *base, u32 reg, u32 value)
 {
-	u8 __iomem *reg_addr = ACCESS_ONCE(base);
-
-	writel(value, reg_addr + reg);
+	writel(value, base + reg);
 }
 
 #define dsaf_write_dev(a, reg, value) \
@@ -1017,9 +1016,7 @@ static inline void dsaf_write_reg(void __iomem *base, u32 reg, u32 value)
 
 static inline u32 dsaf_read_reg(u8 __iomem *base, u32 reg)
 {
-	u8 __iomem *reg_addr = ACCESS_ONCE(base);
-
-	return readl(reg_addr + reg);
+	return readl(base + reg);
 }
 
 static inline void dsaf_write_syscon(struct regmap *base, u32 reg, u32 value)

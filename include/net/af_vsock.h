@@ -62,7 +62,8 @@ struct vsock_sock {
 	struct list_head pending_links;
 	struct list_head accept_queue;
 	bool rejected;
-	struct delayed_work dwork;
+	struct delayed_work connect_work;
+	struct delayed_work pending_work;
 	struct delayed_work close_work;
 	bool close_work_scheduled;
 	u32 peer_shutdown;
@@ -75,7 +76,6 @@ struct vsock_sock {
 
 s64 vsock_stream_has_data(struct vsock_sock *vsk);
 s64 vsock_stream_has_space(struct vsock_sock *vsk);
-void vsock_pending_work(struct work_struct *work);
 struct sock *__vsock_create(struct net *net,
 			    struct socket *sock,
 			    struct sock *parent,
@@ -99,6 +99,9 @@ struct vsock_transport {
 	int (*init)(struct vsock_sock *, struct vsock_sock *);
 	void (*destruct)(struct vsock_sock *);
 	void (*release)(struct vsock_sock *);
+
+	/* Cancel all pending packets sent on vsock. */
+	int (*cancel_pkt)(struct vsock_sock *vsk);
 
 	/* Connections. */
 	int (*connect)(struct vsock_sock *);

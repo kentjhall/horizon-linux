@@ -28,6 +28,7 @@
 #include <xen/interface/vcpu.h>
 #include <xen/interface/xenpmu.h>
 
+#include <asm/spec-ctrl.h>
 #include <asm/xen/interface.h>
 #include <asm/xen/hypercall.h>
 
@@ -87,11 +88,7 @@ static void cpu_bringup(void)
 	cpu_data(cpu).x86_max_cores = 1;
 	set_cpu_sibling_map(cpu);
 
-	/*
-	 * identify_cpu() may have set logical_pkg_id to -1 due
-	 * to incorrect phys_proc_id. Let's re-comupte it.
-	 */
-	topology_update_package_map(apic->cpu_present_to_apicid(cpu), cpu);
+	speculative_store_bypass_ht_init();
 
 	xen_setup_cpu_clockevents();
 
@@ -119,6 +116,7 @@ asmlinkage __visible void cpu_bringup_and_idle(int cpu)
 #endif
 	cpu_bringup();
 	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
+	prevent_tail_call_optimization();
 }
 
 void xen_smp_intr_free(unsigned int cpu)
@@ -305,35 +303,46 @@ static void __init xen_filter_cpu_maps(void)
 
 }
 
-static void __init xen_smp_prepare_boot_cpu(void)
+static void __init xen_pv_smp_prepare_boot_cpu(void)
 {
 	BUG_ON(smp_processor_id() != 0);
 	native_smp_prepare_boot_cpu();
 
-	if (xen_pv_domain()) {
-		if (!xen_feature(XENFEAT_writable_page_tables))
-			/* We've switched to the "real" per-cpu gdt, so make
-			 * sure the old memory can be recycled. */
-			make_lowmem_page_readwrite(xen_initial_gdt);
+	if (!xen_feature(XENFEAT_writable_page_tables))
+		/* We've switched to the "real" per-cpu gdt, so make
+		 * sure the old memory can be recycled. */
+		make_lowmem_page_readwrite(xen_initial_gdt);
 
 #ifdef CONFIG_X86_32
-		/*
-		 * Xen starts us with XEN_FLAT_RING1_DS, but linux code
-		 * expects __USER_DS
-		 */
-		loadsegment(ds, __USER_DS);
-		loadsegment(es, __USER_DS);
+	/*
+	 * Xen starts us with XEN_FLAT_RING1_DS, but linux code
+	 * expects __USER_DS
+	 */
+	loadsegment(ds, __USER_DS);
+	loadsegment(es, __USER_DS);
 #endif
 
-		xen_filter_cpu_maps();
-		xen_setup_vcpu_info_placement();
-	}
+	xen_filter_cpu_maps();
+	xen_setup_vcpu_info_placement();
+
+	/*
+	 * The alternative logic (which patches the unlock/lock) runs before
+	 * the smp bootup up code is activated. Hence we need to set this up
+	 * the core kernel is being patched. Otherwise we will have only
+	 * modules patched but not core code.
+	 */
+	xen_init_spinlocks();
+}
+
+static void __init xen_hvm_smp_prepare_boot_cpu(void)
+{
+	BUG_ON(smp_processor_id() != 0);
+	native_smp_prepare_boot_cpu();
 
 	/*
 	 * Setup vcpu_info for boot CPU.
 	 */
-	if (xen_hvm_domain())
-		xen_vcpu_setup(0);
+	xen_vcpu_setup(0);
 
 	/*
 	 * The alternative logic (which patches the unlock/lock) runs before
@@ -369,6 +378,8 @@ static void __init xen_smp_prepare_cpus(unsigned int max_cpus)
 		zalloc_cpumask_var(&per_cpu(cpu_llc_shared_map, i), GFP_KERNEL);
 	}
 	set_cpu_sibling_map(0);
+
+	speculative_store_bypass_ht_init();
 
 	xen_pmu_init(0);
 
@@ -739,7 +750,7 @@ static irqreturn_t xen_irq_work_interrupt(int irq, void *dev_id)
 }
 
 static const struct smp_ops xen_smp_ops __initconst = {
-	.smp_prepare_boot_cpu = xen_smp_prepare_boot_cpu,
+	.smp_prepare_boot_cpu = xen_pv_smp_prepare_boot_cpu,
 	.smp_prepare_cpus = xen_smp_prepare_cpus,
 	.smp_cpus_done = xen_smp_cpus_done,
 
@@ -771,10 +782,12 @@ static void __init xen_hvm_smp_prepare_cpus(unsigned int max_cpus)
 
 void __init xen_hvm_smp_init(void)
 {
+	if (!xen_have_vector_callback)
+		return;
 	smp_ops.smp_prepare_cpus = xen_hvm_smp_prepare_cpus;
 	smp_ops.smp_send_reschedule = xen_smp_send_reschedule;
 	smp_ops.cpu_die = xen_cpu_die;
 	smp_ops.send_call_func_ipi = xen_smp_send_call_function_ipi;
 	smp_ops.send_call_func_single_ipi = xen_smp_send_call_function_single_ipi;
-	smp_ops.smp_prepare_boot_cpu = xen_smp_prepare_boot_cpu;
+	smp_ops.smp_prepare_boot_cpu = xen_hvm_smp_prepare_boot_cpu;
 }

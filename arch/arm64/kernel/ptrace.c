@@ -327,13 +327,13 @@ static int ptrace_hbp_fill_attr_ctrl(unsigned int note_type,
 				     struct arch_hw_breakpoint_ctrl ctrl,
 				     struct perf_event_attr *attr)
 {
-	int err, len, type, disabled = !ctrl.enabled;
+	int err, len, type, offset, disabled = !ctrl.enabled;
 
 	attr->disabled = disabled;
 	if (disabled)
 		return 0;
 
-	err = arch_bp_generic_fields(ctrl, &len, &type);
+	err = arch_bp_generic_fields(ctrl, &len, &type, &offset);
 	if (err)
 		return err;
 
@@ -352,6 +352,7 @@ static int ptrace_hbp_fill_attr_ctrl(unsigned int note_type,
 
 	attr->bp_len	= len;
 	attr->bp_type	= type;
+	attr->bp_addr	+= offset;
 
 	return 0;
 }
@@ -404,7 +405,7 @@ static int ptrace_hbp_get_addr(unsigned int note_type,
 	if (IS_ERR(bp))
 		return PTR_ERR(bp);
 
-	*addr = bp ? bp->attr.bp_addr : 0;
+	*addr = bp ? counter_arch_bp(bp)->address : 0;
 	return 0;
 }
 
@@ -550,6 +551,8 @@ static int hw_break_set(struct task_struct *target,
 	/* (address, ctrl) registers */
 	limit = regset->n * regset->size;
 	while (count && offset < limit) {
+		if (count < PTRACE_HBP_ADDR_SZ)
+			return -EINVAL;
 		ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &addr,
 					 offset, offset + PTRACE_HBP_ADDR_SZ);
 		if (ret)
@@ -559,6 +562,8 @@ static int hw_break_set(struct task_struct *target,
 			return ret;
 		offset += PTRACE_HBP_ADDR_SZ;
 
+		if (!count)
+			break;
 		ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &ctrl,
 					 offset, offset + PTRACE_HBP_CTRL_SZ);
 		if (ret)
@@ -595,7 +600,7 @@ static int gpr_set(struct task_struct *target, const struct user_regset *regset,
 		   const void *kbuf, const void __user *ubuf)
 {
 	int ret;
-	struct user_pt_regs newregs;
+	struct user_pt_regs newregs = task_pt_regs(target)->user_regs;
 
 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &newregs, 0, -1);
 	if (ret)
@@ -625,7 +630,8 @@ static int fpr_set(struct task_struct *target, const struct user_regset *regset,
 		   const void *kbuf, const void __user *ubuf)
 {
 	int ret;
-	struct user_fpsimd_state newstate;
+	struct user_fpsimd_state newstate =
+		target->thread.fpsimd_state.user_fpsimd;
 
 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &newstate, 0, -1);
 	if (ret)
@@ -649,7 +655,7 @@ static int tls_set(struct task_struct *target, const struct user_regset *regset,
 		   const void *kbuf, const void __user *ubuf)
 {
 	int ret;
-	unsigned long tls;
+	unsigned long tls = target->thread.tp_value;
 
 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &tls, 0, -1);
 	if (ret)
@@ -675,7 +681,8 @@ static int system_call_set(struct task_struct *target,
 			   unsigned int pos, unsigned int count,
 			   const void *kbuf, const void __user *ubuf)
 {
-	int syscallno, ret;
+	int syscallno = task_pt_regs(target)->syscallno;
+	int ret;
 
 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &syscallno, 0, -1);
 	if (ret)
@@ -757,6 +764,53 @@ static const struct user_regset_view user_aarch64_view = {
 	.name = "aarch64", .e_machine = EM_AARCH64,
 	.regsets = aarch64_regsets, .n = ARRAY_SIZE(aarch64_regsets)
 };
+
+static int ptrace_read_user(struct task_struct *tsk, unsigned long off,
+				   unsigned long __user *ret)
+{
+	unsigned long tmp;
+
+	if (off & 3)
+		return -EIO;
+
+	if (off == COMPAT_PT_TEXT_ADDR)
+		tmp = tsk->mm->start_code;
+	else if (off == COMPAT_PT_DATA_ADDR)
+		tmp = tsk->mm->start_data;
+	else if (off == COMPAT_PT_TEXT_END_ADDR)
+		tmp = tsk->mm->end_code;
+	else if (off < sizeof(struct user_pt_regs))
+		return copy_regset_to_user(tsk, task_user_regset_view(current),
+					   REGSET_GPR, off,
+					   sizeof(unsigned long), ret);
+	else
+		return -EIO;
+
+	return put_user(tmp, ret);
+}
+
+static int ptrace_write_user(struct task_struct *tsk, unsigned long off,
+				    unsigned long val)
+{
+	int ret;
+	mm_segment_t old_fs = get_fs();
+
+	if (off & 3 || off >= COMPAT_USER_SZ)
+		return -EIO;
+
+	if (off >= sizeof(struct user_pt_regs))
+		return 0;
+
+	set_fs(KERNEL_DS);
+	ret = copy_regset_from_user(tsk, task_user_regset_view(current),
+				    REGSET_GPR, off,
+				    sizeof(unsigned int),
+				    &val);
+	set_fs(old_fs);
+
+	return ret;
+}
+
 
 #ifdef CONFIG_COMPAT
 #include <linux/compat.h>
@@ -947,7 +1001,7 @@ static int compat_tls_set(struct task_struct *target,
 			  const void __user *ubuf)
 {
 	int ret;
-	compat_ulong_t tls;
+	compat_ulong_t tls = target->thread.tp_value;
 
 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &tls, 0, -1);
 	if (ret)
@@ -1315,7 +1369,26 @@ const struct user_regset_view *task_user_regset_view(struct task_struct *task)
 long arch_ptrace(struct task_struct *child, long request,
 		 unsigned long addr, unsigned long data)
 {
-	return ptrace_request(child, request, addr, data);
+	int ret;
+	unsigned long __user *datap = (unsigned long __user *)data;
+
+	switch (request) {
+	case PTRACE_PEEKUSR:
+		/* read the word at location addr in the USER area. */
+		ret = ptrace_read_user(child, addr, datap);
+		break;
+
+	case PTRACE_POKEUSR:
+		/* write the word at location addr in the USER area */
+		ret = ptrace_write_user(child, addr, data);
+		break;
+
+	default:
+		ret = ptrace_request(child, request, addr, data);
+		break;
+	}
+
+	return ret;
 }
 
 enum ptrace_syscall_dir {
@@ -1441,8 +1514,8 @@ static int valid_native_regs(struct user_pt_regs *regs)
  */
 int valid_user_regs(struct user_pt_regs *regs, struct task_struct *task)
 {
-	if (!test_tsk_thread_flag(task, TIF_SINGLESTEP))
-		regs->pstate &= ~DBG_SPSR_SS;
+	/* https://lore.kernel.org/lkml/20191118131525.GA4180@willie-the-truck */
+	user_regs_reset_single_step(regs, task);
 
 	if (is_compat_thread(task_thread_info(task)))
 		return valid_compat_regs(regs);

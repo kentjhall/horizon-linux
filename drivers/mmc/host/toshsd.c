@@ -479,7 +479,7 @@ static void toshsd_start_data(struct toshsd_host *host, struct mmc_data *data)
 {
 	unsigned int flags = SG_MITER_ATOMIC;
 
-	dev_dbg(&host->pdev->dev, "setup data transfer: blocksize %08x  nr_blocks %d, offset: %08x\n",
+	dev_dbg(&host->pdev->dev, "setup data transfer: blocksize %08x  nr_blocks %d, offset: %08lx\n",
 		data->blksz, data->blocks, data->sg->offset);
 
 	host->data = data;

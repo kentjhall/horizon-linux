@@ -4257,7 +4257,7 @@ static int dib8000_remove_slave_frontend(struct dvb_frontend *fe)
 		index_frontend++;
 	if (index_frontend != 1) {
 		dprintk("remove slave fe %p (index %i)", state->fe[index_frontend-1], index_frontend-1);
-		state->fe[index_frontend] = NULL;
+		state->fe[index_frontend-1] = NULL;
 		return 0;
 	}
 

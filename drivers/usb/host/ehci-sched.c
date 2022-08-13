@@ -248,7 +248,8 @@ static void reserve_release_intr_bandwidth(struct ehci_hcd *ehci,
 		for (i = start_uf; i < EHCI_BANDWIDTH_SIZE;
 				i += qh->ps.bw_uperiod) {
 			for ((j = 2, m = 1 << (j+8)); j < 8; (++j, m <<= 1)) {
-				if (qh->ps.cs_mask & m)
+				if ((qh->ps.cs_mask & m) &&
+					((i+j) < EHCI_BANDWIDTH_SIZE))
 					ehci->bandwidth[i+j] += c_usecs;
 			}
 		}
@@ -290,7 +291,10 @@ static void compute_tt_budget(u8 budget_table[EHCI_BANDWIDTH_SIZE],
 
 			/* propagate the time forward */
 			for (uf = ps->phase_uf; uf < 8; ++uf) {
-				x += budget_line[uf];
+				if (uframe + uf < EHCI_BANDWIDTH_SIZE)
+					x += budget_line[uf];
+				else
+					break;
 
 				/* Each microframe lasts 125 us */
 				if (x <= 125) {
@@ -577,7 +581,7 @@ static void qh_link_periodic(struct ehci_hcd *ehci, struct ehci_qh *qh)
 		/* sorting each branch by period (slow-->fast)
 		 * enables sharing interior tree nodes
 		 */
-		while (here.ptr && qh != here.qh) {
+		while (here.qh && here.ptr && qh != here.qh) {
 			if (qh->ps.period > here.qh->ps.period)
 				break;
 			prev = &here.qh->qh_next;
@@ -1361,7 +1365,8 @@ static void reserve_release_iso_bandwidth(struct ehci_hcd *ehci,
 		/* NOTE: adjustment needed for frame overflow */
 		for (i = uframe; i < EHCI_BANDWIDTH_SIZE;
 				i += stream->ps.bw_uperiod) {
-			for ((j = stream->ps.phase_uf, m = 1 << j); j < 8;
+			for ((j = stream->ps.phase_uf, m = 1 << j); j < 8 &&
+					(i+j) < EHCI_BANDWIDTH_SIZE;
 					(++j, m <<= 1)) {
 				if (s_mask & m)
 					ehci->bandwidth[i+j] += usecs;

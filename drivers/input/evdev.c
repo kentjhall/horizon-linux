@@ -342,20 +342,6 @@ static int evdev_fasync(int fd, struct file *file, int on)
 	return fasync_helper(fd, file, on, &client->fasync);
 }
 
-static int evdev_flush(struct file *file, fl_owner_t id)
-{
-	struct evdev_client *client = file->private_data;
-	struct evdev *evdev = client->evdev;
-
-	mutex_lock(&evdev->mutex);
-
-	if (evdev->exist && !client->revoked)
-		input_flush_device(&evdev->handle, file);
-
-	mutex_unlock(&evdev->mutex);
-	return 0;
-}
-
 static void evdev_free(struct device *dev)
 {
 	struct evdev *evdev = container_of(dev, struct evdev, dev);
@@ -469,6 +455,10 @@ static int evdev_release(struct inode *inode, struct file *file)
 	unsigned int i;
 
 	mutex_lock(&evdev->mutex);
+
+	if (evdev->exist && !client->revoked)
+		input_flush_device(&evdev->handle, file);
+
 	evdev_ungrab(evdev, client);
 	mutex_unlock(&evdev->mutex);
 
@@ -535,6 +525,7 @@ static ssize_t evdev_write(struct file *file, const char __user *buffer,
 	struct evdev *evdev = client->evdev;
 	struct input_event event;
 	int retval = 0;
+	size_t cnt;
 
 	if (count != 0 && count < input_event_size())
 		return -EINVAL;
@@ -549,11 +540,15 @@ static ssize_t evdev_write(struct file *file, const char __user *buffer,
 	}
 
 	while (retval + input_event_size() <= count) {
-
 		if (input_event_from_user(buffer + retval, &event)) {
 			retval = -EFAULT;
 			goto out;
 		}
+
+		cnt = evdev_get_mask_cnt(event.type);
+		if (!cnt || event.code >= cnt)
+			goto out;
+
 		retval += input_event_size();
 
 		input_inject_event(&evdev->handle,
@@ -1214,6 +1209,9 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
 		if (error)
 			return error;
 
+		if (effect.id >= dev->ff->max_effects)
+			return -EINVAL;
+
 		if (put_user(effect.id, &(((struct ff_effect __user *)p)->id)))
 			return -EFAULT;
 
@@ -1331,7 +1329,6 @@ static const struct file_operations evdev_fops = {
 	.compat_ioctl	= evdev_ioctl_compat,
 #endif
 	.fasync		= evdev_fasync,
-	.flush		= evdev_flush,
 	.llseek		= no_llseek,
 };
 

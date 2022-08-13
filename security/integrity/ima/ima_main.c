@@ -16,6 +16,9 @@
  *	implements the IMA hooks: ima_bprm_check, ima_file_mmap,
  *	and ima_file_check.
  */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/module.h>
 #include <linux/file.h>
 #include <linux/binfmts.h>
@@ -51,6 +54,8 @@ static int __init hash_setup(char *str)
 			ima_hash_algo = HASH_ALGO_SHA1;
 		else if (strncmp(str, "md5", 3) == 0)
 			ima_hash_algo = HASH_ALGO_MD5;
+		else
+			return 1;
 		goto out;
 	}
 
@@ -60,6 +65,8 @@ static int __init hash_setup(char *str)
 			break;
 		}
 	}
+	if (i == HASH_ALGO__LAST)
+		return 1;
 out:
 	hash_setup_done = 1;
 	return 1;
@@ -83,6 +90,7 @@ static void ima_rdwr_violation_check(struct file *file,
 				     const char **pathname)
 {
 	struct inode *inode = file_inode(file);
+	char filename[NAME_MAX];
 	fmode_t mode = file->f_mode;
 	bool send_tomtou = false, send_writers = false;
 
@@ -91,10 +99,13 @@ static void ima_rdwr_violation_check(struct file *file,
 			if (!iint)
 				iint = integrity_iint_find(inode);
 			/* IMA_MEASURE is set from reader side */
-			if (iint && (iint->flags & IMA_MEASURE))
+			if (iint && test_bit(IMA_MUST_MEASURE,
+						&iint->atomic_flags))
 				send_tomtou = true;
 		}
 	} else {
+		if (must_measure)
+			set_bit(IMA_MUST_MEASURE, &iint->atomic_flags);
 		if ((atomic_read(&inode->i_writecount) > 0) && must_measure)
 			send_writers = true;
 	}
@@ -102,7 +113,7 @@ static void ima_rdwr_violation_check(struct file *file,
 	if (!send_tomtou && !send_writers)
 		return;
 
-	*pathname = ima_d_path(&file->f_path, pathbuf);
+	*pathname = ima_d_path(&file->f_path, pathbuf, filename);
 
 	if (send_tomtou)
 		ima_add_violation(file, *pathname, iint,
@@ -116,21 +127,24 @@ static void ima_check_last_writer(struct integrity_iint_cache *iint,
 				  struct inode *inode, struct file *file)
 {
 	fmode_t mode = file->f_mode;
+	bool update;
 
 	if (!(mode & FMODE_WRITE))
 		return;
 
-	inode_lock(inode);
+	mutex_lock(&iint->mutex);
 	if (atomic_read(&inode->i_writecount) == 1) {
+		update = test_and_clear_bit(IMA_UPDATE_XATTR,
+					    &iint->atomic_flags);
 		if ((iint->version != inode->i_version) ||
 		    (iint->flags & IMA_NEW_FILE)) {
 			iint->flags &= ~(IMA_DONE_MASK | IMA_NEW_FILE);
 			iint->measured_pcrs = 0;
-			if (iint->flags & IMA_APPRAISE)
+			if (update)
 				ima_update_xattr(iint, file);
 		}
 	}
-	inode_unlock(inode);
+	mutex_unlock(&iint->mutex);
 }
 
 /**
@@ -161,8 +175,9 @@ static int process_measurement(struct file *file, char *buf, loff_t size,
 	struct integrity_iint_cache *iint = NULL;
 	struct ima_template_desc *template_desc;
 	char *pathbuf = NULL;
+	char filename[NAME_MAX];
 	const char *pathname = NULL;
-	int rc = -ENOMEM, action, must_appraise;
+	int rc = 0, action, must_appraise = 0;
 	int pcr = CONFIG_IMA_MEASURE_PCR_IDX;
 	struct evm_ima_xattr_data *xattr_value = NULL;
 	int xattr_len = 0;
@@ -193,17 +208,31 @@ static int process_measurement(struct file *file, char *buf, loff_t size,
 	if (action) {
 		iint = integrity_inode_get(inode);
 		if (!iint)
-			goto out;
+			rc = -ENOMEM;
 	}
 
-	if (violation_check) {
+	if (!rc && violation_check)
 		ima_rdwr_violation_check(file, iint, action & IMA_MEASURE,
 					 &pathbuf, &pathname);
-		if (!action) {
-			rc = 0;
-			goto out_free;
-		}
-	}
+
+	inode_unlock(inode);
+
+	if (rc)
+		goto out;
+	if (!action)
+		goto out;
+
+	mutex_lock(&iint->mutex);
+
+	if (test_and_clear_bit(IMA_CHANGE_ATTR, &iint->atomic_flags))
+		/* reset appraisal flags if ima_inode_post_setattr was called */
+		iint->flags &= ~(IMA_APPRAISE | IMA_APPRAISED |
+				 IMA_APPRAISE_SUBMASK | IMA_APPRAISED_SUBMASK |
+				 IMA_ACTION_FLAGS);
+
+	if (test_and_clear_bit(IMA_CHANGE_XATTR, &iint->atomic_flags))
+		/* reset all flags if ima_inode_setxattr was called */
+		iint->flags &= ~IMA_DONE_MASK;
 
 	/* Determine if already appraised/measured based on bitmask
 	 * (IMA_MEASURE, IMA_MEASURED, IMA_XXXX_APPRAISE, IMA_XXXX_APPRAISED,
@@ -221,7 +250,7 @@ static int process_measurement(struct file *file, char *buf, loff_t size,
 	if (!action) {
 		if (must_appraise)
 			rc = ima_get_cache_status(iint, func);
-		goto out_digsig;
+		goto out_locked;
 	}
 
 	template_desc = ima_template_desc_current();
@@ -233,36 +262,41 @@ static int process_measurement(struct file *file, char *buf, loff_t size,
 	hash_algo = ima_get_hash_algo(xattr_value, xattr_len);
 
 	rc = ima_collect_measurement(iint, file, buf, size, hash_algo);
-	if (rc != 0) {
-		if (file->f_flags & O_DIRECT)
-			rc = (iint->flags & IMA_PERMIT_DIRECTIO) ? 0 : -EACCES;
-		goto out_digsig;
-	}
+	if (rc != 0 && rc != -EBADF && rc != -EINVAL)
+		goto out_locked;
 
-	if (!pathname)	/* ima_rdwr_violation possibly pre-fetched */
-		pathname = ima_d_path(&file->f_path, &pathbuf);
+	if (!pathbuf)	/* ima_rdwr_violation possibly pre-fetched */
+		pathname = ima_d_path(&file->f_path, &pathbuf, filename);
 
 	if (action & IMA_MEASURE)
 		ima_store_measurement(iint, file, pathname,
 				      xattr_value, xattr_len, pcr);
-	if (action & IMA_APPRAISE_SUBMASK)
+	if (rc == 0 && (action & IMA_APPRAISE_SUBMASK)) {
+		inode_lock(inode);
 		rc = ima_appraise_measurement(func, iint, file, pathname,
 					      xattr_value, xattr_len, opened);
+		inode_unlock(inode);
+	}
 	if (action & IMA_AUDIT)
 		ima_audit_measurement(iint, pathname);
 
-out_digsig:
-	if ((mask & MAY_WRITE) && (iint->flags & IMA_DIGSIG) &&
+	if ((file->f_flags & O_DIRECT) && (iint->flags & IMA_PERMIT_DIRECTIO))
+		rc = 0;
+out_locked:
+	if ((mask & MAY_WRITE) && test_bit(IMA_DIGSIG, &iint->atomic_flags) &&
 	     !(iint->flags & IMA_NEW_FILE))
 		rc = -EACCES;
+	mutex_unlock(&iint->mutex);
 	kfree(xattr_value);
-out_free:
+out:
 	if (pathbuf)
 		__putname(pathbuf);
-out:
-	inode_unlock(inode);
-	if ((rc && must_appraise) && (ima_appraise & IMA_APPRAISE_ENFORCE))
-		return -EACCES;
+	if (must_appraise) {
+		if (rc && (ima_appraise & IMA_APPRAISE_ENFORCE))
+			return -EACCES;
+		if (file->f_mode & FMODE_WRITE)
+			set_bit(IMA_UPDATE_XATTR, &iint->atomic_flags);
+	}
 	return 0;
 }
 
@@ -370,6 +404,7 @@ int ima_read_file(struct file *file, enum kernel_read_file_id read_id)
 
 static int read_idmap[READING_MAX_ID] = {
 	[READING_FIRMWARE] = FIRMWARE_CHECK,
+	[READING_FIRMWARE_PREALLOC_BUFFER] = FIRMWARE_CHECK,
 	[READING_MODULE] = MODULE_CHECK,
 	[READING_KEXEC_IMAGE] = KEXEC_KERNEL_CHECK,
 	[READING_KEXEC_INITRAMFS] = KEXEC_INITRAMFS_CHECK,
@@ -420,6 +455,16 @@ static int __init init_ima(void)
 
 	hash_setup(CONFIG_IMA_DEFAULT_HASH);
 	error = ima_init();
+
+	if (error && strcmp(hash_algo_name[ima_hash_algo],
+			    CONFIG_IMA_DEFAULT_HASH) != 0) {
+		pr_info("Allocating %s failed, going to use default hash algorithm %s\n",
+			hash_algo_name[ima_hash_algo], CONFIG_IMA_DEFAULT_HASH);
+		hash_setup_done = 0;
+		hash_setup(CONFIG_IMA_DEFAULT_HASH);
+		error = ima_init();
+	}
+
 	if (!error) {
 		ima_initialized = 1;
 		ima_update_policy_flag();

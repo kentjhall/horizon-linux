@@ -23,9 +23,6 @@
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 
-typedef ssize_t (*io_fn_t)(struct file *, char __user *, size_t, loff_t *);
-typedef ssize_t (*iter_fn_t)(struct kiocb *, struct iov_iter *);
-
 const struct file_operations generic_ro_fops = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= generic_file_read_iter,
@@ -114,7 +111,7 @@ generic_file_llseek_size(struct file *file, loff_t offset, int whence,
 		 * In the generic case the entire file is data, so as long as
 		 * offset isn't at the end of the file then the offset is data.
 		 */
-		if (offset >= eof)
+		if ((unsigned long long)offset >= eof)
 			return -ENXIO;
 		break;
 	case SEEK_HOLE:
@@ -122,7 +119,7 @@ generic_file_llseek_size(struct file *file, loff_t offset, int whence,
 		 * There is a virtual hole at the end of the file, so as long as
 		 * offset isn't i_size or larger, return i_size.
 		 */
-		if (offset >= eof)
+		if ((unsigned long long)offset >= eof)
 			return -ENXIO;
 		offset = eof;
 		break;
@@ -392,8 +389,10 @@ ssize_t vfs_iter_write(struct file *file, struct iov_iter *iter, loff_t *ppos)
 	iter->type |= WRITE;
 	ret = file->f_op->write_iter(&kiocb, iter);
 	BUG_ON(ret == -EIOCBQUEUED);
-	if (ret > 0)
+	if (ret > 0) {
 		*ppos = kiocb.ki_pos;
+		fsnotify_modify(file);
+	}
 	return ret;
 }
 EXPORT_SYMBOL(vfs_iter_write);
@@ -573,12 +572,13 @@ EXPORT_SYMBOL(vfs_write);
 
 static inline loff_t file_pos_read(struct file *file)
 {
-	return file->f_pos;
+	return file->f_mode & FMODE_STREAM ? 0 : file->f_pos;
 }
 
 static inline void file_pos_write(struct file *file, loff_t pos)
 {
-	file->f_pos = pos;
+	if ((file->f_mode & FMODE_STREAM) == 0)
+		file->f_pos = pos;
 }
 
 SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
@@ -675,7 +675,7 @@ unsigned long iov_shorten(struct iovec *iov, unsigned long nr_segs, size_t to)
 EXPORT_SYMBOL(iov_shorten);
 
 static ssize_t do_iter_readv_writev(struct file *filp, struct iov_iter *iter,
-		loff_t *ppos, iter_fn_t fn, int flags)
+		loff_t *ppos, int type, int flags)
 {
 	struct kiocb kiocb;
 	ssize_t ret;
@@ -692,7 +692,10 @@ static ssize_t do_iter_readv_writev(struct file *filp, struct iov_iter *iter,
 		kiocb.ki_flags |= (IOCB_DSYNC | IOCB_SYNC);
 	kiocb.ki_pos = *ppos;
 
-	ret = fn(&kiocb, iter);
+	if (type == READ)
+		ret = filp->f_op->read_iter(&kiocb, iter);
+	else
+		ret = filp->f_op->write_iter(&kiocb, iter);
 	BUG_ON(ret == -EIOCBQUEUED);
 	*ppos = kiocb.ki_pos;
 	return ret;
@@ -700,7 +703,7 @@ static ssize_t do_iter_readv_writev(struct file *filp, struct iov_iter *iter,
 
 /* Do it by hand, with file-ops */
 static ssize_t do_loop_readv_writev(struct file *filp, struct iov_iter *iter,
-		loff_t *ppos, io_fn_t fn, int flags)
+		loff_t *ppos, int type, int flags)
 {
 	ssize_t ret = 0;
 
@@ -711,7 +714,13 @@ static ssize_t do_loop_readv_writev(struct file *filp, struct iov_iter *iter,
 		struct iovec iovec = iov_iter_iovec(iter);
 		ssize_t nr;
 
-		nr = fn(filp, iovec.iov_base, iovec.iov_len, ppos);
+		if (type == READ) {
+			nr = filp->f_op->read(filp, iovec.iov_base,
+					      iovec.iov_len, ppos);
+		} else {
+			nr = filp->f_op->write(filp, iovec.iov_base,
+					       iovec.iov_len, ppos);
+		}
 
 		if (nr < 0) {
 			if (!ret)
@@ -844,8 +853,6 @@ static ssize_t do_readv_writev(int type, struct file *file,
 	struct iovec *iov = iovstack;
 	struct iov_iter iter;
 	ssize_t ret;
-	io_fn_t fn;
-	iter_fn_t iter_fn;
 
 	ret = import_iovec(type, uvector, nr_segs,
 			   ARRAY_SIZE(iovstack), &iov, &iter);
@@ -859,19 +866,14 @@ static ssize_t do_readv_writev(int type, struct file *file,
 	if (ret < 0)
 		goto out;
 
-	if (type == READ) {
-		fn = file->f_op->read;
-		iter_fn = file->f_op->read_iter;
-	} else {
-		fn = (io_fn_t)file->f_op->write;
-		iter_fn = file->f_op->write_iter;
+	if (type != READ)
 		file_start_write(file);
-	}
 
-	if (iter_fn)
-		ret = do_iter_readv_writev(file, &iter, pos, iter_fn, flags);
+	if ((type == READ && file->f_op->read_iter) ||
+	    (type == WRITE && file->f_op->write_iter))
+		ret = do_iter_readv_writev(file, &iter, pos, type, flags);
 	else
-		ret = do_loop_readv_writev(file, &iter, pos, fn, flags);
+		ret = do_loop_readv_writev(file, &iter, pos, type, flags);
 
 	if (type != READ)
 		file_end_write(file);
@@ -1069,8 +1071,6 @@ static ssize_t compat_do_readv_writev(int type, struct file *file,
 	struct iovec *iov = iovstack;
 	struct iov_iter iter;
 	ssize_t ret;
-	io_fn_t fn;
-	iter_fn_t iter_fn;
 
 	ret = compat_import_iovec(type, uvector, nr_segs,
 				  UIO_FASTIOV, &iov, &iter);
@@ -1084,19 +1084,14 @@ static ssize_t compat_do_readv_writev(int type, struct file *file,
 	if (ret < 0)
 		goto out;
 
-	if (type == READ) {
-		fn = file->f_op->read;
-		iter_fn = file->f_op->read_iter;
-	} else {
-		fn = (io_fn_t)file->f_op->write;
-		iter_fn = file->f_op->write_iter;
+	if (type != READ)
 		file_start_write(file);
-	}
 
-	if (iter_fn)
-		ret = do_iter_readv_writev(file, &iter, pos, iter_fn, flags);
+	if ((type == READ && file->f_op->read_iter) ||
+	    (type == WRITE && file->f_op->write_iter))
+		ret = do_iter_readv_writev(file, &iter, pos, type, flags);
 	else
-		ret = do_loop_readv_writev(file, &iter, pos, fn, flags);
+		ret = do_loop_readv_writev(file, &iter, pos, type, flags);
 
 	if (type != READ)
 		file_end_write(file);
@@ -1202,6 +1197,9 @@ COMPAT_SYSCALL_DEFINE5(preadv64v2, unsigned long, fd,
 		const struct compat_iovec __user *,vec,
 		unsigned long, vlen, loff_t, pos, int, flags)
 {
+	if (pos == -1)
+		return do_compat_readv(fd, vec, vlen, flags);
+
 	return do_compat_preadv64(fd, vec, vlen, pos, flags);
 }
 #endif
@@ -1232,7 +1230,7 @@ static size_t compat_writev(struct file *file,
 	if (!(file->f_mode & FMODE_CAN_WRITE))
 		goto out;
 
-	ret = compat_do_readv_writev(WRITE, file, vec, vlen, pos, 0);
+	ret = compat_do_readv_writev(WRITE, file, vec, vlen, pos, flags);
 
 out:
 	if (ret > 0)
@@ -1308,6 +1306,9 @@ COMPAT_SYSCALL_DEFINE5(pwritev64v2, unsigned long, fd,
 		const struct compat_iovec __user *,vec,
 		unsigned long, vlen, loff_t, pos, int, flags)
 {
+	if (pos == -1)
+		return do_compat_writev(fd, vec, vlen, flags);
+
 	return do_compat_pwritev64(fd, vec, vlen, pos, flags);
 }
 #endif
@@ -1516,6 +1517,11 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 	ssize_t ret;
 
 	if (flags != 0)
+		return -EINVAL;
+
+	if (S_ISDIR(inode_in->i_mode) || S_ISDIR(inode_out->i_mode))
+		return -EISDIR;
+	if (!S_ISREG(inode_in->i_mode) || !S_ISREG(inode_out->i_mode))
 		return -EINVAL;
 
 	ret = rw_verify_area(READ, file_in, &pos_in, len);

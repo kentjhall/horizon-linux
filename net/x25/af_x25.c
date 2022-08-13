@@ -100,7 +100,7 @@ int x25_parse_address_block(struct sk_buff *skb,
 	}
 
 	len = *skb->data;
-	needed = 1 + (len >> 4) + (len & 0x0f);
+	needed = 1 + ((len >> 4) + (len & 0x0f) + 1) / 2;
 
 	if (!pskb_may_pull(skb, needed)) {
 		/* packet is too short to hold the addresses it claims
@@ -288,7 +288,7 @@ static struct sock *x25_find_listener(struct x25_address *addr,
 	sk_for_each(s, &x25_list)
 		if ((!strcmp(addr->x25_addr,
 			x25_sk(s)->source_addr.x25_addr) ||
-				!strcmp(addr->x25_addr,
+				!strcmp(x25_sk(s)->source_addr.x25_addr,
 					null_x25_address.x25_addr)) &&
 					s->sk_state == TCP_LISTEN) {
 			/*
@@ -352,17 +352,15 @@ static unsigned int x25_new_lci(struct x25_neigh *nb)
 	unsigned int lci = 1;
 	struct sock *sk;
 
-	read_lock_bh(&x25_list_lock);
-
-	while ((sk = __x25_find_socket(lci, nb)) != NULL) {
+	while ((sk = x25_find_socket(lci, nb)) != NULL) {
 		sock_put(sk);
 		if (++lci == 4096) {
 			lci = 0;
 			break;
 		}
+		cond_resched();
 	}
 
-	read_unlock_bh(&x25_list_lock);
 	return lci;
 }
 
@@ -680,25 +678,33 @@ static int x25_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	struct sockaddr_x25 *addr = (struct sockaddr_x25 *)uaddr;
 	int len, i, rc = 0;
 
-	if (!sock_flag(sk, SOCK_ZAPPED) ||
-	    addr_len != sizeof(struct sockaddr_x25) ||
-	    addr->sx25_family != AF_X25) {
+	if (addr_len != sizeof(struct sockaddr_x25) ||
+	    addr->sx25_family != AF_X25 ||
+	    strnlen(addr->sx25_addr.x25_addr, X25_ADDR_LEN) == X25_ADDR_LEN) {
 		rc = -EINVAL;
 		goto out;
 	}
 
-	len = strlen(addr->sx25_addr.x25_addr);
-	for (i = 0; i < len; i++) {
-		if (!isdigit(addr->sx25_addr.x25_addr[i])) {
-			rc = -EINVAL;
-			goto out;
+	/* check for the null_x25_address */
+	if (strcmp(addr->sx25_addr.x25_addr, null_x25_address.x25_addr)) {
+
+		len = strlen(addr->sx25_addr.x25_addr);
+		for (i = 0; i < len; i++) {
+			if (!isdigit(addr->sx25_addr.x25_addr[i])) {
+				rc = -EINVAL;
+				goto out;
+			}
 		}
 	}
 
 	lock_sock(sk);
-	x25_sk(sk)->source_addr = addr->sx25_addr;
-	x25_insert_socket(sk);
-	sock_reset_flag(sk, SOCK_ZAPPED);
+	if (sock_flag(sk, SOCK_ZAPPED)) {
+		x25_sk(sk)->source_addr = addr->sx25_addr;
+		x25_insert_socket(sk);
+		sock_reset_flag(sk, SOCK_ZAPPED);
+	} else {
+		rc = -EINVAL;
+	}
 	release_sock(sk);
 	SOCK_DEBUG(sk, "x25_bind: socket is bound\n");
 out:
@@ -759,12 +765,17 @@ static int x25_connect(struct socket *sock, struct sockaddr *uaddr,
 	if (sk->sk_state == TCP_ESTABLISHED)
 		goto out;
 
+	rc = -EALREADY;	/* Do nothing if call is already in progress */
+	if (sk->sk_state == TCP_SYN_SENT)
+		goto out;
+
 	sk->sk_state   = TCP_CLOSE;
 	sock->state = SS_UNCONNECTED;
 
 	rc = -EINVAL;
 	if (addr_len != sizeof(struct sockaddr_x25) ||
-	    addr->sx25_family != AF_X25)
+	    addr->sx25_family != AF_X25 ||
+	    strnlen(addr->sx25_addr.x25_addr, X25_ADDR_LEN) == X25_ADDR_LEN)
 		goto out;
 
 	rc = -ENETUNREACH;
@@ -805,7 +816,7 @@ static int x25_connect(struct socket *sock, struct sockaddr *uaddr,
 	/* Now the loop */
 	rc = -EINPROGRESS;
 	if (sk->sk_state != TCP_ESTABLISHED && (flags & O_NONBLOCK))
-		goto out_put_neigh;
+		goto out;
 
 	rc = x25_wait_for_connection_establishment(sk);
 	if (rc)
@@ -814,8 +825,13 @@ static int x25_connect(struct socket *sock, struct sockaddr *uaddr,
 	sock->state = SS_CONNECTED;
 	rc = 0;
 out_put_neigh:
-	if (rc)
+	if (rc && x25->neighbour) {
+		read_lock_bh(&x25_list_lock);
 		x25_neigh_put(x25->neighbour);
+		x25->neighbour = NULL;
+		read_unlock_bh(&x25_list_lock);
+		x25->state = X25_STATE_0;
+	}
 out_put_route:
 	x25_route_put(rt);
 out:
@@ -1033,6 +1049,7 @@ int x25_rx_call_request(struct sk_buff *skb, struct x25_neigh *nb,
 	makex25->lci           = lci;
 	makex25->dest_addr     = dest_addr;
 	makex25->source_addr   = source_addr;
+	x25_neigh_hold(nb);
 	makex25->neighbour     = nb;
 	makex25->facilities    = facilities;
 	makex25->dte_facilities= dte_facilities;
@@ -1790,32 +1807,40 @@ void x25_kill_by_neigh(struct x25_neigh *nb)
 
 static int __init x25_init(void)
 {
-	int rc = proto_register(&x25_proto, 0);
+	int rc;
 
-	if (rc != 0)
+	rc = proto_register(&x25_proto, 0);
+	if (rc)
 		goto out;
 
 	rc = sock_register(&x25_family_ops);
-	if (rc != 0)
+	if (rc)
 		goto out_proto;
 
 	dev_add_pack(&x25_packet_type);
 
 	rc = register_netdevice_notifier(&x25_dev_notifier);
-	if (rc != 0)
+	if (rc)
 		goto out_sock;
+
+	rc = x25_register_sysctl();
+	if (rc)
+		goto out_dev;
+
+	rc = x25_proc_init();
+	if (rc)
+		goto out_sysctl;
 
 	pr_info("Linux Version 0.2\n");
 
-	x25_register_sysctl();
-	rc = x25_proc_init();
-	if (rc != 0)
-		goto out_dev;
 out:
 	return rc;
+out_sysctl:
+	x25_unregister_sysctl();
 out_dev:
 	unregister_netdevice_notifier(&x25_dev_notifier);
 out_sock:
+	dev_remove_pack(&x25_packet_type);
 	sock_unregister(AF_X25);
 out_proto:
 	proto_unregister(&x25_proto);

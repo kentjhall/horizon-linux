@@ -336,17 +336,9 @@ bool amdgpu_atombios_get_connector_info_from_object_table(struct amdgpu_device *
 		path_size += le16_to_cpu(path->usSize);
 
 		if (device_support & le16_to_cpu(path->usDeviceTag)) {
-			uint8_t con_obj_id, con_obj_num, con_obj_type;
-
-			con_obj_id =
+			uint8_t con_obj_id =
 			    (le16_to_cpu(path->usConnObjectId) & OBJECT_ID_MASK)
 			    >> OBJECT_ID_SHIFT;
-			con_obj_num =
-			    (le16_to_cpu(path->usConnObjectId) & ENUM_ID_MASK)
-			    >> ENUM_ID_SHIFT;
-			con_obj_type =
-			    (le16_to_cpu(path->usConnObjectId) &
-			     OBJECT_TYPE_MASK) >> OBJECT_TYPE_SHIFT;
 
 			/* Skip TV/CV support */
 			if ((le16_to_cpu(path->usDeviceTag) ==
@@ -371,15 +363,7 @@ bool amdgpu_atombios_get_connector_info_from_object_table(struct amdgpu_device *
 			router.ddc_valid = false;
 			router.cd_valid = false;
 			for (j = 0; j < ((le16_to_cpu(path->usSize) - 8) / 2); j++) {
-				uint8_t grph_obj_id, grph_obj_num, grph_obj_type;
-
-				grph_obj_id =
-				    (le16_to_cpu(path->usGraphicObjIds[j]) &
-				     OBJECT_ID_MASK) >> OBJECT_ID_SHIFT;
-				grph_obj_num =
-				    (le16_to_cpu(path->usGraphicObjIds[j]) &
-				     ENUM_ID_MASK) >> ENUM_ID_SHIFT;
-				grph_obj_type =
+				uint8_t grph_obj_type =
 				    (le16_to_cpu(path->usGraphicObjIds[j]) &
 				     OBJECT_TYPE_MASK) >> OBJECT_TYPE_SHIFT;
 
@@ -693,6 +677,10 @@ int amdgpu_atombios_get_clock_info(struct amdgpu_device *adev)
 			DRM_INFO("Changing default dispclk from %dMhz to 600Mhz\n",
 				 adev->clock.default_dispclk / 100);
 			adev->clock.default_dispclk = 60000;
+		} else if (adev->clock.default_dispclk <= 60000) {
+			DRM_INFO("Changing default dispclk from %dMhz to 625Mhz\n",
+				 adev->clock.default_dispclk / 100);
+			adev->clock.default_dispclk = 62500;
 		}
 		adev->clock.dp_extclk =
 			le16_to_cpu(firmware_info->info_21.usUniphyDPModeExtClkFreq);
@@ -1784,34 +1772,32 @@ void amdgpu_atombios_scratch_regs_restore(struct amdgpu_device *adev)
 		WREG32(mmBIOS_SCRATCH_0 + i, adev->bios_scratch[i]);
 }
 
-/* Atom needs data in little endian format
- * so swap as appropriate when copying data to
- * or from atom. Note that atom operates on
- * dw units.
+/* Atom needs data in little endian format so swap as appropriate when copying
+ * data to or from atom. Note that atom operates on dw units.
+ *
+ * Use to_le=true when sending data to atom and provide at least
+ * ALIGN(num_bytes,4) bytes in the dst buffer.
+ *
+ * Use to_le=false when receiving data from atom and provide ALIGN(num_bytes,4)
+ * byes in the src buffer.
  */
 void amdgpu_atombios_copy_swap(u8 *dst, u8 *src, u8 num_bytes, bool to_le)
 {
 #ifdef __BIG_ENDIAN
-	u8 src_tmp[20], dst_tmp[20]; /* used for byteswapping */
-	u32 *dst32, *src32;
+	u32 src_tmp[5], dst_tmp[5];
 	int i;
+	u8 align_num_bytes = ALIGN(num_bytes, 4);
 
-	memcpy(src_tmp, src, num_bytes);
-	src32 = (u32 *)src_tmp;
-	dst32 = (u32 *)dst_tmp;
 	if (to_le) {
-		for (i = 0; i < ((num_bytes + 3) / 4); i++)
-			dst32[i] = cpu_to_le32(src32[i]);
-		memcpy(dst, dst_tmp, num_bytes);
+		memcpy(src_tmp, src, num_bytes);
+		for (i = 0; i < align_num_bytes / 4; i++)
+			dst_tmp[i] = cpu_to_le32(src_tmp[i]);
+		memcpy(dst, dst_tmp, align_num_bytes);
 	} else {
-		u8 dws = num_bytes & ~3;
-		for (i = 0; i < ((num_bytes + 3) / 4); i++)
-			dst32[i] = le32_to_cpu(src32[i]);
-		memcpy(dst, dst_tmp, dws);
-		if (num_bytes % 4) {
-			for (i = 0; i < (num_bytes % 4); i++)
-				dst[dws+i] = dst_tmp[dws+i];
-		}
+		memcpy(src_tmp, src, align_num_bytes);
+		for (i = 0; i < align_num_bytes / 4; i++)
+			dst_tmp[i] = le32_to_cpu(src_tmp[i]);
+		memcpy(dst, dst_tmp, num_bytes);
 	}
 #else
 	memcpy(dst, src, num_bytes);

@@ -495,8 +495,18 @@ static struct ins *ins__find(const char *name)
 int symbol__alloc_hist(struct symbol *sym)
 {
 	struct annotation *notes = symbol__annotation(sym);
-	const size_t size = symbol__size(sym);
+	size_t size = symbol__size(sym);
 	size_t sizeof_sym_hist;
+
+	/*
+	 * Add buffer of one element for zero length symbol.
+	 * When sample is taken from first instruction of
+	 * zero length symbol, perf still resolves it and
+	 * shows symbol name in perf report and allows to
+	 * annotate it.
+	 */
+	if (size == 0)
+		size = 1;
 
 	/* Check for overflow when calculating sizeof_sym_hist */
 	if (size > (SIZE_MAX - sizeof(struct sym_hist)) / sizeof(u64))
@@ -593,7 +603,8 @@ static int __symbol__inc_addr_samples(struct symbol *sym, struct map *map,
 
 	pr_debug3("%s: addr=%#" PRIx64 "\n", __func__, map->unmap_ip(map, addr));
 
-	if (addr < sym->start || addr >= sym->end) {
+	if ((addr < sym->start || addr >= sym->end) &&
+	    (addr != sym->end || sym->start != sym->end)) {
 		pr_debug("%s(%d): ERANGE! sym->name=%s, start=%#" PRIx64 ", addr=%#" PRIx64 ", end=%#" PRIx64 "\n",
 		       __func__, __LINE__, sym->name, sym->start, addr, sym->end);
 		return -ERANGE;
@@ -1249,6 +1260,7 @@ static int dso__disassemble_filename(struct dso *dso, char *filename, size_t fil
 {
 	char linkname[PATH_MAX];
 	char *build_id_filename;
+	char *build_id_path = NULL;
 
 	if (dso->symtab_type == DSO_BINARY_TYPE__KALLSYMS &&
 	    !dso__is_kcore(dso))
@@ -1264,8 +1276,14 @@ static int dso__disassemble_filename(struct dso *dso, char *filename, size_t fil
 		goto fallback;
 	}
 
+	build_id_path = strdup(filename);
+	if (!build_id_path)
+		return -1;
+
+	dirname(build_id_path);
+
 	if (dso__is_kcore(dso) ||
-	    readlink(filename, linkname, sizeof(linkname)) < 0 ||
+	    readlink(build_id_path, linkname, sizeof(linkname)) < 0 ||
 	    strstr(linkname, DSO__NAME_KALLSYMS) ||
 	    access(filename, R_OK)) {
 fallback:
@@ -1277,13 +1295,14 @@ fallback:
 		__symbol__join_symfs(filename, filename_size, dso->long_name);
 	}
 
+	free(build_id_path);
 	return 0;
 }
 
 int symbol__disassemble(struct symbol *sym, struct map *map, size_t privsize)
 {
 	struct dso *dso = map->dso;
-	char command[PATH_MAX * 2];
+	char *command;
 	FILE *file;
 	char symfs_filename[PATH_MAX];
 	struct kcore_extract kce;
@@ -1345,7 +1364,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map, size_t privsize)
 		strcpy(symfs_filename, tmp);
 	}
 
-	snprintf(command, sizeof(command),
+	err = asprintf(&command,
 		 "%s %s%s --start-address=0x%016" PRIx64
 		 " --stop-address=0x%016" PRIx64
 		 " -l -d %s %s -C %s 2>/dev/null|grep -v %s|expand",
@@ -1358,12 +1377,17 @@ int symbol__disassemble(struct symbol *sym, struct map *map, size_t privsize)
 		 symbol_conf.annotate_src ? "-S" : "",
 		 symfs_filename, symfs_filename);
 
+	if (err < 0) {
+		pr_err("Failure allocating memory for the command to run\n");
+		goto out_remove_tmp;
+	}
+
 	pr_debug("Executing: %s\n", command);
 
 	err = -1;
 	if (pipe(stdout_fd) < 0) {
 		pr_err("Failure creating the pipe to run %s\n", command);
-		goto out_remove_tmp;
+		goto out_free_command;
 	}
 
 	pid = fork();
@@ -1390,7 +1414,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map, size_t privsize)
 		 * If we were using debug info should retry with
 		 * original binary.
 		 */
-		goto out_remove_tmp;
+		goto out_free_command;
 	}
 
 	nline = 0;
@@ -1413,6 +1437,8 @@ int symbol__disassemble(struct symbol *sym, struct map *map, size_t privsize)
 
 	fclose(file);
 	err = 0;
+out_free_command:
+	free(command);
 out_remove_tmp:
 	close(stdout_fd[0]);
 
@@ -1426,7 +1452,7 @@ out:
 
 out_close_stdout:
 	close(stdout_fd[1]);
-	goto out_remove_tmp;
+	goto out_free_command;
 }
 
 static void insert_source_line(struct rb_root *root, struct source_line *src_line)

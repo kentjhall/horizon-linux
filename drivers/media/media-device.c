@@ -58,9 +58,10 @@ static int media_device_close(struct file *filp)
 	return 0;
 }
 
-static int media_device_get_info(struct media_device *dev,
-				 struct media_device_info *info)
+static long media_device_get_info(struct media_device *dev, void *arg)
 {
+	struct media_device_info *info = arg;
+
 	memset(info, 0, sizeof(*info));
 
 	if (dev->driver_name[0])
@@ -97,9 +98,9 @@ static struct media_entity *find_entity(struct media_device *mdev, u32 id)
 	return NULL;
 }
 
-static long media_device_enum_entities(struct media_device *mdev,
-				       struct media_entity_desc *entd)
+static long media_device_enum_entities(struct media_device *mdev, void *arg)
 {
+	struct media_entity_desc *entd = arg;
 	struct media_entity *ent;
 
 	ent = find_entity(mdev, entd->id);
@@ -130,7 +131,7 @@ static long media_device_enum_entities(struct media_device *mdev,
 	 * old range.
 	 */
 	if (ent->function < MEDIA_ENT_F_OLD_BASE ||
-	    ent->function > MEDIA_ENT_T_DEVNODE_UNKNOWN) {
+	    ent->function > MEDIA_ENT_F_TUNER) {
 		if (is_media_entity_v4l2_subdev(ent))
 			entd->type = MEDIA_ENT_F_V4L2_SUBDEV_UNKNOWN;
 		else if (ent->function != MEDIA_ENT_F_IO_V4L)
@@ -150,9 +151,9 @@ static void media_device_kpad_to_upad(const struct media_pad *kpad,
 	upad->flags = kpad->flags;
 }
 
-static long media_device_enum_links(struct media_device *mdev,
-				    struct media_links_enum *links)
+static long media_device_enum_links(struct media_device *mdev, void *arg)
 {
+	struct media_links_enum *links = arg;
 	struct media_entity *entity;
 
 	entity = find_entity(mdev, links->entity);
@@ -198,9 +199,9 @@ static long media_device_enum_links(struct media_device *mdev,
 	return 0;
 }
 
-static long media_device_setup_link(struct media_device *mdev,
-				    struct media_link_desc *linkd)
+static long media_device_setup_link(struct media_device *mdev, void *arg)
 {
+	struct media_link_desc *linkd = arg;
 	struct media_link *link = NULL;
 	struct media_entity *source;
 	struct media_entity *sink;
@@ -226,9 +227,9 @@ static long media_device_setup_link(struct media_device *mdev,
 	return __media_entity_setup_link(link, linkd->flags);
 }
 
-static long media_device_get_topology(struct media_device *mdev,
-				      struct media_v2_topology *topo)
+static long media_device_get_topology(struct media_device *mdev, void *arg)
 {
+	struct media_v2_topology *topo = arg;
 	struct media_entity *entity;
 	struct media_interface *intf;
 	struct media_pad *pad;
@@ -259,8 +260,7 @@ static long media_device_get_topology(struct media_device *mdev,
 		memset(&kentity, 0, sizeof(kentity));
 		kentity.id = entity->graph_obj.id;
 		kentity.function = entity->function;
-		strncpy(kentity.name, entity->name,
-			sizeof(kentity.name));
+		strlcpy(kentity.name, entity->name, sizeof(kentity.name));
 
 		if (copy_to_user(uentity, &kentity, sizeof(kentity)))
 			ret = -EFAULT;
@@ -473,6 +473,7 @@ static long media_device_enum_links32(struct media_device *mdev,
 {
 	struct media_links_enum links;
 	compat_uptr_t pads_ptr, links_ptr;
+	int ret;
 
 	memset(&links, 0, sizeof(links));
 
@@ -484,7 +485,14 @@ static long media_device_enum_links32(struct media_device *mdev,
 	links.pads = compat_ptr(pads_ptr);
 	links.links = compat_ptr(links_ptr);
 
-	return media_device_enum_links(mdev, &links);
+	ret = media_device_enum_links(mdev, &links);
+	if (ret)
+		return ret;
+
+	if (copy_to_user(ulinks->reserved, links.reserved,
+			 sizeof(ulinks->reserved)))
+		return -EFAULT;
+	return 0;
 }
 
 #define MEDIA_IOC_ENUM_LINKS32		_IOWR('|', 0x02, struct media_links_enum32)

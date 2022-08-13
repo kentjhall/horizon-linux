@@ -351,7 +351,7 @@ static int wacom_set_device_mode(struct hid_device *hdev,
 	u8 *rep_data;
 	struct hid_report *r;
 	struct hid_report_enum *re;
-	int length;
+	u32 length;
 	int error = -ENOMEM, limit = 0;
 
 	if (wacom_wac->mode_report < 0)
@@ -611,8 +611,10 @@ static struct wacom_hdev_data *wacom_get_hdev_data(struct hid_device *hdev)
 
 	/* Try to find an already-probed interface from the same device */
 	list_for_each_entry(data, &wacom_udev_list, list) {
-		if (compare_device_paths(hdev, data->dev, '/'))
+		if (compare_device_paths(hdev, data->dev, '/')) {
+			kref_get(&data->kref);
 			return data;
+		}
 	}
 
 	/* Fallback to finding devices that appear to be "siblings" */
@@ -710,6 +712,9 @@ static int wacom_led_control(struct wacom *wacom)
 		return -ENODEV;
 
 	if (!wacom->led.groups)
+		return -ENOTSUPP;
+
+	if (wacom->wacom_wac.features.type == REMOTE)
 		return -ENOTSUPP;
 
 	if (wacom->wacom_wac.pid) { /* wireless connected */
@@ -1545,7 +1550,7 @@ static ssize_t wacom_show_remote_mode(struct kobject *kobj,
 	u8 mode;
 
 	mode = wacom->led.groups[index].select;
-	if (mode >= 0 && mode < 3)
+	if (mode < 3)
 		return snprintf(buf, PAGE_SIZE, "%d\n", mode);
 	else
 		return snprintf(buf, PAGE_SIZE, "%d\n", -1);
@@ -2017,6 +2022,14 @@ static int wacom_parse_and_register(struct wacom *wacom, bool wireless)
 
 	wacom_update_name(wacom, wireless ? " (WL)" : "");
 
+	/* pen only Bamboo neither support touch nor pad */
+	if ((features->type == BAMBOO_PEN) &&
+	    ((features->device_type & WACOM_DEVICETYPE_TOUCH) ||
+	    (features->device_type & WACOM_DEVICETYPE_PAD))) {
+		error = -ENODEV;
+		goto fail;
+	}
+
 	error = wacom_add_shared_data(hdev);
 	if (error)
 		goto fail;
@@ -2060,14 +2073,6 @@ static int wacom_parse_and_register(struct wacom *wacom, bool wireless)
 	/* touch only Bamboo doesn't support pen */
 	if ((features->type == BAMBOO_TOUCH) &&
 	    (features->device_type & WACOM_DEVICETYPE_PEN)) {
-		error = -ENODEV;
-		goto fail_quirks;
-	}
-
-	/* pen only Bamboo neither support touch nor pad */
-	if ((features->type == BAMBOO_PEN) &&
-	    ((features->device_type & WACOM_DEVICETYPE_TOUCH) ||
-	    (features->device_type & WACOM_DEVICETYPE_PAD))) {
 		error = -ENODEV;
 		goto fail_quirks;
 	}
@@ -2187,23 +2192,23 @@ static void wacom_remote_destroy_one(struct wacom *wacom, unsigned int index)
 	int i;
 	unsigned long flags;
 
-	spin_lock_irqsave(&remote->remote_lock, flags);
-	remote->remotes[index].registered = false;
-	spin_unlock_irqrestore(&remote->remote_lock, flags);
-
-	if (remote->remotes[index].battery.battery)
-		devres_release_group(&wacom->hdev->dev,
-				     &remote->remotes[index].battery.bat_desc);
-
-	if (remote->remotes[index].group.name)
-		devres_release_group(&wacom->hdev->dev,
-				     &remote->remotes[index]);
-
 	for (i = 0; i < WACOM_MAX_REMOTES; i++) {
 		if (remote->remotes[i].serial == serial) {
+
+			spin_lock_irqsave(&remote->remote_lock, flags);
+			remote->remotes[i].registered = false;
+			spin_unlock_irqrestore(&remote->remote_lock, flags);
+
+			if (remote->remotes[i].battery.battery)
+				devres_release_group(&wacom->hdev->dev,
+						     &remote->remotes[i].battery.bat_desc);
+
+			if (remote->remotes[i].group.name)
+				devres_release_group(&wacom->hdev->dev,
+						     &remote->remotes[i]);
+
 			remote->remotes[i].serial = 0;
 			remote->remotes[i].group.name = NULL;
-			remote->remotes[i].registered = false;
 			remote->remotes[i].battery.battery = NULL;
 			wacom->led.groups[i].select = WACOM_STATUS_UNKNOWN;
 		}
@@ -2432,6 +2437,8 @@ static void wacom_remove(struct hid_device *hdev)
 	cancel_work_sync(&wacom->remote_work);
 	if (hdev->bus == BUS_BLUETOOTH)
 		device_remove_file(&hdev->dev, &dev_attr_speed);
+
+	wacom_release_resources(wacom);
 
 	hid_set_drvdata(hdev, NULL);
 }

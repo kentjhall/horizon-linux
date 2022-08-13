@@ -30,6 +30,9 @@
 #define isb()		asm volatile("isb" : : : "memory")
 #define dmb(opt)	asm volatile("dmb " #opt : : : "memory")
 #define dsb(opt)	asm volatile("dsb " #opt : : : "memory")
+#define csdb()		asm volatile("hint #20" : : : "memory")
+
+#define csdb()		asm volatile("hint #20" : : : "memory")
 
 #define mb()		dsb(sy)
 #define rmb()		dsb(ld)
@@ -38,29 +41,60 @@
 #define dma_rmb()	dmb(oshld)
 #define dma_wmb()	dmb(oshst)
 
+/*
+ * Generate a mask for array_index__nospec() that is ~0UL when 0 <= idx < sz
+ * and 0 otherwise.
+ */
+#define array_index_mask_nospec array_index_mask_nospec
+static inline unsigned long array_index_mask_nospec(unsigned long idx,
+						    unsigned long sz)
+{
+	unsigned long mask;
+
+	asm volatile(
+	"	cmp	%1, %2\n"
+	"	sbc	%0, xzr, xzr\n"
+	: "=r" (mask)
+	: "r" (idx), "Ir" (sz)
+	: "cc");
+
+	csdb();
+	return mask;
+}
+
 #define __smp_mb()	dmb(ish)
 #define __smp_rmb()	dmb(ishld)
 #define __smp_wmb()	dmb(ishst)
 
-#define __smp_store_release(p, v)						\
+#define __smp_store_release(p, v)					\
 do {									\
+	union { typeof(*p) __val; char __c[1]; } __u =			\
+		{ .__val = (__force typeof(*p)) (v) }; 			\
 	compiletime_assert_atomic_type(*p);				\
 	switch (sizeof(*p)) {						\
 	case 1:								\
 		asm volatile ("stlrb %w1, %0"				\
-				: "=Q" (*p) : "r" (v) : "memory");	\
+				: "=Q" (*p)				\
+				: "r" (*(__u8 *)__u.__c)		\
+				: "memory");				\
 		break;							\
 	case 2:								\
 		asm volatile ("stlrh %w1, %0"				\
-				: "=Q" (*p) : "r" (v) : "memory");	\
+				: "=Q" (*p)				\
+				: "r" (*(__u16 *)__u.__c)		\
+				: "memory");				\
 		break;							\
 	case 4:								\
 		asm volatile ("stlr %w1, %0"				\
-				: "=Q" (*p) : "r" (v) : "memory");	\
+				: "=Q" (*p)				\
+				: "r" (*(__u32 *)__u.__c)		\
+				: "memory");				\
 		break;							\
 	case 8:								\
 		asm volatile ("stlr %1, %0"				\
-				: "=Q" (*p) : "r" (v) : "memory");	\
+				: "=Q" (*p)				\
+				: "r" (*(__u64 *)__u.__c)		\
+				: "memory");				\
 		break;							\
 	}								\
 } while (0)
@@ -106,6 +140,10 @@ do {									\
 	}								\
 	VAL;								\
 })
+
+#define speculation_barrier()						\
+	asm volatile(   "dsb sy\n"					\
+			"isb\n" : : : "memory")
 
 #include <asm-generic/barrier.h>
 

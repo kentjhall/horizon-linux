@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2007-2008 Advanced Micro Devices, Inc.
+ * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
  * Author: Joerg Roedel <jroedel@suse.de>
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -195,7 +196,7 @@ struct iommu_group *iommu_group_alloc(void)
 				   NULL, "%d", group->id);
 	if (ret) {
 		ida_simple_remove(&iommu_group_ida, group->id);
-		kfree(group);
+		kobject_put(&group->kobj);
 		return ERR_PTR(ret);
 	}
 
@@ -383,36 +384,30 @@ int iommu_group_add_device(struct iommu_group *group, struct device *dev)
 	device->dev = dev;
 
 	ret = sysfs_create_link(&dev->kobj, &group->kobj, "iommu_group");
-	if (ret) {
-		kfree(device);
-		return ret;
-	}
+	if (ret)
+		goto err_free_device;
 
 	device->name = kasprintf(GFP_KERNEL, "%s", kobject_name(&dev->kobj));
 rename:
 	if (!device->name) {
-		sysfs_remove_link(&dev->kobj, "iommu_group");
-		kfree(device);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_remove_link;
 	}
 
 	ret = sysfs_create_link_nowarn(group->devices_kobj,
 				       &dev->kobj, device->name);
 	if (ret) {
-		kfree(device->name);
 		if (ret == -EEXIST && i >= 0) {
 			/*
 			 * Account for the slim chance of collision
 			 * and append an instance to the name.
 			 */
+			kfree(device->name);
 			device->name = kasprintf(GFP_KERNEL, "%s.%d",
 						 kobject_name(&dev->kobj), i++);
 			goto rename;
 		}
-
-		sysfs_remove_link(&dev->kobj, "iommu_group");
-		kfree(device);
-		return ret;
+		goto err_free_name;
 	}
 
 	kobject_get(group->devices_kobj);
@@ -424,8 +419,10 @@ rename:
 	mutex_lock(&group->mutex);
 	list_add_tail(&device->list, &group->devices);
 	if (group->domain)
-		__iommu_attach_device(group->domain, dev);
+		ret = __iommu_attach_device(group->domain, dev);
 	mutex_unlock(&group->mutex);
+	if (ret)
+		goto err_put_group;
 
 	/* Notify any listeners about change to group. */
 	blocking_notifier_call_chain(&group->notifier,
@@ -436,6 +433,22 @@ rename:
 	pr_info("Adding device %s to group %d\n", dev_name(dev), group->id);
 
 	return 0;
+
+err_put_group:
+	mutex_lock(&group->mutex);
+	list_del(&device->list);
+	mutex_unlock(&group->mutex);
+	dev->iommu_group = NULL;
+	kobject_put(group->devices_kobj);
+	sysfs_remove_link(group->devices_kobj, device->name);
+err_free_name:
+	kfree(device->name);
+err_remove_link:
+	sysfs_remove_link(&dev->kobj, "iommu_group");
+err_free_device:
+	kfree(device);
+	pr_err("Failed to add device %s to group %d: %d\n", dev_name(dev), group->id, ret);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(iommu_group_add_device);
 
@@ -1079,6 +1092,16 @@ void iommu_domain_free(struct iommu_domain *domain)
 }
 EXPORT_SYMBOL_GPL(iommu_domain_free);
 
+int iommu_get_hwid(struct iommu_domain *domain, struct device *dev,
+		   unsigned int id)
+{
+	if (unlikely(domain->ops->get_hwid == NULL))
+		return -ENODEV;
+
+	return domain->ops->get_hwid(domain, dev, id);
+}
+EXPORT_SYMBOL_GPL(iommu_get_hwid);
+
 static int __iommu_attach_device(struct iommu_domain *domain,
 				 struct device *dev)
 {
@@ -1277,7 +1300,7 @@ static size_t iommu_pgsize(struct iommu_domain *domain,
 	pgsize_idx = __fls(size);
 
 	/* need to consider alignment requirements ? */
-	if (likely(addr_merge)) {
+	if (!domain->ops->ignore_align && addr_merge) {
 		/* Max page size allowed by address */
 		unsigned int align_pgsize_idx = __ffs(addr_merge);
 		pgsize_idx = min(pgsize_idx, align_pgsize_idx);
@@ -1300,7 +1323,7 @@ static size_t iommu_pgsize(struct iommu_domain *domain,
 }
 
 int iommu_map(struct iommu_domain *domain, unsigned long iova,
-	      phys_addr_t paddr, size_t size, int prot)
+	      phys_addr_t paddr, size_t size, ulong prot)
 {
 	unsigned long orig_iova = iova;
 	unsigned int min_pagesz;
@@ -1390,9 +1413,9 @@ size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
 	 * or we hit an area that isn't mapped.
 	 */
 	while (unmapped < size) {
-		size_t pgsize = iommu_pgsize(domain, iova, size - unmapped);
+		size_t left = size - unmapped;
 
-		unmapped_page = domain->ops->unmap(domain, iova, pgsize);
+		unmapped_page = domain->ops->unmap(domain, iova, left);
 		if (!unmapped_page)
 			break;
 
@@ -1409,7 +1432,7 @@ size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
 EXPORT_SYMBOL_GPL(iommu_unmap);
 
 size_t default_iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
-			 struct scatterlist *sg, unsigned int nents, int prot)
+			 struct scatterlist *sg, unsigned int nents, ulong prot)
 {
 	struct scatterlist *s;
 	size_t mapped = 0;
@@ -1570,9 +1593,9 @@ int iommu_request_dm_for_dev(struct device *dev)
 	int ret;
 
 	/* Device must already be in a group before calling this function */
-	group = iommu_group_get_for_dev(dev);
-	if (IS_ERR(group))
-		return PTR_ERR(group);
+	group = iommu_group_get(dev);
+	if (!group)
+		return -EINVAL;
 
 	mutex_lock(&group->mutex);
 

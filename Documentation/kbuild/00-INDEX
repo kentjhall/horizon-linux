@@ -12,3 +12,6 @@ makefiles.txt
 	- developer information for linux kernel makefiles
 modules.txt
 	- how to build modules and to install them
+overlays.txt
+	- a description of kernel overlays; a way to shard the source tree
+	  into separate directories that are combined together at build time

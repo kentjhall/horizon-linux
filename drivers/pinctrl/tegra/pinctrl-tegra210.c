@@ -1,7 +1,7 @@
 /*
  * Pinctrl data for the NVIDIA Tegra210 pinmux
  *
- * Copyright (c) 2015, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -15,11 +15,16 @@
 
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pinctrl/pinctrl.h>
 #include <linux/pinctrl/pinmux.h>
 
 #include "pinctrl-tegra.h"
+
+struct tegra210_pinctrl_soc {
+	bool lpdr_support;
+};
 
 /*
  * Most pins affected by the pinmux can also be GPIOs. Define these first.
@@ -195,6 +200,24 @@
 #define TEGRA_PIN_BATT_BCL			_PIN(5)
 #define TEGRA_PIN_CLK_REQ			_PIN(6)
 #define TEGRA_PIN_SHUTDOWN			_PIN(7)
+#define TEGRA_DRV_PAD_QSPI_COMP			_PIN(8)
+#define TEGRA_DRV_PAD_QSPI_COMP_CONTROL		_PIN(9)
+#define TEGRA_DRV_PAD_QSPI_LPBK_CONTROL		_PIN(10)
+#define TEGRA_PAD_DSI_AB_CONTROL		_PIN(11)
+#define TEGRA_PAD_DSI_CD_CONTROL		_PIN(12)
+#define TEGRA_PIN_SDMMC2_CLK			_PIN(13)
+#define TEGRA_PIN_SDMMC2_CLKB			_PIN(14)
+#define TEGRA_PIN_SDMMC2_CMD			_PIN(15)
+#define TEGRA_PIN_SDMMC2_DAT0			_PIN(16)
+#define TEGRA_PIN_SDMMC2_DAT1			_PIN(17)
+#define TEGRA_PIN_SDMMC2_DAT2			_PIN(18)
+#define TEGRA_PIN_SDMMC2_DAT3			_PIN(19)
+#define TEGRA_PIN_SDMMC2_DAT4			_PIN(20)
+#define TEGRA_PIN_SDMMC2_DAT5			_PIN(21)
+#define TEGRA_PIN_SDMMC2_DAT6			_PIN(22)
+#define TEGRA_PIN_SDMMC2_DAT7			_PIN(23)
+#define TEGRA_PIN_SDMMC2_DQS			_PIN(24)
+#define TEGRA_PIN_SDMMC2_DQSB			_PIN(25)
 
 static const struct pinctrl_pin_desc tegra210_pins[] = {
 	PINCTRL_PIN(TEGRA_PIN_PEX_L0_RST_N_PA0, "PEX_L0_RST_N PA0"),
@@ -279,6 +302,19 @@ static const struct pinctrl_pin_desc tegra210_pins[] = {
 	PINCTRL_PIN(TEGRA_PIN_SDMMC1_DAT2_PM3, "SDMMC1_DAT2 PM3"),
 	PINCTRL_PIN(TEGRA_PIN_SDMMC1_DAT1_PM4, "SDMMC1_DAT1 PM4"),
 	PINCTRL_PIN(TEGRA_PIN_SDMMC1_DAT0_PM5, "SDMMC1_DAT0 PM5"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_CLK, "SDMMC2_CLK"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_CLKB, "SDMMC2_CLKB"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_CMD, "SDMMC2_CMD"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DAT0, "SDMMC2_DAT0"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DAT1, "SDMMC2_DAT1"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DAT2, "SDMMC2_DAT2"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DAT3, "SDMMC2_DAT3"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DAT4, "SDMMC2_DAT4"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DAT5, "SDMMC2_DAT5"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DAT6, "SDMMC2_DAT6"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DAT7, "SDMMC2_DAT7"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DQS, "SDMMC2_DQS"),
+	PINCTRL_PIN(TEGRA_PIN_SDMMC2_DQSB, "SDMMC2_DQSB"),
 	PINCTRL_PIN(TEGRA_PIN_SDMMC3_CLK_PP0, "SDMMC3_CLK PP0"),
 	PINCTRL_PIN(TEGRA_PIN_SDMMC3_CMD_PP1, "SDMMC3_CMD PP1"),
 	PINCTRL_PIN(TEGRA_PIN_SDMMC3_DAT3_PP2, "SDMMC3_DAT3 PP2"),
@@ -359,6 +395,8 @@ static const struct pinctrl_pin_desc tegra210_pins[] = {
 	PINCTRL_PIN(TEGRA_PIN_BATT_BCL, "BATT_BCL"),
 	PINCTRL_PIN(TEGRA_PIN_CLK_REQ, "CLK_REQ"),
 	PINCTRL_PIN(TEGRA_PIN_SHUTDOWN, "SHUTDOWN"),
+	PINCTRL_PIN(TEGRA_PAD_DSI_AB_CONTROL, "PAD_DSI_AB_CONTROL"),
+	PINCTRL_PIN(TEGRA_PAD_DSI_CD_CONTROL, "PAD_DSI_CD_CONTROL"),
 };
 
 static const unsigned pex_l0_rst_n_pa0_pins[] = {
@@ -382,6 +420,10 @@ static const unsigned pex_l1_clkreq_n_pa4_pins[] = {
 };
 
 static const unsigned sata_led_active_pa5_pins[] = {
+	TEGRA_PIN_SATA_LED_ACTIVE_PA5,
+};
+
+static const unsigned pa5_pins[] = {
 	TEGRA_PIN_SATA_LED_ACTIVE_PA5,
 };
 
@@ -687,6 +729,58 @@ static const unsigned sdmmc1_dat1_pm4_pins[] = {
 
 static const unsigned sdmmc1_dat0_pm5_pins[] = {
 	TEGRA_PIN_SDMMC1_DAT0_PM5,
+};
+
+static const unsigned sdmmc2_clk_pins[] = {
+	TEGRA_PIN_SDMMC2_CLK,
+};
+
+static const unsigned sdmmc2_clkb_pins[] = {
+	TEGRA_PIN_SDMMC2_CLKB,
+};
+
+static const unsigned sdmmc2_cmd_pins[] = {
+	TEGRA_PIN_SDMMC2_CMD,
+};
+
+static const unsigned sdmmc2_dat0_pins[] = {
+	TEGRA_PIN_SDMMC2_DAT0,
+};
+
+static const unsigned sdmmc2_dat1_pins[] = {
+	TEGRA_PIN_SDMMC2_DAT1,
+};
+
+static const unsigned sdmmc2_dat2_pins[] = {
+	TEGRA_PIN_SDMMC2_DAT2,
+};
+
+static const unsigned sdmmc2_dat3_pins[] = {
+	TEGRA_PIN_SDMMC2_DAT3,
+};
+
+static const unsigned sdmmc2_dat4_pins[] = {
+	TEGRA_PIN_SDMMC2_DAT4,
+};
+
+static const unsigned sdmmc2_dat5_pins[] = {
+	TEGRA_PIN_SDMMC2_DAT5,
+};
+
+static const unsigned sdmmc2_dat6_pins[] = {
+	TEGRA_PIN_SDMMC2_DAT6,
+};
+
+static const unsigned sdmmc2_dat7_pins[] = {
+	TEGRA_PIN_SDMMC2_DAT7,
+};
+
+static const unsigned sdmmc2_dqs_pins[] = {
+	TEGRA_PIN_SDMMC2_DQS,
+};
+
+static const unsigned sdmmc2_dqsb_pins[] = {
+	TEGRA_PIN_SDMMC2_DQSB,
 };
 
 static const unsigned sdmmc3_clk_pp0_pins[] = {
@@ -1093,6 +1187,14 @@ static const unsigned drive_pz5_pins[] = {
 	TEGRA_PIN_PZ5,
 };
 
+static const unsigned pad_dsi_ab_pins[] = {
+	TEGRA_PAD_DSI_AB_CONTROL,
+};
+
+static const unsigned pad_dsi_cd_pins[] = {
+	TEGRA_PAD_DSI_CD_CONTROL,
+};
+
 static const unsigned drive_sdmmc1_pins[] = {
 	TEGRA_PIN_SDMMC1_CLK_PM0,
 	TEGRA_PIN_SDMMC1_CMD_PM1,
@@ -1103,6 +1205,19 @@ static const unsigned drive_sdmmc1_pins[] = {
 };
 
 static const unsigned drive_sdmmc2_pins[] = {
+	TEGRA_PIN_SDMMC2_CLK,
+	TEGRA_PIN_SDMMC2_CLKB,
+	TEGRA_PIN_SDMMC2_CMD,
+	TEGRA_PIN_SDMMC2_DAT0,
+	TEGRA_PIN_SDMMC2_DAT1,
+	TEGRA_PIN_SDMMC2_DAT2,
+	TEGRA_PIN_SDMMC2_DAT3,
+	TEGRA_PIN_SDMMC2_DAT4,
+	TEGRA_PIN_SDMMC2_DAT5,
+	TEGRA_PIN_SDMMC2_DAT6,
+	TEGRA_PIN_SDMMC2_DAT7,
+	TEGRA_PIN_SDMMC2_DQS,
+	TEGRA_PIN_SDMMC2_DQSB,
 };
 
 static const unsigned drive_sdmmc3_pins[] = {
@@ -1115,6 +1230,18 @@ static const unsigned drive_sdmmc3_pins[] = {
 };
 
 static const unsigned drive_sdmmc4_pins[] = {
+};
+
+static const unsigned drive_qspi_comp_pins[] = {
+	TEGRA_DRV_PAD_QSPI_COMP,
+};
+
+static const unsigned drive_qspi_comp_control_pins[] = {
+	TEGRA_DRV_PAD_QSPI_COMP_CONTROL,
+};
+
+static const unsigned drive_qspi_lpbk_control_pins[] = {
+	TEGRA_DRV_PAD_QSPI_LPBK_CONTROL,
 };
 
 enum tegra_mux {
@@ -1165,6 +1292,7 @@ enum tegra_mux {
 	TEGRA_MUX_RSVD3,
 	TEGRA_MUX_SATA,
 	TEGRA_MUX_SDMMC1,
+	TEGRA_MUX_SDMMC2,
 	TEGRA_MUX_SDMMC3,
 	TEGRA_MUX_SHUTDOWN,
 	TEGRA_MUX_SOC,
@@ -1246,6 +1374,7 @@ static struct tegra_function tegra210_functions[] = {
 	FUNCTION(rsvd3),
 	FUNCTION(sata),
 	FUNCTION(sdmmc1),
+	FUNCTION(sdmmc2),
 	FUNCTION(sdmmc3),
 	FUNCTION(shutdown),
 	FUNCTION(soc),
@@ -1284,8 +1413,8 @@ static struct tegra_function tegra210_functions[] = {
 #define PINGROUP_BIT_N(b)		(-1)
 
 #define PINGROUP(pg_name, f0, f1, f2, f3, r, hsm, drvtype, e_io_hv,	\
-		 rdrv, drvdn_b, drvdn_w, drvup_b, drvup_w, slwr_b,	\
-		 slwr_w, slwf_b, slwf_w)				\
+		 lpdr, rdrv, drvdn_b, drvdn_w, drvup_b, drvup_w, slwr_b,\
+		 slwr_w, slwf_b, slwf_w, lpbk)				\
 	{								\
 		.name = #pg_name,					\
 		.pins = pg_name##_pins,					\
@@ -1310,7 +1439,9 @@ static struct tegra_function tegra210_functions[] = {
 		.lock_bit = 7,						\
 		.ioreset_bit = -1,					\
 		.rcv_sel_bit = PINGROUP_BIT_##e_io_hv(10),		\
+		.e_io_hv_bit = PINGROUP_BIT_##e_io_hv(10),		\
 		.parked_bit = 5,					\
+		.pad_bit = -1,						\
 		.hsm_bit = PINGROUP_BIT_##hsm(9),			\
 		.schmitt_bit = 12,					\
 		.drvtype_bit = PINGROUP_BIT_##drvtype(13),		\
@@ -1325,6 +1456,8 @@ static struct tegra_function tegra210_functions[] = {
 		.slwr_width = slwr_w,					\
 		.slwf_bit = slwf_b,					\
 		.slwf_width = slwf_w,					\
+		.lpdr_bit = PINGROUP_BIT_##lpdr(8),			\
+		.lpbk_bit = lpbk,					\
 	}
 
 #define DRV_PINGROUP(pg_name, r, drvdn_b, drvdn_w, drvup_b, drvup_w,	\
@@ -1341,11 +1474,14 @@ static struct tegra_function tegra210_functions[] = {
 		.lock_bit = -1,						\
 		.ioreset_bit = -1,					\
 		.rcv_sel_bit = -1,					\
+		.e_io_hv_bit = -1,					\
 		.drv_reg = DRV_PINGROUP_REG(r),				\
 		.drv_bank = 0,						\
 		.parked_bit = -1,					\
+		.pad_bit = -1,						\
 		.hsm_bit = -1,						\
 		.schmitt_bit = -1,					\
+		.lpdr_bit = -1,						\
 		.lpmd_bit = -1,						\
 		.drvdn_bit = drvdn_b,					\
 		.drvdn_width = drvdn_w,					\
@@ -1356,172 +1492,226 @@ static struct tegra_function tegra210_functions[] = {
 		.slwf_bit = slwf_b,					\
 		.slwf_width = slwf_w,					\
 		.drvtype_bit = -1,					\
+		.lpbk_bit = -1,						\
 	}
 
-static const struct tegra_pingroup tegra210_groups[] = {
-	/*       pg_name,              f0,         f1,     f2,    f3,    r,      hsm, drvtype, e_io_hv, rdrv,  drvdn_b, drvdn_w, drvup_b, drvup_w, slwr_b, slwr_w, slwf_b, slwf_w */
-	PINGROUP(sdmmc1_clk_pm0,       SDMMC1,     RSVD1,  RSVD2, RSVD3, 0x3000, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc1_cmd_pm1,       SDMMC1,     SPI3,   RSVD2, RSVD3, 0x3004, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc1_dat3_pm2,      SDMMC1,     SPI3,   RSVD2, RSVD3, 0x3008, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc1_dat2_pm3,      SDMMC1,     SPI3,   RSVD2, RSVD3, 0x300c, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc1_dat1_pm4,      SDMMC1,     SPI3,   RSVD2, RSVD3, 0x3010, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc1_dat0_pm5,      SDMMC1,     RSVD1,  RSVD2, RSVD3, 0x3014, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc3_clk_pp0,       SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x301c, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc3_cmd_pp1,       SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3020, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc3_dat0_pp5,      SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3024, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc3_dat1_pp4,      SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3028, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc3_dat2_pp3,      SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x302c, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(sdmmc3_dat3_pp2,      SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3030, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pex_l0_rst_n_pa0,     PE0,        RSVD1,  RSVD2, RSVD3, 0x3038, N,   N,       Y,       0xa5c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pex_l0_clkreq_n_pa1,  PE0,        RSVD1,  RSVD2, RSVD3, 0x303c, N,   N,       Y,       0xa58, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pex_wake_n_pa2,       PE,         RSVD1,  RSVD2, RSVD3, 0x3040, N,   N,       Y,       0xa68, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pex_l1_rst_n_pa3,     PE1,        RSVD1,  RSVD2, RSVD3, 0x3044, N,   N,       Y,       0xa64, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pex_l1_clkreq_n_pa4,  PE1,        RSVD1,  RSVD2, RSVD3, 0x3048, N,   N,       Y,       0xa60, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(sata_led_active_pa5,  SATA,       RSVD1,  RSVD2, RSVD3, 0x304c, N,   N,       N,       0xa94, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(spi1_mosi_pc0,        SPI1,       RSVD1,  RSVD2, RSVD3, 0x3050, Y,   Y,       N,       0xae0, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi1_miso_pc1,        SPI1,       RSVD1,  RSVD2, RSVD3, 0x3054, Y,   Y,       N,       0xadc, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi1_sck_pc2,         SPI1,       RSVD1,  RSVD2, RSVD3, 0x3058, Y,   Y,       N,       0xae4, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi1_cs0_pc3,         SPI1,       RSVD1,  RSVD2, RSVD3, 0x305c, Y,   Y,       N,       0xad4, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi1_cs1_pc4,         SPI1,       RSVD1,  RSVD2, RSVD3, 0x3060, Y,   Y,       N,       0xad8, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi2_mosi_pb4,        SPI2,       DTV,    RSVD2, RSVD3, 0x3064, Y,   Y,       N,       0xaf4, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi2_miso_pb5,        SPI2,       DTV,    RSVD2, RSVD3, 0x3068, Y,   Y,       N,       0xaf0, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi2_sck_pb6,         SPI2,       DTV,    RSVD2, RSVD3, 0x306c, Y,   Y,       N,       0xaf8, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi2_cs0_pb7,         SPI2,       DTV,    RSVD2, RSVD3, 0x3070, Y,   Y,       N,       0xae8, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi2_cs1_pdd0,        SPI2,       RSVD1,  RSVD2, RSVD3, 0x3074, Y,   Y,       N,       0xaec, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi4_mosi_pc7,        SPI4,       RSVD1,  RSVD2, RSVD3, 0x3078, Y,   Y,       N,       0xb04, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi4_miso_pd0,        SPI4,       RSVD1,  RSVD2, RSVD3, 0x307c, Y,   Y,       N,       0xb00, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi4_sck_pc5,         SPI4,       RSVD1,  RSVD2, RSVD3, 0x3080, Y,   Y,       N,       0xb08, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(spi4_cs0_pc6,         SPI4,       RSVD1,  RSVD2, RSVD3, 0x3084, Y,   Y,       N,       0xafc, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(qspi_sck_pee0,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x3088, Y,   Y,       N,       0xa90, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(qspi_cs_n_pee1,       QSPI,       RSVD1,  RSVD2, RSVD3, 0x308c, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(qspi_io0_pee2,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x3090, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(qspi_io1_pee3,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x3094, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(qspi_io2_pee4,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x3098, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(qspi_io3_pee5,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x309c, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(dmic1_clk_pe0,        DMIC1,      I2S3,   RSVD2, RSVD3, 0x30a4, N,   N,       N,       0x984, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dmic1_dat_pe1,        DMIC1,      I2S3,   RSVD2, RSVD3, 0x30a8, N,   N,       N,       0x988, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dmic2_clk_pe2,        DMIC2,      I2S3,   RSVD2, RSVD3, 0x30ac, N,   N,       N,       0x98c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dmic2_dat_pe3,        DMIC2,      I2S3,   RSVD2, RSVD3, 0x30b0, N,   N,       N,       0x990, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dmic3_clk_pe4,        DMIC3,      I2S5A,  RSVD2, RSVD3, 0x30b4, N,   N,       N,       0x994, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dmic3_dat_pe5,        DMIC3,      I2S5A,  RSVD2, RSVD3, 0x30b8, N,   N,       N,       0x998, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gen1_i2c_scl_pj1,     I2C1,       RSVD1,  RSVD2, RSVD3, 0x30bc, N,   N,       Y,       0x9a8, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gen1_i2c_sda_pj0,     I2C1,       RSVD1,  RSVD2, RSVD3, 0x30c0, N,   N,       Y,       0x9ac, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gen2_i2c_scl_pj2,     I2C2,       RSVD1,  RSVD2, RSVD3, 0x30c4, N,   N,       Y,       0x9b0, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gen2_i2c_sda_pj3,     I2C2,       RSVD1,  RSVD2, RSVD3, 0x30c8, N,   N,       Y,       0x9b4, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gen3_i2c_scl_pf0,     I2C3,       RSVD1,  RSVD2, RSVD3, 0x30cc, N,   N,       Y,       0x9b8, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gen3_i2c_sda_pf1,     I2C3,       RSVD1,  RSVD2, RSVD3, 0x30d0, N,   N,       Y,       0x9bc, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam_i2c_scl_ps2,      I2C3,       I2CVI,  RSVD2, RSVD3, 0x30d4, N,   N,       Y,       0x934, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam_i2c_sda_ps3,      I2C3,       I2CVI,  RSVD2, RSVD3, 0x30d8, N,   N,       Y,       0x938, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pwr_i2c_scl_py3,      I2CPMU,     RSVD1,  RSVD2, RSVD3, 0x30dc, N,   N,       Y,       0xa6c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pwr_i2c_sda_py4,      I2CPMU,     RSVD1,  RSVD2, RSVD3, 0x30e0, N,   N,       Y,       0xa70, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart1_tx_pu0,         UARTA,      RSVD1,  RSVD2, RSVD3, 0x30e4, N,   N,       N,       0xb28, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart1_rx_pu1,         UARTA,      RSVD1,  RSVD2, RSVD3, 0x30e8, N,   N,       N,       0xb24, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart1_rts_pu2,        UARTA,      RSVD1,  RSVD2, RSVD3, 0x30ec, N,   N,       N,       0xb20, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart1_cts_pu3,        UARTA,      RSVD1,  RSVD2, RSVD3, 0x30f0, N,   N,       N,       0xb1c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart2_tx_pg0,         UARTB,      I2S4A,  SPDIF, UART,  0x30f4, N,   N,       N,       0xb38, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart2_rx_pg1,         UARTB,      I2S4A,  SPDIF, UART,  0x30f8, N,   N,       N,       0xb34, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart2_rts_pg2,        UARTB,      I2S4A,  RSVD2, UART,  0x30fc, N,   N,       N,       0xb30, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart2_cts_pg3,        UARTB,      I2S4A,  RSVD2, UART,  0x3100, N,   N,       N,       0xb2c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart3_tx_pd1,         UARTC,      SPI4,   RSVD2, RSVD3, 0x3104, N,   N,       N,       0xb48, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart3_rx_pd2,         UARTC,      SPI4,   RSVD2, RSVD3, 0x3108, N,   N,       N,       0xb44, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart3_rts_pd3,        UARTC,      SPI4,   RSVD2, RSVD3, 0x310c, N,   N,       N,       0xb40, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart3_cts_pd4,        UARTC,      SPI4,   RSVD2, RSVD3, 0x3110, N,   N,       N,       0xb3c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart4_tx_pi4,         UARTD,      UART,   RSVD2, RSVD3, 0x3114, N,   N,       N,       0xb58, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart4_rx_pi5,         UARTD,      UART,   RSVD2, RSVD3, 0x3118, N,   N,       N,       0xb54, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart4_rts_pi6,        UARTD,      UART,   RSVD2, RSVD3, 0x311c, N,   N,       N,       0xb50, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(uart4_cts_pi7,        UARTD,      UART,   RSVD2, RSVD3, 0x3120, N,   N,       N,       0xb4c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dap1_fs_pb0,          I2S1,       RSVD1,  RSVD2, RSVD3, 0x3124, Y,   Y,       N,       0x95c, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(dap1_din_pb1,         I2S1,       RSVD1,  RSVD2, RSVD3, 0x3128, Y,   Y,       N,       0x954, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(dap1_dout_pb2,        I2S1,       RSVD1,  RSVD2, RSVD3, 0x312c, Y,   Y,       N,       0x958, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(dap1_sclk_pb3,        I2S1,       RSVD1,  RSVD2, RSVD3, 0x3130, Y,   Y,       N,       0x960, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(dap2_fs_paa0,         I2S2,       RSVD1,  RSVD2, RSVD3, 0x3134, Y,   Y,       N,       0x96c, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(dap2_din_paa2,        I2S2,       RSVD1,  RSVD2, RSVD3, 0x3138, Y,   Y,       N,       0x964, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(dap2_dout_paa3,       I2S2,       RSVD1,  RSVD2, RSVD3, 0x313c, Y,   Y,       N,       0x968, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(dap2_sclk_paa1,       I2S2,       RSVD1,  RSVD2, RSVD3, 0x3140, Y,   Y,       N,       0x970, -1,      -1,      -1,      -1,      28,     2,      30,     2),
-	PINGROUP(dap4_fs_pj4,          I2S4B,      RSVD1,  RSVD2, RSVD3, 0x3144, N,   N,       N,       0x97c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dap4_din_pj5,         I2S4B,      RSVD1,  RSVD2, RSVD3, 0x3148, N,   N,       N,       0x974, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dap4_dout_pj6,        I2S4B,      RSVD1,  RSVD2, RSVD3, 0x314c, N,   N,       N,       0x978, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dap4_sclk_pj7,        I2S4B,      RSVD1,  RSVD2, RSVD3, 0x3150, N,   N,       N,       0x980, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam1_mclk_ps0,        EXTPERIPH3, RSVD1,  RSVD2, RSVD3, 0x3154, N,   N,       N,       0x918, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam2_mclk_ps1,        EXTPERIPH3, RSVD1,  RSVD2, RSVD3, 0x3158, N,   N,       N,       0x924, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(jtag_rtck,            JTAG,       RSVD1,  RSVD2, RSVD3, 0x315c, N,   N,       N,       0xa2c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(clk_32k_in,           CLK,        RSVD1,  RSVD2, RSVD3, 0x3160, N,   N,       N,       0x940, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(clk_32k_out_py5,      SOC,        BLINK,  RSVD2, RSVD3, 0x3164, N,   N,       N,       0x944, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(batt_bcl,             BCL,        RSVD1,  RSVD2, RSVD3, 0x3168, N,   N,       Y,       0x8f8, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(clk_req,              SYS,        RSVD1,  RSVD2, RSVD3, 0x316c, N,   N,       N,       0x948, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cpu_pwr_req,          CPU,        RSVD1,  RSVD2, RSVD3, 0x3170, N,   N,       N,       0x950, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pwr_int_n,            PMI,        RSVD1,  RSVD2, RSVD3, 0x3174, N,   N,       N,       0xa74, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(shutdown,             SHUTDOWN,   RSVD1,  RSVD2, RSVD3, 0x3178, N,   N,       N,       0xac8, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(core_pwr_req,         CORE,       RSVD1,  RSVD2, RSVD3, 0x317c, N,   N,       N,       0x94c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(aud_mclk_pbb0,        AUD,        RSVD1,  RSVD2, RSVD3, 0x3180, N,   N,       N,       0x8f4, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dvfs_pwm_pbb1,        RSVD0,      CLDVFS, SPI3,  RSVD3, 0x3184, N,   N,       N,       0x9a4, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dvfs_clk_pbb2,        RSVD0,      CLDVFS, SPI3,  RSVD3, 0x3188, N,   N,       N,       0x9a0, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gpio_x1_aud_pbb3,     RSVD0,      RSVD1,  SPI3,  RSVD3, 0x318c, N,   N,       N,       0xa14, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gpio_x3_aud_pbb4,     RSVD0,      RSVD1,  SPI3,  RSVD3, 0x3190, N,   N,       N,       0xa18, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pcc7,                 RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3194, N,   N,       Y,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(hdmi_cec_pcc0,        CEC,        RSVD1,  RSVD2, RSVD3, 0x3198, N,   N,       Y,       0xa24, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(hdmi_int_dp_hpd_pcc1, DP,         RSVD1,  RSVD2, RSVD3, 0x319c, N,   N,       Y,       0xa28, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(spdif_out_pcc2,       SPDIF,      RSVD1,  RSVD2, RSVD3, 0x31a0, N,   N,       N,       0xad0, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(spdif_in_pcc3,        SPDIF,      RSVD1,  RSVD2, RSVD3, 0x31a4, N,   N,       N,       0xacc, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(usb_vbus_en0_pcc4,    USB,        RSVD1,  RSVD2, RSVD3, 0x31a8, N,   N,       Y,       0xb5c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(usb_vbus_en1_pcc5,    USB,        RSVD1,  RSVD2, RSVD3, 0x31ac, N,   N,       Y,       0xb60, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(dp_hpd0_pcc6,         DP,         RSVD1,  RSVD2, RSVD3, 0x31b0, N,   N,       N,       0x99c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(wifi_en_ph0,          RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31b4, N,   N,       N,       0xb64, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(wifi_rst_ph1,         RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31b8, N,   N,       N,       0xb68, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(wifi_wake_ap_ph2,     RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31bc, N,   N,       N,       0xb6c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(ap_wake_bt_ph3,       RSVD0,      UARTB,  SPDIF, RSVD3, 0x31c0, N,   N,       N,       0x8ec, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(bt_rst_ph4,           RSVD0,      UARTB,  SPDIF, RSVD3, 0x31c4, N,   N,       N,       0x8fc, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(bt_wake_ap_ph5,       RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31c8, N,   N,       N,       0x900, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(ap_wake_nfc_ph7,      RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31cc, N,   N,       N,       0x8f0, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(nfc_en_pi0,           RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31d0, N,   N,       N,       0xa50, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(nfc_int_pi1,          RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31d4, N,   N,       N,       0xa54, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gps_en_pi2,           RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31d8, N,   N,       N,       0xa1c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(gps_rst_pi3,          RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31dc, N,   N,       N,       0xa20, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam_rst_ps4,          VGP1,       RSVD1,  RSVD2, RSVD3, 0x31e0, N,   N,       N,       0x93c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam_af_en_ps5,        VIMCLK,     VGP2,   RSVD2, RSVD3, 0x31e4, N,   N,       N,       0x92c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam_flash_en_ps6,     VIMCLK,     VGP3,   RSVD2, RSVD3, 0x31e8, N,   N,       N,       0x930, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam1_pwdn_ps7,        VGP4,       RSVD1,  RSVD2, RSVD3, 0x31ec, N,   N,       N,       0x91c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam2_pwdn_pt0,        VGP5,       RSVD1,  RSVD2, RSVD3, 0x31f0, N,   N,       N,       0x928, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(cam1_strobe_pt1,      VGP6,       RSVD1,  RSVD2, RSVD3, 0x31f4, N,   N,       N,       0x920, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(lcd_te_py2,           DISPLAYA,   RSVD1,  RSVD2, RSVD3, 0x31f8, N,   N,       N,       0xa44, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(lcd_bl_pwm_pv0,       DISPLAYA,   PWM0,   SOR0,  RSVD3, 0x31fc, N,   N,       N,       0xa34, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(lcd_bl_en_pv1,        RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3200, N,   N,       N,       0xa30, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(lcd_rst_pv2,          RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3204, N,   N,       N,       0xa40, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(lcd_gpio1_pv3,        DISPLAYB,   RSVD1,  RSVD2, RSVD3, 0x3208, N,   N,       N,       0xa38, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(lcd_gpio2_pv4,        DISPLAYB,   PWM1,   RSVD2, SOR1,  0x320c, N,   N,       N,       0xa3c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(ap_ready_pv5,         RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3210, N,   N,       N,       0x8e8, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(touch_rst_pv6,        RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3214, N,   N,       N,       0xb18, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(touch_clk_pv7,        TOUCH,      RSVD1,  RSVD2, RSVD3, 0x3218, N,   N,       N,       0xb10, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(modem_wake_ap_px0,    RSVD0,      RSVD1,  RSVD2, RSVD3, 0x321c, N,   N,       N,       0xa48, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(touch_int_px1,        RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3220, N,   N,       N,       0xb14, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(motion_int_px2,       RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3224, N,   N,       N,       0xa4c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(als_prox_int_px3,     RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3228, N,   N,       N,       0x8e4, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(temp_alert_px4,       RSVD0,      RSVD1,  RSVD2, RSVD3, 0x322c, N,   N,       N,       0xb0c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(button_power_on_px5,  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3230, N,   N,       N,       0x908, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(button_vol_up_px6,    RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3234, N,   N,       N,       0x914, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(button_vol_down_px7,  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3238, N,   N,       N,       0x910, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(button_slide_sw_py0,  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x323c, N,   N,       N,       0x90c, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(button_home_py1,      RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3240, N,   N,       N,       0x904, 12,      5,       20,      5,       -1,     -1,     -1,     -1),
-	PINGROUP(pa6,                  SATA,       RSVD1,  RSVD2, RSVD3, 0x3244, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pe6,                  RSVD0,      I2S5A,  PWM2,  RSVD3, 0x3248, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pe7,                  RSVD0,      I2S5A,  PWM3,  RSVD3, 0x324c, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(ph6,                  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3250, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pk0,                  IQC0,       I2S5B,  RSVD2, RSVD3, 0x3254, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pk1,                  IQC0,       I2S5B,  RSVD2, RSVD3, 0x3258, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pk2,                  IQC0,       I2S5B,  RSVD2, RSVD3, 0x325c, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pk3,                  IQC0,       I2S5B,  RSVD2, RSVD3, 0x3260, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pk4,                  IQC1,       RSVD1,  RSVD2, RSVD3, 0x3264, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pk5,                  IQC1,       RSVD1,  RSVD2, RSVD3, 0x3268, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pk6,                  IQC1,       RSVD1,  RSVD2, RSVD3, 0x326c, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pk7,                  IQC1,       RSVD1,  RSVD2, RSVD3, 0x3270, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pl0,                  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3274, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pl1,                  SOC,        RSVD1,  RSVD2, RSVD3, 0x3278, Y,   Y,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pz0,                  VIMCLK2,    RSVD1,  RSVD2, RSVD3, 0x327c, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pz1,                  VIMCLK2,    SDMMC1, RSVD2, RSVD3, 0x3280, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pz2,                  SDMMC3,     CCLA,   RSVD2, RSVD3, 0x3284, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pz3,                  SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3288, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pz4,                  SDMMC1,     RSVD1,  RSVD2, RSVD3, 0x328c, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
-	PINGROUP(pz5,                  SOC,        RSVD1,  RSVD2, RSVD3, 0x3290, N,   N,       N,       -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1),
+#define PAD_PINGROUP(pg_name, r, pad_b)					\
+	{								\
+		.name = "pad_" #pg_name,				\
+		.pins = pad_##pg_name##_pins,				\
+		.npins = ARRAY_SIZE(pad_##pg_name##_pins),		\
+		.mux_reg = -1,						\
+		.pupd_reg = -1,						\
+		.tri_reg = -1,						\
+		.einput_bit = -1,					\
+		.odrain_bit = -1,					\
+		.lock_bit = -1,						\
+		.ioreset_bit = -1,					\
+		.rcv_sel_bit = -1,					\
+		.e_io_hv_bit = -1,					\
+		.parked_bit = -1,					\
+		.hsm_bit = -1,						\
+		.schmitt_bit = -1,					\
+		.lpdr_bit = -1,						\
+		.pbias_buf_bit = -1,					\
+		.preemp_bit = -1,					\
+		.rfu_in_bit = -1,					\
+		.drv_reg =  -1,						\
+		.drv_bank = 0,						\
+		.lpmd_bit = -1,						\
+		.drvdn_bit = -1,					\
+		.drvdn_width = -1,					\
+		.drvup_bit = -1,					\
+		.drvup_width = -1,					\
+		.slwr_bit = -1,						\
+		.slwr_width = -1,					\
+		.slwf_bit = -1,						\
+		.slwf_width = -1,					\
+		.drvtype_bit = -1,					\
+		.pad_bit = pad_b,					\
+		.pad_bank = 0,						\
+		.pad_reg =DRV_PINGROUP_REG(r),				\
+		.lpbk_bit = -1,						\
+	}
+
+static struct tegra_pingroup tegra210_groups[] = {
+	/*       pg_name,              f0,         f1,     f2,    f3,    r,      hsm, drvtype, e_io_hv, lpdr, rdrv,  drvdn_b, drvdn_w, drvup_b, drvup_w, slwr_b, slwr_w, slwf_b, slwf_w, lpbk */
+	PINGROUP(sdmmc1_clk_pm0,       SDMMC1,     RSVD1,  RSVD2, RSVD3, 0x3000, Y,   Y,       N,       N,	0x8d4,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, 0),
+	PINGROUP(sdmmc1_cmd_pm1,       SDMMC1,     SPI3,   RSVD2, RSVD3, 0x3004, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc1_dat3_pm2,      SDMMC1,     SPI3,   RSVD2, RSVD3, 0x3008, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc1_dat2_pm3,      SDMMC1,     SPI3,   RSVD2, RSVD3, 0x300c, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc1_dat1_pm4,      SDMMC1,     SPI3,   RSVD2, RSVD3, 0x3010, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc1_dat0_pm5,      SDMMC1,     RSVD1,  RSVD2, RSVD3, 0x3014, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc2_clk,           SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32b4, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_clkb,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32b8, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_cmd,           SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32bc, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dat0,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x3294, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dat1,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x3298, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dat2,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x329c, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dat3,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32a0, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dat4,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32a4, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dat5,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32a8, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dat6,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32ac, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dat7,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32b0, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dqs,           SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32c0, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc2_dqsb,          SDMMC2,     RSVD1,  RSVD2, RSVD3, 0x32c4, Y,   Y,       N,       N,      -1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1,     -1),
+	PINGROUP(sdmmc3_clk_pp0,       SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x301c, Y,   Y,       N,       N,	0x8d8,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, 0),
+	PINGROUP(sdmmc3_cmd_pp1,       SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3020, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc3_dat0_pp5,      SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3024, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc3_dat1_pp4,      SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3028, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc3_dat2_pp3,      SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x302c, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(sdmmc3_dat3_pp2,      SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3030, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pex_l0_rst_n_pa0,     PE0,        RSVD1,  RSVD2, RSVD3, 0x3038, N,   N,       Y,       Y,	0xa5c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pex_l0_clkreq_n_pa1,  PE0,        RSVD1,  RSVD2, RSVD3, 0x303c, N,   N,       Y,       Y,	0xa58, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pex_wake_n_pa2,       PE,         RSVD1,  RSVD2, RSVD3, 0x3040, N,   N,       Y,       Y,	0xa68, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pex_l1_rst_n_pa3,     PE1,        RSVD1,  RSVD2, RSVD3, 0x3044, N,   N,       Y,       Y,	0xa64, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pex_l1_clkreq_n_pa4,  PE1,        RSVD1,  RSVD2, RSVD3, 0x3048, N,   N,       Y,       Y,	0xa60, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(sata_led_active_pa5,  SATA,       RSVD1,  RSVD2, RSVD3, 0x304c, N,   N,       N,       Y,	0xa94, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pa5,                  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x304c, N,   N,       N,       Y,	0xa94, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(spi1_mosi_pc0,        SPI1,       RSVD1,  RSVD2, RSVD3, 0x3050, Y,   Y,       N,       N,	0xae0, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi1_miso_pc1,        SPI1,       RSVD1,  RSVD2, RSVD3, 0x3054, Y,   Y,       N,       N,	0xadc, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi1_sck_pc2,         SPI1,       RSVD1,  RSVD2, RSVD3, 0x3058, Y,   Y,       N,       N,	0xae4, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi1_cs0_pc3,         SPI1,       RSVD1,  RSVD2, RSVD3, 0x305c, Y,   Y,       N,       N,	0xad4, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi1_cs1_pc4,         SPI1,       RSVD1,  RSVD2, RSVD3, 0x3060, Y,   Y,       N,       N,	0xad8, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi2_mosi_pb4,        SPI2,       DTV,    RSVD2, RSVD3, 0x3064, Y,   Y,       N,       N,	0xaf4, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi2_miso_pb5,        SPI2,       DTV,    RSVD2, RSVD3, 0x3068, Y,   Y,       N,       N,	0xaf0, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi2_sck_pb6,         SPI2,       DTV,    RSVD2, RSVD3, 0x306c, Y,   Y,       N,       N,	0xaf8, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi2_cs0_pb7,         SPI2,       DTV,    RSVD2, RSVD3, 0x3070, Y,   Y,       N,       N,	0xae8, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi2_cs1_pdd0,        SPI2,       RSVD1,  RSVD2, RSVD3, 0x3074, Y,   Y,       N,       N,	0xaec, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi4_mosi_pc7,        SPI4,       RSVD1,  RSVD2, RSVD3, 0x3078, Y,   Y,       N,       N,	0xb04, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi4_miso_pd0,        SPI4,       RSVD1,  RSVD2, RSVD3, 0x307c, Y,   Y,       N,       N,	0xb00, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi4_sck_pc5,         SPI4,       RSVD1,  RSVD2, RSVD3, 0x3080, Y,   Y,       N,       N,	0xb08, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(spi4_cs0_pc6,         SPI4,       RSVD1,  RSVD2, RSVD3, 0x3084, Y,   Y,       N,       N,	0xafc, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(qspi_sck_pee0,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x3088, Y,   Y,       N,       N,	0xa90, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(qspi_cs_n_pee1,       QSPI,       RSVD1,  RSVD2, RSVD3, 0x308c, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(qspi_io0_pee2,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x3090, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(qspi_io1_pee3,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x3094, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(qspi_io2_pee4,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x3098, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(qspi_io3_pee5,        QSPI,       RSVD1,  RSVD2, RSVD3, 0x309c, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(dmic1_clk_pe0,        DMIC1,      I2S3,   RSVD2, RSVD3, 0x30a4, N,   N,       N,       Y,	0x984, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dmic1_dat_pe1,        DMIC1,      I2S3,   RSVD2, RSVD3, 0x30a8, N,   N,       N,       Y,	0x988, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dmic2_clk_pe2,        DMIC2,      I2S3,   RSVD2, RSVD3, 0x30ac, N,   N,       N,       Y,	0x98c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dmic2_dat_pe3,        DMIC2,      I2S3,   RSVD2, RSVD3, 0x30b0, N,   N,       N,       Y,	0x990, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dmic3_clk_pe4,        DMIC3,      I2S5A,  RSVD2, RSVD3, 0x30b4, N,   N,       N,       Y,	0x994, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dmic3_dat_pe5,        DMIC3,      I2S5A,  RSVD2, RSVD3, 0x30b8, N,   N,       N,       Y,	0x998, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gen1_i2c_scl_pj1,     I2C1,       RSVD1,  RSVD2, RSVD3, 0x30bc, N,   N,       Y,       Y,	0x9a8, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gen1_i2c_sda_pj0,     I2C1,       RSVD1,  RSVD2, RSVD3, 0x30c0, N,   N,       Y,       Y,	0x9ac, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gen2_i2c_scl_pj2,     I2C2,       RSVD1,  RSVD2, RSVD3, 0x30c4, N,   N,       Y,       Y,	0x9b0, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gen2_i2c_sda_pj3,     I2C2,       RSVD1,  RSVD2, RSVD3, 0x30c8, N,   N,       Y,       Y,	0x9b4, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gen3_i2c_scl_pf0,     I2C3,       RSVD1,  RSVD2, RSVD3, 0x30cc, N,   N,       Y,       Y,	0x9b8, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gen3_i2c_sda_pf1,     I2C3,       RSVD1,  RSVD2, RSVD3, 0x30d0, N,   N,       Y,       Y,	0x9bc, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam_i2c_scl_ps2,      I2C3,       I2CVI,  RSVD2, RSVD3, 0x30d4, N,   N,       Y,       Y,	0x934, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam_i2c_sda_ps3,      I2C3,       I2CVI,  RSVD2, RSVD3, 0x30d8, N,   N,       Y,       Y,	0x938, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pwr_i2c_scl_py3,      I2CPMU,     RSVD1,  RSVD2, RSVD3, 0x30dc, N,   N,       Y,       Y,	0xa6c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pwr_i2c_sda_py4,      I2CPMU,     RSVD1,  RSVD2, RSVD3, 0x30e0, N,   N,       Y,       Y,	0xa70, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart1_tx_pu0,         UARTA,      RSVD1,  RSVD2, RSVD3, 0x30e4, N,   N,       N,       Y,	0xb28, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart1_rx_pu1,         UARTA,      RSVD1,  RSVD2, RSVD3, 0x30e8, N,   N,       N,       Y,	0xb24, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart1_rts_pu2,        UARTA,      RSVD1,  RSVD2, RSVD3, 0x30ec, N,   N,       N,       Y,	0xb20, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart1_cts_pu3,        UARTA,      RSVD1,  RSVD2, RSVD3, 0x30f0, N,   N,       N,       Y,	0xb1c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart2_tx_pg0,         UARTB,      I2S4A,  SPDIF, UART,  0x30f4, N,   N,       N,       Y,	0xb38, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart2_rx_pg1,         UARTB,      I2S4A,  SPDIF, UART,  0x30f8, N,   N,       N,       Y,	0xb34, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart2_rts_pg2,        UARTB,      I2S4A,  RSVD2, UART,  0x30fc, N,   N,       N,       Y,	0xb30, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart2_cts_pg3,        UARTB,      I2S4A,  RSVD2, UART,  0x3100, N,   N,       N,       Y,	0xb2c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart3_tx_pd1,         UARTC,      SPI4,   RSVD2, RSVD3, 0x3104, N,   N,       N,       Y,	0xb48, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart3_rx_pd2,         UARTC,      SPI4,   RSVD2, RSVD3, 0x3108, N,   N,       N,       Y,	0xb44, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart3_rts_pd3,        UARTC,      SPI4,   RSVD2, RSVD3, 0x310c, N,   N,       N,       Y,	0xb40, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart3_cts_pd4,        UARTC,      SPI4,   RSVD2, RSVD3, 0x3110, N,   N,       N,       Y,	0xb3c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart4_tx_pi4,         UARTD,      UART,   RSVD2, RSVD3, 0x3114, N,   N,       N,       Y,	0xb58, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart4_rx_pi5,         UARTD,      UART,   RSVD2, RSVD3, 0x3118, N,   N,       N,       Y,	0xb54, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart4_rts_pi6,        UARTD,      UART,   RSVD2, RSVD3, 0x311c, N,   N,       N,       Y,	0xb50, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(uart4_cts_pi7,        UARTD,      UART,   RSVD2, RSVD3, 0x3120, N,   N,       N,       Y,	0xb4c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dap1_fs_pb0,          I2S1,       RSVD1,  RSVD2, RSVD3, 0x3124, Y,   Y,       N,       Y,	0x95c, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(dap1_din_pb1,         I2S1,       RSVD1,  RSVD2, RSVD3, 0x3128, Y,   Y,       N,       N,	0x954, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(dap1_dout_pb2,        I2S1,       RSVD1,  RSVD2, RSVD3, 0x312c, Y,   Y,       N,       N,	0x958, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(dap1_sclk_pb3,        I2S1,       RSVD1,  RSVD2, RSVD3, 0x3130, Y,   Y,       N,       N,	0x960, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(dap2_fs_paa0,         I2S2,       RSVD1,  RSVD2, RSVD3, 0x3134, Y,   Y,       N,       N,	0x96c, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(dap2_din_paa2,        I2S2,       RSVD1,  RSVD2, RSVD3, 0x3138, Y,   Y,       N,       N,	0x964, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(dap2_dout_paa3,       I2S2,       RSVD1,  RSVD2, RSVD3, 0x313c, Y,   Y,       N,       N,	0x968, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(dap2_sclk_paa1,       I2S2,       RSVD1,  RSVD2, RSVD3, 0x3140, Y,   Y,       N,       N,	0x970, -1,      -1,      -1,      -1,      28,     2,      30,     2, -1),
+	PINGROUP(dap4_fs_pj4,          I2S4B,      RSVD1,  RSVD2, RSVD3, 0x3144, N,   N,       N,       Y,	0x97c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dap4_din_pj5,         I2S4B,      RSVD1,  RSVD2, RSVD3, 0x3148, N,   N,       N,       Y,	0x974, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dap4_dout_pj6,        I2S4B,      RSVD1,  RSVD2, RSVD3, 0x314c, N,   N,       N,       Y,	0x978, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dap4_sclk_pj7,        I2S4B,      RSVD1,  RSVD2, RSVD3, 0x3150, N,   N,       N,       Y,	0x980, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam1_mclk_ps0,        EXTPERIPH3, RSVD1,  RSVD2, RSVD3, 0x3154, N,   N,       N,       Y,	0x918, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam2_mclk_ps1,        EXTPERIPH3, RSVD1,  RSVD2, RSVD3, 0x3158, N,   N,       N,       Y,	0x924, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(jtag_rtck,            JTAG,       RSVD1,  RSVD2, RSVD3, 0x315c, N,   N,       N,       Y,	0xa2c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(clk_32k_in,           CLK,        RSVD1,  RSVD2, RSVD3, 0x3160, N,   N,       N,       Y,	0x940, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(clk_32k_out_py5,      SOC,        BLINK,  RSVD2, RSVD3, 0x3164, N,   N,       N,       Y,	0x944, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(batt_bcl,             BCL,        RSVD1,  RSVD2, RSVD3, 0x3168, N,   N,       Y,       Y,	0x8f8, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(clk_req,              SYS,        RSVD1,  RSVD2, RSVD3, 0x316c, N,   N,       N,       Y,	0x948, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cpu_pwr_req,          CPU,        RSVD1,  RSVD2, RSVD3, 0x3170, N,   N,       N,       Y,	0x950, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pwr_int_n,            PMI,        RSVD1,  RSVD2, RSVD3, 0x3174, N,   N,       N,       Y,	0xa74, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(shutdown,             SHUTDOWN,   RSVD1,  RSVD2, RSVD3, 0x3178, N,   N,       N,       Y,	0xac8, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(core_pwr_req,         CORE,       RSVD1,  RSVD2, RSVD3, 0x317c, N,   N,       N,       Y,	0x94c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(aud_mclk_pbb0,        AUD,        RSVD1,  RSVD2, RSVD3, 0x3180, N,   N,       N,       Y,	0x8f4, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dvfs_pwm_pbb1,        RSVD0,      CLDVFS, SPI3,  RSVD3, 0x3184, N,   N,       N,       Y,	0x9a4, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dvfs_clk_pbb2,        RSVD0,      CLDVFS, SPI3,  RSVD3, 0x3188, N,   N,       N,       Y,	0x9a0, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gpio_x1_aud_pbb3,     RSVD0,      RSVD1,  SPI3,  RSVD3, 0x318c, N,   N,       N,       Y,	0xa14, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gpio_x3_aud_pbb4,     RSVD0,      RSVD1,  SPI3,  RSVD3, 0x3190, N,   N,       N,       Y,	0xa18, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pcc7,                 RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3194, N,   N,       Y,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(hdmi_cec_pcc0,        CEC,        RSVD1,  RSVD2, RSVD3, 0x3198, N,   N,       Y,       Y,	0xa24, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(hdmi_int_dp_hpd_pcc1, DP,         RSVD1,  RSVD2, RSVD3, 0x319c, N,   N,       Y,       Y,	0xa28, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(spdif_out_pcc2,       SPDIF,      RSVD1,  RSVD2, RSVD3, 0x31a0, N,   N,       N,       Y,	0xad0, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(spdif_in_pcc3,        SPDIF,      RSVD1,  RSVD2, RSVD3, 0x31a4, N,   N,       N,       Y,	0xacc, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(usb_vbus_en0_pcc4,    USB,        RSVD1,  RSVD2, RSVD3, 0x31a8, N,   N,       Y,       Y,	0xb5c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(usb_vbus_en1_pcc5,    USB,        RSVD1,  RSVD2, RSVD3, 0x31ac, N,   N,       Y,       Y,	0xb60, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(dp_hpd0_pcc6,         DP,         RSVD1,  RSVD2, RSVD3, 0x31b0, N,   N,       N,       Y,	0x99c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(wifi_en_ph0,          RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31b4, N,   N,       N,       Y,	0xb64, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(wifi_rst_ph1,         RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31b8, N,   N,       N,       Y,	0xb68, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(wifi_wake_ap_ph2,     RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31bc, N,   N,       N,       Y,	0xb6c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(ap_wake_bt_ph3,       RSVD0,      UARTB,  SPDIF, RSVD3, 0x31c0, N,   N,       N,       Y,	0x8ec, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(bt_rst_ph4,           RSVD0,      UARTB,  SPDIF, RSVD3, 0x31c4, N,   N,       N,       Y,	0x8fc, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(bt_wake_ap_ph5,       RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31c8, N,   N,       N,       Y,	0x900, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(ap_wake_nfc_ph7,      RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31cc, N,   N,       N,       Y,	0x8f0, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(nfc_en_pi0,           RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31d0, N,   N,       N,       Y,	0xa50, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(nfc_int_pi1,          RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31d4, N,   N,       N,       Y,	0xa54, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gps_en_pi2,           RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31d8, N,   N,       N,       Y,	0xa1c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(gps_rst_pi3,          RSVD0,      RSVD1,  RSVD2, RSVD3, 0x31dc, N,   N,       N,       Y,	0xa20, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam_rst_ps4,          VGP1,       RSVD1,  RSVD2, RSVD3, 0x31e0, N,   N,       N,       Y,	0x93c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam_af_en_ps5,        VIMCLK,     VGP2,   RSVD2, RSVD3, 0x31e4, N,   N,       N,       Y,	0x92c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam_flash_en_ps6,     VIMCLK,     VGP3,   RSVD2, RSVD3, 0x31e8, N,   N,       N,       Y,	0x930, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam1_pwdn_ps7,        VGP4,       RSVD1,  RSVD2, RSVD3, 0x31ec, N,   N,       N,       Y,	0x91c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam2_pwdn_pt0,        VGP5,       RSVD1,  RSVD2, RSVD3, 0x31f0, N,   N,       N,       Y,	0x928, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(cam1_strobe_pt1,      VGP6,       RSVD1,  RSVD2, RSVD3, 0x31f4, N,   N,       N,       Y,	0x920, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(lcd_te_py2,           DISPLAYA,   RSVD1,  RSVD2, RSVD3, 0x31f8, N,   N,       N,       Y,	0xa44, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(lcd_bl_pwm_pv0,       DISPLAYA,   PWM0,   SOR0,  RSVD3, 0x31fc, N,   N,       N,       Y,	0xa34, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(lcd_bl_en_pv1,        RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3200, N,   N,       N,       Y,	0xa30, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(lcd_rst_pv2,          RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3204, N,   N,       N,       Y,	0xa40, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(lcd_gpio1_pv3,        DISPLAYB,   RSVD1,  RSVD2, RSVD3, 0x3208, N,   N,       N,       Y,	0xa38, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(lcd_gpio2_pv4,        DISPLAYB,   PWM1,   RSVD2, SOR1,  0x320c, N,   N,       N,       Y,	0xa3c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(ap_ready_pv5,         RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3210, N,   N,       N,       Y,	0x8e8, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(touch_rst_pv6,        RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3214, N,   N,       N,       Y,	0xb18, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(touch_clk_pv7,        TOUCH,      RSVD1,  RSVD2, RSVD3, 0x3218, N,   N,       N,       Y,	0xb10, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(modem_wake_ap_px0,    RSVD0,      RSVD1,  RSVD2, RSVD3, 0x321c, N,   N,       N,       Y,	0xa48, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(touch_int_px1,        RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3220, N,   N,       N,       Y,	0xb14, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(motion_int_px2,       RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3224, N,   N,       N,       Y,	0xa4c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(als_prox_int_px3,     RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3228, N,   N,       N,       Y,	0x8e4, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(temp_alert_px4,       RSVD0,      RSVD1,  RSVD2, RSVD3, 0x322c, N,   N,       N,       Y,	0xb0c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(button_power_on_px5,  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3230, N,   N,       N,       Y,	0x908, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(button_vol_up_px6,    RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3234, N,   N,       N,       Y,	0x914, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(button_vol_down_px7,  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3238, N,   N,       N,       Y,	0x910, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(button_slide_sw_py0,  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x323c, N,   N,       N,       Y,	0x90c, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(button_home_py1,      RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3240, N,   N,       N,       Y,	0x904, 12,      5,       20,      5,       -1,     -1,     -1,     -1, -1),
+	PINGROUP(pa6,                  SATA,       RSVD1,  RSVD2, RSVD3, 0x3244, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pe6,                  RSVD0,      I2S5A,  PWM2,  RSVD3, 0x3248, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pe7,                  RSVD0,      I2S5A,  PWM3,  RSVD3, 0x324c, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(ph6,                  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3250, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pk0,                  IQC0,       I2S5B,  RSVD2, RSVD3, 0x3254, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pk1,                  IQC0,       I2S5B,  RSVD2, RSVD3, 0x3258, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pk2,                  IQC0,       I2S5B,  RSVD2, RSVD3, 0x325c, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pk3,                  IQC0,       I2S5B,  RSVD2, RSVD3, 0x3260, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pk4,                  IQC1,       RSVD1,  RSVD2, RSVD3, 0x3264, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pk5,                  IQC1,       RSVD1,  RSVD2, RSVD3, 0x3268, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pk6,                  IQC1,       RSVD1,  RSVD2, RSVD3, 0x326c, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pk7,                  IQC1,       RSVD1,  RSVD2, RSVD3, 0x3270, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pl0,                  RSVD0,      RSVD1,  RSVD2, RSVD3, 0x3274, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pl1,                  SOC,        RSVD1,  RSVD2, RSVD3, 0x3278, Y,   Y,       N,       N,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pz0,                  VIMCLK2,    RSVD1,  RSVD2, RSVD3, 0x327c, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pz1,                  VIMCLK2,    SDMMC1, RSVD2, RSVD3, 0x3280, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pz2,                  SDMMC3,     CCLA,   RSVD2, RSVD3, 0x3284, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pz3,                  SDMMC3,     RSVD1,  RSVD2, RSVD3, 0x3288, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pz4,                  SDMMC1,     RSVD1,  RSVD2, RSVD3, 0x328c, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
+	PINGROUP(pz5,                  SOC,        RSVD1,  RSVD2, RSVD3, 0x3290, N,   N,       N,       Y,	-1,    -1,      -1,      -1,      -1,      -1,     -1,     -1,     -1, -1),
 
 	/* pg_name, r, drvdn_b, drvdn_w, drvup_b, drvup_w, slwr_b, slwr_w, slwf_b, slwf_w */
 	DRV_PINGROUP(pa6,    0x9c0, 12, 5,  20, 5,  -1, -1, -1, -1),
@@ -1549,6 +1739,11 @@ static const struct tegra_pingroup tegra210_groups[] = {
 	DRV_PINGROUP(sdmmc2, 0xa9c, 2,  6,  8,  6,  28, 2,  30, 2),
 	DRV_PINGROUP(sdmmc3, 0xab0, 12, 7,  20, 7,  28, 2,  30, 2),
 	DRV_PINGROUP(sdmmc4, 0xab4, 2,  6,  8,  6,  28, 2,  30, 2),
+	DRV_PINGROUP(qspi_comp_control, 0xb70, -1, -1, -1, -1, -1, -1, -1, -1),
+	DRV_PINGROUP(qspi_lpbk_control, 0xb78, -1, -1, -1, -1, -1, -1, -1, -1),
+	DRV_PINGROUP(qspi_comp, 0xa78, 12, 5, 20, 5, -1, -1, -1, -1),
+	PAD_PINGROUP(dsi_ab, 0xac0, 22),
+	PAD_PINGROUP(dsi_cd, 0xac0, 21),
 };
 
 static const struct tegra_pinctrl_soc_data tegra210_pinctrl = {
@@ -1566,12 +1761,39 @@ static const struct tegra_pinctrl_soc_data tegra210_pinctrl = {
 
 static int tegra210_pinctrl_probe(struct platform_device *pdev)
 {
+	const struct tegra210_pinctrl_soc *soc;
+	struct tegra_pingroup *g;
+	int i;
+
+	soc = of_device_get_match_data(&pdev->dev);
+	if (soc->lpdr_support) {
+		for (i = 0; i < tegra210_pinctrl.ngroups; ++i) {
+			g = &tegra210_groups[i];
+			if (g->mux_reg >= 0)
+				g->lpdr_bit = 8;
+		}
+	}
+
 	return tegra_pinctrl_probe(pdev, &tegra210_pinctrl);
 }
 
+static const struct tegra210_pinctrl_soc tegra210_pinctrl_soc_data = {
+	.lpdr_support = false,
+};
+
+static const struct tegra210_pinctrl_soc tegra210b01_pinctrl_soc_data = {
+	.lpdr_support = true,
+};
+
 static const struct of_device_id tegra210_pinctrl_of_match[] = {
-	{ .compatible = "nvidia,tegra210-pinmux", },
-	{ },
+	{
+		.compatible = "nvidia,tegra210-pinmux",
+		.data = &tegra210_pinctrl_soc_data,
+	}, {
+		.compatible = "nvidia,tegra210b01-pinmux",
+		.data = &tegra210b01_pinctrl_soc_data,
+	}, {
+	},
 };
 MODULE_DEVICE_TABLE(of, tegra210_pinctrl_of_match);
 
@@ -1582,7 +1804,12 @@ static struct platform_driver tegra210_pinctrl_driver = {
 	},
 	.probe = tegra210_pinctrl_probe,
 };
-module_platform_driver(tegra210_pinctrl_driver);
+
+static int __init tegra_pinctrl_init(void)
+{
+	return platform_driver_register(&tegra210_pinctrl_driver);
+}
+postcore_initcall(tegra_pinctrl_init);
 
 MODULE_AUTHOR("NVIDIA");
 MODULE_DESCRIPTION("NVIDIA Tegra210 pinctrl driver");

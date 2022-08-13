@@ -173,9 +173,6 @@ static int cryptomgr_schedule_probe(struct crypto_larval *larval)
 			goto err_free_param;
 	}
 
-	if (!i)
-		goto err_free_param;
-
 	param->tb[i + 1] = NULL;
 
 	param->type.attr.rta_len = sizeof(param->type);
@@ -193,8 +190,6 @@ static int cryptomgr_schedule_probe(struct crypto_larval *larval)
 	thread = kthread_run(cryptomgr_probe, param, "cryptomgr_probe");
 	if (IS_ERR(thread))
 		goto err_put_larval;
-
-	wait_for_completion_interruptible(&larval->completion);
 
 	return NOTIFY_STOP;
 

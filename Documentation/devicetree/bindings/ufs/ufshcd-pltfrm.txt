@@ -42,6 +42,11 @@ Optional properties:
 			  Note that it is assume same number of lanes is used both
 			  directions at once. If not specified, default is 2 lanes per direction.
 
+- nvidia,enable-ufs-provisioning : Flag to enable creation of debugfs entries for ufs
+				   provisioning.
+				   When enabled debugfs entries to program LUNs and
+				   refclk frequency of a UFS device are created inside
+				   parent UFS debugfs node.
 Note: If above properties are not defined it can be assumed that the supply
 regulators or clocks are always on.
 

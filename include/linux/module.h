@@ -20,6 +20,7 @@
 #include <linux/export.h>
 #include <linux/extable.h>	/* only as arch move module.h -> extable.h */
 #include <linux/rbtree_latch.h>
+#include <linux/cfi.h>
 
 #include <linux/percpu.h>
 #include <asm/module.h>
@@ -127,15 +128,15 @@ extern void cleanup_module(void);
 
 /* Each module must use one module_init(). */
 #define module_init(initfn)					\
-	static inline initcall_t __inittest(void)		\
+	static inline initcall_t __maybe_unused __inittest(void)		\
 	{ return initfn; }					\
-	int init_module(void) __attribute__((alias(#initfn)));
+	int init_module(void) __copy(initfn) __attribute__((alias(#initfn)));
 
 /* This is only required if you want to be unloadable. */
 #define module_exit(exitfn)					\
-	static inline exitcall_t __exittest(void)		\
+	static inline exitcall_t __maybe_unused __exittest(void)		\
 	{ return exitfn; }					\
-	void cleanup_module(void) __attribute__((alias(#exitfn)));
+	void cleanup_module(void) __copy(exitfn) __attribute__((alias(#exitfn)));
 
 #endif
 
@@ -348,6 +349,10 @@ struct module {
 	const struct kernel_symbol *syms;
 	const unsigned long *crcs;
 	unsigned int num_syms;
+
+#ifdef CONFIG_CFI_CLANG
+	cfi_check_fn cfi_check;
+#endif
 
 	/* Kernel parameters. */
 #ifdef CONFIG_SYSFS
@@ -790,6 +795,15 @@ static inline void module_bug_finalize(const Elf_Ehdr *hdr,
 }
 static inline void module_bug_cleanup(struct module *mod) {}
 #endif	/* CONFIG_GENERIC_BUG */
+
+#ifdef RETPOLINE
+extern bool retpoline_module_ok(bool has_retpoline);
+#else
+static inline bool retpoline_module_ok(bool has_retpoline)
+{
+	return true;
+}
+#endif
 
 #ifdef CONFIG_MODULE_SIG
 static inline bool module_sig_ok(struct module *module)

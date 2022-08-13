@@ -38,6 +38,17 @@ static void prop_warn(struct property *prop, const char *fmt, ...)
 	va_end(ap);
 }
 
+static void file_err(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	fprintf(stderr, "%s:%d:ERROR: ", current_file->name, current_file->lineno);
+	vfprintf(stderr, fmt, ap);
+	fprintf(stderr, "\n");
+	va_end(ap);
+	exit(1);
+}
+
 void _menu_init(void)
 {
 	current_entry = current_menu = &rootmenu;
@@ -62,6 +73,56 @@ void menu_add_entry(struct symbol *sym)
 		menu_add_symbol(P_SYMBOL, sym, NULL);
 }
 
+struct menu *menu_append_entry(char *prompt)
+{
+	struct menu *menu;
+
+	for (menu = current_menu->list; menu; menu = menu->next) {
+		if (!menu->prompt)
+			continue;
+		if (menu->prompt->type != P_MENU)
+			continue;
+		if (!menu->prompt->text)
+			continue;
+		if (strcmp(menu->prompt->text, prompt))
+			continue;
+		last_entry_ptr = &menu->list;
+		while (*last_entry_ptr)
+			last_entry_ptr = &((*last_entry_ptr)->next);
+		current_entry = menu;
+		current_menu = menu;
+		return current_menu;
+	}
+
+	file_err("Existing menu \"%s\" not found; cannot append to it", prompt);
+	exit(1);
+}
+
+struct menu *menu_append_choice(char *prompt)
+{
+	struct menu *menu;
+
+	for (menu = current_menu->list; menu; menu = menu->next) {
+		if (!menu->prompt)
+			continue;
+		if (menu->prompt->type != P_PROMPT)
+			continue;
+		if (!menu->prompt->text)
+			continue;
+		if (strcmp(menu->prompt->text, prompt))
+			continue;
+		last_entry_ptr = &menu->list;
+		while (*last_entry_ptr)
+			last_entry_ptr = &((*last_entry_ptr)->next);
+		current_entry = menu;
+		current_menu = menu;
+		return current_menu;
+	}
+
+	file_err("Existing menu \"%s\" not found; cannot append to it", prompt);
+	exit(1);
+}
+
 void menu_end_entry(void)
 {
 }
@@ -76,6 +137,8 @@ struct menu *menu_add_menu(void)
 void menu_end_menu(void)
 {
 	last_entry_ptr = &current_menu->next;
+	while (*last_entry_ptr)
+		last_entry_ptr = &((*last_entry_ptr)->next);
 	current_menu = current_menu->parent;
 }
 
@@ -364,6 +427,7 @@ void menu_finalize(struct menu *parent)
 			menu->parent = parent;
 			last_menu = menu;
 		}
+		expr_free(basedep);
 		if (last_menu) {
 			parent->list = parent->next;
 			parent->next = last_menu->next;

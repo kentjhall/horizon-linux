@@ -31,16 +31,39 @@
 #include <asm/io.h>
 #include <asm/uaccess.h>
 
+#include <linux/nospec.h>
+
 #include <linux/kbd_kern.h>
 #include <linux/vt_kern.h>
 #include <linux/kbd_diacr.h>
 #include <linux/selection.h>
 
-char vt_dont_switch;
-extern struct tty_driver *console_driver;
+bool vt_dont_switch;
 
-#define VT_IS_IN_USE(i)	(console_driver->ttys[i] && console_driver->ttys[i]->count)
-#define VT_BUSY(i)	(VT_IS_IN_USE(i) || i == fg_console || vc_cons[i].d == sel_cons)
+static inline bool vt_in_use(unsigned int i)
+{
+	const struct vc_data *vc = vc_cons[i].d;
+
+	/*
+	 * console_lock must be held to prevent the vc from being deallocated
+	 * while we're checking whether it's in-use.
+	 */
+	WARN_CONSOLE_UNLOCKED();
+
+	return vc && kref_read(&vc->port.kref) > 1;
+}
+
+static inline bool vt_busy(int i)
+{
+	if (vt_in_use(i))
+		return true;
+	if (i == fg_console)
+		return true;
+	if (vc_is_sel(vc_cons[i].d))
+		return true;
+
+	return false;
+}
 
 /*
  * Console (vt and kd) routines, as defined by USL SVR4 manual, and by
@@ -129,6 +152,12 @@ static void __vt_event_wait(struct vt_event_wait *vw)
 	wait_event_interruptible(vt_event_waitqueue, vw->done);
 }
 
+static long __vt_event_wait_timeout(struct vt_event_wait *vw, long timeout)
+{
+	return wait_event_interruptible_timeout(vt_event_waitqueue,
+		vw->done, timeout);
+}
+
 static void __vt_event_dequeue(struct vt_event_wait *vw)
 {
 	unsigned long flags;
@@ -193,6 +222,8 @@ static int vt_event_wait_ioctl(struct vt_event __user *event)
 
 int vt_waitactive(int n)
 {
+	long ret;
+
 	struct vt_event_wait vw;
 	do {
 		vw.event.event = VT_EVENT_SWITCH;
@@ -201,9 +232,18 @@ int vt_waitactive(int n)
 			__vt_event_dequeue(&vw);
 			break;
 		}
-		__vt_event_wait(&vw);
+
+		/*
+		 * 5 seconds is chosen as a result of observation from
+		 * stressing test exercising vt_waitactive for more than 7K
+		 * cycles, worst case for userspace to generate wake event
+		 * is no more than 4 seconds, usually in 2~3 secoonds range
+		 */
+		ret = __vt_event_wait_timeout(&vw, 5 * HZ);
 		__vt_event_dequeue(&vw);
-		if (vw.done == 0)
+		if (WARN_ON(ret == 0))
+			return -EIO;
+		else if (ret == -ERESTARTSYS)
 			return -EINTR;
 	} while (vw.event.newev != n);
 	return 0;
@@ -220,7 +260,7 @@ int vt_waitactive(int n)
 
 
 static inline int 
-do_fontx_ioctl(int cmd, struct consolefontdesc __user *user_cfd, int perm, struct console_font_op *op)
+do_fontx_ioctl(struct vc_data *vc, int cmd, struct consolefontdesc __user *user_cfd, int perm, struct console_font_op *op)
 {
 	struct consolefontdesc cfdarg;
 	int i;
@@ -238,15 +278,16 @@ do_fontx_ioctl(int cmd, struct consolefontdesc __user *user_cfd, int perm, struc
 		op->height = cfdarg.charheight;
 		op->charcount = cfdarg.charcount;
 		op->data = cfdarg.chardata;
-		return con_font_op(vc_cons[fg_console].d, op);
-	case GIO_FONTX: {
+		return con_font_op(vc, op);
+
+	case GIO_FONTX:
 		op->op = KD_FONT_OP_GET;
 		op->flags = KD_FONT_FLAG_OLD;
 		op->width = 8;
 		op->height = cfdarg.charheight;
 		op->charcount = cfdarg.charcount;
 		op->data = cfdarg.chardata;
-		i = con_font_op(vc_cons[fg_console].d, op);
+		i = con_font_op(vc, op);
 		if (i)
 			return i;
 		cfdarg.charheight = op->height;
@@ -254,7 +295,6 @@ do_fontx_ioctl(int cmd, struct consolefontdesc __user *user_cfd, int perm, struc
 		if (copy_to_user(user_cfd, &cfdarg, sizeof(struct consolefontdesc)))
 			return -EFAULT;
 		return 0;
-		}
 	}
 	return -EINVAL;
 }
@@ -290,16 +330,14 @@ static int vt_disallocate(unsigned int vc_num)
 	int ret = 0;
 
 	console_lock();
-	if (VT_BUSY(vc_num))
+	if (vt_busy(vc_num))
 		ret = -EBUSY;
 	else if (vc_num)
 		vc = vc_deallocate(vc_num);
 	console_unlock();
 
-	if (vc && vc_num >= MIN_NR_CONSOLES) {
-		tty_port_destroy(&vc->port);
-		kfree(vc);
-	}
+	if (vc && vc_num >= MIN_NR_CONSOLES)
+		tty_port_put(&vc->port);
 
 	return ret;
 }
@@ -312,17 +350,15 @@ static void vt_disallocate_all(void)
 
 	console_lock();
 	for (i = 1; i < MAX_NR_CONSOLES; i++)
-		if (!VT_BUSY(i))
+		if (!vt_busy(i))
 			vc[i] = vc_deallocate(i);
 		else
 			vc[i] = NULL;
 	console_unlock();
 
 	for (i = 1; i < MAX_NR_CONSOLES; i++) {
-		if (vc[i] && i >= MIN_NR_CONSOLES) {
-			tty_port_destroy(&vc[i]->port);
-			kfree(vc[i]);
-		}
+		if (vc[i] && i >= MIN_NR_CONSOLES)
+			tty_port_put(&vc[i]->port);
 	}
 }
 
@@ -336,21 +372,12 @@ int vt_ioctl(struct tty_struct *tty,
 {
 	struct vc_data *vc = tty->driver_data;
 	struct console_font_op op;	/* used in multiple places here */
-	unsigned int console;
+	unsigned int console = vc->vc_num;
 	unsigned char ucval;
 	unsigned int uival;
 	void __user *up = (void __user *)arg;
 	int i, perm;
 	int ret = 0;
-
-	console = vc->vc_num;
-
-
-	if (!vc_cons_allocated(console)) { 	/* impossible? */
-		ret = -ENOIOCTLCMD;
-		goto out;
-	}
-
 
 	/*
 	 * To have permissions to do most of the vt ioctls, we either have
@@ -642,15 +669,16 @@ int vt_ioctl(struct tty_struct *tty,
 		struct vt_stat __user *vtstat = up;
 		unsigned short state, mask;
 
-		/* Review: FIXME: Console lock ? */
 		if (put_user(fg_console + 1, &vtstat->v_active))
 			ret = -EFAULT;
 		else {
 			state = 1;	/* /dev/tty0 is always open */
+			console_lock(); /* required by vt_in_use() */
 			for (i = 0, mask = 2; i < MAX_NR_CONSOLES && mask;
 							++i, mask <<= 1)
-				if (VT_IS_IN_USE(i))
+				if (vt_in_use(i))
 					state |= mask;
+			console_unlock();
 			ret = put_user(state, &vtstat->v_state);
 		}
 		break;
@@ -660,10 +688,11 @@ int vt_ioctl(struct tty_struct *tty,
 	 * Returns the first available (non-opened) console.
 	 */
 	case VT_OPENQRY:
-		/* FIXME: locking ? - but then this is a stupid API */
+		console_lock(); /* required by vt_in_use() */
 		for (i = 0; i < MAX_NR_CONSOLES; ++i)
-			if (! VT_IS_IN_USE(i))
+			if (!vt_in_use(i))
 				break;
+		console_unlock();
 		uival = i < MAX_NR_CONSOLES ? (i+1) : -1;
 		goto setint;		 
 
@@ -703,6 +732,8 @@ int vt_ioctl(struct tty_struct *tty,
 		if (vsa.console == 0 || vsa.console > MAX_NR_CONSOLES)
 			ret = -ENXIO;
 		else {
+			vsa.console = array_index_nospec(vsa.console,
+							 MAX_NR_CONSOLES + 1);
 			vsa.console--;
 			console_lock();
 			ret = vc_allocate(vsa.console);
@@ -846,58 +877,59 @@ int vt_ioctl(struct tty_struct *tty,
 
 	case VT_RESIZEX:
 	{
-		struct vt_consize __user *vtconsize = up;
-		ushort ll,cc,vlin,clin,vcol,ccol;
+		struct vt_consize v;
 		if (!perm)
 			return -EPERM;
-		if (!access_ok(VERIFY_READ, vtconsize,
-				sizeof(struct vt_consize))) {
-			ret = -EFAULT;
-			break;
-		}
+		if (copy_from_user(&v, up, sizeof(struct vt_consize)))
+			return -EFAULT;
 		/* FIXME: Should check the copies properly */
-		__get_user(ll, &vtconsize->v_rows);
-		__get_user(cc, &vtconsize->v_cols);
-		__get_user(vlin, &vtconsize->v_vlin);
-		__get_user(clin, &vtconsize->v_clin);
-		__get_user(vcol, &vtconsize->v_vcol);
-		__get_user(ccol, &vtconsize->v_ccol);
-		vlin = vlin ? vlin : vc->vc_scan_lines;
-		if (clin) {
-			if (ll) {
-				if (ll != vlin/clin) {
-					/* Parameters don't add up */
-					ret = -EINVAL;
-					break;
-				}
-			} else 
-				ll = vlin/clin;
+		if (!v.v_vlin)
+			v.v_vlin = vc->vc_scan_lines;
+		if (v.v_clin) {
+			int rows = v.v_vlin/v.v_clin;
+			if (v.v_rows != rows) {
+				if (v.v_rows) /* Parameters don't add up */
+					return -EINVAL;
+				v.v_rows = rows;
+			}
 		}
-		if (vcol && ccol) {
-			if (cc) {
-				if (cc != vcol/ccol) {
-					ret = -EINVAL;
-					break;
-				}
-			} else
-				cc = vcol/ccol;
+		if (v.v_vcol && v.v_ccol) {
+			int cols = v.v_vcol/v.v_ccol;
+			if (v.v_cols != cols) {
+				if (v.v_cols)
+					return -EINVAL;
+				v.v_cols = cols;
+			}
 		}
 
-		if (clin > 32) {
-			ret =  -EINVAL;
-			break;
-		}
-		    
+		if (v.v_clin > 32)
+			return -EINVAL;
+
 		for (i = 0; i < MAX_NR_CONSOLES; i++) {
+			struct vc_data *vcp;
+
 			if (!vc_cons[i].d)
 				continue;
 			console_lock();
-			if (vlin)
-				vc_cons[i].d->vc_scan_lines = vlin;
-			if (clin)
-				vc_cons[i].d->vc_font.height = clin;
-			vc_cons[i].d->vc_resize_user = 1;
-			vc_resize(vc_cons[i].d, cc, ll);
+			vcp = vc_cons[i].d;
+			if (vcp) {
+				int ret;
+				int save_scan_lines = vcp->vc_scan_lines;
+				int save_font_height = vcp->vc_font.height;
+
+				if (v.v_vlin)
+					vcp->vc_scan_lines = v.v_vlin;
+				if (v.v_clin)
+					vcp->vc_font.height = v.v_clin;
+				vcp->vc_resize_user = 1;
+				ret = vc_resize(vcp, v.v_cols, v.v_rows);
+				if (ret) {
+					vcp->vc_scan_lines = save_scan_lines;
+					vcp->vc_font.height = save_font_height;
+					console_unlock();
+					return ret;
+				}
+			}
 			console_unlock();
 		}
 		break;
@@ -912,7 +944,7 @@ int vt_ioctl(struct tty_struct *tty,
 		op.height = 0;
 		op.charcount = 256;
 		op.data = up;
-		ret = con_font_op(vc_cons[fg_console].d, &op);
+		ret = con_font_op(vc, &op);
 		break;
 	}
 
@@ -923,7 +955,7 @@ int vt_ioctl(struct tty_struct *tty,
 		op.height = 32;
 		op.charcount = 256;
 		op.data = up;
-		ret = con_font_op(vc_cons[fg_console].d, &op);
+		ret = con_font_op(vc, &op);
 		break;
 	}
 
@@ -940,7 +972,7 @@ int vt_ioctl(struct tty_struct *tty,
 
 	case PIO_FONTX:
 	case GIO_FONTX:
-		ret = do_fontx_ioctl(cmd, up, perm, &op);
+		ret = do_fontx_ioctl(vc, cmd, up, perm, &op);
 		break;
 
 	case PIO_FONTRESET:
@@ -957,11 +989,11 @@ int vt_ioctl(struct tty_struct *tty,
 		{
 		op.op = KD_FONT_OP_SET_DEFAULT;
 		op.data = NULL;
-		ret = con_font_op(vc_cons[fg_console].d, &op);
+		ret = con_font_op(vc, &op);
 		if (ret)
 			break;
 		console_lock();
-		con_set_default_unimap(vc_cons[fg_console].d);
+		con_set_default_unimap(vc);
 		console_unlock();
 		break;
 		}
@@ -1019,12 +1051,12 @@ int vt_ioctl(struct tty_struct *tty,
 	case VT_LOCKSWITCH:
 		if (!capable(CAP_SYS_TTY_CONFIG))
 			return -EPERM;
-		vt_dont_switch = 1;
+		vt_dont_switch = true;
 		break;
 	case VT_UNLOCKSWITCH:
 		if (!capable(CAP_SYS_TTY_CONFIG))
 			return -EPERM;
-		vt_dont_switch = 0;
+		vt_dont_switch = false;
 		break;
 	case VT_GETHIFONTMASK:
 		ret = put_user(vc->vc_hi_font_mask,
@@ -1088,8 +1120,9 @@ struct compat_consolefontdesc {
 };
 
 static inline int
-compat_fontx_ioctl(int cmd, struct compat_consolefontdesc __user *user_cfd,
-			 int perm, struct console_font_op *op)
+compat_fontx_ioctl(struct vc_data *vc, int cmd,
+		   struct compat_consolefontdesc __user *user_cfd,
+		   int perm, struct console_font_op *op)
 {
 	struct compat_consolefontdesc cfdarg;
 	int i;
@@ -1107,7 +1140,8 @@ compat_fontx_ioctl(int cmd, struct compat_consolefontdesc __user *user_cfd,
 		op->height = cfdarg.charheight;
 		op->charcount = cfdarg.charcount;
 		op->data = compat_ptr(cfdarg.chardata);
-		return con_font_op(vc_cons[fg_console].d, op);
+		return con_font_op(vc, op);
+
 	case GIO_FONTX:
 		op->op = KD_FONT_OP_GET;
 		op->flags = KD_FONT_FLAG_OLD;
@@ -1115,7 +1149,7 @@ compat_fontx_ioctl(int cmd, struct compat_consolefontdesc __user *user_cfd,
 		op->height = cfdarg.charheight;
 		op->charcount = cfdarg.charcount;
 		op->data = compat_ptr(cfdarg.chardata);
-		i = con_font_op(vc_cons[fg_console].d, op);
+		i = con_font_op(vc, op);
 		if (i)
 			return i;
 		cfdarg.charheight = op->height;
@@ -1192,17 +1226,9 @@ long vt_compat_ioctl(struct tty_struct *tty,
 {
 	struct vc_data *vc = tty->driver_data;
 	struct console_font_op op;	/* used in multiple places here */
-	unsigned int console;
 	void __user *up = (void __user *)arg;
 	int perm;
 	int ret = 0;
-
-	console = vc->vc_num;
-
-	if (!vc_cons_allocated(console)) { 	/* impossible? */
-		ret = -ENOIOCTLCMD;
-		goto out;
-	}
 
 	/*
 	 * To have permissions to do most of the vt ioctls, we either have
@@ -1218,7 +1244,7 @@ long vt_compat_ioctl(struct tty_struct *tty,
 	 */
 	case PIO_FONTX:
 	case GIO_FONTX:
-		ret = compat_fontx_ioctl(cmd, up, perm, &op);
+		ret = compat_fontx_ioctl(vc, cmd, up, perm, &op);
 		break;
 
 	case KDFONTOP:
@@ -1263,7 +1289,7 @@ long vt_compat_ioctl(struct tty_struct *tty,
 		arg = (unsigned long)compat_ptr(arg);
 		goto fallback;
 	}
-out:
+
 	return ret;
 
 fallback:

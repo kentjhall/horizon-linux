@@ -126,4 +126,13 @@ config LEDS_TRIGGER_PANIC
 	  a different trigger.
 	  If unsure, say Y.
 
+config LEDS_TRIGGER_THROTTLE
+	bool "LED System Throttle Trigger"
+	depends on LEDS_TRIGGERS
+	help
+	  This allows LEDs to be configured to blink when system is being
+	  throttled. Enabling this option will allow to mark certain LEDs as
+	  throttle indicators.
+	  If unsure, say Y.
+
 endif # LEDS_TRIGGERS

@@ -280,6 +280,8 @@ EXPORT_SYMBOL_GPL(ring_buffer_event_data);
 /* Missed count stored at end */
 #define RB_MISSED_STORED	(1 << 30)
 
+#define RB_MISSED_FLAGS		(RB_MISSED_EVENTS|RB_MISSED_STORED)
+
 struct buffer_data_page {
 	u64		 time_stamp;	/* page time stamp */
 	local_t		 commit;	/* write committed index */
@@ -331,7 +333,9 @@ static void rb_init_page(struct buffer_data_page *bpage)
  */
 size_t ring_buffer_page_len(void *page)
 {
-	return local_read(&((struct buffer_data_page *)page)->commit)
+	struct buffer_data_page *bpage = page;
+
+	return (local_read(&bpage->commit) & ~RB_MISSED_FLAGS)
 		+ BUF_PAGE_HDR_SIZE;
 }
 
@@ -412,14 +416,16 @@ struct rb_event_info {
 
 /*
  * Used for which event context the event is in.
- *  NMI     = 0
- *  IRQ     = 1
- *  SOFTIRQ = 2
- *  NORMAL  = 3
+ *  TRANSITION = 0
+ *  NMI     = 1
+ *  IRQ     = 2
+ *  SOFTIRQ = 3
+ *  NORMAL  = 4
  *
  * See trace_recursive_lock() comment below for more details.
  */
 enum {
+	RB_CTX_TRANSITION,
 	RB_CTX_NMI,
 	RB_CTX_IRQ,
 	RB_CTX_SOFTIRQ,
@@ -697,7 +703,7 @@ u64 ring_buffer_time_stamp(struct ring_buffer *buffer, int cpu)
 
 	preempt_disable_notrace();
 	time = rb_time_stamp(buffer);
-	preempt_enable_no_resched_notrace();
+	preempt_enable_notrace();
 
 	return time;
 }
@@ -1500,6 +1506,8 @@ rb_remove_pages(struct ring_buffer_per_cpu *cpu_buffer, unsigned long nr_pages)
 	tmp_iter_page = first_page;
 
 	do {
+		cond_resched();
+
 		to_remove_page = tmp_iter_page;
 		rb_inc_page(cpu_buffer, &tmp_iter_page);
 
@@ -1644,18 +1652,18 @@ int ring_buffer_resize(struct ring_buffer *buffer, unsigned long size,
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
 	unsigned long nr_pages;
-	int cpu, err = 0;
+	int cpu, err;
 
 	/*
 	 * Always succeed at resizing a non-existent buffer:
 	 */
 	if (!buffer)
-		return size;
+		return 0;
 
 	/* Make sure the requested buffer exists */
 	if (cpu_id != RING_BUFFER_ALL_CPUS &&
 	    !cpumask_test_cpu(cpu_id, buffer->cpumask))
-		return size;
+		return 0;
 
 	nr_pages = DIV_ROUND_UP(size, BUF_PAGE_SIZE);
 
@@ -1795,7 +1803,7 @@ int ring_buffer_resize(struct ring_buffer *buffer, unsigned long size,
 	}
 
 	mutex_unlock(&buffer->mutex);
-	return size;
+	return 0;
 
  out_err:
 	for_each_buffer_cpu(buffer, cpu) {
@@ -2573,10 +2581,10 @@ rb_wakeups(struct ring_buffer *buffer, struct ring_buffer_per_cpu *cpu_buffer)
  * a bit of overhead in something as critical as function tracing,
  * we use a bitmask trick.
  *
- *  bit 0 =  NMI context
- *  bit 1 =  IRQ context
- *  bit 2 =  SoftIRQ context
- *  bit 3 =  normal context.
+ *  bit 1 =  NMI context
+ *  bit 2 =  IRQ context
+ *  bit 3 =  SoftIRQ context
+ *  bit 4 =  normal context.
  *
  * This works because this is the order of contexts that can
  * preempt other contexts. A SoftIRQ never preempts an IRQ
@@ -2599,6 +2607,30 @@ rb_wakeups(struct ring_buffer *buffer, struct ring_buffer_per_cpu *cpu_buffer)
  * The least significant bit can be cleared this way, and it
  * just so happens that it is the same bit corresponding to
  * the current context.
+ *
+ * Now the TRANSITION bit breaks the above slightly. The TRANSITION bit
+ * is set when a recursion is detected at the current context, and if
+ * the TRANSITION bit is already set, it will fail the recursion.
+ * This is needed because there's a lag between the changing of
+ * interrupt context and updating the preempt count. In this case,
+ * a false positive will be found. To handle this, one extra recursion
+ * is allowed, and this is done by the TRANSITION bit. If the TRANSITION
+ * bit is already set, then it is considered a recursion and the function
+ * ends. Otherwise, the TRANSITION bit is set, and that bit is returned.
+ *
+ * On the trace_recursive_unlock(), the TRANSITION bit will be the first
+ * to be cleared. Even if it wasn't the context that set it. That is,
+ * if an interrupt comes in while NORMAL bit is set and the ring buffer
+ * is called before preempt_count() is updated, since the check will
+ * be on the NORMAL bit, the TRANSITION bit will then be set. If an
+ * NMI then comes in, it will set the NMI bit, but when the NMI code
+ * does the trace_recursive_unlock() it will clear the TRANSTION bit
+ * and leave the NMI bit set. But this is fine, because the interrupt
+ * code that set the TRANSITION bit will then clear the NMI bit when it
+ * calls trace_recursive_unlock(). If another NMI comes in, it will
+ * set the TRANSITION bit and continue.
+ *
+ * Note: The TRANSITION bit only handles a single transition between context.
  */
 
 static __always_inline int
@@ -2617,8 +2649,16 @@ trace_recursive_lock(struct ring_buffer_per_cpu *cpu_buffer)
 	} else
 		bit = RB_CTX_NORMAL;
 
-	if (unlikely(val & (1 << bit)))
-		return 1;
+	if (unlikely(val & (1 << bit))) {
+		/*
+		 * It is possible that this was called by transitioning
+		 * between interrupt context, and preempt_count() has not
+		 * been updated yet. In this case, use the TRANSITION bit.
+		 */
+		bit = RB_CTX_TRANSITION;
+		if (val & (1 << bit))
+			return 1;
+	}
 
 	val |= (1 << bit);
 	cpu_buffer->current_context = val;
@@ -3133,6 +3173,22 @@ int ring_buffer_record_is_on(struct ring_buffer *buffer)
 }
 
 /**
+ * ring_buffer_record_is_set_on - return true if the ring buffer is set writable
+ * @buffer: The ring buffer to see if write is set enabled
+ *
+ * Returns true if the ring buffer is set writable by ring_buffer_record_on().
+ * Note that this does NOT mean it is in a writable state.
+ *
+ * It may return true when the ring buffer has been disabled by
+ * ring_buffer_record_disable(), as that is a temporary disabling of
+ * the ring buffer.
+ */
+int ring_buffer_record_is_set_on(struct ring_buffer *buffer)
+{
+	return !(atomic_read(&buffer->record_disabled) & RB_BUFFER_OFF);
+}
+
+/**
  * ring_buffer_record_disable_cpu - stop all writes into the cpu_buffer
  * @buffer: The ring buffer to stop writes to.
  * @cpu: The CPU buffer to stop
@@ -3435,11 +3491,23 @@ EXPORT_SYMBOL_GPL(ring_buffer_iter_reset);
 int ring_buffer_iter_empty(struct ring_buffer_iter *iter)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
+	struct buffer_page *reader;
+	struct buffer_page *head_page;
+	struct buffer_page *commit_page;
+	unsigned commit;
 
 	cpu_buffer = iter->cpu_buffer;
 
-	return iter->head_page == cpu_buffer->commit_page &&
-		iter->head == rb_commit_index(cpu_buffer);
+	/* Remember, trace recording is off when iterator is in use */
+	reader = cpu_buffer->reader_page;
+	head_page = cpu_buffer->head_page;
+	commit_page = cpu_buffer->commit_page;
+	commit = rb_page_commit(commit_page);
+
+	return ((iter->head_page == commit_page && iter->head == commit) ||
+		(iter->head_page == reader && commit_page == head_page &&
+		 head_page->read == commit &&
+		 iter->head == rb_page_commit(cpu_buffer->reader_page)));
 }
 EXPORT_SYMBOL_GPL(ring_buffer_iter_empty);
 
@@ -4003,6 +4071,7 @@ EXPORT_SYMBOL_GPL(ring_buffer_consume);
  * ring_buffer_read_prepare - Prepare for a non consuming read of the buffer
  * @buffer: The ring buffer to read from
  * @cpu: The cpu buffer to iterate over
+ * @flags: gfp flags to use for memory allocation
  *
  * This performs the initial preparations necessary to iterate
  * through the buffer.  Memory is allocated, buffer recording
@@ -4020,7 +4089,7 @@ EXPORT_SYMBOL_GPL(ring_buffer_consume);
  * This overall must be paired with ring_buffer_read_finish.
  */
 struct ring_buffer_iter *
-ring_buffer_read_prepare(struct ring_buffer *buffer, int cpu)
+ring_buffer_read_prepare(struct ring_buffer *buffer, int cpu, gfp_t flags)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
 	struct ring_buffer_iter *iter;
@@ -4028,7 +4097,7 @@ ring_buffer_read_prepare(struct ring_buffer *buffer, int cpu)
 	if (!cpumask_test_cpu(cpu, buffer->cpumask))
 		return NULL;
 
-	iter = kmalloc(sizeof(*iter), GFP_KERNEL);
+	iter = kmalloc(sizeof(*iter), flags);
 	if (!iter)
 		return NULL;
 
@@ -4870,9 +4939,9 @@ static __init int test_ringbuffer(void)
 		rb_data[cpu].cnt = cpu;
 		rb_threads[cpu] = kthread_create(rb_test, &rb_data[cpu],
 						 "rbtester/%d", cpu);
-		if (WARN_ON(!rb_threads[cpu])) {
+		if (WARN_ON(IS_ERR(rb_threads[cpu]))) {
 			pr_cont("FAILED\n");
-			ret = -1;
+			ret = PTR_ERR(rb_threads[cpu]);
 			goto out_free;
 		}
 
@@ -4882,9 +4951,9 @@ static __init int test_ringbuffer(void)
 
 	/* Now create the rb hammer! */
 	rb_hammer = kthread_run(rb_hammer_test, NULL, "rbhammer");
-	if (WARN_ON(!rb_hammer)) {
+	if (WARN_ON(IS_ERR(rb_hammer))) {
 		pr_cont("FAILED\n");
-		ret = -1;
+		ret = PTR_ERR(rb_hammer);
 		goto out_free;
 	}
 

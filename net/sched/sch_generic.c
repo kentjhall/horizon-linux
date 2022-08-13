@@ -337,6 +337,7 @@ void __netdev_watchdog_up(struct net_device *dev)
 			dev_hold(dev);
 	}
 }
+EXPORT_SYMBOL_GPL(__netdev_watchdog_up);
 
 static void dev_watchdog_up(struct net_device *dev)
 {
@@ -681,6 +682,7 @@ void qdisc_reset(struct Qdisc *qdisc)
 		qdisc->gso_skb = NULL;
 	}
 	qdisc->q.qlen = 0;
+	qdisc->qstats.backlog = 0;
 }
 EXPORT_SYMBOL(qdisc_reset);
 
@@ -698,7 +700,11 @@ static void qdisc_rcu_free(struct rcu_head *head)
 
 void qdisc_destroy(struct Qdisc *qdisc)
 {
-	const struct Qdisc_ops  *ops = qdisc->ops;
+	const struct Qdisc_ops *ops;
+
+	if (!qdisc)
+		return;
+	ops = qdisc->ops;
 
 	if (qdisc->flags & TCQ_F_BUILTIN ||
 	    !atomic_dec_and_test(&qdisc->refcnt))
@@ -758,13 +764,20 @@ static void attach_one_default_qdisc(struct net_device *dev,
 				     struct netdev_queue *dev_queue,
 				     void *_unused)
 {
+#ifdef CONFIG_NET_SCH_TEGRA
+	extern struct Qdisc_ops sch_tegra_pfifo_fast_ops;
+#endif
 	struct Qdisc *qdisc;
 	const struct Qdisc_ops *ops = default_qdisc_ops;
 
 	if (dev->priv_flags & IFF_NO_QUEUE)
 		ops = &noqueue_qdisc_ops;
 
+#ifdef CONFIG_NET_SCH_TEGRA
+	qdisc = qdisc_create_dflt(dev_queue, &sch_tegra_pfifo_fast_ops, TC_H_ROOT);
+#else
 	qdisc = qdisc_create_dflt(dev_queue, ops, TC_H_ROOT);
+#endif
 	if (!qdisc) {
 		netdev_info(dev, "activation failed\n");
 		return;

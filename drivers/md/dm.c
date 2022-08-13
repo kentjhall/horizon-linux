@@ -21,6 +21,7 @@
 #include <linux/delay.h>
 #include <linux/wait.h>
 #include <linux/pr.h>
+#include <linux/vmalloc.h>
 
 #define DM_MSG_PREFIX "core"
 
@@ -808,7 +809,8 @@ static void dec_pending(struct dm_io *io, int error)
 		} else {
 			/* done with normal IO or empty flush */
 			trace_block_bio_complete(md->queue, bio, io_error);
-			bio->bi_error = io_error;
+			if (io_error)
+				bio->bi_error = io_error;
 			bio_endio(bio);
 		}
 	}
@@ -972,10 +974,64 @@ void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
 }
 EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
 
+/*
+ * Flush current->bio_list when the target map method blocks.
+ * This fixes deadlocks in snapshot and possibly in other targets.
+ */
+struct dm_offload {
+	struct blk_plug plug;
+	struct blk_plug_cb cb;
+};
+
+static void flush_current_bio_list(struct blk_plug_cb *cb, bool from_schedule)
+{
+	struct dm_offload *o = container_of(cb, struct dm_offload, cb);
+	struct bio_list list;
+	struct bio *bio;
+	int i;
+
+	INIT_LIST_HEAD(&o->cb.list);
+
+	if (unlikely(!current->bio_list))
+		return;
+
+	for (i = 0; i < 2; i++) {
+		list = current->bio_list[i];
+		bio_list_init(&current->bio_list[i]);
+
+		while ((bio = bio_list_pop(&list))) {
+			struct bio_set *bs = bio->bi_pool;
+			if (unlikely(!bs) || bs == fs_bio_set) {
+				bio_list_add(&current->bio_list[i], bio);
+				continue;
+			}
+
+			spin_lock(&bs->rescue_lock);
+			bio_list_add(&bs->rescue_list, bio);
+			queue_work(bs->rescue_workqueue, &bs->rescue_work);
+			spin_unlock(&bs->rescue_lock);
+		}
+	}
+}
+
+static void dm_offload_start(struct dm_offload *o)
+{
+	blk_start_plug(&o->plug);
+	o->cb.callback = flush_current_bio_list;
+	list_add(&o->cb.list, &current->plug->cb_list);
+}
+
+static void dm_offload_end(struct dm_offload *o)
+{
+	list_del(&o->cb.list);
+	blk_finish_plug(&o->plug);
+}
+
 static void __map_bio(struct dm_target_io *tio)
 {
 	int r;
 	sector_t sector;
+	struct dm_offload o;
 	struct bio *clone = &tio->clone;
 	struct dm_target *ti = tio->ti;
 
@@ -988,7 +1044,11 @@ static void __map_bio(struct dm_target_io *tio)
 	 */
 	atomic_inc(&tio->io->io_count);
 	sector = clone->bi_iter.bi_sector;
+
+	dm_offload_start(&o);
 	r = ti->type->map(ti, clone);
+	dm_offload_end(&o);
+
 	if (r == DM_MAPIO_REMAPPED) {
 		/* the bio has been remapped so dispatch it */
 
@@ -1314,7 +1374,7 @@ static int dm_any_congested(void *congested_data, int bdi_bits)
 			 * With request-based DM we only need to check the
 			 * top-level queue for congestion.
 			 */
-			r = md->queue->backing_dev_info.wb.state & bdi_bits;
+			r = md->queue->backing_dev_info->wb.state & bdi_bits;
 		} else {
 			map = dm_get_live_table_fast(md);
 			if (map)
@@ -1397,7 +1457,7 @@ void dm_init_md_queue(struct mapped_device *md)
 	 * - must do so here (in alloc_dev callchain) before queue is used
 	 */
 	md->queue->queuedata = md;
-	md->queue->backing_dev_info.congested_data = md;
+	md->queue->backing_dev_info->congested_data = md;
 }
 
 void dm_init_normal_md_queue(struct mapped_device *md)
@@ -1408,7 +1468,8 @@ void dm_init_normal_md_queue(struct mapped_device *md)
 	/*
 	 * Initialize aspects of queue that aren't relevant for blk-mq
 	 */
-	md->queue->backing_dev_info.congested_fn = dm_any_congested;
+	md->queue->backing_dev_info->congested_data = md;
+	md->queue->backing_dev_info->congested_fn = dm_any_congested;
 	blk_queue_bounce_limit(md->queue, BLK_BOUNCE_ANY);
 }
 
@@ -1453,7 +1514,7 @@ static struct mapped_device *alloc_dev(int minor)
 	struct mapped_device *md;
 	void *old_md;
 
-	md = kzalloc_node(sizeof(*md), GFP_KERNEL, numa_node_id);
+	md = vzalloc_node(sizeof(*md), numa_node_id);
 	if (!md) {
 		DMWARN("unable to allocate device, out of memory.");
 		return NULL;
@@ -1495,6 +1556,12 @@ static struct mapped_device *alloc_dev(int minor)
 		goto bad;
 
 	dm_init_md_queue(md);
+	/*
+	 * default to bio-based required ->make_request_fn until DM
+	 * table is loaded and md->type established. If request-based
+	 * table is loaded: blk-mq will override accordingly.
+	 */
+	blk_queue_make_request(md->queue, dm_make_request);
 
 	md->disk = alloc_disk_node(1, numa_node_id);
 	if (!md->disk)
@@ -1547,7 +1614,7 @@ bad_io_barrier:
 bad_minor:
 	module_put(THIS_MODULE);
 bad_module_get:
-	kfree(md);
+	kvfree(md);
 	return NULL;
 }
 
@@ -1566,7 +1633,7 @@ static void free_dev(struct mapped_device *md)
 	free_minor(minor);
 
 	module_put(THIS_MODULE);
-	kfree(md);
+	kvfree(md);
 }
 
 static void __bind_mempools(struct mapped_device *md, struct dm_table *t)
@@ -1793,7 +1860,6 @@ int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
 	case DM_TYPE_BIO_BASED:
 	case DM_TYPE_DAX_BIO_BASED:
 		dm_init_normal_md_queue(md);
-		blk_queue_make_request(md->queue, dm_make_request);
 		/*
 		 * DM handles splitting bios as needed.  Free the bio_split bioset
 		 * since it won't be used (saves 1 process per bio-based DM device).
@@ -1886,9 +1952,7 @@ static void __dm_destroy(struct mapped_device *md, bool wait)
 	set_bit(DMF_FREEING, &md->flags);
 	spin_unlock(&_minor_lock);
 
-	spin_lock_irq(q->queue_lock);
-	queue_flag_set(QUEUE_FLAG_DYING, q);
-	spin_unlock_irq(q->queue_lock);
+	blk_set_queue_dying(q);
 
 	if (dm_request_based(md) && md->kworker_task)
 		kthread_flush_worker(&md->kworker);
@@ -2456,11 +2520,15 @@ struct mapped_device *dm_get_from_kobject(struct kobject *kobj)
 
 	md = container_of(kobj, struct mapped_device, kobj_holder.kobj);
 
-	if (test_bit(DMF_FREEING, &md->flags) ||
-	    dm_deleting_md(md))
-		return NULL;
-
+	spin_lock(&_minor_lock);
+	if (test_bit(DMF_FREEING, &md->flags) || dm_deleting_md(md)) {
+		md = NULL;
+		goto out;
+	}
 	dm_get(md);
+out:
+	spin_unlock(&_minor_lock);
+
 	return md;
 }
 

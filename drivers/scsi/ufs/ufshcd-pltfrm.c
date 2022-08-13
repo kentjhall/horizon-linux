@@ -3,6 +3,7 @@
  *
  * This code is based on drivers/scsi/ufs/ufshcd-pltfrm.c
  * Copyright (C) 2011-2013 Samsung India Software Operations
+ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
  *
  * Authors:
  *	Santosh Yaraganavi <santosh.sy@samsung.com>
@@ -163,7 +164,7 @@ static int ufshcd_populate_vreg(struct device *dev, const char *name,
 	if (ret) {
 		dev_err(dev, "%s: unable to find %s err %d\n",
 				__func__, prop_name, ret);
-		goto out_free;
+		goto out;
 	}
 
 	vreg->min_uA = 0;
@@ -185,9 +186,6 @@ static int ufshcd_populate_vreg(struct device *dev, const char *name,
 
 	goto out;
 
-out_free:
-	devm_kfree(dev, vreg);
-	vreg = NULL;
 out:
 	if (!ret)
 		*out_vreg = vreg;
@@ -324,10 +322,19 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
 		goto out;
 	}
 
-	err = ufshcd_alloc_host(dev, &hba);
-	if (err) {
-		dev_err(&pdev->dev, "Allocation failed\n");
+	hba = kzalloc(sizeof(struct ufs_hba), GFP_KERNEL);
+	if (!hba) {
+		dev_err(dev, "Allocation failed\n");
+		err = -ENOMEM;
 		goto out;
+	}
+
+	hba->dev = dev;
+
+	err = ufshcd_alloc_host(hba);
+	if (err) {
+		dev_err(&pdev->dev, "Host allocation failed\n");
+		goto dealloc_host;
 	}
 
 	hba->vops = vops;
@@ -345,26 +352,24 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
 		goto dealloc_host;
 	}
 
-	pm_runtime_set_active(&pdev->dev);
-	pm_runtime_enable(&pdev->dev);
-
 	ufshcd_init_lanes_per_dir(hba);
 
 	err = ufshcd_init(hba, mmio_base, irq);
 	if (err) {
 		dev_err(dev, "Initialization failed\n");
-		goto out_disable_rpm;
+		goto dealloc_host;
 	}
 
 	platform_set_drvdata(pdev, hba);
 
+	pm_runtime_set_active(&pdev->dev);
+	pm_runtime_enable(&pdev->dev);
+
 	return 0;
 
-out_disable_rpm:
-	pm_runtime_disable(&pdev->dev);
-	pm_runtime_set_suspended(&pdev->dev);
 dealloc_host:
 	ufshcd_dealloc_host(hba);
+	kfree(hba);
 out:
 	return err;
 }

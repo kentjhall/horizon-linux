@@ -106,18 +106,24 @@ static struct attribute_group pt_cap_group = {
 };
 
 PMU_FORMAT_ATTR(cyc,		"config:1"	);
+PMU_FORMAT_ATTR(pwr_evt,	"config:4"	);
+PMU_FORMAT_ATTR(fup_on_ptw,	"config:5"	);
 PMU_FORMAT_ATTR(mtc,		"config:9"	);
 PMU_FORMAT_ATTR(tsc,		"config:10"	);
 PMU_FORMAT_ATTR(noretcomp,	"config:11"	);
+PMU_FORMAT_ATTR(ptw,		"config:12"	);
 PMU_FORMAT_ATTR(mtc_period,	"config:14-17"	);
 PMU_FORMAT_ATTR(cyc_thresh,	"config:19-22"	);
 PMU_FORMAT_ATTR(psb_period,	"config:24-27"	);
 
 static struct attribute *pt_formats_attr[] = {
 	&format_attr_cyc.attr,
+	&format_attr_pwr_evt.attr,
+	&format_attr_fup_on_ptw.attr,
 	&format_attr_mtc.attr,
 	&format_attr_tsc.attr,
 	&format_attr_noretcomp.attr,
+	&format_attr_ptw.attr,
 	&format_attr_mtc_period.attr,
 	&format_attr_cyc_thresh.attr,
 	&format_attr_psb_period.attr,
@@ -1111,7 +1117,7 @@ static int pt_event_addr_filters_validate(struct list_head *filters)
 		if (!filter->range || !filter->size)
 			return -EOPNOTSUPP;
 
-		if (!filter->inode) {
+		if (!filter->path.dentry) {
 			if (!valid_kernel_ip(filter->offset))
 				return -EINVAL;
 
@@ -1138,7 +1144,7 @@ static void pt_event_addr_filters_sync(struct perf_event *event)
 		return;
 
 	list_for_each_entry(filter, &head->list, entry) {
-		if (filter->inode && !offs[range]) {
+		if (filter->path.dentry && !offs[range]) {
 			msr_a = msr_b = 0;
 		} else {
 			/* apply the offset */

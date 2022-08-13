@@ -1,7 +1,7 @@
 /*
  * NVIDIA Tegra SoC device tree board support
  *
- * Copyright (C) 2011, 2013, NVIDIA Corporation
+ * Copyright (C) 2011-2016, NVIDIA CORPORATION. All rights reserved.
  * Copyright (C) 2010 Secret Lab Technologies, Ltd.
  * Copyright (C) 2010 Google, Inc.
  *
@@ -35,6 +35,7 @@
 #include <linux/sys_soc.h>
 #include <linux/usb/tegra_usb_phy.h>
 
+#include <soc/tegra/flowctrl.h>
 #include <soc/tegra/fuse.h>
 #include <soc/tegra/pmc.h>
 
@@ -48,7 +49,6 @@
 #include "board.h"
 #include "common.h"
 #include "cpuidle.h"
-#include "flowctrl.h"
 #include "iomap.h"
 #include "irq.h"
 #include "pm.h"
@@ -75,7 +75,6 @@ static void __init tegra_init_early(void)
 {
 	of_register_trusted_foundations();
 	tegra_cpu_reset_handler_init();
-	tegra_flowctrl_init();
 }
 
 static void __init tegra_dt_init_irq(void)
@@ -137,8 +136,8 @@ static const char * const tegra_dt_board_compat[] = {
 };
 
 DT_MACHINE_START(TEGRA_DT, "NVIDIA Tegra SoC (Flattened Device Tree)")
-	.l2c_aux_val	= 0x3c400001,
-	.l2c_aux_mask	= 0xc20fc3fe,
+	.l2c_aux_val	= 0x3c400000,
+	.l2c_aux_mask	= 0xc20fc3ff,
 	.smp		= smp_ops(tegra_smp_ops),
 	.map_io		= tegra_map_common_io,
 	.init_early	= tegra_init_early,

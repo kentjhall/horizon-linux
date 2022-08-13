@@ -260,9 +260,9 @@ static int init_powernv_pstates(void)
 
 		if (id == pstate_max)
 			powernv_pstate_info.max = i;
-		else if (id == pstate_nominal)
+		if (id == pstate_nominal)
 			powernv_pstate_info.nominal = i;
-		else if (id == pstate_min)
+		if (id == pstate_min)
 			powernv_pstate_info.min = i;
 	}
 
@@ -599,6 +599,16 @@ void gpstate_timer_handler(unsigned long data)
 
 	if (!spin_trylock(&gpstates->gpstate_lock))
 		return;
+	/*
+	 * If the timer has migrated to the different cpu then bring
+	 * it back to one of the policy->cpus
+	 */
+	if (!cpumask_test_cpu(raw_smp_processor_id(), policy->cpus)) {
+		gpstates->timer.expires = jiffies + msecs_to_jiffies(1);
+		add_timer_on(&gpstates->timer, cpumask_first(policy->cpus));
+		spin_unlock(&gpstates->gpstate_lock);
+		return;
+	}
 
 	gpstates->last_sampled_time += time_diff;
 	gpstates->elapsed_time += time_diff;
@@ -626,10 +636,8 @@ void gpstate_timer_handler(unsigned long data)
 	gpstates->last_gpstate_idx = pstate_to_idx(freq_data.gpstate_id);
 	gpstates->last_lpstate_idx = pstate_to_idx(freq_data.pstate_id);
 
+	set_pstate(&freq_data);
 	spin_unlock(&gpstates->gpstate_lock);
-
-	/* Timer may get migrated to a different cpu on cpu hot unplug */
-	smp_call_function_any(policy->cpus, set_pstate, &freq_data, 1);
 }
 
 /*
@@ -647,8 +655,14 @@ static int powernv_cpufreq_target_index(struct cpufreq_policy *policy,
 	if (unlikely(rebooting) && new_index != get_nominal_index())
 		return 0;
 
-	if (!throttled)
+	if (!throttled) {
+		/* we don't want to be preempted while
+		 * checking if the CPU frequency has been throttled
+		 */
+		preempt_disable();
 		powernv_cpufreq_throttle_check(NULL);
+		preempt_enable();
+	}
 
 	cur_msec = jiffies_to_msecs(get_jiffies_64());
 
@@ -770,12 +784,15 @@ static int powernv_cpufreq_reboot_notifier(struct notifier_block *nb,
 				unsigned long action, void *unused)
 {
 	int cpu;
-	struct cpufreq_policy cpu_policy;
+	struct cpufreq_policy *cpu_policy;
 
 	rebooting = true;
 	for_each_online_cpu(cpu) {
-		cpufreq_get_policy(&cpu_policy, cpu);
-		powernv_cpufreq_target_index(&cpu_policy, get_nominal_index());
+		cpu_policy = cpufreq_cpu_get(cpu);
+		if (!cpu_policy)
+			continue;
+		powernv_cpufreq_target_index(cpu_policy, get_nominal_index());
+		cpufreq_cpu_put(cpu_policy);
 	}
 
 	return NOTIFY_DONE;
@@ -788,6 +805,7 @@ static struct notifier_block powernv_cpufreq_reboot_nb = {
 void powernv_cpufreq_work_fn(struct work_struct *work)
 {
 	struct chip *chip = container_of(work, struct chip, throttle);
+	struct cpufreq_policy *policy;
 	unsigned int cpu;
 	cpumask_t mask;
 
@@ -802,12 +820,14 @@ void powernv_cpufreq_work_fn(struct work_struct *work)
 	chip->restore = false;
 	for_each_cpu(cpu, &mask) {
 		int index;
-		struct cpufreq_policy policy;
 
-		cpufreq_get_policy(&policy, cpu);
-		index = cpufreq_table_find_index_c(&policy, policy.cur);
-		powernv_cpufreq_target_index(&policy, index);
-		cpumask_andnot(&mask, &mask, policy.cpus);
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		index = cpufreq_table_find_index_c(policy, policy->cur);
+		powernv_cpufreq_target_index(policy, index);
+		cpumask_andnot(&mask, &mask, policy->cpus);
+		cpufreq_cpu_put(policy);
 	}
 out:
 	put_online_cpus();
@@ -941,6 +961,12 @@ static int init_chip_info(void)
 
 static inline void clean_chip_info(void)
 {
+	int i;
+
+	/* flush any pending work items */
+	if (chips)
+		for (i = 0; i < nr_chips; i++)
+			cancel_work_sync(&chips[i].throttle);
 	kfree(chips);
 }
 

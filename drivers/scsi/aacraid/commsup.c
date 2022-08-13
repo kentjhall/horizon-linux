@@ -1179,8 +1179,9 @@ static void aac_handle_aif(struct aac_dev * dev, struct fib * fibptr)
 				  ADD : DELETE;
 				break;
 			}
-			case AifBuManagerEvent:
-				aac_handle_aif_bu(dev, aifcmd);
+			break;
+		case AifBuManagerEvent:
+			aac_handle_aif_bu(dev, aifcmd);
 			break;
 		}
 
@@ -1374,9 +1375,10 @@ static int _aac_reset_adapter(struct aac_dev *aac, int forced)
 	host = aac->scsi_host_ptr;
 	scsi_block_requests(host);
 	aac_adapter_disable_int(aac);
-	if (aac->thread->pid != current->pid) {
+	if (aac->thread && aac->thread->pid != current->pid) {
 		spin_unlock_irq(host->host_lock);
 		kthread_stop(aac->thread);
+		aac->thread = NULL;
 		jafo = 1;
 	}
 
@@ -1416,13 +1418,13 @@ static int _aac_reset_adapter(struct aac_dev *aac, int forced)
 	 * will ensure that i/o is queisced and the card is flushed in that
 	 * case.
 	 */
+	aac_free_irq(aac);
 	aac_fib_map_free(aac);
 	pci_free_consistent(aac->pdev, aac->comm_size, aac->comm_addr, aac->comm_phys);
 	aac->comm_addr = NULL;
 	aac->comm_phys = 0;
 	kfree(aac->queues);
 	aac->queues = NULL;
-	aac_free_irq(aac);
 	kfree(aac->fsa_dev);
 	aac->fsa_dev = NULL;
 	quirks = aac_get_driver_ident(index)->quirks;
@@ -1445,6 +1447,7 @@ static int _aac_reset_adapter(struct aac_dev *aac, int forced)
 					  aac->name);
 		if (IS_ERR(aac->thread)) {
 			retval = PTR_ERR(aac->thread);
+			aac->thread = NULL;
 			goto out;
 		}
 	}

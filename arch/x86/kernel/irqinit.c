@@ -4,6 +4,7 @@
 #include <linux/sched.h>
 #include <linux/ioport.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/timex.h>
 #include <linux/random.h>
 #include <linux/kprobes.h>
@@ -51,7 +52,7 @@ static struct irqaction irq2 = {
 	.flags = IRQF_NO_THREAD,
 };
 
-DEFINE_PER_CPU(vector_irq_t, vector_irq) = {
+DEFINE_PER_CPU_USER_MAPPED(vector_irq_t, vector_irq) = {
 	[0 ... NR_VECTORS - 1] = VECTOR_UNUSED,
 };
 

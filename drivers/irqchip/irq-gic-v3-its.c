@@ -365,7 +365,7 @@ static struct its_collection *its_build_invall_cmd(struct its_cmd_block *cmd,
 						   struct its_cmd_desc *desc)
 {
 	its_encode_cmd(cmd, GITS_CMD_INVALL);
-	its_encode_collection(cmd, desc->its_mapc_cmd.col->col_id);
+	its_encode_collection(cmd, desc->its_invall_cmd.col->col_id);
 
 	its_fixup_cmd(cmd);
 
@@ -684,7 +684,7 @@ static struct irq_chip its_irq_chip = {
  * This gives us (((1UL << id_bits) - 8192) >> 5) possible allocations.
  */
 #define IRQS_PER_CHUNK_SHIFT	5
-#define IRQS_PER_CHUNK		(1 << IRQS_PER_CHUNK_SHIFT)
+#define IRQS_PER_CHUNK		(1UL << IRQS_PER_CHUNK_SHIFT)
 
 static unsigned long *lpi_bitmap;
 static u32 lpi_chunks;
@@ -1320,11 +1320,10 @@ static struct its_device *its_create_device(struct its_node *its, u32 dev_id,
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	/*
-	 * At least one bit of EventID is being used, hence a minimum
-	 * of two entries. No, the architecture doesn't let you
-	 * express an ITT with a single entry.
+	 * We allocate at least one chunk worth of LPIs bet device,
+	 * and thus that many ITEs. The device may require less though.
 	 */
-	nr_ites = max(2UL, roundup_pow_of_two(nvecs));
+	nr_ites = max(IRQS_PER_CHUNK, roundup_pow_of_two(nvecs));
 	sz = nr_ites * its->ite_size;
 	sz = max(sz, ITS_ITT_ALIGN) + ITS_ITT_ALIGN - 1;
 	itt = kzalloc(sz, GFP_KERNEL);
@@ -1373,13 +1372,14 @@ static void its_free_device(struct its_device *its_dev)
 	kfree(its_dev);
 }
 
-static int its_alloc_device_irq(struct its_device *dev, irq_hw_number_t *hwirq)
+static int its_alloc_device_irq(struct its_device *dev, int nvecs, irq_hw_number_t *hwirq)
 {
 	int idx;
 
-	idx = find_first_zero_bit(dev->event_map.lpi_map,
-				  dev->event_map.nr_lpis);
-	if (idx == dev->event_map.nr_lpis)
+	idx = bitmap_find_free_region(dev->event_map.lpi_map,
+				      dev->event_map.nr_lpis,
+				      get_count_order(nvecs));
+	if (idx < 0)
 		return -ENOSPC;
 
 	*hwirq = dev->event_map.lpi_base + idx;
@@ -1465,20 +1465,20 @@ static int its_irq_domain_alloc(struct irq_domain *domain, unsigned int virq,
 	int err;
 	int i;
 
-	for (i = 0; i < nr_irqs; i++) {
-		err = its_alloc_device_irq(its_dev, &hwirq);
-		if (err)
-			return err;
+	err = its_alloc_device_irq(its_dev, nr_irqs, &hwirq);
+	if (err)
+		return err;
 
-		err = its_irq_gic_domain_alloc(domain, virq + i, hwirq);
+	for (i = 0; i < nr_irqs; i++) {
+		err = its_irq_gic_domain_alloc(domain, virq + i, hwirq + i);
 		if (err)
 			return err;
 
 		irq_domain_set_hwirq_and_chip(domain, virq + i,
-					      hwirq, &its_irq_chip, its_dev);
+					      hwirq + i, &its_irq_chip, its_dev);
 		pr_debug("ID:%d pID:%d vID:%d\n",
-			 (int)(hwirq - its_dev->event_map.lpi_base),
-			 (int) hwirq, virq + i);
+			 (int)(hwirq + i - its_dev->event_map.lpi_base),
+			 (int)(hwirq + i), virq + i);
 	}
 
 	return 0;
@@ -1519,14 +1519,13 @@ static void its_irq_domain_free(struct irq_domain *domain, unsigned int virq,
 	struct its_device *its_dev = irq_data_get_irq_chip_data(d);
 	int i;
 
+	bitmap_release_region(its_dev->event_map.lpi_map,
+			      its_get_event_id(irq_domain_get_irq_data(domain, virq)),
+			      get_count_order(nr_irqs));
+
 	for (i = 0; i < nr_irqs; i++) {
 		struct irq_data *data = irq_domain_get_irq_data(domain,
 								virq + i);
-		u32 event = its_get_event_id(data);
-
-		/* Mark interrupt index as unused */
-		clear_bit(event, its_dev->event_map.lpi_map);
-
 		/* Nuke the entry in the domain */
 		irq_domain_reset_irq_data(data);
 	}
@@ -1598,6 +1597,14 @@ static void __maybe_unused its_enable_quirk_cavium_23144(void *data)
 	its->flags |= ITS_FLAGS_WORKAROUND_CAVIUM_23144;
 }
 
+static void __maybe_unused its_enable_quirk_qdf2400_e0065(void *data)
+{
+	struct its_node *its = data;
+
+	/* On QDF2400, the size of the ITE is 16Bytes */
+	its->ite_size = 16;
+}
+
 static const struct gic_quirk its_quirks[] = {
 #ifdef CONFIG_CAVIUM_ERRATUM_22375
 	{
@@ -1613,6 +1620,14 @@ static const struct gic_quirk its_quirks[] = {
 		.iidr	= 0xa100034c,	/* ThunderX pass 1.x */
 		.mask	= 0xffff0fff,
 		.init	= its_enable_quirk_cavium_23144,
+	},
+#endif
+#ifdef CONFIG_QCOM_QDF2400_ERRATUM_0065
+	{
+		.desc	= "ITS: QDF2400 erratum 0065",
+		.iidr	= 0x00001070, /* QDF2400 ITS rev 1.x */
+		.mask	= 0xffffffff,
+		.init	= its_enable_quirk_qdf2400_e0065,
 	},
 #endif
 	{
@@ -1792,6 +1807,8 @@ static int __init its_of_probe(struct device_node *node)
 
 	for (np = of_find_matching_node(node, its_device_id); np;
 	     np = of_find_matching_node(np, its_device_id)) {
+		if (!of_device_is_available(np))
+			continue;
 		if (!of_property_read_bool(np, "msi-controller")) {
 			pr_warn("%s: no msi-controller property, ITS ignored\n",
 				np->full_name);

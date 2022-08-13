@@ -2,6 +2,7 @@
  *  linux/drivers/mmc/card/mmc_test.c
  *
  *  Copyright 2007-2008 Pierre Ossman
+ *  Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -214,7 +215,7 @@ static void mmc_test_prepare_mrq(struct mmc_test_card *test,
 	struct mmc_request *mrq, struct scatterlist *sg, unsigned sg_len,
 	unsigned dev_addr, unsigned blocks, unsigned blksz, int write)
 {
-	BUG_ON(!mrq || !mrq->cmd || !mrq->data || !mrq->stop);
+	WARN_ON(!mrq || !mrq->cmd || !mrq->data || !mrq->stop);
 
 	if (blocks > 1) {
 		mrq->cmd->opcode = write ?
@@ -249,42 +250,12 @@ static void mmc_test_prepare_mrq(struct mmc_test_card *test,
 	mmc_set_data_timeout(mrq->data, test->card);
 }
 
-static int mmc_test_busy(struct mmc_command *cmd)
-{
-	return !(cmd->resp[0] & R1_READY_FOR_DATA) ||
-		(R1_CURRENT_STATE(cmd->resp[0]) == R1_STATE_PRG);
-}
-
 /*
  * Wait for the card to finish the busy state
  */
 static int mmc_test_wait_busy(struct mmc_test_card *test)
 {
-	int ret, busy;
-	struct mmc_command cmd = {0};
-
-	busy = 0;
-	do {
-		memset(&cmd, 0, sizeof(struct mmc_command));
-
-		cmd.opcode = MMC_SEND_STATUS;
-		cmd.arg = test->card->rca << 16;
-		cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
-
-		ret = mmc_wait_for_cmd(test->card->host, &cmd, 0);
-		if (ret)
-			break;
-
-		if (!busy && mmc_test_busy(&cmd)) {
-			busy = 1;
-			if (test->card->host->caps & MMC_CAP_WAIT_WHILE_BUSY)
-				pr_info("%s: Warning: Host did not "
-					"wait for busy state to end.\n",
-					mmc_hostname(test->card->host));
-		}
-	} while (mmc_test_busy(&cmd));
-
-	return ret;
+	return mmc_wait_busy(test->card);
 }
 
 /*
@@ -712,24 +683,9 @@ static void mmc_test_prepare_broken_mrq(struct mmc_test_card *test,
 static int mmc_test_check_result(struct mmc_test_card *test,
 				 struct mmc_request *mrq)
 {
-	int ret;
+	int ret = 0;
 
-	BUG_ON(!mrq || !mrq->cmd || !mrq->data);
-
-	ret = 0;
-
-	if (mrq->sbc && mrq->sbc->error)
-		ret = mrq->sbc->error;
-	if (!ret && mrq->cmd->error)
-		ret = mrq->cmd->error;
-	if (!ret && mrq->data->error)
-		ret = mrq->data->error;
-	if (!ret && mrq->stop && mrq->stop->error)
-		ret = mrq->stop->error;
-	if (!ret && mrq->data->bytes_xfered !=
-		mrq->data->blocks * mrq->data->blksz)
-		ret = RESULT_FAIL;
-
+	ret = mmc_check_result(mrq);
 	if (ret == -EINVAL)
 		ret = RESULT_UNSUP_HOST;
 
@@ -818,7 +774,7 @@ static int mmc_test_nonblock_transfer(struct mmc_test_card *test,
 	struct mmc_async_req *cur_areq = &test_areq[0].areq;
 	struct mmc_async_req *other_areq = &test_areq[1].areq;
 	int i;
-	int ret;
+	int ret = RESULT_OK;
 
 	test_areq[0].test = test;
 	test_areq[1].test = test;
@@ -865,23 +821,14 @@ static int mmc_test_simple_transfer(struct mmc_test_card *test,
 	struct scatterlist *sg, unsigned sg_len, unsigned dev_addr,
 	unsigned blocks, unsigned blksz, int write)
 {
-	struct mmc_request mrq = {0};
-	struct mmc_command cmd = {0};
-	struct mmc_command stop = {0};
-	struct mmc_data data = {0};
+	int ret;
 
-	mrq.cmd = &cmd;
-	mrq.data = &data;
-	mrq.stop = &stop;
-
-	mmc_test_prepare_mrq(test, &mrq, sg, sg_len, dev_addr,
+	ret = mmc_simple_transfer(test->card, sg, sg_len, dev_addr,
 		blocks, blksz, write);
 
-	mmc_wait_for_req(test->card->host, &mrq);
-
-	mmc_test_wait_busy(test);
-
-	return mmc_test_check_result(test, &mrq);
+	if (ret == -EINVAL)
+		ret = RESULT_UNSUP_HOST;
+	return ret;
 }
 
 /*
@@ -3251,34 +3198,31 @@ static void mmc_test_remove(struct mmc_card *card)
 	mmc_test_free_dbgfs_file(card);
 }
 
-static void mmc_test_shutdown(struct mmc_card *card)
+static int mmc_test_init(void)
 {
-}
+	int card_idx;
 
-static struct mmc_driver mmc_driver = {
-	.drv		= {
-		.name	= "mmc_test",
-	},
-	.probe		= mmc_test_probe,
-	.remove		= mmc_test_remove,
-	.shutdown	= mmc_test_shutdown,
-};
-
-static int __init mmc_test_init(void)
-{
-	return mmc_register_driver(&mmc_driver);
+	for (card_idx = 0; card_idx < MAX_CARDS_NUM; card_idx++) {
+		if (mmc_cards[card_idx] != NULL)
+			mmc_test_probe(mmc_cards[card_idx]);
+	}
+	return 0;
 }
 
 static void __exit mmc_test_exit(void)
 {
+	int card_idx;
+
+	for (card_idx = 0; card_idx < MAX_CARDS_NUM; card_idx++) {
+		if (mmc_cards[card_idx] != NULL)
+			mmc_test_remove(mmc_cards[card_idx]);
+	}
 	/* Clear stalled data if card is still plugged */
 	mmc_test_free_result(NULL);
 	mmc_test_free_dbgfs_file(NULL);
-
-	mmc_unregister_driver(&mmc_driver);
 }
 
-module_init(mmc_test_init);
+late_initcall(mmc_test_init);
 module_exit(mmc_test_exit);
 
 MODULE_LICENSE("GPL");

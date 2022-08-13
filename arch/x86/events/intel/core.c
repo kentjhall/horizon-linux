@@ -431,11 +431,11 @@ static __initconst const u64 skl_hw_cache_event_ids
  [ C(DTLB) ] = {
 	[ C(OP_READ) ] = {
 		[ C(RESULT_ACCESS) ] = 0x81d0,	/* MEM_INST_RETIRED.ALL_LOADS */
-		[ C(RESULT_MISS)   ] = 0x608,	/* DTLB_LOAD_MISSES.WALK_COMPLETED */
+		[ C(RESULT_MISS)   ] = 0xe08,	/* DTLB_LOAD_MISSES.WALK_COMPLETED */
 	},
 	[ C(OP_WRITE) ] = {
 		[ C(RESULT_ACCESS) ] = 0x82d0,	/* MEM_INST_RETIRED.ALL_STORES */
-		[ C(RESULT_MISS)   ] = 0x649,	/* DTLB_STORE_MISSES.WALK_COMPLETED */
+		[ C(RESULT_MISS)   ] = 0xe49,	/* DTLB_STORE_MISSES.WALK_COMPLETED */
 	},
 	[ C(OP_PREFETCH) ] = {
 		[ C(RESULT_ACCESS) ] = 0x0,
@@ -2066,9 +2066,15 @@ static int intel_pmu_handle_irq(struct pt_regs *regs)
 	int bit, loops;
 	u64 status;
 	int handled;
+	int pmu_enabled;
 
 	cpuc = this_cpu_ptr(&cpu_hw_events);
 
+	/*
+	 * Save the PMU state.
+	 * It needs to be restored when leaving the handler.
+	 */
+	pmu_enabled = cpuc->enabled;
 	/*
 	 * No known reason to not always do late ACK,
 	 * but just in case do it opt-in.
@@ -2076,6 +2082,7 @@ static int intel_pmu_handle_irq(struct pt_regs *regs)
 	if (!x86_pmu.late_ack)
 		apic_write(APIC_LVTPC, APIC_DM_NMI);
 	intel_bts_disable_local();
+	cpuc->enabled = 0;
 	__intel_pmu_disable_all();
 	handled = intel_pmu_drain_bts_buffer();
 	handled += intel_bts_interrupt();
@@ -2173,7 +2180,8 @@ again:
 
 done:
 	/* Only restore PMU state when it's active. See x86_pmu_disable(). */
-	if (cpuc->enabled)
+	cpuc->enabled = pmu_enabled;
+	if (pmu_enabled)
 		__intel_pmu_enable_all(0, true);
 	intel_bts_enable_local();
 
@@ -2190,16 +2198,7 @@ done:
 static struct event_constraint *
 intel_bts_constraints(struct perf_event *event)
 {
-	struct hw_perf_event *hwc = &event->hw;
-	unsigned int hw_event, bts_event;
-
-	if (event->attr.freq)
-		return NULL;
-
-	hw_event = hwc->config & INTEL_ARCH_EVENT_MASK;
-	bts_event = x86_pmu.event_map(PERF_COUNT_HW_BRANCH_INSTRUCTIONS);
-
-	if (unlikely(hw_event == bts_event && hwc->sample_period == 1))
+	if (unlikely(intel_pmu_has_bts(event)))
 		return &bts_constraint;
 
 	return NULL;
@@ -2494,6 +2493,35 @@ intel_stop_scheduling(struct cpu_hw_events *cpuc)
 }
 
 static struct event_constraint *
+dyn_constraint(struct cpu_hw_events *cpuc, struct event_constraint *c, int idx)
+{
+	WARN_ON_ONCE(!cpuc->constraint_list);
+
+	if (!(c->flags & PERF_X86_EVENT_DYNAMIC)) {
+		struct event_constraint *cx;
+
+		/*
+		 * grab pre-allocated constraint entry
+		 */
+		cx = &cpuc->constraint_list[idx];
+
+		/*
+		 * initialize dynamic constraint
+		 * with static constraint
+		 */
+		*cx = *c;
+
+		/*
+		 * mark constraint as dynamic
+		 */
+		cx->flags |= PERF_X86_EVENT_DYNAMIC;
+		c = cx;
+	}
+
+	return c;
+}
+
+static struct event_constraint *
 intel_get_excl_constraints(struct cpu_hw_events *cpuc, struct perf_event *event,
 			   int idx, struct event_constraint *c)
 {
@@ -2523,27 +2551,7 @@ intel_get_excl_constraints(struct cpu_hw_events *cpuc, struct perf_event *event,
 	 * only needed when constraint has not yet
 	 * been cloned (marked dynamic)
 	 */
-	if (!(c->flags & PERF_X86_EVENT_DYNAMIC)) {
-		struct event_constraint *cx;
-
-		/*
-		 * grab pre-allocated constraint entry
-		 */
-		cx = &cpuc->constraint_list[idx];
-
-		/*
-		 * initialize dynamic constraint
-		 * with static constraint
-		 */
-		*cx = *c;
-
-		/*
-		 * mark constraint as dynamic, so we
-		 * can free it later on
-		 */
-		cx->flags |= PERF_X86_EVENT_DYNAMIC;
-		c = cx;
-	}
+	c = dyn_constraint(cpuc, c, idx);
 
 	/*
 	 * From here on, the constraint is dynamic.
@@ -2814,6 +2822,39 @@ static unsigned long intel_pmu_free_running_flags(struct perf_event *event)
 	return flags;
 }
 
+static int intel_pmu_bts_config(struct perf_event *event)
+{
+	struct perf_event_attr *attr = &event->attr;
+
+	if (unlikely(intel_pmu_has_bts(event))) {
+		/* BTS is not supported by this architecture. */
+		if (!x86_pmu.bts_active)
+			return -EOPNOTSUPP;
+
+		/* BTS is currently only allowed for user-mode. */
+		if (!attr->exclude_kernel)
+			return -EOPNOTSUPP;
+
+		/* disallow bts if conflicting events are present */
+		if (x86_add_exclusive(x86_lbr_exclusive_lbr))
+			return -EBUSY;
+
+		event->destroy = hw_perf_lbr_event_destroy;
+	}
+
+	return 0;
+}
+
+static int core_pmu_hw_config(struct perf_event *event)
+{
+	int ret = x86_pmu_hw_config(event);
+
+	if (ret)
+		return ret;
+
+	return intel_pmu_bts_config(event);
+}
+
 static int intel_pmu_hw_config(struct perf_event *event)
 {
 	int ret = x86_pmu_hw_config(event);
@@ -2821,8 +2862,12 @@ static int intel_pmu_hw_config(struct perf_event *event)
 	if (ret)
 		return ret;
 
+	ret = intel_pmu_bts_config(event);
+	if (ret)
+		return ret;
+
 	if (event->attr.precise_ip) {
-		if (!event->attr.freq) {
+		if (!(event->attr.freq || (event->attr.wakeup_events && !event->attr.watermark))) {
 			event->hw.flags |= PERF_X86_EVENT_AUTO_RELOAD;
 			if (!(event->attr.sample_type &
 			      ~intel_pmu_free_running_flags(event)))
@@ -2840,7 +2885,7 @@ static int intel_pmu_hw_config(struct perf_event *event)
 		/*
 		 * BTS is set up earlier in this path, so don't account twice
 		 */
-		if (!intel_pmu_has_bts(event)) {
+		if (!unlikely(intel_pmu_has_bts(event))) {
 			/* disallow lbr if conflicting events are present */
 			if (x86_add_exclusive(x86_lbr_exclusive_lbr))
 				return -EBUSY;
@@ -3019,15 +3064,20 @@ hsw_get_event_constraints(struct cpu_hw_events *cpuc, int idx,
  * Therefore the effective (average) period matches the requested period,
  * despite coarser hardware granularity.
  */
-static unsigned bdw_limit_period(struct perf_event *event, unsigned left)
+static u64 bdw_limit_period(struct perf_event *event, u64 left)
 {
 	if ((event->hw.config & INTEL_ARCH_EVENT_MASK) ==
 			X86_CONFIG(.event=0xc0, .umask=0x01)) {
 		if (left < 128)
 			left = 128;
-		left &= ~0x3fu;
+		left &= ~0x3fULL;
 	}
 	return left;
+}
+
+static u64 nhm_limit_period(struct perf_event *event, u64 left)
+{
+	return max(left, 32ULL);
 }
 
 PMU_FORMAT_ATTR(event,	"config:0-7"	);
@@ -3057,7 +3107,7 @@ ssize_t intel_event_sysfs_show(char *page, u64 config)
 	return x86_event_sysfs_show(page, config, event);
 }
 
-struct intel_shared_regs *allocate_shared_regs(int cpu)
+static struct intel_shared_regs *allocate_shared_regs(int cpu)
 {
 	struct intel_shared_regs *regs;
 	int i;
@@ -3089,10 +3139,9 @@ static struct intel_excl_cntrs *allocate_excl_cntrs(int cpu)
 	return c;
 }
 
-static int intel_pmu_cpu_prepare(int cpu)
-{
-	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
 
+int intel_cpuc_prepare(struct cpu_hw_events *cpuc, int cpu)
+{
 	if (x86_pmu.extra_regs || x86_pmu.lbr_sel_map) {
 		cpuc->shared_regs = allocate_shared_regs(cpu);
 		if (!cpuc->shared_regs)
@@ -3102,7 +3151,7 @@ static int intel_pmu_cpu_prepare(int cpu)
 	if (x86_pmu.flags & PMU_FL_EXCL_CNTRS) {
 		size_t sz = X86_PMC_IDX_MAX * sizeof(struct event_constraint);
 
-		cpuc->constraint_list = kzalloc(sz, GFP_KERNEL);
+		cpuc->constraint_list = kzalloc_node(sz, GFP_KERNEL, cpu_to_node(cpu));
 		if (!cpuc->constraint_list)
 			goto err_shared_regs;
 
@@ -3125,6 +3174,11 @@ err_shared_regs:
 
 err:
 	return -ENOMEM;
+}
+
+static int intel_pmu_cpu_prepare(int cpu)
+{
+	return intel_cpuc_prepare(&per_cpu(cpu_hw_events, cpu), cpu);
 }
 
 static void intel_pmu_cpu_starting(int cpu)
@@ -3164,13 +3218,16 @@ static void intel_pmu_cpu_starting(int cpu)
 
 	if (x86_pmu.flags & PMU_FL_EXCL_CNTRS) {
 		for_each_cpu(i, topology_sibling_cpumask(cpu)) {
+			struct cpu_hw_events *sibling;
 			struct intel_excl_cntrs *c;
 
-			c = per_cpu(cpu_hw_events, i).excl_cntrs;
+			sibling = &per_cpu(cpu_hw_events, i);
+			c = sibling->excl_cntrs;
 			if (c && c->core_id == core_id) {
 				cpuc->kfree_on_online[1] = cpuc->excl_cntrs;
 				cpuc->excl_cntrs = c;
-				cpuc->excl_thread_id = 1;
+				if (!sibling->excl_thread_id)
+					cpuc->excl_thread_id = 1;
 				break;
 			}
 		}
@@ -3179,9 +3236,8 @@ static void intel_pmu_cpu_starting(int cpu)
 	}
 }
 
-static void free_excl_cntrs(int cpu)
+static void free_excl_cntrs(struct cpu_hw_events *cpuc)
 {
-	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
 	struct intel_excl_cntrs *c;
 
 	c = cpuc->excl_cntrs;
@@ -3196,7 +3252,11 @@ static void free_excl_cntrs(int cpu)
 
 static void intel_pmu_cpu_dying(int cpu)
 {
-	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
+	fini_debug_store_on_cpu(cpu);
+}
+
+void intel_cpuc_finish(struct cpu_hw_events *cpuc)
+{
 	struct intel_shared_regs *pc;
 
 	pc = cpuc->shared_regs;
@@ -3206,9 +3266,12 @@ static void intel_pmu_cpu_dying(int cpu)
 		cpuc->shared_regs = NULL;
 	}
 
-	free_excl_cntrs(cpu);
+	free_excl_cntrs(cpuc);
+}
 
-	fini_debug_store_on_cpu(cpu);
+static void intel_pmu_cpu_dead(int cpu)
+{
+	intel_cpuc_finish(&per_cpu(cpu_hw_events, cpu));
 }
 
 static void intel_pmu_sched_task(struct perf_event_context *ctx,
@@ -3218,6 +3281,11 @@ static void intel_pmu_sched_task(struct perf_event_context *ctx,
 		intel_pmu_pebs_sched_task(ctx, sched_in);
 	if (x86_pmu.lbr_nr)
 		intel_pmu_lbr_sched_task(ctx, sched_in);
+}
+
+static int intel_pmu_check_period(struct perf_event *event, u64 value)
+{
+	return intel_pmu_has_bts_period(event, value) ? -EINVAL : 0;
 }
 
 PMU_FORMAT_ATTR(offcore_rsp, "config1:0-63");
@@ -3254,7 +3322,7 @@ static __initconst const struct x86_pmu core_pmu = {
 	.enable_all		= core_pmu_enable_all,
 	.enable			= core_pmu_enable_event,
 	.disable		= x86_pmu_disable_event,
-	.hw_config		= x86_pmu_hw_config,
+	.hw_config		= core_pmu_hw_config,
 	.schedule_events	= x86_schedule_events,
 	.eventsel		= MSR_ARCH_PERFMON_EVENTSEL0,
 	.perfctr		= MSR_ARCH_PERFMON_PERFCTR0,
@@ -3285,6 +3353,9 @@ static __initconst const struct x86_pmu core_pmu = {
 	.cpu_prepare		= intel_pmu_cpu_prepare,
 	.cpu_starting		= intel_pmu_cpu_starting,
 	.cpu_dying		= intel_pmu_cpu_dying,
+	.cpu_dead		= intel_pmu_cpu_dead,
+
+	.check_period		= intel_pmu_check_period,
 };
 
 static __initconst const struct x86_pmu intel_pmu = {
@@ -3320,8 +3391,12 @@ static __initconst const struct x86_pmu intel_pmu = {
 	.cpu_prepare		= intel_pmu_cpu_prepare,
 	.cpu_starting		= intel_pmu_cpu_starting,
 	.cpu_dying		= intel_pmu_cpu_dying,
+	.cpu_dead		= intel_pmu_cpu_dead,
+
 	.guest_get_msrs		= intel_guest_get_msrs,
 	.sched_task		= intel_pmu_sched_task,
+
+	.check_period		= intel_pmu_check_period,
 };
 
 static __init void intel_clovertown_quirk(void)
@@ -3360,7 +3435,7 @@ static int intel_snb_pebs_broken(int cpu)
 		break;
 
 	case INTEL_FAM6_SANDYBRIDGE_X:
-		switch (cpu_data(cpu).x86_mask) {
+		switch (cpu_data(cpu).x86_stepping) {
 		case 6: rev = 0x618; break;
 		case 7: rev = 0x70c; break;
 		}
@@ -3664,6 +3739,7 @@ __init int intel_pmu_init(void)
 		x86_pmu.pebs_constraints = intel_nehalem_pebs_event_constraints;
 		x86_pmu.enable_all = intel_pmu_nhm_enable_all;
 		x86_pmu.extra_regs = intel_nehalem_extra_regs;
+		x86_pmu.limit_period = nhm_limit_period;
 
 		x86_pmu.cpu_events = nhm_events_attrs;
 
@@ -3680,11 +3756,11 @@ __init int intel_pmu_init(void)
 		pr_cont("Nehalem events, ");
 		break;
 
-	case INTEL_FAM6_ATOM_PINEVIEW:
-	case INTEL_FAM6_ATOM_LINCROFT:
-	case INTEL_FAM6_ATOM_PENWELL:
-	case INTEL_FAM6_ATOM_CLOVERVIEW:
-	case INTEL_FAM6_ATOM_CEDARVIEW:
+	case INTEL_FAM6_ATOM_BONNELL:
+	case INTEL_FAM6_ATOM_BONNELL_MID:
+	case INTEL_FAM6_ATOM_SALTWELL:
+	case INTEL_FAM6_ATOM_SALTWELL_MID:
+	case INTEL_FAM6_ATOM_SALTWELL_TABLET:
 		memcpy(hw_cache_event_ids, atom_hw_cache_event_ids,
 		       sizeof(hw_cache_event_ids));
 
@@ -3696,9 +3772,11 @@ __init int intel_pmu_init(void)
 		pr_cont("Atom events, ");
 		break;
 
-	case INTEL_FAM6_ATOM_SILVERMONT1:
-	case INTEL_FAM6_ATOM_SILVERMONT2:
+	case INTEL_FAM6_ATOM_SILVERMONT:
+	case INTEL_FAM6_ATOM_SILVERMONT_X:
+	case INTEL_FAM6_ATOM_SILVERMONT_MID:
 	case INTEL_FAM6_ATOM_AIRMONT:
+	case INTEL_FAM6_ATOM_AIRMONT_MID:
 		memcpy(hw_cache_event_ids, slm_hw_cache_event_ids,
 			sizeof(hw_cache_event_ids));
 		memcpy(hw_cache_extra_regs, slm_hw_cache_extra_regs,
@@ -3715,7 +3793,7 @@ __init int intel_pmu_init(void)
 		break;
 
 	case INTEL_FAM6_ATOM_GOLDMONT:
-	case INTEL_FAM6_ATOM_DENVERTON:
+	case INTEL_FAM6_ATOM_GOLDMONT_X:
 		memcpy(hw_cache_event_ids, glm_hw_cache_event_ids,
 		       sizeof(hw_cache_event_ids));
 		memcpy(hw_cache_extra_regs, glm_hw_cache_extra_regs,
@@ -3975,7 +4053,7 @@ __init int intel_pmu_init(void)
 		     x86_pmu.num_counters, INTEL_PMC_MAX_GENERIC);
 		x86_pmu.num_counters = INTEL_PMC_MAX_GENERIC;
 	}
-	x86_pmu.intel_ctrl = (1 << x86_pmu.num_counters) - 1;
+	x86_pmu.intel_ctrl = (1ULL << x86_pmu.num_counters) - 1;
 
 	if (x86_pmu.num_counters_fixed > INTEL_PMC_MAX_FIXED) {
 		WARN(1, KERN_ERR "hw perf events fixed %d > max(%d), clipping!",
@@ -4078,7 +4156,7 @@ static __init int fixup_ht_bug(void)
 	get_online_cpus();
 
 	for_each_online_cpu(c) {
-		free_excl_cntrs(c);
+		free_excl_cntrs(&per_cpu(cpu_hw_events, c));
 	}
 
 	put_online_cpus();

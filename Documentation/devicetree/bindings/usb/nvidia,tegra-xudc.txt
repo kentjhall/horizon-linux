@@ -1,0 +1,103 @@
+Device tree binding for NVIDIA Tegra XUSB device mode controller (xUDC)
+============================
+
+The Tegra xUDC controller supports both USB 2.0 HighSpeed/FullSpeed and
+USB 3.0 SuperSpeed protocols.
+
+Required properties:
+--------------------
+ - compatible: For Tegra186, must contain "nvidia,tegra186-xudc".
+               For Tegra194, must contain "nvidia,tegra194-xudc".
+               For Tegra210, must contain "nvidia,tegra210-xudc".
+               For Tegra210b01, must contain "nvidia,tegra210b01-xudc".
+ - reg: For Tegra210 and Tegra210b01, must contain the base and length of
+   the xUDC device registers, xUDC FPCI registers and xUDC IPFS registers.
+   For Tegra186 and Tegra194, must contain the base and length of the xUDC
+   device registers, xUDC FPCI registers.
+ - interrupts: Must be the xUDC device interrupt.
+ - clocks: For Tegra186 and Tegra194, must contain the entries of "xusb_dev",
+   "xusb_ss", "xusb_ss_src", and "xusb_fs_src".
+   For Tegra210 and Tegra210b01, must contain the entries of "xusb_dev",
+   "xusb_ss", "xusb_ssp_src", "xusb_hs_src", and "xusb_fs_src".
+   See ../clock/clock-bindings.txt for details.
+ - iommus: phandle and IOMMU specifier for the IOMMU that serves the XUSB
+   device. See ../iommu/iommu.txt for details.
+
+Required properties for Tegra xudc:
+---------------------------------
+ - nvidia,xusb-padctl: phandle to the XUSB pad controller that is used to
+   configure the USB pads used by the XHCI controller.
+ - phys: Must contain an entry for each entry in phy-names.
+   See ../phy/phy-bindings.txt for details.
+ - phy-names: Should include an entry for each PHY used by the controller.
+   Names must be "usb2", and "usb3" if support SuperSpeed device mode.
+   - "usb3" phy, SuperSpeed (SSTX+/SSTX-/SSRX+/SSRX-) data lines.
+   - "usb2" phy, USB 2.0 (D+/D-) data lines.
+ - extcon-cables: OTG support. Must contains an excon-cable entry which
+   detects USB VBUS pin. See ../extcon/extcon-gpio-states.txt for details.
+   When the extcon cable state is 1, OTG port will transition to device mode.
+ - extcon-cable-names: Must be "vbus".
+
+For Tegra186:
+ - avdd-usb-supply: USB controller power supply. Must supply 3.3 V.
+
+For Tegra210 and Tegra210b01:
+ - hvdd_usb-supply: PEX USB 3.0 pads power supply. Must supply 1.8 V.
+ - avddio-usb-supply: USB 2.0 pads power supply. Must supply 3.3 V.
+ - avdd-pll-utmip-supply: UTMI PLL power supply. Must supply 1.8 V.
+
+Optional properties:
+--------------------
+ - charger-detector: USB charger detection support. Must be the phandle of the
+   USB charger detection driver DT node.
+ - nvidia,boost_cpu_freq: The value to which CPU frequency is to be boosted.
+   This is only the minimum frequency; DVFS can scale up CPU frequency further
+   based on need and CPU load. CPU boost frequency through PMQOS is enabled
+   for the xUDC controller only when this field’s value is greater than zero.
+   The boost is applicable only to large bulk transfers on bulk endpoints;
+   other endpoints do not need to be boosted.
+   Example :
+   Before boosting on Quill-prod:
+     Output of "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+     345600
+     2419200
+     2419200
+     345600
+     345600
+     345600
+   After boosting on QUill-prod: (nvidia,boost_cpu_freq = <800>)
+     Output of "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+     806400
+     2419200
+     2419200
+     806400
+     806400
+     806400
+ - emc-frequency: Set the value which EMC frequency will be requested.
+   xUDC controller will request EMC bandwidth through BWMGR for Bulk transfers.
+
+Example:
+--------
+	xudc@3550000 {
+		compatible = "nvidia,tegra186-xudc";
+		reg = <0x0 0x03550000 0x0 0x8000>,
+			<0x0 0x03558000 0x0 0x1000>;
+		interrupts = <0 166 0x4>;
+		iommus = <&smmu TEGRA_SID_XUSB_DEV>;
+		clocks = <&tegra_car TEGRA186_CLK_XUSB_CORE_DEV>,
+			<&tegra_car TEGRA186_CLK_XUSB_SS>,
+			<&tegra_car TEGRA186_CLK_XUSB_CORE_SS>,
+			<&tegra_car TEGRA186_CLK_XUSB_FS>;
+
+		nvidia,xusb-padctl = <&xusb_padctl>;
+		phys = <&{/xusb_padctl@3520000/pads/usb2/lanes/usb2-0}>, /* USB 3.0 micro-AB, J503 */
+			<&{/xusb_padctl@3520000/pads/usb2/lanes/usb3-1}>; /* USB 3.0 micro-AB, J503 */
+		phy-names = "usb2", "usb3";
+		extcon-cables = <&vbus_id_extcon 0>;
+		extcon-cable-names = "vbus";
+		#extcon-cells = <1>;
+		avdd-usb-supply = <&spmic_sd3_3v3>;
+
+		charger-detector = <&tegra_usb_cd>;
+		nvidia,boost_cpu_freq = <1200>;
+	};

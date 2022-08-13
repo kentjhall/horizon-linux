@@ -1734,6 +1734,21 @@ nothing_to_do:
 	return 1;
 }
 
+static bool ata_check_nblocks(struct scsi_cmnd *scmd, u32 n_blocks)
+{
+	struct request *rq = scmd->request;
+	u32 req_blocks;
+
+	if (!blk_rq_is_passthrough(rq))
+		return true;
+
+	req_blocks = blk_rq_bytes(rq) / scmd->device->sector_size;
+	if (n_blocks > req_blocks)
+		return false;
+
+	return true;
+}
+
 /**
  *	ata_scsi_rw_xlat - Translate SCSI r/w command into an ATA one
  *	@qc: Storage for translated ATA taskfile
@@ -1776,6 +1791,8 @@ static unsigned int ata_scsi_rw_xlat(struct ata_queued_cmd *qc)
 		scsi_10_lba_len(cdb, &block, &n_block);
 		if (cdb[1] & (1 << 3))
 			tf_flags |= ATA_TFLAG_FUA;
+		if (!ata_check_nblocks(scmd, n_block))
+			goto invalid_fld;
 		break;
 	case READ_6:
 	case WRITE_6:
@@ -1790,6 +1807,8 @@ static unsigned int ata_scsi_rw_xlat(struct ata_queued_cmd *qc)
 		 */
 		if (!n_block)
 			n_block = 256;
+		if (!ata_check_nblocks(scmd, n_block))
+			goto invalid_fld;
 		break;
 	case READ_16:
 	case WRITE_16:
@@ -1800,6 +1819,8 @@ static unsigned int ata_scsi_rw_xlat(struct ata_queued_cmd *qc)
 		scsi_16_lba_len(cdb, &block, &n_block);
 		if (cdb[1] & (1 << 3))
 			tf_flags |= ATA_TFLAG_FUA;
+		if (!ata_check_nblocks(scmd, n_block))
+			goto invalid_fld;
 		break;
 	default:
 		DPRINTK("no-byte command\n");
@@ -2293,6 +2314,7 @@ static unsigned int ata_scsiop_inq_89(struct ata_scsi_args *args, u8 *rbuf)
 
 static unsigned int ata_scsiop_inq_b0(struct ata_scsi_args *args, u8 *rbuf)
 {
+	struct ata_device *dev = args->dev;
 	u16 min_io_sectors;
 
 	rbuf[1] = 0xb0;
@@ -2318,7 +2340,12 @@ static unsigned int ata_scsiop_inq_b0(struct ata_scsi_args *args, u8 *rbuf)
 	 * with the unmap bit set.
 	 */
 	if (ata_id_has_trim(args->id)) {
-		put_unaligned_be64(65535 * ATA_MAX_TRIM_RNUM, &rbuf[36]);
+		u64 max_blocks = 65535 * ATA_MAX_TRIM_RNUM;
+
+		if (dev->horkage & ATA_HORKAGE_MAX_TRIM_128M)
+			max_blocks = 128 << (20 - SECTOR_SHIFT);
+
+		put_unaligned_be64(max_blocks, &rbuf[36]);
 		put_unaligned_be32(1, &rbuf[28]);
 	}
 
@@ -2971,10 +2998,12 @@ static unsigned int atapi_xlat(struct ata_queued_cmd *qc)
 static struct ata_device *ata_find_dev(struct ata_port *ap, int devno)
 {
 	if (!sata_pmp_attached(ap)) {
-		if (likely(devno < ata_link_max_devices(&ap->link)))
+		if (likely(devno >= 0 &&
+			   devno < ata_link_max_devices(&ap->link)))
 			return &ap->link.device[devno];
 	} else {
-		if (likely(devno < ap->nr_pmp_links))
+		if (likely(devno >= 0 &&
+			   devno < ap->nr_pmp_links))
 			return &ap->pmp_link[devno].device[0];
 	}
 
@@ -3220,6 +3249,12 @@ static unsigned int ata_scsi_pass_thru(struct ata_queued_cmd *qc)
 
 	/* We may not issue DMA commands if no DMA mode is set */
 	if (tf->protocol == ATA_PROT_DMA && dev->dma_mode == 0) {
+		fp = 1;
+		goto invalid_fld;
+	}
+
+	/* We may not issue NCQ commands to devices not supporting NCQ */
+	if (ata_is_ncq(tf->protocol) && !ata_ncq_enabled(dev)) {
 		fp = 1;
 		goto invalid_fld;
 	}
@@ -3764,10 +3799,20 @@ static unsigned int ata_scsi_zbc_out_xlat(struct ata_queued_cmd *qc)
 		 */
 		goto invalid_param_len;
 	}
-	if (block > dev->n_sectors)
-		goto out_of_range;
 
 	all = cdb[14] & 0x1;
+	if (all) {
+		/*
+		 * Ignore the block address (zone ID) as defined by ZBC.
+		 */
+		block = 0;
+	} else if (block >= dev->n_sectors) {
+		/*
+		 * Block must be a valid zone ID (a zone start LBA).
+		 */
+		fp = 2;
+		goto invalid_fld;
+	}
 
 	if (ata_ncq_enabled(qc->dev) &&
 	    ata_fpdma_zac_mgmt_out_supported(qc->dev)) {
@@ -3795,10 +3840,6 @@ static unsigned int ata_scsi_zbc_out_xlat(struct ata_queued_cmd *qc)
 
  invalid_fld:
 	ata_scsi_set_invalid_field(qc->dev, scmd, fp, 0xff);
-	return 1;
- out_of_range:
-	/* "Logical Block Address out of range" */
-	ata_scsi_set_sense(qc->dev, scmd, ILLEGAL_REQUEST, 0x21, 0x00);
 	return 1;
 invalid_param_len:
 	/* "Parameter list length error" */
@@ -3932,12 +3973,13 @@ static unsigned int ata_scsi_mode_select_xlat(struct ata_queued_cmd *qc)
 {
 	struct scsi_cmnd *scmd = qc->scsicmd;
 	const u8 *cdb = scmd->cmnd;
-	const u8 *p;
 	u8 pg, spg;
 	unsigned six_byte, pg_len, hdr_len, bd_len;
 	int len;
 	u16 fp = (u16)-1;
 	u8 bp = 0xff;
+	u8 buffer[64];
+	const u8 *p = buffer;
 
 	VPRINTK("ENTER\n");
 
@@ -3971,10 +4013,12 @@ static unsigned int ata_scsi_mode_select_xlat(struct ata_queued_cmd *qc)
 	if (!scsi_sg_count(scmd) || scsi_sglist(scmd)->length < len)
 		goto invalid_param_len;
 
-	p = page_address(sg_page(scsi_sglist(scmd)));
-
 	/* Move past header and block descriptors.  */
 	if (len < hdr_len)
+		goto invalid_param_len;
+
+	if (!sg_copy_to_buffer(scsi_sglist(scmd), scsi_sg_count(scmd),
+			       buffer, sizeof(buffer)))
 		goto invalid_param_len;
 
 	if (six_byte)
@@ -4148,7 +4192,7 @@ static inline void ata_scsi_dump_cdb(struct ata_port *ap,
 #ifdef ATA_DEBUG
 	struct scsi_device *scsidev = cmd->device;
 
-	DPRINTK("CDB (%u:%d,%d,%d) %9ph\n",
+	DPRINTK("CDB (%u:%d,%d,%lld) %9ph\n",
 		ap->print_id,
 		scsidev->channel, scsidev->id, scsidev->lun,
 		cmd->cmnd);
@@ -4175,7 +4219,9 @@ static inline int __ata_scsi_queuecmd(struct scsi_cmnd *scmd,
 		if (likely((scsi_op != ATA_16) || !atapi_passthru16)) {
 			/* relay SCSI command to ATAPI device */
 			int len = COMMAND_SIZE(scsi_op);
-			if (unlikely(len > scmd->cmd_len || len > dev->cdb_len))
+			if (unlikely(len > scmd->cmd_len ||
+				     len > dev->cdb_len ||
+				     scmd->cmd_len > ATAPI_CDB_LEN))
 				goto bad_cdb_len;
 
 			xlat_func = atapi_xlat;
@@ -4407,22 +4453,19 @@ int ata_scsi_add_hosts(struct ata_host *host, struct scsi_host_template *sht)
 		 */
 		shost->max_host_blocked = 1;
 
-		rc = scsi_add_host_with_dma(ap->scsi_host,
-						&ap->tdev, ap->host->dev);
+		rc = scsi_add_host_with_dma(shost, &ap->tdev, ap->host->dev);
 		if (rc)
-			goto err_add;
+			goto err_alloc;
 	}
 
 	return 0;
 
- err_add:
-	scsi_host_put(host->ports[i]->scsi_host);
  err_alloc:
 	while (--i >= 0) {
 		struct Scsi_Host *shost = host->ports[i]->scsi_host;
 
+		/* scsi_host_put() is in ata_devres_release() */
 		scsi_remove_host(shost);
-		scsi_host_put(shost);
 	}
 	return rc;
 }

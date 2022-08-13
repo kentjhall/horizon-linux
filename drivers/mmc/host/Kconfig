@@ -204,7 +204,6 @@ config MMC_SDHCI_DOVE
 
 config MMC_SDHCI_TEGRA
 	tristate "SDHCI platform support for the Tegra SD/MMC Controller"
-	depends on ARCH_TEGRA
 	depends on MMC_SDHCI_PLTFM
 	select MMC_SDHCI_IO_ACCESSORS
 	help
@@ -798,3 +797,15 @@ config MMC_SDHCI_BRCMSTB
 	  Broadcom STB SoCs.
 
 	  If unsure, say Y.
+config MMC_CQ_HCI
+	tristate "Command Queue Support"
+	depends on HAS_DMA
+	help
+		This selects the Command Queue Host Controller Interface (CQHCI)
+		support present in host controllers of Qualcomm Technologies, Inc
+		amongst others.
+		This controller supports eMMC devices with command queue support.
+
+		If you have a controller with this interface, say Y or M here.
+
+		If unsure, say N.

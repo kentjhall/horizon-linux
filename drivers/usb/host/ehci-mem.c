@@ -71,9 +71,10 @@ static void qh_destroy(struct ehci_hcd *ehci, struct ehci_qh *qh)
 		ehci_dbg (ehci, "unused qh not empty!\n");
 		BUG ();
 	}
-	if (qh->dummy)
+	if (ehci->qtd_pool && qh->dummy)
 		ehci_qtd_free (ehci, qh->dummy);
-	dma_pool_free(ehci->qh_pool, qh->hw, qh->qh_dma);
+	if (ehci->qh_pool)
+		dma_pool_free(ehci->qh_pool, qh->hw, qh->qh_dma);
 	kfree(qh);
 }
 
@@ -233,6 +234,6 @@ static int ehci_mem_init (struct ehci_hcd *ehci, gfp_t flags)
 
 fail:
 	ehci_dbg (ehci, "couldn't init memory\n");
-	ehci_mem_cleanup (ehci);
+	ehci_mem_cleanup(ehci);
 	return -ENOMEM;
 }

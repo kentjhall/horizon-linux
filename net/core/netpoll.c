@@ -28,6 +28,7 @@
 #include <linux/slab.h>
 #include <linux/export.h>
 #include <linux/if_vlan.h>
+#include <net/dsa.h>
 #include <net/tcp.h>
 #include <net/udp.h>
 #include <net/addrconf.h>
@@ -105,18 +106,24 @@ static void queue_process(struct work_struct *work)
 	while ((skb = skb_dequeue(&npinfo->txq))) {
 		struct net_device *dev = skb->dev;
 		struct netdev_queue *txq;
+		unsigned int q_index;
 
 		if (!netif_device_present(dev) || !netif_running(dev)) {
 			kfree_skb(skb);
 			continue;
 		}
 
-		txq = skb_get_tx_queue(dev, skb);
-
 		local_irq_save(flags);
+		/* check if skb->queue_mapping is still valid */
+		q_index = skb_get_queue_mapping(skb);
+		if (unlikely(q_index >= dev->real_num_tx_queues)) {
+			q_index = q_index % dev->real_num_tx_queues;
+			skb_set_queue_mapping(skb, q_index);
+		}
+		txq = netdev_get_tx_queue(dev, q_index);
 		HARD_TX_LOCK(dev, txq, smp_processor_id());
 		if (netif_xmit_frozen_or_stopped(txq) ||
-		    netpoll_start_xmit(skb, dev, txq) != NETDEV_TX_OK) {
+		    !dev_xmit_complete(netpoll_start_xmit(skb, dev, txq))) {
 			skb_queue_head(&npinfo->txq, skb);
 			HARD_TX_UNLOCK(dev, txq);
 			local_irq_restore(flags);
@@ -172,7 +179,7 @@ static void poll_napi(struct net_device *dev)
 {
 	struct napi_struct *napi;
 
-	list_for_each_entry(napi, &dev->napi_list, dev_list) {
+	list_for_each_entry_rcu(napi, &dev->napi_list, dev_list) {
 		if (napi->poll_owner != smp_processor_id() &&
 		    spin_trylock(&napi->poll_lock)) {
 			poll_one_napi(napi);
@@ -351,7 +358,7 @@ void netpoll_send_skb_on_dev(struct netpoll *np, struct sk_buff *skb,
 
 				HARD_TX_UNLOCK(dev, txq);
 
-				if (status == NETDEV_TX_OK)
+				if (dev_xmit_complete(status))
 					break;
 
 			}
@@ -368,7 +375,7 @@ void netpoll_send_skb_on_dev(struct netpoll *np, struct sk_buff *skb,
 
 	}
 
-	if (status != NETDEV_TX_OK) {
+	if (!dev_xmit_complete(status)) {
 		skb_queue_tail(&npinfo->txq, skb);
 		schedule_delayed_work(&npinfo->tx_work,0);
 	}
@@ -655,21 +662,34 @@ EXPORT_SYMBOL_GPL(__netpoll_setup);
 
 int netpoll_setup(struct netpoll *np)
 {
-	struct net_device *ndev = NULL;
+	struct net_device *ndev = NULL, *dev = NULL;
+	struct net *net = current->nsproxy->net_ns;
 	struct in_device *in_dev;
 	int err;
 
 	rtnl_lock();
-	if (np->dev_name) {
-		struct net *net = current->nsproxy->net_ns;
+	if (np->dev_name[0])
 		ndev = __dev_get_by_name(net, np->dev_name);
-	}
+
 	if (!ndev) {
 		np_err(np, "%s doesn't exist, aborting\n", np->dev_name);
 		err = -ENODEV;
 		goto unlock;
 	}
 	dev_hold(ndev);
+
+	/* bring up DSA management network devices up first */
+	for_each_netdev(net, dev) {
+		if (!netdev_uses_dsa(dev))
+			continue;
+
+		err = dev_change_flags(dev, dev->flags | IFF_UP);
+		if (err < 0) {
+			np_err(np, "%s failed to open %s\n",
+			       np->dev_name, dev->name);
+			goto put;
+		}
+	}
 
 	if (netdev_master_upper_dev_get(ndev)) {
 		np_err(np, "%s is a slave device, aborting\n", np->dev_name);

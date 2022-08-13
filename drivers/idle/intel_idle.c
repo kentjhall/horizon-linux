@@ -724,6 +724,50 @@ static struct cpuidle_state atom_cstates[] = {
 	{
 		.enter = NULL }
 };
+static struct cpuidle_state tangier_cstates[] = {
+	{
+		.name = "C1-TNG",
+		.desc = "MWAIT 0x00",
+		.flags = MWAIT2flg(0x00),
+		.exit_latency = 1,
+		.target_residency = 4,
+		.enter = &intel_idle,
+		.enter_freeze = intel_idle_freeze, },
+	{
+		.name = "C4-TNG",
+		.desc = "MWAIT 0x30",
+		.flags = MWAIT2flg(0x30) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 100,
+		.target_residency = 400,
+		.enter = &intel_idle,
+		.enter_freeze = intel_idle_freeze, },
+	{
+		.name = "C6-TNG",
+		.desc = "MWAIT 0x52",
+		.flags = MWAIT2flg(0x52) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 140,
+		.target_residency = 560,
+		.enter = &intel_idle,
+		.enter_freeze = intel_idle_freeze, },
+	{
+		.name = "C7-TNG",
+		.desc = "MWAIT 0x60",
+		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 1200,
+		.target_residency = 4000,
+		.enter = &intel_idle,
+		.enter_freeze = intel_idle_freeze, },
+	{
+		.name = "C9-TNG",
+		.desc = "MWAIT 0x64",
+		.flags = MWAIT2flg(0x64) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 10000,
+		.target_residency = 20000,
+		.enter = &intel_idle,
+		.enter_freeze = intel_idle_freeze, },
+	{
+		.enter = NULL }
+};
 static struct cpuidle_state avn_cstates[] = {
 	{
 		.name = "C1-AVN",
@@ -978,6 +1022,10 @@ static const struct idle_cpu idle_cpu_atom = {
 	.state_table = atom_cstates,
 };
 
+static const struct idle_cpu idle_cpu_tangier = {
+	.state_table = tangier_cstates,
+};
+
 static const struct idle_cpu idle_cpu_lincroft = {
 	.state_table = atom_cstates,
 	.auto_demotion_disable_flags = ATM_LNC_C6_AUTO_DEMOTE,
@@ -1059,13 +1107,14 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
 	ICPU(INTEL_FAM6_WESTMERE,		idle_cpu_nehalem),
 	ICPU(INTEL_FAM6_WESTMERE_EP,		idle_cpu_nehalem),
 	ICPU(INTEL_FAM6_NEHALEM_EX,		idle_cpu_nehalem),
-	ICPU(INTEL_FAM6_ATOM_PINEVIEW,		idle_cpu_atom),
-	ICPU(INTEL_FAM6_ATOM_LINCROFT,		idle_cpu_lincroft),
+	ICPU(INTEL_FAM6_ATOM_BONNELL,		idle_cpu_atom),
+	ICPU(INTEL_FAM6_ATOM_BONNELL_MID,		idle_cpu_lincroft),
 	ICPU(INTEL_FAM6_WESTMERE_EX,		idle_cpu_nehalem),
 	ICPU(INTEL_FAM6_SANDYBRIDGE,		idle_cpu_snb),
 	ICPU(INTEL_FAM6_SANDYBRIDGE_X,		idle_cpu_snb),
-	ICPU(INTEL_FAM6_ATOM_CEDARVIEW,		idle_cpu_atom),
-	ICPU(INTEL_FAM6_ATOM_SILVERMONT1,	idle_cpu_byt),
+	ICPU(INTEL_FAM6_ATOM_SALTWELL,		idle_cpu_atom),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT,	idle_cpu_byt),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT_MID,	idle_cpu_tangier),
 	ICPU(INTEL_FAM6_ATOM_AIRMONT,		idle_cpu_cht),
 	ICPU(INTEL_FAM6_IVYBRIDGE,		idle_cpu_ivb),
 	ICPU(INTEL_FAM6_IVYBRIDGE_X,		idle_cpu_ivt),
@@ -1073,7 +1122,7 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
 	ICPU(INTEL_FAM6_HASWELL_X,		idle_cpu_hsw),
 	ICPU(INTEL_FAM6_HASWELL_ULT,		idle_cpu_hsw),
 	ICPU(INTEL_FAM6_HASWELL_GT3E,		idle_cpu_hsw),
-	ICPU(INTEL_FAM6_ATOM_SILVERMONT2,	idle_cpu_avn),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT_X,	idle_cpu_avn),
 	ICPU(INTEL_FAM6_BROADWELL_CORE,		idle_cpu_bdw),
 	ICPU(INTEL_FAM6_BROADWELL_GT3E,		idle_cpu_bdw),
 	ICPU(INTEL_FAM6_BROADWELL_X,		idle_cpu_bdw),
@@ -1085,7 +1134,7 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
 	ICPU(INTEL_FAM6_SKYLAKE_X,		idle_cpu_skx),
 	ICPU(INTEL_FAM6_XEON_PHI_KNL,		idle_cpu_knl),
 	ICPU(INTEL_FAM6_ATOM_GOLDMONT,		idle_cpu_bxt),
-	ICPU(INTEL_FAM6_ATOM_DENVERTON,		idle_cpu_dnv),
+	ICPU(INTEL_FAM6_ATOM_GOLDMONT_X,	idle_cpu_dnv),
 	{}
 };
 

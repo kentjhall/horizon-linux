@@ -129,3 +129,9 @@ void pcie_ecrc_get_policy(char *str)
 
 	ecrc_policy = i;
 }
+
+bool pcie_is_ecrc_enabled(void)
+{
+	return ecrc_policy == ECRC_POLICY_ON ? 1 : 0;
+}
+EXPORT_SYMBOL(pcie_is_ecrc_enabled);

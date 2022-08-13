@@ -311,6 +311,9 @@ int blk_mq_reinit_tagset(struct blk_mq_tag_set *set)
 	for (i = 0; i < set->nr_hw_queues; i++) {
 		struct blk_mq_tags *tags = set->tags[i];
 
+		if (!tags)
+			continue;
+
 		for (j = 0; j < tags->nr_tags; j++) {
 			if (!tags->rqs[j])
 				continue;
@@ -333,6 +336,13 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
 	struct blk_mq_hw_ctx *hctx;
 	int i;
 
+	/*
+	 * __blk_mq_update_nr_hw_queues will update the nr_hw_queues and
+	 * queue_hw_ctx after freeze the queue, so we use q_usage_counter
+	 * to avoid race with it.
+	 */
+	if (!percpu_ref_tryget(&q->q_usage_counter))
+		return;
 
 	queue_for_each_hw_ctx(q, hctx, i) {
 		struct blk_mq_tags *tags = hctx->tags;
@@ -348,7 +358,7 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
 			bt_for_each(hctx, &tags->breserved_tags, fn, priv, true);
 		bt_for_each(hctx, &tags->bitmap_tags, fn, priv, false);
 	}
-
+	blk_queue_exit(q);
 }
 
 static unsigned int bt_unused_tags(const struct sbitmap_queue *bt)

@@ -54,6 +54,7 @@ static void ip6_datagram_flow_key_init(struct flowi6 *fl6, struct sock *sk)
 	fl6->fl6_dport = inet->inet_dport;
 	fl6->fl6_sport = inet->inet_sport;
 	fl6->flowlabel = np->flow_label;
+	fl6->flowi6_uid = sk->sk_uid;
 
 	if (!fl6->flowi6_oif)
 		fl6->flowi6_oif = np->sticky_pktinfo.ipi6_ifindex;
@@ -87,7 +88,7 @@ int ip6_datagram_dst_update(struct sock *sk, bool fix_sk_saddr)
 	final_p = fl6_update_dst(&fl6, opt, &final);
 	rcu_read_unlock();
 
-	dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
+	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl6, final_p);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto out;
@@ -145,10 +146,12 @@ int __ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr,
 	struct sockaddr_in6	*usin = (struct sockaddr_in6 *) uaddr;
 	struct inet_sock	*inet = inet_sk(sk);
 	struct ipv6_pinfo	*np = inet6_sk(sk);
-	struct in6_addr		*daddr;
+	struct in6_addr		*daddr, old_daddr;
+	__be32			fl6_flowlabel = 0;
+	__be32			old_fl6_flowlabel;
+	__be32			old_dport;
 	int			addr_type;
 	int			err;
-	__be32			fl6_flowlabel = 0;
 
 	if (usin->sin6_family == AF_INET) {
 		if (__ipv6_only_sock(sk))
@@ -166,18 +169,22 @@ int __ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr,
 	if (np->sndflow)
 		fl6_flowlabel = usin->sin6_flowinfo & IPV6_FLOWINFO_MASK;
 
-	addr_type = ipv6_addr_type(&usin->sin6_addr);
-
-	if (addr_type == IPV6_ADDR_ANY) {
+	if (ipv6_addr_any(&usin->sin6_addr)) {
 		/*
 		 *	connect to self
 		 */
-		usin->sin6_addr.s6_addr[15] = 0x01;
+		if (ipv6_addr_v4mapped(&sk->sk_v6_rcv_saddr))
+			ipv6_addr_set_v4mapped(htonl(INADDR_LOOPBACK),
+					       &usin->sin6_addr);
+		else
+			usin->sin6_addr = in6addr_loopback;
 	}
+
+	addr_type = ipv6_addr_type(&usin->sin6_addr);
 
 	daddr = &usin->sin6_addr;
 
-	if (addr_type == IPV6_ADDR_MAPPED) {
+	if (addr_type & IPV6_ADDR_MAPPED) {
 		struct sockaddr_in sin;
 
 		if (__ipv6_only_sock(sk)) {
@@ -234,9 +241,13 @@ ipv4_connected:
 		}
 	}
 
+	/* save the current peer information before updating it */
+	old_daddr = sk->sk_v6_daddr;
+	old_fl6_flowlabel = np->flow_label;
+	old_dport = inet->inet_dport;
+
 	sk->sk_v6_daddr = *daddr;
 	np->flow_label = fl6_flowlabel;
-
 	inet->inet_dport = usin->sin6_port;
 
 	/*
@@ -245,8 +256,15 @@ ipv4_connected:
 	 */
 
 	err = ip6_datagram_dst_update(sk, true);
-	if (err)
+	if (err) {
+		/* Restore the socket peer info, to keep it consistent with
+		 * the old socket state
+		 */
+		sk->sk_v6_daddr = old_daddr;
+		np->flow_label = old_fl6_flowlabel;
+		inet->inet_dport = old_dport;
 		goto out;
+	}
 
 	sk->sk_state = TCP_ESTABLISHED;
 	sk_set_txhash(sk);
@@ -331,6 +349,7 @@ void ipv6_local_error(struct sock *sk, int err, struct flowi6 *fl6, u32 info)
 	skb_reset_network_header(skb);
 	iph = ipv6_hdr(skb);
 	iph->daddr = fl6->daddr;
+	ip6_flow_hdr(iph, 0, 0);
 
 	serr = SKB_EXT_ERR(skb);
 	serr->ee.ee_errno = err;
@@ -400,9 +419,6 @@ static inline bool ipv6_datagram_support_addr(struct sock_exterr_skb *serr)
  * At one point, excluding local errors was a quick test to identify icmp/icmp6
  * errors. This is no longer true, but the test remained, so the v6 stack,
  * unlike v4, also honors cmsg requests on all wifi and timestamp errors.
- *
- * Timestamp code paths do not initialize the fields expected by cmsg:
- * the PKTINFO fields in skb->cb[]. Fill those in here.
  */
 static bool ip6_datagram_support_cmsg(struct sk_buff *skb,
 				      struct sock_exterr_skb *serr)
@@ -414,13 +430,8 @@ static bool ip6_datagram_support_cmsg(struct sk_buff *skb,
 	if (serr->ee.ee_origin == SO_EE_ORIGIN_LOCAL)
 		return false;
 
-	if (!skb->dev)
+	if (!IP6CB(skb)->iif)
 		return false;
-
-	if (skb->protocol == htons(ETH_P_IPV6))
-		IP6CB(skb)->iif = skb->dev->ifindex;
-	else
-		PKTINFO_SKB_CB(skb)->ipi_ifindex = skb->dev->ifindex;
 
 	return true;
 }
@@ -698,14 +709,15 @@ void ip6_datagram_recv_specific_ctl(struct sock *sk, struct msghdr *msg,
 	}
 	if (np->rxopt.bits.rxorigdstaddr) {
 		struct sockaddr_in6 sin6;
-		__be16 *ports = (__be16 *) skb_transport_header(skb);
+		__be16 _ports[2], *ports;
 
-		if (skb_transport_offset(skb) + 4 <= skb->len) {
+		ports = skb_header_pointer(skb, skb_transport_offset(skb),
+					   sizeof(_ports), &_ports);
+		if (ports) {
 			/* All current transport protocols have the port numbers in the
 			 * first four bytes of the transport header and this function is
 			 * written with this assumption in mind.
 			 */
-
 			sin6.sin6_family = AF_INET6;
 			sin6.sin6_addr = ipv6_hdr(skb)->daddr;
 			sin6.sin6_port = ports[1];

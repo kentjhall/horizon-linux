@@ -1,6 +1,7 @@
 /*
  * usb port device code
  *
+ * Copyright (c) 2015-2017, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (C) 2012 Intel Corp
  *
  * Author: Lan Tianyu <tianyu.lan@intel.com>
@@ -179,7 +180,10 @@ static int usb_port_runtime_resume(struct device *dev)
 	if (!port_dev->is_superspeed && peer)
 		pm_runtime_get_sync(&peer->dev);
 
-	usb_autopm_get_interface(intf);
+	retval = usb_autopm_get_interface(intf);
+	if (retval < 0)
+		return retval;
+
 	retval = usb_hub_set_port_power(hdev, hub, port1, true);
 	msleep(hub_power_on_good_delay(hub));
 	if (udev && !retval) {
@@ -232,7 +236,10 @@ static int usb_port_runtime_suspend(struct device *dev)
 	if (usb_port_block_power_off)
 		return -EBUSY;
 
-	usb_autopm_get_interface(intf);
+	retval = usb_autopm_get_interface(intf);
+	if (retval < 0)
+		return retval;
+
 	retval = usb_hub_set_port_power(hdev, hub, port1, false);
 	usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_CONNECTION);
 	if (!port_dev->is_superspeed)
@@ -566,6 +573,9 @@ void usb_hub_remove_port_device(struct usb_hub *hub, int port1)
 {
 	struct usb_port *port_dev = hub->ports[port1 - 1];
 	struct usb_port *peer;
+
+	if (port_dev == NULL)
+		return;
 
 	peer = port_dev->peer;
 	if (peer)

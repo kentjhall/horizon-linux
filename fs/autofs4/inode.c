@@ -14,7 +14,6 @@
 #include <linux/pagemap.h>
 #include <linux/parser.h>
 #include <linux/bitops.h>
-#include <linux/magic.h>
 #include "autofs_i.h"
 #include <linux/module.h>
 
@@ -260,8 +259,10 @@ int autofs4_fill_super(struct super_block *s, void *data, int silent)
 	}
 	root_inode = autofs4_get_inode(s, S_IFDIR | 0755);
 	root = d_make_root(root_inode);
-	if (!root)
+	if (!root) {
+		ret = -ENOMEM;
 		goto fail_ino;
+	}
 	pipe = NULL;
 
 	root->d_fsdata = ino;

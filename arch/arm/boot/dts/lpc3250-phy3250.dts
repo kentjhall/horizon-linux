@@ -49,8 +49,8 @@
 		sd_reg: regulator@2 {
 			compatible = "regulator-fixed";
 			regulator-name = "sd_reg";
-			regulator-min-microvolt = <1800000>;
-			regulator-max-microvolt = <1800000>;
+			regulator-min-microvolt = <3300000>;
+			regulator-max-microvolt = <3300000>;
 			gpio = <&gpio 5 5 0>;
 			enable-active-high;
 		};
@@ -81,8 +81,8 @@
 	uda1380: uda1380@18 {
 		compatible = "nxp,uda1380";
 		reg = <0x18>;
-		power-gpio = <&gpio 0x59 0>;
-		reset-gpio = <&gpio 0x51 0>;
+		power-gpio = <&gpio 3 10 0>;
+		reset-gpio = <&gpio 3 2 0>;
 		dac-clk = "wspll";
 	};
 

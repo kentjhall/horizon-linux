@@ -14,6 +14,15 @@ config POWER_SUPPLY_DEBUG
 	  Say Y here to enable debugging messages for power supply class
 	  and drivers.
 
+config POWER_SUPPLY_EXTCON
+	bool "Power supply detection through extcon"
+	depends on EXTCON
+	help
+	  Say Y to enable the power supply cable type notification
+	  through extcon. The external driver like USB Host identify
+	  the supply type and generate the cable type notification
+	  through extcon.
+
 config PDA_POWER
 	tristate "Generic PDA/phone power driver"
 	depends on !S390
@@ -177,6 +186,24 @@ config BATTERY_BQ27XXX_I2C
 	help
 	  Say Y here to enable support for batteries with BQ27xxx chips
 	  connected over an I2C bus.
+
+config BATTERY_BQ27441
+	tristate "TI's BQ27441 Fuel Gauge"
+	depends on I2C
+	select BATTERY_CHARGER_GAUGE_COMM
+	help
+	  BQ27441 is fuel-gauge systems for lithium-ion (Li+) batteries
+	  in handheld and portable equipment.
+
+config BATTERY_GPIO
+	tristate "GPIO gas gauge"
+	depends on GPIOLIB
+	help
+	  Say Y to enable support for gas gauges which simply use a gpio to be
+	  notified when they are low and need to shut down.
+
+	  This driver can be built as a module. If so, the module will be
+	  called gpio-gas-gauge.
 
 config BATTERY_DA9030
 	tristate "DA9030 battery driver"
@@ -424,7 +451,7 @@ config CHARGER_BQ24257
 	tristate "TI BQ24250/24251/24257 battery charger driver"
 	depends on I2C
 	depends on GPIOLIB || COMPILE_TEST
-	depends on REGMAP_I2C
+	select REGMAP_I2C
 	help
 	  Say Y to enable support for the TI BQ24250, BQ24251, and BQ24257 battery
 	  chargers.
@@ -435,6 +462,14 @@ config CHARGER_BQ24735
 	depends on GPIOLIB || COMPILE_TEST
 	help
 	  Say Y to enable support for the TI BQ24735 battery charger.
+
+config CHARGER_BQ2419X
+	tristate "BQ24190/BQ24192/BQ24192i/BQ24193 Charger driver support"
+	depends on I2C
+	select BATTERY_CHARGER_GAUGE_COMM
+	help
+	  Say Y here to enable driver support for TI BQ24190/
+	  BQ24192/BQ24192i/BQ24193 Charger.
 
 config CHARGER_BQ25890
 	tristate "TI BQ25890 battery charger driver"
@@ -465,6 +500,13 @@ config CHARGER_TPS65217
 	help
 	 Say Y here to enable support for battery charging with TPS65217
 	 PMIC chips.
+
+config CHARGER_ISL9238
+	tristate "ISL9238 buck-boost Narrow Output Voltage DC battery charger"
+	depends on I2C
+	help
+	  Say Y here to enable battery charger driver support for
+	  ISL ISL9238/ISL9238A NVDC battery charger.
 
 config BATTERY_GAUGE_LTC2941
 	tristate "LTC2941/LTC2943 Battery Gauge Driver"
@@ -510,5 +552,22 @@ config AXP20X_POWER
 	help
 	  This driver provides support for the power supply features of
 	  AXP20x PMIC.
+
+config BATTERY_BQ40Z50
+        tristate "TI BQ40Z50 Fuel Gauge driver"
+        depends on I2C
+        select BATTERY_CHARGER_GAUGE_COMM
+        help
+          BQ40Z50 FG device incorporating impedance track technolody,
+	  is a fully integrated 1-series, 2-series, 3-series,
+	  4-series Li-Ion or Li-Polymer cell battery pack manager
+	  and protection.
+
+config BATTERY_CHARGER_GAUGE_COMM
+	bool "Battery charger and Fuel gauge interface layer"
+	help
+	  This driver is to communicate from charger driver to fuel
+	  gauge driver and vice versa.this interface needed to pass battery
+	  status information.
 
 endif # POWER_SUPPLY

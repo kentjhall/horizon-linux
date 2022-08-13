@@ -10,6 +10,8 @@ Required properties:
 Optional properties:
 - assert-falling-edge: when present, assert is indicated by a falling edge
                        (instead of by a rising edge)
+- capture-clear: when present, captures clear events (If asserts on falling
+                 edge, clear events occur on rising edge or vice-versa)
 
 Example:
 	pps {

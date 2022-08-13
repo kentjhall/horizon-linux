@@ -225,20 +225,21 @@ find_appropriate_src(struct net *net,
 		.tuple = tuple,
 		.zone = zone
 	};
-	struct rhlist_head *hl;
+	struct rhlist_head *hl, *h;
 
 	hl = rhltable_lookup(&nf_nat_bysource_table, &key,
 			     nf_nat_bysource_params);
-	if (!hl)
-		return 0;
 
-	ct = container_of(hl, typeof(*ct), nat_bysource);
+	rhl_for_each_entry_rcu(ct, h, hl, nat_bysource) {
+		nf_ct_invert_tuplepr(result,
+				     &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
+		result->dst = tuple->dst;
 
-	nf_ct_invert_tuplepr(result,
-			     &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
-	result->dst = tuple->dst;
+		if (in_range(l3proto, l4proto, result, range))
+			return 1;
+	}
 
-	return in_range(l3proto, l4proto, result, range);
+	return 0;
 }
 
 /* For [FUTURE] fragmentation handling, we want the least-used
@@ -445,7 +446,7 @@ nf_nat_setup_info(struct nf_conn *ct,
 		else
 			ct->status |= IPS_DST_NAT;
 
-		if (nfct_help(ct))
+		if (nfct_help(ct) && !nfct_seqadj(ct))
 			if (!nfct_seqadj_ext_add(ct))
 				return NF_DROP;
 	}
@@ -549,10 +550,6 @@ struct nf_nat_proto_clean {
 static int nf_nat_proto_remove(struct nf_conn *i, void *data)
 {
 	const struct nf_nat_proto_clean *clean = data;
-	struct nf_conn_nat *nat = nfct_nat(i);
-
-	if (!nat)
-		return 0;
 
 	if ((clean->l3proto && nf_ct_l3num(i) != clean->l3proto) ||
 	    (clean->l4proto && nf_ct_protonum(i) != clean->l4proto))
@@ -563,12 +560,10 @@ static int nf_nat_proto_remove(struct nf_conn *i, void *data)
 
 static int nf_nat_proto_clean(struct nf_conn *ct, void *data)
 {
-	struct nf_conn_nat *nat = nfct_nat(ct);
-
 	if (nf_nat_proto_remove(ct, data))
 		return 1;
 
-	if (!nat)
+	if ((ct->status & IPS_SRC_NAT_DONE) == 0)
 		return 0;
 
 	/* This netns is being destroyed, and conntrack has nat null binding.
@@ -704,13 +699,9 @@ EXPORT_SYMBOL_GPL(nf_nat_l3proto_unregister);
 /* No one using conntrack by the time this called. */
 static void nf_nat_cleanup_conntrack(struct nf_conn *ct)
 {
-	struct nf_conn_nat *nat = nf_ct_ext_find(ct, NF_CT_EXT_NAT);
-
-	if (!nat)
-		return;
-
-	rhltable_remove(&nf_nat_bysource_table, &ct->nat_bysource,
-			nf_nat_bysource_params);
+	if (ct->status & IPS_SRC_NAT_DONE)
+		rhltable_remove(&nf_nat_bysource_table, &ct->nat_bysource,
+				nf_nat_bysource_params);
 }
 
 static struct nf_ct_ext_type nat_extend __read_mostly = {
@@ -891,6 +882,8 @@ static void __exit nf_nat_cleanup(void)
 #ifdef CONFIG_XFRM
 	RCU_INIT_POINTER(nf_nat_decode_session_hook, NULL);
 #endif
+	synchronize_rcu();
+
 	for (i = 0; i < NFPROTO_NUMPROTO; i++)
 		kfree(nf_nat_l4protos[i]);
 

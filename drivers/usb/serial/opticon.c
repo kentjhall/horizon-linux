@@ -116,7 +116,7 @@ static int send_control_msg(struct usb_serial_port *port, u8 requesttype,
 	retval = usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0),
 				requesttype,
 				USB_DIR_OUT|USB_TYPE_VENDOR|USB_RECIP_INTERFACE,
-				0, 0, buffer, 1, 0);
+				0, 0, buffer, 1, USB_CTRL_SET_TIMEOUT);
 	kfree(buffer);
 
 	if (retval < 0)
@@ -142,7 +142,7 @@ static int opticon_open(struct tty_struct *tty, struct usb_serial_port *port)
 	usb_clear_halt(port->serial->dev, port->read_urb->pipe);
 
 	res = usb_serial_generic_open(tty, port);
-	if (!res)
+	if (res)
 		return res;
 
 	/* Request CTS line state, sometimes during opening the current

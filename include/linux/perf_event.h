@@ -455,6 +455,11 @@ struct pmu {
 	 * Filter events for PMU-specific reasons.
 	 */
 	int (*filter_match)		(struct perf_event *event); /* optional */
+
+	/*
+	 * Check period value for PERF_EVENT_IOC_PERIOD ioctl.
+	 */
+	int (*check_period)		(struct perf_event *event, u64 value); /* optional */
 };
 
 /**
@@ -470,7 +475,7 @@ struct pmu {
  */
 struct perf_addr_filter {
 	struct list_head	entry;
-	struct inode		*inode;
+	struct path		path;
 	unsigned long		offset;
 	unsigned long		size;
 	unsigned int		range	: 1,
@@ -1168,6 +1173,11 @@ extern int perf_cpu_time_max_percent_handler(struct ctl_table *table, int write,
 int perf_event_max_stack_handler(struct ctl_table *table, int write,
 				 void __user *buffer, size_t *lenp, loff_t *ppos);
 
+static inline bool perf_paranoid_any(void)
+{
+	return sysctl_perf_event_paranoid > 2;
+}
+
 static inline bool perf_paranoid_tracepoint_raw(void)
 {
 	return sysctl_perf_event_paranoid > -1;
@@ -1259,6 +1269,7 @@ extern void perf_event_disable(struct perf_event *event);
 extern void perf_event_disable_local(struct perf_event *event);
 extern void perf_event_disable_inatomic(struct perf_event *event);
 extern void perf_event_task_tick(void);
+extern int perf_event_account_interrupt(struct perf_event *event);
 #else /* !CONFIG_PERF_EVENTS: */
 static inline void *
 perf_aux_output_begin(struct perf_output_handle *handle,

@@ -735,6 +735,8 @@ hashlimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	return hashlimit_mt_common(skb, par, hinfo, &info->cfg, 2);
 }
 
+#define HASHLIMIT_MAX_SIZE 1048576
+
 static int hashlimit_mt_check_common(const struct xt_mtchk_param *par,
 				     struct xt_hashlimit_htable **hinfo,
 				     struct hashlimit_cfg2 *cfg,
@@ -745,6 +747,14 @@ static int hashlimit_mt_check_common(const struct xt_mtchk_param *par,
 
 	if (cfg->gc_interval == 0 || cfg->expire == 0)
 		return -EINVAL;
+	if (cfg->size > HASHLIMIT_MAX_SIZE) {
+		cfg->size = HASHLIMIT_MAX_SIZE;
+		pr_info_ratelimited("size too large, truncated to %u\n", cfg->size);
+	}
+	if (cfg->max > HASHLIMIT_MAX_SIZE) {
+		cfg->max = HASHLIMIT_MAX_SIZE;
+		pr_info_ratelimited("max too large, truncated to %u\n", cfg->max);
+	}
 	if (par->family == NFPROTO_IPV4) {
 		if (cfg->srcmask > 32 || cfg->dstmask > 32)
 			return -EINVAL;
@@ -794,8 +804,9 @@ static int hashlimit_mt_check_v1(const struct xt_mtchk_param *par)
 	struct hashlimit_cfg2 cfg = {};
 	int ret;
 
-	if (info->name[sizeof(info->name) - 1] != '\0')
-		return -EINVAL;
+	ret = xt_check_proc_name(info->name, sizeof(info->name));
+	if (ret)
+		return ret;
 
 	ret = cfg_copy(&cfg, (void *)&info->cfg, 1);
 
@@ -809,9 +820,11 @@ static int hashlimit_mt_check_v1(const struct xt_mtchk_param *par)
 static int hashlimit_mt_check(const struct xt_mtchk_param *par)
 {
 	struct xt_hashlimit_mtinfo2 *info = par->matchinfo;
+	int ret;
 
-	if (info->name[sizeof(info->name) - 1] != '\0')
-		return -EINVAL;
+	ret = xt_check_proc_name(info->name, sizeof(info->name));
+	if (ret)
+		return ret;
 
 	return hashlimit_mt_check_common(par, &info->hinfo, &info->cfg,
 					 info->name, 2);

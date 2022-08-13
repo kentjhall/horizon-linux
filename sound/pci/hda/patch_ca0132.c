@@ -38,6 +38,10 @@
 /* Enable this to see controls for tuning purpose. */
 /*#define ENABLE_TUNING_CONTROLS*/
 
+#ifdef ENABLE_TUNING_CONTROLS
+#include <sound/tlv.h>
+#endif
+
 #define FLOAT_ZERO	0x00000000
 #define FLOAT_ONE	0x3f800000
 #define FLOAT_TWO	0x40000000
@@ -780,6 +784,7 @@ static const struct hda_pintbl alienware_pincfgs[] = {
 static const struct snd_pci_quirk ca0132_quirks[] = {
 	SND_PCI_QUIRK(0x1028, 0x0685, "Alienware 15 2015", QUIRK_ALIENWARE),
 	SND_PCI_QUIRK(0x1028, 0x0688, "Alienware 17 2015", QUIRK_ALIENWARE),
+	SND_PCI_QUIRK(0x1028, 0x0708, "Alienware 15 R2 2016", QUIRK_ALIENWARE),
 	{}
 };
 
@@ -1295,13 +1300,14 @@ struct scp_msg {
 
 static void dspio_clear_response_queue(struct hda_codec *codec)
 {
+	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 	unsigned int dummy = 0;
-	int status = -1;
+	int status;
 
 	/* clear all from the response queue */
 	do {
 		status = dspio_read(codec, &dummy);
-	} while (status == 0);
+	} while (status == 0 && time_before(jiffies, timeout));
 }
 
 static int dspio_get_response_data(struct hda_codec *codec)
@@ -1480,6 +1486,9 @@ static int dspio_scp(struct hda_codec *codec,
 			return -EINVAL;
 		} else if (ret_size != reply_data_size) {
 			codec_dbg(codec, "RetLen and HdrLen .NE.\n");
+			return -EINVAL;
+		} else if (!reply) {
+			codec_dbg(codec, "NULL reply\n");
 			return -EINVAL;
 		} else {
 			*reply_len = ret_size*sizeof(unsigned int);
@@ -3063,8 +3072,8 @@ static int equalizer_ctl_put(struct snd_kcontrol *kcontrol,
 	return 1;
 }
 
-static const DECLARE_TLV_DB_SCALE(voice_focus_db_scale, 2000, 100, 0);
-static const DECLARE_TLV_DB_SCALE(eq_db_scale, -2400, 100, 0);
+static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(voice_focus_db_scale, 2000, 100, 0);
+static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(eq_db_scale, -2400, 100, 0);
 
 static int add_tuning_control(struct hda_codec *codec,
 				hda_nid_t pnid, hda_nid_t nid,
@@ -4416,12 +4425,14 @@ static void ca0132_process_dsp_response(struct hda_codec *codec,
 	struct ca0132_spec *spec = codec->spec;
 
 	codec_dbg(codec, "ca0132_process_dsp_response\n");
+	snd_hda_power_up_pm(codec);
 	if (spec->wait_scp) {
 		if (dspio_get_response_data(codec) >= 0)
 			spec->wait_scp = 0;
 	}
 
 	dspio_clear_response_queue(codec);
+	snd_hda_power_down_pm(codec);
 }
 
 static void hp_callback(struct hda_codec *codec, struct hda_jack_callback *cb)
@@ -4432,11 +4443,10 @@ static void hp_callback(struct hda_codec *codec, struct hda_jack_callback *cb)
 	/* Delay enabling the HP amp, to let the mic-detection
 	 * state machine run.
 	 */
-	cancel_delayed_work_sync(&spec->unsol_hp_work);
-	schedule_delayed_work(&spec->unsol_hp_work, msecs_to_jiffies(500));
 	tbl = snd_hda_jack_tbl_get(codec, cb->nid);
 	if (tbl)
 		tbl->block_report = 1;
+	schedule_delayed_work(&spec->unsol_hp_work, msecs_to_jiffies(500));
 }
 
 static void amic_callback(struct hda_codec *codec, struct hda_jack_callback *cb)
@@ -4614,12 +4624,25 @@ static void ca0132_free(struct hda_codec *codec)
 	kfree(codec->spec);
 }
 
+#ifdef CONFIG_PM
+static int ca0132_suspend(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	cancel_delayed_work_sync(&spec->unsol_hp_work);
+	return 0;
+}
+#endif
+
 static const struct hda_codec_ops ca0132_patch_ops = {
 	.build_controls = ca0132_build_controls,
 	.build_pcms = ca0132_build_pcms,
 	.init = ca0132_init,
 	.free = ca0132_free,
 	.unsol_event = snd_hda_jack_unsol_event,
+#ifdef CONFIG_PM
+	.suspend = ca0132_suspend,
+#endif
 };
 
 static void ca0132_config(struct hda_codec *codec)

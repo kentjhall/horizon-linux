@@ -36,6 +36,7 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/export.h>
+#include <linux/nospec.h>
 #include <asm/processor.h>
 #include <asm/page.h>
 #include <asm/current.h>
@@ -73,13 +74,14 @@ static unsigned long ioapic_read_indirect(struct kvm_ioapic *ioapic,
 	default:
 		{
 			u32 redir_index = (ioapic->ioregsel - 0x10) >> 1;
-			u64 redir_content;
+			u64 redir_content = ~0ULL;
 
-			if (redir_index < IOAPIC_NUM_PINS)
-				redir_content =
-					ioapic->redirtbl[redir_index].bits;
-			else
-				redir_content = ~0ULL;
+			if (redir_index < IOAPIC_NUM_PINS) {
+				u32 index = array_index_nospec(
+					redir_index, IOAPIC_NUM_PINS);
+
+				redir_content = ioapic->redirtbl[index].bits;
+			}
 
 			result = (ioapic->ioregsel & 0x1) ?
 			    (redir_content >> 32) & 0xffffffff :
@@ -257,8 +259,7 @@ void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, ulong *ioapic_handled_vectors)
 		    index == RTC_GSI) {
 			if (kvm_apic_match_dest(vcpu, NULL, 0,
 			             e->fields.dest_id, e->fields.dest_mode) ||
-			    (e->fields.trig_mode == IOAPIC_EDGE_TRIG &&
-			     kvm_apic_pending_eoi(vcpu, e->fields.vector)))
+			    kvm_apic_pending_eoi(vcpu, e->fields.vector))
 				__set_bit(e->fields.vector,
 					  ioapic_handled_vectors);
 		}
@@ -279,6 +280,7 @@ static void ioapic_write_indirect(struct kvm_ioapic *ioapic, u32 val)
 {
 	unsigned index;
 	bool mask_before, mask_after;
+	int old_remote_irr, old_delivery_status;
 	union kvm_ioapic_redirect_entry *e;
 
 	switch (ioapic->ioregsel) {
@@ -299,16 +301,31 @@ static void ioapic_write_indirect(struct kvm_ioapic *ioapic, u32 val)
 		ioapic_debug("change redir index %x val %x\n", index, val);
 		if (index >= IOAPIC_NUM_PINS)
 			return;
+		index = array_index_nospec(index, IOAPIC_NUM_PINS);
 		e = &ioapic->redirtbl[index];
 		mask_before = e->fields.mask;
+		/* Preserve read-only fields */
+		old_remote_irr = e->fields.remote_irr;
+		old_delivery_status = e->fields.delivery_status;
 		if (ioapic->ioregsel & 1) {
 			e->bits &= 0xffffffff;
 			e->bits |= (u64) val << 32;
 		} else {
 			e->bits &= ~0xffffffffULL;
 			e->bits |= (u32) val;
-			e->fields.remote_irr = 0;
 		}
+		e->fields.remote_irr = old_remote_irr;
+		e->fields.delivery_status = old_delivery_status;
+
+		/*
+		 * Some OSes (Linux, Xen) assume that Remote IRR bit will
+		 * be cleared by IOAPIC hardware when the entry is configured
+		 * as edge-triggered. This behavior is used to simulate an
+		 * explicit EOI on IOAPICs that don't have the EOI register.
+		 */
+		if (e->fields.trig_mode == IOAPIC_EDGE_TRIG)
+			e->fields.remote_irr = 0;
+
 		mask_after = e->fields.mask;
 		if (mask_before != mask_after)
 			kvm_fire_mask_notifiers(ioapic->kvm, KVM_IRQCHIP_IOAPIC, index, mask_after);

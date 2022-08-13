@@ -422,6 +422,12 @@ static LIST_HEAD(spi_master_list);
  */
 static DEFINE_MUTEX(board_lock);
 
+/*
+ * Prevents addition of devices with same chip select and
+ * addition of devices below an unregistering controller.
+ */
+static DEFINE_MUTEX(spi_add_lock);
+
 /**
  * spi_alloc_device - Allocate a new SPI device
  * @master: Controller to which device is connected
@@ -500,7 +506,6 @@ static int spi_dev_check(struct device *dev, void *data)
  */
 int spi_add_device(struct spi_device *spi)
 {
-	static DEFINE_MUTEX(spi_add_lock);
 	struct spi_master *master = spi->master;
 	struct device *dev = master->dev.parent;
 	int status;
@@ -526,6 +531,13 @@ int spi_add_device(struct spi_device *spi)
 	if (status) {
 		dev_err(dev, "chipselect %d already in use\n",
 				spi->chip_select);
+		goto done;
+	}
+
+	/* Controller may unregister concurrently */
+	if (IS_ENABLED(CONFIG_SPI_DYNAMIC) &&
+	    !device_is_registered(&master->dev)) {
+		status = -ENODEV;
 		goto done;
 	}
 
@@ -621,8 +633,10 @@ void spi_unregister_device(struct spi_device *spi)
 	if (!spi)
 		return;
 
-	if (spi->dev.of_node)
+	if (spi->dev.of_node) {
 		of_node_clear_flag(spi->dev.of_node, OF_POPULATED);
+		of_node_put(spi->dev.of_node);
+	}
 	if (ACPI_COMPANION(&spi->dev))
 		acpi_device_clear_enumerated(ACPI_COMPANION(&spi->dev));
 	device_unregister(&spi->dev);
@@ -741,8 +755,14 @@ static int spi_map_buf(struct spi_master *master, struct device *dev,
 	for (i = 0; i < sgs; i++) {
 
 		if (vmalloced_buf || kmap_buf) {
-			min = min_t(size_t,
-				    len, desc_len - offset_in_page(buf));
+			/*
+			 * Next scatterlist entry size is the minimum between
+			 * the desc_len and the remaining buffer length that
+			 * fits in a page.
+			 */
+			min = min_t(size_t, desc_len,
+				    min_t(size_t, len,
+					  PAGE_SIZE - offset_in_page(buf)));
 			if (vmalloced_buf)
 				vm_page = vmalloc_to_page(buf);
 			else
@@ -797,12 +817,12 @@ static int __spi_map_msg(struct spi_master *master, struct spi_message *msg)
 	if (master->dma_tx)
 		tx_dev = master->dma_tx->device->dev;
 	else
-		tx_dev = &master->dev;
+		tx_dev = master->dev.parent;
 
 	if (master->dma_rx)
 		rx_dev = master->dma_rx->device->dev;
 	else
-		rx_dev = &master->dev;
+		rx_dev = master->dev.parent;
 
 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
 		if (!master->can_dma(master, msg->spi, xfer))
@@ -844,12 +864,12 @@ static int __spi_unmap_msg(struct spi_master *master, struct spi_message *msg)
 	if (master->dma_tx)
 		tx_dev = master->dma_tx->device->dev;
 	else
-		tx_dev = &master->dev;
+		tx_dev = master->dev.parent;
 
 	if (master->dma_rx)
 		rx_dev = master->dma_rx->device->dev;
 	else
-		rx_dev = &master->dev;
+		rx_dev = master->dev.parent;
 
 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
 		if (!master->can_dma(master, msg->spi, xfer))
@@ -947,6 +967,8 @@ static int spi_map_msg(struct spi_master *master, struct spi_message *msg)
 		if (max_tx || max_rx) {
 			list_for_each_entry(xfer, &msg->transfers,
 					    transfer_list) {
+				if (!xfer->len)
+					continue;
 				if (!xfer->tx_buf)
 					xfer->tx_buf = master->dummy_tx;
 				if (!xfer->rx_buf)
@@ -1004,7 +1026,7 @@ static int spi_transfer_one_message(struct spi_master *master,
 				ret = 0;
 				ms = 8LL * 1000LL * xfer->len;
 				do_div(ms, xfer->speed_hz);
-				ms += ms + 100; /* some tolerance */
+				ms += ms + 200; /* some tolerance */
 
 				if (ms > UINT_MAX)
 					ms = UINT_MAX;
@@ -1533,6 +1555,8 @@ of_register_spi_device(struct spi_master *master, struct device_node *nc)
 		spi->mode |= SPI_3WIRE;
 	if (of_find_property(nc, "spi-lsb-first", NULL))
 		spi->mode |= SPI_LSB_FIRST;
+	if (of_find_property(nc, "spi-lsbyte-first", NULL))
+		spi->mode |= SPI_LSBYTE_FIRST;
 
 	/* Device DUAL/QUAD mode */
 	if (!of_property_read_u32(nc, "spi-tx-bus-width", &value)) {
@@ -1589,11 +1613,13 @@ of_register_spi_device(struct spi_master *master, struct device_node *nc)
 	if (rc) {
 		dev_err(&master->dev, "spi_device register error %s\n",
 			nc->full_name);
-		goto err_out;
+		goto err_of_node_put;
 	}
 
 	return spi;
 
+err_of_node_put:
+	of_node_put(nc);
 err_out:
 	spi_dev_put(spi);
 	return ERR_PTR(rc);
@@ -1616,6 +1642,8 @@ static void of_register_spi_devices(struct spi_master *master)
 
 	for_each_available_child_of_node(master->dev.of_node, nc) {
 		if (of_node_test_and_set_flag(nc, OF_POPULATED))
+			continue;
+		if (!strcmp(nc->name, "prod-settings"))
 			continue;
 		spi = of_register_spi_device(master, nc);
 		if (IS_ERR(spi)) {
@@ -1815,6 +1843,46 @@ struct spi_master *spi_alloc_master(struct device *dev, unsigned size)
 }
 EXPORT_SYMBOL_GPL(spi_alloc_master);
 
+static void devm_spi_release_master(struct device *dev, void *master)
+{
+	spi_master_put(*(struct spi_master **)master);
+}
+
+/**
+ * devm_spi_alloc_master - resource-managed spi_alloc_master()
+ * @dev: physical device of SPI master
+ * @size: how much zeroed driver-private data to allocate
+ * Context: can sleep
+ *
+ * Allocate an SPI master and automatically release a reference on it
+ * when @dev is unbound from its driver.  Drivers are thus relieved from
+ * having to call spi_master_put().
+ *
+ * The arguments to this function are identical to spi_alloc_master().
+ *
+ * Return: the SPI master structure on success, else NULL.
+ */
+struct spi_master *devm_spi_alloc_master(struct device *dev, unsigned int size)
+{
+	struct spi_master **ptr, *master;
+
+	ptr = devres_alloc(devm_spi_release_master, sizeof(*ptr),
+			   GFP_KERNEL);
+	if (!ptr)
+		return NULL;
+
+	master = spi_alloc_master(dev, size);
+	if (master) {
+		*ptr = master;
+		devres_add(dev, ptr);
+	} else {
+		devres_free(ptr);
+	}
+
+	return master;
+}
+EXPORT_SYMBOL_GPL(devm_spi_alloc_master);
+
 #ifdef CONFIG_OF
 static int of_spi_register_master(struct spi_master *master)
 {
@@ -1995,6 +2063,11 @@ int devm_spi_register_master(struct device *dev, struct spi_master *master)
 }
 EXPORT_SYMBOL_GPL(devm_spi_register_master);
 
+static int devm_spi_match_master(struct device *dev, void *res, void *master)
+{
+	return *(struct spi_master **)res == master;
+}
+
 static int __unregister(struct device *dev, void *null)
 {
 	spi_unregister_device(to_spi_device(dev));
@@ -2013,19 +2086,34 @@ static int __unregister(struct device *dev, void *null)
  */
 void spi_unregister_master(struct spi_master *master)
 {
-	int dummy;
+	/* Prevent addition of new devices, unregister existing ones */
+	if (IS_ENABLED(CONFIG_SPI_DYNAMIC))
+		mutex_lock(&spi_add_lock);
+
+	device_for_each_child(&master->dev, NULL, __unregister);
 
 	if (master->queued) {
 		if (spi_destroy_queue(master))
 			dev_err(&master->dev, "queue remove failed\n");
 	}
 
+	device_for_each_child(&master->dev, NULL, __unregister);
+
 	mutex_lock(&board_lock);
 	list_del(&master->list);
 	mutex_unlock(&board_lock);
 
-	dummy = device_for_each_child(&master->dev, NULL, __unregister);
-	device_unregister(&master->dev);
+	device_del(&master->dev);
+
+	/* Release the last reference on the master if its driver
+	 * has not yet been converted to devm_spi_alloc_master().
+	 */
+	if (!devres_find(master->dev.parent, devm_spi_release_master,
+			 devm_spi_match_master, master))
+		put_device(&master->dev);
+
+	if (IS_ENABLED(CONFIG_SPI_DYNAMIC))
+		mutex_unlock(&spi_add_lock);
 }
 EXPORT_SYMBOL_GPL(spi_unregister_master);
 
@@ -2518,10 +2606,11 @@ int spi_setup(struct spi_device *spi)
 
 	spi_set_cs(spi, false);
 
-	dev_dbg(&spi->dev, "setup mode %d, %s%s%s%s%u bits/w, %u Hz max --> %d\n",
+	dev_dbg(&spi->dev, "setup mode %d, %s%s%s%s%s%u bits/w, %u Hz max --> %d\n",
 			(int) (spi->mode & (SPI_CPOL | SPI_CPHA)),
 			(spi->mode & SPI_CS_HIGH) ? "cs_high, " : "",
 			(spi->mode & SPI_LSB_FIRST) ? "lsb, " : "",
+			(spi->mode & SPI_LSBYTE_FIRST) ? "lsbyte, " : "",
 			(spi->mode & SPI_3WIRE) ? "3wire, " : "",
 			(spi->mode & SPI_LOOP) ? "loopback, " : "",
 			spi->bits_per_word, spi->max_speed_hz,
@@ -3073,6 +3162,29 @@ int spi_write_then_read(struct spi_device *spi,
 	return status;
 }
 EXPORT_SYMBOL_GPL(spi_write_then_read);
+
+/**
+ * spi_cs_low - set chip select pin state
+ * @spi: device for which chip select pin state to be set
+ * state: if true chip select pin will be kept low else high
+ *
+ * The return value is zero for success, else
+ * errno status code.
+ */
+int spi_cs_low(struct spi_device *spi, bool state)
+{
+	struct spi_master *master = spi->master;
+	int ret = 0;
+
+	mutex_lock(&master->bus_lock_mutex);
+
+	if (master->spi_cs_low)
+		ret = master->spi_cs_low(spi, state);
+
+	mutex_unlock(&master->bus_lock_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(spi_cs_low);
 
 /*-------------------------------------------------------------------------*/
 

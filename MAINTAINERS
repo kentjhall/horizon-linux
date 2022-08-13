@@ -7193,6 +7193,14 @@ M:	Sasha Levin <sasha.levin@oracle.com>
 S:	Maintained
 F:	tools/lib/lockdep/
 
+HMM - Heterogeneous Memory Management
+M:	Jérôme Glisse <jglisse@redhat.com>
+L:	linux-mm@kvack.org
+S:	Maintained
+F:	mm/hmm*
+F:	include/linux/hmm*
+F:      Documentation/vm/hmm.txt
+
 LIBNVDIMM: NON-VOLATILE MEMORY DEVICE SUBSYSTEM
 M:	Dan Williams <dan.j.williams@intel.com>
 L:	linux-nvdimm@lists.01.org
@@ -9010,6 +9018,11 @@ F:	arch/*/oprofile/
 F:	drivers/oprofile/
 F:	include/linux/oprofile.h
 
+OP-TEE DRIVER
+M:	Jens Wiklander <jens.wiklander@linaro.org>
+S:	Maintained
+F:	drivers/tee/optee/
+
 ORACLE CLUSTER FILESYSTEM 2 (OCFS2)
 M:	Mark Fasheh <mfasheh@versity.com>
 M:	Joel Becker <jlbec@evilplan.org>
@@ -10655,6 +10668,14 @@ F:	drivers/hwtracing/stm/
 F:	include/linux/stm.h
 F:	include/uapi/linux/stm.h
 
+TEE SUBSYSTEM
+M:	Jens Wiklander <jens.wiklander@linaro.org>
+S:	Maintained
+F:	include/linux/tee_drv.h
+F:	include/uapi/linux/tee.h
+F:	drivers/tee/
+F:	Documentation/tee.txt
+
 THUNDERBOLT DRIVER
 M:	Andreas Noever <andreas.noever@gmail.com>
 S:	Maintained
@@ -11068,6 +11089,13 @@ F:	arch/arm/mach-s3c24xx/mach-bast.c
 F:	arch/arm/mach-s3c24xx/bast-ide.c
 F:	arch/arm/mach-s3c24xx/bast-irq.c
 
+SIPHASH PRF ROUTINES
+M:	Jason A. Donenfeld <Jason@zx2c4.com>
+S:	Maintained
+F:	lib/siphash.c
+F:	lib/test_siphash.c
+F:	include/linux/siphash.h
+
 TI DAVINCI MACHINE SUPPORT
 M:	Sekhar Nori <nsekhar@ti.com>
 M:	Kevin Hilman <khilman@kernel.org>
@@ -11469,6 +11497,7 @@ F:	arch/alpha/kernel/srm_env.c
 
 STABLE BRANCH
 M:	Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+M:	Sasha Levin <sashal@kernel.org>
 L:	stable@vger.kernel.org
 S:	Supported
 F:	Documentation/stable_kernel_rules.txt
@@ -11896,6 +11925,11 @@ TEGRA SPI DRIVER
 M:	Laxman Dewangan <ldewangan@nvidia.com>
 S:	Supported
 F:	drivers/spi/spi-tegra*
+
+TEGRA XUSB PADCTL DRIVER
+M:	JC Kuo <jckuo@nvidia.com>
+S:	Supported
+F:	drivers/phy/tegra/xusb*
 
 TEHUTI ETHERNET DRIVER
 M:	Andy Gospodarek <andy@greyhouse.net>
@@ -12465,13 +12499,6 @@ W:	http://www.linux-usb.org/usbnet
 S:	Maintained
 F:	drivers/net/usb/dm9601.c
 
-USB DIAMOND RIO500 DRIVER
-M:	Cesar Miquel <miquel@df.uba.ar>
-L:	rio500-users@lists.sourceforge.net
-W:	http://rio500.sourceforge.net
-S:	Maintained
-F:	drivers/usb/misc/rio500*
-
 USB EHCI DRIVER
 M:	Alan Stern <stern@rowland.harvard.edu>
 L:	linux-usb@vger.kernel.org
@@ -12626,6 +12653,15 @@ F:	Documentation/usb/
 F:	drivers/usb/
 F:	include/linux/usb.h
 F:	include/linux/usb/
+
+USB TYPEC SUBSYSTEM
+M:	Heikki Krogerus <heikki.krogerus@linux.intel.com>
+L:	linux-usb@vger.kernel.org
+S:	Maintained
+F:	Documentation/ABI/testing/sysfs-class-typec
+F:	Documentation/usb/typec.rst
+F:	drivers/usb/typec/
+F:	include/linux/usb/typec.h
 
 USB UHCI DRIVER
 M:	Alan Stern <stern@rowland.harvard.edu>

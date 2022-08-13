@@ -35,6 +35,7 @@
 #define CLK_IS_CRITICAL		BIT(11) /* do not gate, ever */
 /* parents need enable during gate/ungate, set rate and re-parent */
 #define CLK_OPS_PARENT_ENABLE	BIT(12)
+#define CLK_SET_RATE_NOCACHE	BIT(13) /* do not check cached clk rate */
 
 struct clk;
 struct clk_hw;
@@ -741,6 +742,8 @@ unsigned long clk_hw_get_flags(const struct clk_hw *hw);
 bool clk_hw_is_prepared(const struct clk_hw *hw);
 bool clk_hw_is_enabled(const struct clk_hw *hw);
 bool __clk_is_enabled(struct clk *clk);
+bool __clk_is_prepared(struct clk *clk);
+
 struct clk *__clk_lookup(const char *name);
 int __clk_mux_determine_rate(struct clk_hw *hw,
 			     struct clk_rate_request *req);
@@ -750,6 +753,9 @@ int __clk_mux_determine_rate_closest(struct clk_hw *hw,
 void clk_hw_reparent(struct clk_hw *hw, struct clk_hw *new_parent);
 void clk_hw_set_rate_range(struct clk_hw *hw, unsigned long min_rate,
 			   unsigned long max_rate);
+int __clk_hw_set_rate(struct clk_hw *hw, unsigned long rate,
+		      unsigned long parent_rate);
+int __clk_hw_enable(struct clk_hw *hw);
 
 static inline void __clk_hw_set_clk(struct clk_hw *dst, struct clk_hw *src)
 {
@@ -908,8 +914,17 @@ static inline void clk_writel(u32 val, u32 __iomem *reg)
 #endif	/* platform dependent I/O accessors */
 
 #ifdef CONFIG_DEBUG_FS
+struct dentry *__clk_debugfs_add_file(struct clk *clk, char *name,
+		umode_t mode, void *data, const struct file_operations *fops);
 struct dentry *clk_debugfs_add_file(struct clk_hw *hw, char *name, umode_t mode,
 				void *data, const struct file_operations *fops);
+#else
+static inline struct dentry *__clk_debugfs_add_file(struct clk *clk, char *name,
+		umode_t mode, void *data, const struct file_operations *fops)
+{ return NULL; }
+static inline struct dentry *clk_debugfs_add_file(struct clk_hw *hw, char *name,
+		umode_t mode, void *data, const struct file_operations *fops)
+{ return NULL; }
 #endif
 
 #endif /* CONFIG_COMMON_CLK */

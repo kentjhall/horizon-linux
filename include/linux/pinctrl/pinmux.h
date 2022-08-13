@@ -56,6 +56,8 @@ struct pinctrl_dev;
  *	depending on whether the GPIO is configured as input or output,
  *	a direction selector function may be implemented as a backing
  *	to the GPIO controllers that need pin muxing.
+ * @gpio_save_config: Save the GPIo configurations.
+ * @gpio_restore_config: Restore GPIO configurations.
  * @strict: do not allow simultaneous use of the same pin for GPIO and another
  *	function. Check both gpio_owner and mux_owner strictly before approving
  *	the pin request.
@@ -82,6 +84,13 @@ struct pinmux_ops {
 				   struct pinctrl_gpio_range *range,
 				   unsigned offset,
 				   bool input);
+	int (*gpio_save_config) (struct pinctrl_dev *pctldev,
+				 struct pinctrl_gpio_range *range,
+				 unsigned offset);
+	int (*gpio_restore_config) (struct pinctrl_dev *pctldev,
+				    struct pinctrl_gpio_range *range,
+				    unsigned offset);
+
 	bool strict;
 };
 
