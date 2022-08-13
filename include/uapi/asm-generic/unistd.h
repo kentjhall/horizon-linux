@@ -886,8 +886,22 @@ __SYSCALL(__NR_futex_waitv, sys_futex_waitv)
 #define __NR_set_mempolicy_home_node 450
 __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
 
+#ifndef __NO_HORIZON
+#define __NR_horizon_execve 500
+__SYSCALL(__NR_horizon_execve, sys_horizon_execve)
+#define __NR_horizon_execveat 501
+__SYSCALL(__NR_horizon_execveat, sys_horizon_execveat)
+
+#define __NR_horizon_servctl 502
+__SYSCALL(__NR_horizon_servctl, sys_horizon_servctl)
+#endif
+
 #undef __NR_syscalls
+#ifndef __NO_HORIZON
+#define __NR_syscalls (__NR_horizon_servctl + 1)
+#else
 #define __NR_syscalls 451
+#endif
 
 /*
  * 32 bit systems traditionally used different

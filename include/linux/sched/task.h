@@ -87,6 +87,13 @@ extern __noreturn void do_group_exit(int);
 extern void exit_files(struct task_struct *);
 extern void exit_itimers(struct task_struct *);
 
+#ifdef CONFIG_HORIZON
+extern struct task_struct *copy_process(
+			struct pid *pid,
+			int trace,
+			int node,
+			struct kernel_clone_args *args);
+#endif
 extern pid_t kernel_clone(struct kernel_clone_args *kargs);
 struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node);
 struct task_struct *fork_idle(int);

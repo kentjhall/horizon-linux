@@ -66,6 +66,7 @@
 #include <linux/io_uring.h>
 #include <linux/kprobes.h>
 #include <linux/rethook.h>
+#include <linux/horizon.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
@@ -698,6 +699,11 @@ static void exit_notify(struct task_struct *tsk, int group_dead)
 		list_add(&tsk->ptrace_entry, &dead);
 	}
 
+#ifdef CONFIG_HORIZON
+	if (test_thread_flag(TIF_HORIZON))
+		wake_up_all(&task_pid(tsk)->wait_pidfd);
+#endif
+
 	/* mt-exec, de_thread() is waiting for group leader */
 	if (unlikely(tsk->signal->notify_count < 0))
 		wake_up_process(tsk->signal->group_exec_task);
@@ -708,6 +714,47 @@ static void exit_notify(struct task_struct *tsk, int group_dead)
 		release_task(p);
 	}
 }
+
+#ifdef CONFIG_HORIZON
+static void horizon_exit(void)
+{
+	struct hzn_named_service *iter, *tmp;
+	struct hzn_session_request *req;
+
+	// horizon processes can't be horizon services
+	if (test_thread_flag(TIF_HORIZON))
+		return;
+
+	spin_lock(&hzn_named_services_lock);
+
+	// unregister any named service instance
+	list_for_each_entry_safe(iter, tmp, &hzn_named_services, entry) {
+		if (iter->service == current) {
+			put_task_struct(iter->service);
+			list_del(&iter->entry);
+			kfree(iter);
+		}
+	}
+
+	spin_unlock(&hzn_named_services_lock);
+
+	spin_lock(&current->hzn_requests_lock);
+
+	// notify requesting threads of exit
+	list_for_each_entry(req, &current->hzn_requests, entry) {
+		if (req->cmd) { // not a close command
+			atomic_set(&req->requester->hzn_request_state,
+			           HZN_SESSION_REQUEST_FAILED);
+			wake_up_process(req->requester);
+		}
+	}
+
+	// stop any subsequent threads from joining the queue
+	current->hzn_requests_stop = true;
+
+	spin_unlock(&current->hzn_requests_lock);
+}
+#endif
 
 #ifdef CONFIG_DEBUG_STACK_USAGE
 static void check_stack_usage(void)
@@ -739,6 +786,10 @@ void __noreturn do_exit(long code)
 	int group_dead;
 
 	WARN_ON(tsk->plug);
+
+#ifdef CONFIG_HORIZON
+	horizon_exit();
+#endif
 
 	kcov_task_exit(tsk);
 

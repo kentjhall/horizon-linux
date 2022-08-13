@@ -43,14 +43,29 @@ asmlinkage long __arm64_sys_ni_syscall(const struct pt_regs *__unused)
 	return sys_ni_syscall();
 }
 
+#ifdef CONFIG_HORIZON
+asmlinkage long hsys_ni_syscall(const struct pt_regs *regs, int scno);
+
+asmlinkage long __arm64_hsys_ni_syscall(const struct pt_regs *regs)
+{
+	return hsys_ni_syscall(regs,
+			read_sysreg(esr_el1) & ESR_ELx_xVC_IMM_MASK);
+}
+#endif
+
 /*
  * Wrappers to pass the pt_regs argument.
  */
 #define __arm64_sys_personality		__arm64_sys_arm64_personality
 
+#ifndef CONFIG_HORIZON
+#define __NO_HORIZON
+#endif
+
 #undef __SYSCALL
 #define __SYSCALL(nr, sym)	asmlinkage long __arm64_##sym(const struct pt_regs *);
 #include <asm/unistd.h>
+#include <asm/horizon/unistd.h>
 
 #undef __SYSCALL
 #define __SYSCALL(nr, sym)	[nr] = __arm64_##sym,
@@ -59,3 +74,10 @@ const syscall_fn_t sys_call_table[__NR_syscalls] = {
 	[0 ... __NR_syscalls - 1] = __arm64_sys_ni_syscall,
 #include <asm/unistd.h>
 };
+
+#ifdef CONFIG_HORIZON
+const syscall_fn_t horizon_sys_call_table[__HNR_syscalls] = {
+	[0 ... __HNR_syscalls - 1] = __arm64_hsys_ni_syscall,
+#include <asm/horizon/unistd.h>
+};
+#endif

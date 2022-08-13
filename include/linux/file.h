@@ -88,6 +88,14 @@ extern int __get_unused_fd_flags(unsigned flags, unsigned long nofile);
 extern int get_unused_fd_flags(unsigned flags);
 extern void put_unused_fd(unsigned int fd);
 
+#ifdef CONFIG_HORIZON
+struct files_struct;
+extern int __alloc_fd(struct files_struct *files,
+		      unsigned start, unsigned end, unsigned flags);
+extern void __fd_install(struct files_struct *files,
+			 unsigned int fd, struct file *file);
+extern int __close_fd(struct files_struct *files, unsigned fd);
+#endif
 extern void fd_install(unsigned int fd, struct file *file);
 
 extern int __receive_fd(struct file *file, int __user *ufd,

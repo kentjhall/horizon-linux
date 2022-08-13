@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config HORIZON
+	bool "Horizon Linux kernel"
+	depends on ARM64
+	depends on FUTEX
+	select MEM_SOFT_DIRTY
+	default y

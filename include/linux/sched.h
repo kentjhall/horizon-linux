@@ -34,6 +34,7 @@
 #include <linux/rseq.h>
 #include <linux/seqlock.h>
 #include <linux/kcsan.h>
+#include <linux/horizon.h>
 #include <asm/kmap_size.h>
 
 /* task_struct member predeclarations (sorted alphabetically): */
@@ -965,6 +966,29 @@ struct task_struct {
 
 	/* Recipient of SIGCHLD, wait4() reports: */
 	struct task_struct __rcu	*parent;
+
+#ifdef CONFIG_HORIZON
+	union {
+		/* used by horizon process */
+		struct {
+			u64				hzn_title_id;
+			u32				hzn_system_resource_size;
+			enum hzn_address_space_type	hzn_address_space_type;
+			atomic_t			hzn_request_state;
+			u32				hzn_thread_handle;
+		};
+
+		/* used by horizon service task */
+		struct {
+			unsigned long			hzn_cmd_addr;
+			struct hzn_session_request	*hzn_session_request;
+
+			spinlock_t			hzn_requests_lock;
+			struct list_head		hzn_requests;
+			bool				hzn_requests_stop;
+		};
+	};
+#endif
 
 	/*
 	 * Children/sibling form the list of natural children:
@@ -2241,6 +2265,10 @@ static inline bool vcpu_is_preempted(int cpu)
 
 extern long sched_setaffinity(pid_t pid, const struct cpumask *new_mask);
 extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
+
+#ifdef CONFIG_HORIZON
+extern void do_sched_yield(void);
+#endif
 
 #ifndef TASK_SIZE_OF
 #define TASK_SIZE_OF(tsk)	TASK_SIZE
