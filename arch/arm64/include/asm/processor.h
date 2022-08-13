@@ -27,6 +27,7 @@
 #include <linux/stddef.h>
 #include <linux/string.h>
 #include <linux/thread_info.h>
+#include <linux/horizon.h>
 
 #include <vdso/processor.h>
 
@@ -49,6 +50,14 @@
 #define DEFAULT_MAP_WINDOW_64	(UL(1) << VA_BITS_MIN)
 #define TASK_SIZE_64		(UL(1) << vabits_actual)
 
+#ifdef CONFIG_HORIZON
+#define TASK_SIZE_64_IF_HORIZON(tsk, otherwise)						\
+	(!test_tsk_thread_flag(tsk, TIF_HORIZON) ?					\
+	(otherwise) : UL(1) << ((tsk)->hzn_address_space_type == HZN_IS_39_BIT ? 39 :	\
+	                       ((tsk)->hzn_address_space_type == HZN_IS_36_BIT ? 36 : 32)))
+#else
+#define TASK_SIZE_64_IF_HORIZON(tsk, otherwise)	otherwise
+#endif
 #ifdef CONFIG_COMPAT
 #if defined(CONFIG_ARM64_64K_PAGES) && defined(CONFIG_KUSER_HELPERS)
 /*
@@ -60,14 +69,14 @@
 #define TASK_SIZE_32		(UL(0x100000000) - PAGE_SIZE)
 #endif /* CONFIG_ARM64_64K_PAGES */
 #define TASK_SIZE		(test_thread_flag(TIF_32BIT) ? \
-				TASK_SIZE_32 : TASK_SIZE_64)
+				TASK_SIZE_32 : TASK_SIZE_64_IF_HORIZON(current, TASK_SIZE_64))
 #define TASK_SIZE_OF(tsk)	(test_tsk_thread_flag(tsk, TIF_32BIT) ? \
-				TASK_SIZE_32 : TASK_SIZE_64)
+				TASK_SIZE_32 : TASK_SIZE_64_IF_HORIZON(tsk, TASK_SIZE_64))
 #define DEFAULT_MAP_WINDOW	(test_thread_flag(TIF_32BIT) ? \
-				TASK_SIZE_32 : DEFAULT_MAP_WINDOW_64)
+				TASK_SIZE_32 : TASK_SIZE_64_IF_HORIZON(current, DEFAULT_MAP_WINDOW_64))
 #else
-#define TASK_SIZE		TASK_SIZE_64
-#define DEFAULT_MAP_WINDOW	DEFAULT_MAP_WINDOW_64
+#define TASK_SIZE		TASK_SIZE_64_IF_HORIZON(current, TASK_SIZE_64)
+#define DEFAULT_MAP_WINDOW	TASK_SIZE_64_IF_HORIZON(current, DEFAULT_MAP_WINDOW_64)
 #endif /* CONFIG_COMPAT */
 
 #ifdef CONFIG_ARM64_FORCE_52BIT
@@ -81,9 +90,9 @@
 #ifdef CONFIG_COMPAT
 #define AARCH32_VECTORS_BASE	0xffff0000
 #define STACK_TOP		(test_thread_flag(TIF_32BIT) ? \
-				AARCH32_VECTORS_BASE : STACK_TOP_MAX)
+				AARCH32_VECTORS_BASE : TASK_SIZE_64_IF_HORIZON(current, STACK_TOP_MAX))
 #else
-#define STACK_TOP		STACK_TOP_MAX
+#define STACK_TOP		TASK_SIZE_64_IF_HORIZON(current, STACK_TOP_MAX)
 #endif /* CONFIG_COMPAT */
 
 #ifndef CONFIG_ARM64_FORCE_52BIT
@@ -172,17 +181,42 @@ static inline void arch_thread_struct_whitelist(unsigned long *offset,
 }
 
 #ifdef CONFIG_COMPAT
+#ifdef CONFIG_HORIZON
 #define task_user_tls(t)						\
 ({									\
 	unsigned long *__tls;						\
-	if (is_compat_thread(task_thread_info(t)))			\
+	if (is_compat_thread(task_thread_info(t)) ||                    \
+            test_ti_thread_flag(task_thread_info(t), TIF_HORIZON)) 	\
 		__tls = &(t)->thread.uw.tp2_value;			\
 	else								\
 		__tls = &(t)->thread.uw.tp_value;			\
 	__tls;								\
  })
 #else
-#define task_user_tls(t)	(&(t)->thread.uw.tp_value)
+#define task_user_tls(t)						\
+({									\
+	unsigned long *__tls;						\
+	if (is_compat_thread(task_thread_info(t))) 			\
+		__tls = &(t)->thread.uw.tp2_value;			\
+	else								\
+		__tls = &(t)->thread.uw.tp_value;			\
+	__tls;								\
+ })
+#endif
+#else
+#ifdef CONFIG_HORIZON
+#define task_user_tls(t)						\
+({									\
+	unsigned long *__tls;						\
+	if (test_ti_thread_flag(task_thread_info(t), TIF_HORIZON)) 	\
+		__tls = &(t)->thread.uw.tp2_value;			\
+	else								\
+		__tls = &(t)->thread.uw.tp_value;			\
+	__tls;								\
+ })
+#else
+#define task_user_tls(t)       (&(t)->thread.uw.tp_value)
+#endif
 #endif
 
 /* Sync TPIDR_EL0 back to thread_struct for current */
@@ -229,11 +263,17 @@ static inline void compat_start_thread(struct pt_regs *regs, unsigned long pc,
 }
 #endif
 
+#ifdef CONFIG_HORIZON
+#define is_ttbr0_addr(addr)					\
+	/* entry assembly clears tags for TTBR0 addrs */	\
+	(addr < TASK_SIZE)
+#else
 static inline bool is_ttbr0_addr(unsigned long addr)
 {
 	/* entry assembly clears tags for TTBR0 addrs */
 	return addr < TASK_SIZE;
 }
+#endif
 
 static inline bool is_ttbr1_addr(unsigned long addr)
 {

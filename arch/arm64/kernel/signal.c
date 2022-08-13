@@ -793,6 +793,10 @@ static int setup_rt_frame(int usig, struct ksignal *ksig, sigset_t *set,
 
 static void setup_restart_syscall(struct pt_regs *regs)
 {
+#ifdef CONFIG_HORIZON
+	if (test_thread_flag(TIF_HORIZON))
+		BUG();
+#endif
 	if (is_compat_task())
 		compat_setup_restart_syscall(regs);
 	else

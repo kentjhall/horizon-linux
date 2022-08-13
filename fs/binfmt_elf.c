@@ -1005,8 +1005,14 @@ out_free_interp:
 	if (elf_read_implies_exec(*elf_ex, executable_stack))
 		current->personality |= READ_IMPLIES_EXEC;
 
-	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+#ifdef CONFIG_HORIZON
+	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space
+	/* Random address space complicates things for horizon, just disable it */
+	    && !test_thread_flag(TIF_HORIZON))
 		current->flags |= PF_RANDOMIZE;
+#else
+	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+#endif
 
 	setup_new_exec(bprm);
 
@@ -1107,7 +1113,13 @@ out_free_interp:
 			 * independently randomized mmap region (0 load_bias
 			 * without MAP_FIXED).
 			 */
+#ifdef CONFIG_HORIZON
+			// horizon programs are an exception, they may be ET_DYN
+			// without INTERP
+			if (interpreter || test_thread_flag(TIF_HORIZON)) {
+#else
 			if (interpreter) {
+#endif
 				load_bias = ELF_ET_DYN_BASE;
 				if (current->flags & PF_RANDOMIZE)
 					load_bias += arch_mmap_rnd();

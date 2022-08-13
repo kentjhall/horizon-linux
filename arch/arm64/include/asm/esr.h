@@ -229,6 +229,9 @@
 #define ESR_ELx_SYS64_ISS_SYS_CNTFRQ	(ESR_ELx_SYS64_ISS_SYS_VAL(3, 3, 0, 14, 0) | \
 					 ESR_ELx_SYS64_ISS_DIR_READ)
 
+#define ESR_ELx_SYS64_ISS_SYS_CNTPCT	(ESR_ELx_SYS64_ISS_SYS_VAL(3, 3, 1, 14, 0) | \
+					 ESR_ELx_SYS64_ISS_DIR_READ)
+
 #define esr_sys64_to_sysreg(e)					\
 	sys_reg((((e) & ESR_ELx_SYS64_ISS_OP0_MASK) >>		\
 		 ESR_ELx_SYS64_ISS_OP0_SHIFT),			\

@@ -223,6 +223,17 @@ static inline int is_syscall_trace_event(struct trace_event_call *tp_event)
 	SYSCALL_METADATA(sname, x, __VA_ARGS__)			\
 	__SYSCALL_DEFINEx(x, sname, __VA_ARGS__)
 
+#define HSYSCALL_DEFINE1(name, ...) HSYSCALL_DEFINEx(1, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE2(name, ...) HSYSCALL_DEFINEx(2, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE3(name, ...) HSYSCALL_DEFINEx(3, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE4(name, ...) HSYSCALL_DEFINEx(4, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE5(name, ...) HSYSCALL_DEFINEx(5, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE6(name, ...) HSYSCALL_DEFINEx(6, _##name, __VA_ARGS__)
+
+#define HSYSCALL_DEFINEx(x, sname, ...)				\
+	SYSCALL_METADATA(sname, x, __VA_ARGS__)			\
+	__HSYSCALL_DEFINEx(x, sname, __VA_ARGS__)
+
 #define __PROTECT(...) asmlinkage_protect(__VA_ARGS__)
 
 /*

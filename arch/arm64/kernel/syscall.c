@@ -13,9 +13,13 @@
 #include <asm/syscall.h>
 #include <asm/thread_info.h>
 #include <asm/unistd.h>
+#include <asm/horizon/unistd.h>
 
 long compat_arm_syscall(struct pt_regs *regs, int scno);
 long sys_ni_syscall(void);
+#ifdef CONFIG_HORIZON
+long hsys_ni_syscall(const struct pt_regs *regs, int scno);
+#endif
 
 static long do_ni_syscall(struct pt_regs *regs, int scno)
 {
@@ -28,7 +32,12 @@ static long do_ni_syscall(struct pt_regs *regs, int scno)
 	}
 #endif
 
+#ifdef CONFIG_HORIZON
+	return test_thread_flag(TIF_HORIZON) ?
+		hsys_ni_syscall(regs, scno) : sys_ni_syscall();
+#else
 	return sys_ni_syscall();
+#endif
 }
 
 static long __invoke_syscall(struct pt_regs *regs, syscall_fn_t syscall_fn)
@@ -198,16 +207,42 @@ static inline void sve_user_discard(void)
 	sve_user_disable();
 }
 
+#ifdef CONFIG_HORIZON
+void do_el0_svc(unsigned long esr, struct pt_regs *regs)
+#else
 void do_el0_svc(struct pt_regs *regs)
+#endif
 {
 	sve_user_discard();
+#ifdef CONFIG_HORIZON
+	el0_svc_common(regs,
+		       test_thread_flag(TIF_HORIZON) ?
+		       (esr & ESR_ELx_xVC_IMM_MASK) : regs->regs[8],
+		       test_thread_flag(TIF_HORIZON) ?
+		       __HNR_syscalls : __NR_syscalls,
+		       test_thread_flag(TIF_HORIZON) ?
+		       horizon_sys_call_table : sys_call_table);
+#else
 	el0_svc_common(regs, regs->regs[8], __NR_syscalls, sys_call_table);
+#endif
 }
 
 #ifdef CONFIG_COMPAT
+#ifdef CONFIG_HORIZON
+void do_el0_svc_compat(unsigned long esr, struct pt_regs *regs)
+#else
 void do_el0_svc_compat(struct pt_regs *regs)
+#endif
 {
+#ifdef CONFIG_HORIZON
+	el0_svc_common(regs,
+		       test_thread_flag(TIF_HORIZON) ?
+		       (esr & ESR_ELx_xVC_IMM_MASK) : regs->regs[7],
+		       // horizon TODO 32-bit syscalls
+		       __NR_compat_syscalls, compat_sys_call_table);
+#else
 	el0_svc_common(regs, regs->regs[7], __NR_compat_syscalls,
 		       compat_sys_call_table);
+#endif
 }
 #endif

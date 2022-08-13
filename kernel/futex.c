@@ -145,6 +145,25 @@
  * double_lock_hb() and double_unlock_hb(), respectively.
  */
 
+#ifdef HORIZON_FUTEX
+
+#include <linux/horizon/handle_table.h>
+
+// this is only used here for determining what to put in uaddr, so we'll just
+// replace it with ours
+#define task_pid_vnr(tsk) ((tsk)->hzn_thread_handle)
+#define find_get_task_by_vpid(vpid)							\
+({											\
+ 	struct file *thread_file = hzn_handle_table_get(vpid, &hzn_thread_fops);	\
+ 	struct task_struct *thread = NULL;						\
+ 	if (thread_file) {								\
+		thread = get_pid_task(thread_file->private_data, PIDTYPE_PID);		\
+		fput(thread_file);							\
+	}										\
+	thread;										\
+})
+#endif
+
 #ifdef CONFIG_HAVE_FUTEX_CMPXCHG
 #define futex_cmpxchg_enabled 1
 #else
@@ -728,6 +747,19 @@ static int get_futex_value_locked(u32 *dest, u32 __user *from)
 	return ret ? -EFAULT : 0;
 }
 
+#ifdef HORIZON_FUTEX
+static int put_futex_value_locked(u32 from, u32 __user *dest)
+{
+	int ret;
+
+	pagefault_disable();
+	ret = __put_user(from, dest);
+	pagefault_enable();
+
+	return ret ? -EFAULT : 0;
+}
+#endif
+
 
 /*
  * PI code:
@@ -1030,6 +1062,10 @@ static int attach_to_pi_state(u32 __user *uaddr, u32 uval,
 	if (uval != uval2)
 		goto out_eagain;
 
+#ifdef HORIZON_FUTEX
+	if (pi_state->owner && pid != task_pid_vnr(pi_state->owner))
+		goto out_einval;
+#else
 	/*
 	 * Handle the owner died case:
 	 */
@@ -1080,6 +1116,7 @@ static int attach_to_pi_state(u32 __user *uaddr, u32 uval,
 		goto out_einval;
 
 out_attach:
+#endif
 	get_pi_state(pi_state);
 	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
 	*ps = pi_state;
@@ -1626,6 +1663,7 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	return ret;
 }
 
+#ifndef HORIZON_FUTEX
 static int futex_atomic_op_inuser(unsigned int encoded_op, u32 __user *uaddr)
 {
 	unsigned int op =	  (encoded_op & 0x70000000) >> 28;
@@ -1761,6 +1799,7 @@ out_unlock:
 	wake_up_q(&wake_q);
 	return ret;
 }
+#endif
 
 /**
  * requeue_futex() - Requeue a futex_q from one hb to another
@@ -1844,6 +1883,7 @@ void requeue_pi_wake_futex(struct futex_q *q, union futex_key *key,
  *  - >0 - acquired the lock, return value is vpid of the top_waiter
  *  - <0 - error
  */
+#ifndef HORIZON_FUTEX
 static int
 futex_proxy_trylock_atomic(u32 __user *pifutex, struct futex_hash_bucket *hb1,
 			   struct futex_hash_bucket *hb2, union futex_key *key1,
@@ -1851,6 +1891,14 @@ futex_proxy_trylock_atomic(u32 __user *pifutex, struct futex_hash_bucket *hb1,
 			   struct task_struct **exiting, int set_waiters)
 {
 	struct futex_q *top_waiter = NULL;
+#else
+static int
+futex_proxy_trylock_atomic(u32 __user *pifutex, struct futex_q *top_waiter,
+			   struct futex_hash_bucket *hb2,
+			   union futex_key *key2, struct futex_pi_state **ps,
+			   struct task_struct **exiting, int set_waiters)
+{
+#endif
 	u32 curval;
 	int ret, vpid;
 
@@ -1860,6 +1908,7 @@ futex_proxy_trylock_atomic(u32 __user *pifutex, struct futex_hash_bucket *hb1,
 	if (unlikely(should_fail_futex(true)))
 		return -EFAULT;
 
+#ifndef HORIZON_FUTEX
 	/*
 	 * Find the top_waiter and determine if there are additional waiters.
 	 * If the caller intends to requeue more than 1 waiter to pifutex,
@@ -1877,6 +1926,7 @@ futex_proxy_trylock_atomic(u32 __user *pifutex, struct futex_hash_bucket *hb1,
 	/* Ensure we requeue to the expected futex. */
 	if (!match_futex(top_waiter->requeue_pi_key, key2))
 		return -EINVAL;
+#endif
 
 	/*
 	 * Try to take the lock for top_waiter.  Set the FUTEX_WAITERS bit in
@@ -1921,6 +1971,9 @@ static int futex_requeue(u32 __user *uaddr1, unsigned int flags,
 	struct futex_hash_bucket *hb1, *hb2;
 	struct futex_q *this, *next;
 	DEFINE_WAKE_Q(wake_q);
+#ifdef HORIZON_FUTEX
+	struct futex_q *top_waiter;
+#endif
 
 	if (nr_wake < 0 || nr_requeue < 0)
 		return -EINVAL;
@@ -1935,12 +1988,14 @@ static int futex_requeue(u32 __user *uaddr1, unsigned int flags,
 		return -ENOSYS;
 
 	if (requeue_pi) {
+#ifndef HORIZON_FUTEX
 		/*
 		 * Requeue PI only works on two distinct uaddrs. This
 		 * check is only valid for private futexes. See below.
 		 */
 		if (uaddr1 == uaddr2)
 			return -EINVAL;
+#endif
 
 		/*
 		 * requeue_pi requires a pi_state, try to allocate it now
@@ -1966,6 +2021,7 @@ retry:
 	ret = get_futex_key(uaddr1, flags & FLAGS_SHARED, &key1, FUTEX_READ);
 	if (unlikely(ret != 0))
 		return ret;
+#ifndef HORIZON_FUTEX
 	ret = get_futex_key(uaddr2, flags & FLAGS_SHARED, &key2,
 			    requeue_pi ? FUTEX_WRITE : FUTEX_READ);
 	if (unlikely(ret != 0))
@@ -2008,6 +2064,41 @@ retry_private:
 			goto out_unlock;
 		}
 	}
+#else
+	BUG_ON(!requeue_pi); // not allowed for horizon futex
+
+	hb1 = hash_futex(&key1);
+
+	/*
+	 * Without double_lock_hb this seems suss, but order should be
+	 * consistent because bucket for non-PI futex is always grabbed first.
+	 */
+	spin_lock(&hb1->lock); 
+
+	top_waiter = futex_top_waiter(hb1, &key1);
+
+	/* There are no waiters, nothing for us to do. */
+	if (!top_waiter) {
+		spin_unlock(&hb1->lock);
+		return 0;
+	}
+
+	BUG_ON(!top_waiter->requeue_pi_key); // all waiters should be PI for horizon futex
+	key2 = *top_waiter->requeue_pi_key;
+	if (match_futex(&key1, &key2)) {
+		spin_unlock(&hb1->lock);
+		return -EINVAL;
+
+	}
+	BUG_ON(flags & FLAGS_SHARED); // not allowed for horizon futex
+	uaddr2 = (void *)(key2.private.address + key2.both.offset);
+	hb2 = hash_futex(&key2);
+
+	hb_waiters_inc(hb2);
+	if (hb1 != hb2)
+		spin_lock(&hb2->lock);
+#endif
+
 
 	if (requeue_pi && (task_count - nr_wake < nr_requeue)) {
 		struct task_struct *exiting = NULL;
@@ -2018,9 +2109,15 @@ retry_private:
 		 * bit.  We force this here where we are able to easily handle
 		 * faults rather in the requeue loop below.
 		 */
+#ifndef HORIZON_FUTEX
 		ret = futex_proxy_trylock_atomic(uaddr2, hb1, hb2, &key1,
 						 &key2, &pi_state,
 						 &exiting, nr_requeue);
+#else
+		ret = futex_proxy_trylock_atomic(uaddr2, top_waiter, hb2,
+						 &key2, &pi_state,
+						 &exiting, nr_requeue);
+#endif
 
 		/*
 		 * At this point the top_waiter has either taken uaddr2 or is
@@ -2170,6 +2267,14 @@ retry_private:
 		requeue_futex(this, hb1, hb2, &key2);
 	}
 
+#ifdef HORIZON_FUTEX
+	if (!ret && task_count == 0) {
+		// horizon ignores cmpval; uses uaddr1 as flag to indicate if there
+		// are waiters
+		ret = put_futex_value_locked(0, uaddr1);
+	}
+#endif
+
 	/*
 	 * We took an extra initial reference to the pi_state either
 	 * in futex_proxy_trylock_atomic() or in lookup_pi_state(). We
@@ -2247,13 +2352,39 @@ static inline void __queue_me(struct futex_q *q, struct futex_hash_bucket *hb)
  * state is implicit in the state of woken task (see futex_wait_requeue_pi() for
  * an example).
  */
+#ifndef HORIZON_FUTEX
 static inline void queue_me(struct futex_q *q, struct futex_hash_bucket *hb)
+#else
+static int __futex_unlock_pi(u32 __user *uaddr, unsigned int flags,
+		struct futex_hash_bucket *held);
+static inline void queue_me(struct futex_q *q, struct futex_hash_bucket *hb,
+		u32 __user *uaddr2)
+#endif
 	__releases(&hb->lock)
 {
+#ifdef HORIZON_FUTEX
+	int ret;
+#endif
+
 	__queue_me(q, hb);
+
+#ifdef HORIZON_FUTEX
+	/*
+	 * Now that we're queued, unlock the PI futex; leave behavior undefined
+	 * if the lock isn't held. Flags is 0 because we only support private
+	 * futex. This will grab the PI's hash bucket lock while we hold
+	 * non-PI's, so the ordering should still be consistent with
+	 * futex_requeue.
+	 */
+	if ((ret = __futex_unlock_pi(uaddr2, 0, hb)) != 0)
+		pr_warn("horizon failed to release PI futex at 0x%lx on "
+			"WAIT_PROCESS_WIDE_KEY_ATOMIC (__futex_unlock_pi() = %d)\n",
+			(unsigned long)uaddr2, ret);
+#endif
 	spin_unlock(&hb->lock);
 }
 
+#ifndef HORIZON_FUTEX
 /**
  * unqueue_me() - Remove the futex_q from its futex_hash_bucket
  * @q:	The futex_q to unqueue
@@ -2307,6 +2438,7 @@ retry:
 
 	return ret;
 }
+#endif
 
 /*
  * PI futexes can not be requeued and must remove themself from the
@@ -2506,7 +2638,9 @@ out_unlock:
 	return ret;
 }
 
+#ifndef HORIZON_FUTEX
 static long futex_wait_restart(struct restart_block *restart);
+#endif
 
 /**
  * fixup_owner() - Post lock pi_state and corner case management
@@ -2574,8 +2708,13 @@ static int fixup_owner(u32 __user *uaddr, struct futex_q *q, int locked)
  * @q:		the futex_q to queue up on
  * @timeout:	the prepared hrtimer_sleeper, or null for no timeout
  */
+#ifndef HORIZON_FUTEX
 static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 				struct hrtimer_sleeper *timeout)
+#else
+static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
+				struct hrtimer_sleeper *timeout, u32 __user *uaddr2)
+#endif
 {
 	/*
 	 * The task state is guaranteed to be set before another task can
@@ -2584,7 +2723,11 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 	 * access to the hash list and forcing another memory barrier.
 	 */
 	set_current_state(TASK_INTERRUPTIBLE);
+#ifndef HORIZON_FUTEX
 	queue_me(q, hb);
+#else
+	queue_me(q, hb, uaddr2);
+#endif
 
 	/* Arm the timer */
 	if (timeout)
@@ -2626,7 +2769,9 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 static int futex_wait_setup(u32 __user *uaddr, u32 val, unsigned int flags,
 			   struct futex_q *q, struct futex_hash_bucket **hb)
 {
+#ifndef HORIZON_FUTEX
 	u32 uval;
+#endif
 	int ret;
 
 	/*
@@ -2655,6 +2800,7 @@ retry:
 retry_private:
 	*hb = queue_lock(q);
 
+#ifndef HORIZON_FUTEX
 	ret = get_futex_value_locked(&uval, uaddr);
 
 	if (ret) {
@@ -2674,10 +2820,29 @@ retry_private:
 		queue_unlock(*hb);
 		ret = -EWOULDBLOCK;
 	}
+#else
+	// horizon uses this interface differently; val is ignored and the uaddr is
+	// set to indicate if there are waiters
+	ret = put_futex_value_locked(1, uaddr);
+
+	if (ret) {
+		queue_unlock(*hb);
+
+		ret = put_user(1, uaddr);
+		if (ret)
+			return ret;
+
+		if (!(flags & FLAGS_SHARED))
+			goto retry_private;
+
+		goto retry;
+	}
+#endif
 
 	return ret;
 }
 
+#ifndef HORIZON_FUTEX
 static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
 		      ktime_t *abs_time, u32 bitset)
 {
@@ -2758,6 +2923,7 @@ static long futex_wait_restart(struct restart_block *restart)
 	return (long)futex_wait(uaddr, restart->futex.flags,
 				restart->futex.val, tp, restart->futex.bitset);
 }
+#endif
 
 
 /*
@@ -2956,7 +3122,16 @@ uaddr_faulted:
  * This is the in-kernel slowpath: we look up the PI state (if any),
  * and do the rt-mutex unlock.
  */
+#ifndef HORIZON_FUTEX
 static int futex_unlock_pi(u32 __user *uaddr, unsigned int flags)
+#else
+static inline int futex_unlock_pi(u32 __user *uaddr, unsigned int flags)
+{
+	return __futex_unlock_pi(uaddr, flags, NULL);
+}
+static int __futex_unlock_pi(u32 __user *uaddr, unsigned int flags,
+		struct futex_hash_bucket *held)
+#endif
 {
 	u32 curval, uval, vpid = task_pid_vnr(current);
 	union futex_key key = FUTEX_KEY_INIT;
@@ -2981,6 +3156,9 @@ retry:
 		return ret;
 
 	hb = hash_futex(&key);
+#ifdef HORIZON_FUTEX
+	if (hb != held)
+#endif
 	spin_lock(&hb->lock);
 
 	/*
@@ -3015,6 +3193,9 @@ retry:
 		 * rt_waiter. Also see the WARN in wake_futex_pi().
 		 */
 		raw_spin_lock_irq(&pi_state->pi_mutex.wait_lock);
+#ifdef HORIZON_FUTEX
+		if (hb != held)
+#endif
 		spin_unlock(&hb->lock);
 
 		/* drops pi_state->pi_mutex.wait_lock */
@@ -3054,6 +3235,9 @@ retry:
 	 * owner.
 	 */
 	if ((ret = cmpxchg_futex_value_locked(&curval, uaddr, uval, 0))) {
+#ifdef HORIZON_FUTEX
+		if (hb != held)
+#endif
 		spin_unlock(&hb->lock);
 		switch (ret) {
 		case -EFAULT:
@@ -3074,6 +3258,9 @@ retry:
 	ret = (curval == uval) ? 0 : -EAGAIN;
 
 out_unlock:
+#ifdef HORIZON_FUTEX
+	if (hb != held)
+#endif
 	spin_unlock(&hb->lock);
 out_putkey:
 	return ret;
@@ -3210,7 +3397,12 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
 	 */
 	rt_mutex_init_waiter(&rt_waiter);
 
+#ifndef HORIZON_FUTEX
 	ret = get_futex_key(uaddr2, flags & FLAGS_SHARED, &key2, FUTEX_WRITE);
+#else
+	BUG_ON(flags & FLAGS_SHARED); // not allowed for horizon futex
+	ret = get_futex_key(uaddr2, 0, &key2, FUTEX_WRITE);
+#endif
 	if (unlikely(ret != 0))
 		goto out;
 
@@ -3237,7 +3429,11 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
 	}
 
 	/* Queue the futex_q, drop the hb lock, wait for wakeup. */
+#ifndef HORIZON_FUTEX
 	futex_wait_queue_me(hb, &q, to);
+#else
+	futex_wait_queue_me(hb, &q, to, uaddr2);
+#endif
 
 	spin_lock(&hb->lock);
 	ret = handle_early_requeue_pi_wakeup(hb, &q, &key2, to);
@@ -3341,6 +3537,7 @@ out:
 	return ret;
 }
 
+#ifndef HORIZON_FUTEX
 /*
  * Support for robust futexes: the kernel cleans up held futexes at
  * thread exit time.
@@ -3421,6 +3618,7 @@ err_unlock:
 
 	return ret;
 }
+#endif
 
 /* Constants for the pending_op argument of handle_futex_death */
 #define HANDLE_DEATH_PENDING	true
@@ -3660,6 +3858,12 @@ static void futex_cleanup(struct task_struct *tsk)
  */
 void futex_exit_recursive(struct task_struct *tsk)
 {
+#if defined(CONFIG_HORIZON) && !defined(HORIZON_FUTEX)
+        if (test_ti_thread_flag(task_thread_info(tsk), TIF_HORIZON)) {
+                horizon_futex_exit_recursive(tsk);
+		return;
+	}
+#endif
 	/* If the state is FUTEX_STATE_EXITING then futex_exit_mutex is held */
 	if (tsk->futex_state == FUTEX_STATE_EXITING)
 		mutex_unlock(&tsk->futex_exit_mutex);
@@ -3706,6 +3910,8 @@ static void futex_cleanup_end(struct task_struct *tsk, int state)
 	mutex_unlock(&tsk->futex_exit_mutex);
 }
 
+// horizon processes never exec
+#ifndef HORIZON_FUTEX
 void futex_exec_release(struct task_struct *tsk)
 {
 	/*
@@ -3723,9 +3929,16 @@ void futex_exec_release(struct task_struct *tsk)
 	 */
 	futex_cleanup_end(tsk, FUTEX_STATE_OK);
 }
+#endif
 
 void futex_exit_release(struct task_struct *tsk)
 {
+#if defined(CONFIG_HORIZON) && !defined(HORIZON_FUTEX)
+        if (test_ti_thread_flag(task_thread_info(tsk), TIF_HORIZON)) {
+                horizon_futex_exit_release(tsk);
+		return;
+	}
+#endif
 	futex_cleanup_begin(tsk);
 	futex_cleanup(tsk);
 	futex_cleanup_end(tsk, FUTEX_STATE_DEAD);
@@ -3738,7 +3951,11 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 	unsigned int flags = 0;
 
 	if (!(op & FUTEX_PRIVATE_FLAG))
+#ifndef HORIZON_FUTEX
 		flags |= FLAGS_SHARED;
+#else
+		return -ENOSYS; // horizon futex may only be private
+#endif
 
 	if (op & FUTEX_CLOCK_REALTIME) {
 		flags |= FLAGS_CLOCKRT;
@@ -3758,6 +3975,7 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 	}
 
 	switch (cmd) {
+#ifndef HORIZON_FUTEX
 	case FUTEX_WAIT:
 		val3 = FUTEX_BITSET_MATCH_ANY;
 		fallthrough;
@@ -3774,6 +3992,7 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 0);
 	case FUTEX_WAKE_OP:
 		return futex_wake_op(uaddr, flags, uaddr2, val, val2, val3);
+#endif
 	case FUTEX_LOCK_PI:
 		return futex_lock_pi(uaddr, flags, timeout, 0);
 	case FUTEX_UNLOCK_PI:
@@ -3791,6 +4010,7 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 }
 
 
+#ifndef HORIZON_FUTEX
 SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
 		struct __kernel_timespec __user *, utime, u32 __user *, uaddr2,
 		u32, val3)
@@ -3827,6 +4047,7 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
 
 	return do_futex(uaddr, op, val, tp, uaddr2, val2, val3);
 }
+#endif
 
 #ifdef CONFIG_COMPAT
 /*
@@ -3931,6 +4152,7 @@ static void compat_exit_robust_list(struct task_struct *curr)
 	}
 }
 
+#ifndef HORIZON_FUTEX
 COMPAT_SYSCALL_DEFINE2(set_robust_list,
 		struct compat_robust_list_head __user *, head,
 		compat_size_t, len)
@@ -3984,8 +4206,10 @@ err_unlock:
 
 	return ret;
 }
+#endif
 #endif /* CONFIG_COMPAT */
 
+#ifndef HORIZON_FUTEX
 #ifdef CONFIG_COMPAT_32BIT_TIME
 SYSCALL_DEFINE6(futex_time32, u32 __user *, uaddr, int, op, u32, val,
 		struct old_timespec32 __user *, utime, u32 __user *, uaddr2,
@@ -4018,6 +4242,7 @@ SYSCALL_DEFINE6(futex_time32, u32 __user *, uaddr, int, op, u32, val,
 	return do_futex(uaddr, op, val, tp, uaddr2, val2, val3);
 }
 #endif /* CONFIG_COMPAT_32BIT_TIME */
+#endif
 
 static void __init futex_detect_cmpxchg(void)
 {

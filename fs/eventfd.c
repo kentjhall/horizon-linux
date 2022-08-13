@@ -29,6 +29,7 @@ DEFINE_PER_CPU(int, eventfd_wake_count);
 
 static DEFINE_IDA(eventfd_ida);
 
+#ifndef CONFIG_HORIZON
 struct eventfd_ctx {
 	struct kref kref;
 	wait_queue_head_t wqh;
@@ -44,6 +45,7 @@ struct eventfd_ctx {
 	unsigned int flags;
 	int id;
 };
+#endif
 
 /**
  * eventfd_signal - Adds @n to the eventfd counter.

@@ -119,6 +119,10 @@ extern u64 select_estimate_accuracy(struct timespec64 *tv);
 extern int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp,
 			   fd_set __user *exp, struct timespec64 *end_time);
 
+#ifdef CONFIG_HORIZON
+extern int poll_schedule_timeout(struct poll_wqueues *pwq, int state,
+				 ktime_t *expires, unsigned long slack);
+#endif
 extern int poll_select_set_timeout(struct timespec64 *to, time64_t sec,
 				   long nsec);
 

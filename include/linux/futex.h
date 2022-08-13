@@ -77,6 +77,14 @@ void futex_exec_release(struct task_struct *tsk);
 
 long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 	      u32 __user *uaddr2, u32 val2, u32 val3);
+
+#ifdef CONFIG_HORIZON
+void horizon_futex_exit_recursive(struct task_struct *tsk);
+void horizon_futex_exit_release(struct task_struct *tsk);
+
+long do_horizon_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+	           u32 __user *uaddr2, u32 val2, u32 val3);
+#endif
 #else
 static inline void futex_init_task(struct task_struct *tsk) { }
 static inline void futex_exit_recursive(struct task_struct *tsk) { }
