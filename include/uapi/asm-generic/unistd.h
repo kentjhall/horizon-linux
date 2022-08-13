@@ -731,8 +731,22 @@ __SYSCALL(__NR_pkey_alloc,    sys_pkey_alloc)
 #define __NR_pkey_free 290
 __SYSCALL(__NR_pkey_free,     sys_pkey_free)
 
+#ifndef __NO_HORIZON
+#define __NR_horizon_execve 500
+__SYSCALL(__NR_horizon_execve, sys_horizon_execve)
+#define __NR_horizon_execveat 501
+__SYSCALL(__NR_horizon_execveat, sys_horizon_execveat)
+
+#define __NR_horizon_servctl 502
+__SYSCALL(__NR_horizon_servctl, sys_horizon_servctl)
+#endif
+
 #undef __NR_syscalls
+#ifndef __NO_HORIZON
+#define __NR_syscalls (__NR_horizon_servctl + 1)
+#else
 #define __NR_syscalls 291
+#endif
 
 /*
  * All syscalls below here should go away really,

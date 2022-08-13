@@ -523,6 +523,18 @@ static void cntvct_read_handler(unsigned int esr, struct pt_regs *regs)
 	regs->pc += 4;
 }
 
+#ifdef CONFIG_HORIZON
+static void cntpct_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
+
+	isb();
+	if (rt != 31)
+		regs->regs[rt] = read_sysreg(cntpct_el0);
+	regs->pc += 4;
+}
+#endif
+
 static void cntfrq_read_handler(unsigned int esr, struct pt_regs *regs)
 {
 	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
@@ -562,6 +574,14 @@ static struct sys64_hook sys64_hooks[] = {
 		.esr_val = ESR_ELx_SYS64_ISS_SYS_CNTFRQ,
 		.handler = cntfrq_read_handler,
 	},
+#ifdef CONFIG_HORIZON
+	{
+		/* Trap read access to CNTPCT_EL0 */
+		.esr_mask = ESR_ELx_SYS64_ISS_SYS_OP_MASK,
+		.esr_val = ESR_ELx_SYS64_ISS_SYS_CNTPCT,
+		.handler = cntpct_read_handler,
+	},
+#endif
 	{},
 };
 
@@ -579,6 +599,9 @@ asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
 }
 
 long compat_arm_syscall(struct pt_regs *regs);
+
+long __hsys_ni_syscall(u64 reg0, u64 reg1, u64 reg2, u64 reg3, u64 reg4,
+		u64 reg5, int scno);
 
 asmlinkage long do_ni_syscall(struct pt_regs *regs)
 {
@@ -599,7 +622,11 @@ asmlinkage long do_ni_syscall(struct pt_regs *regs)
 			__show_regs(regs);
 	}
 
-	return sys_ni_syscall();
+	return test_thread_flag(TIF_HORIZON) ?
+		__hsys_ni_syscall(regs->regs[0], regs->regs[1], regs->regs[2],
+				  regs->regs[3], regs->regs[4], regs->regs[5],
+				  read_sysreg(esr_el1) & ESR_ELx_xVC_IMM_MASK)
+		: sys_ni_syscall();
 }
 
 static const char *esr_class_str[] = {

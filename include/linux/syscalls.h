@@ -205,6 +205,46 @@ extern struct trace_event_functions exit_syscall_print_funcs;
 	}								\
 	static inline long SYSC##name(__MAP(x,__SC_DECL,__VA_ARGS__))
 
+#define HSYSCALL_DEFINE0(sname)						\
+	SYSCALL_METADATA(_##sname, 0);					\
+	static inline long __do_hsys##sname(u64 *__out);		\
+	asmlinkage long hsys_##sname(void)				\
+	{								\
+		return __do_hsys##sname(&current_pt_regs()->regs[1]);	\
+	}								\
+	static inline long __do_hsys##sname(u64 *__out)
+
+#define HSYSCALL_DEFINE1(name, ...) HSYSCALL_DEFINEx(1, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE2(name, ...) HSYSCALL_DEFINEx(2, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE3(name, ...) HSYSCALL_DEFINEx(3, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE4(name, ...) HSYSCALL_DEFINEx(4, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE5(name, ...) HSYSCALL_DEFINEx(5, _##name, __VA_ARGS__)
+#define HSYSCALL_DEFINE6(name, ...) HSYSCALL_DEFINEx(6, _##name, __VA_ARGS__)
+
+#define HSYSCALL_DEFINEx(x, sname, ...)				\
+	SYSCALL_METADATA(sname, x, __VA_ARGS__)			\
+	__HSYSCALL_DEFINEx(x, sname, __VA_ARGS__)
+
+#define __HSYSCALL_DEFINEx(x, name, ...)				\
+	asmlinkage long hsys##name(__MAP(x,__SC_DECL,__VA_ARGS__))	\
+		__attribute__((alias(__stringify(HSyS##name))));	\
+	static inline long HSYSC##name(u64 *__out,			\
+			__MAP(x,__SC_DECL,__VA_ARGS__));		\
+	asmlinkage long HSyS##name(__MAP(x,__SC_LONG,__VA_ARGS__));	\
+	asmlinkage long HSyS##name(__MAP(x,__SC_LONG,__VA_ARGS__))	\
+	{								\
+		long ret = HSYSC##name(&current_pt_regs()->regs[1],	\
+				__MAP(x,__SC_CAST,__VA_ARGS__));	\
+		__MAP(x,__SC_TEST,__VA_ARGS__);				\
+		__PROTECT(x, ret,__MAP(x,__SC_ARGS,__VA_ARGS__));	\
+		return ret;						\
+	}								\
+	static inline long HSYSC##name(u64 *__out,			\
+			__MAP(x,__SC_DECL,__VA_ARGS__))
+
+#define HSYSCALL_OUT(out) \
+	(*__out = (u64)(out))
+
 asmlinkage long sys32_quotactl(unsigned int cmd, const char __user *special,
 			       qid_t id, void __user *addr);
 asmlinkage long sys_time(time_t __user *tloc);
@@ -340,6 +380,61 @@ asmlinkage long sys_init_module(void __user *umod, unsigned long len,
 				const char __user *uargs);
 asmlinkage long sys_delete_module(const char __user *name_user,
 				unsigned int flags);
+
+#ifdef CONFIG_HORIZON
+asmlinkage long hsys_set_heap_size(long __unused, u64 size);
+asmlinkage long hsys_set_memory_attribute(unsigned long addr, u64 size,
+						u32 mask, u32 value);
+asmlinkage long hsys_map_memory(unsigned long dst_addr, unsigned long src_addr,
+				u64 size);
+asmlinkage long hsys_unmap_memory(unsigned long dst_addr, unsigned long src_addr,
+		 			u64 size);
+asmlinkage long hsys_query_memory(void __user *memory_info, long __unused,
+					unsigned long addr);
+asmlinkage long hsys_exit_process(void);
+asmlinkage long hsys_create_thread(long __unused, unsigned long entry,
+		 			unsigned long thread_context,
+					unsigned long stack_top,
+					s32 priority, s32 processor_id);
+asmlinkage long hsys_start_thread(u32 thread_handle);
+asmlinkage long hsys_exit_thread(void);
+asmlinkage long hsys_sleep_thread(u64 ns);
+asmlinkage long hsys_get_thread_priority(u32 thread_handle);
+asmlinkage long hsys_set_thread_core_mask(u32 thread_handle, s32 core_mask_0,
+		 				u64 core_mask_1);
+asmlinkage long hsys_clear_event(u32 event_handle);
+asmlinkage long hsys_reset_signal(u32 handle);
+asmlinkage long hsys_map_shared_memory(u32 shared_mem_handle,
+					 unsigned long addr, u64 size,
+					 u32 memory_perm);
+asmlinkage long hsys_unmap_shared_memory(u32 shared_mem_handle,
+					 unsigned long addr, u64 size);
+asmlinkage long hsys_create_transfer_memory(long __unused, unsigned long addr,
+						 u64 size,
+						 u32 memory_perm);
+asmlinkage long hsys_close_handle(u32 handle);
+asmlinkage long hsys_wait_synchronization(long __unused,
+						 u32 __user *handles_ptr,
+						 s32 handles_num, s64 timeout);
+asmlinkage long hsys_arbitrate_lock(u32 thread_handle, u32 __user *addr,
+					 u32 tag);
+asmlinkage long hsys_arbitrate_unlock(u32 __user *addr);
+asmlinkage long hsys_wait_process_wide_key_atomic(u32 __user *key_addr,
+							 u32 __user *tag_addr,
+							 u32 tag, s64 timeout);
+asmlinkage long hsys_signal_process_wide_key(u32 __user *addr, s32 val);
+asmlinkage long hsys_get_system_tick(void);
+asmlinkage long hsys_connect_to_named_port(long __unused,
+						 char __user *port_name);
+asmlinkage long hsys_send_sync_request(u32 session_handle);
+asmlinkage long hsys_get_thread_id(long __unused, u32 thread_handle);
+asmlinkage long hsys_break(u32 break_reason, u64 info1, u64 info2);
+asmlinkage long hsys_output_debug_string(char __user *str, u64 size);
+asmlinkage long hsys_get_info(long __unused, u32 info_type, u32 handle,
+				 u64 info_sub_type);
+asmlinkage long hsys_map_physical_memory(unsigned long addr, u64 size);
+asmlinkage long hsys_unmap_physical_memory(unsigned long addr, u64 size);
+#endif
 
 #ifdef CONFIG_OLD_SIGSUSPEND
 asmlinkage long sys_sigsuspend(old_sigset_t mask);
@@ -902,5 +997,16 @@ asmlinkage long sys_pkey_mprotect(unsigned long start, size_t len,
 				  unsigned long prot, int pkey);
 asmlinkage long sys_pkey_alloc(unsigned long flags, unsigned long init_val);
 asmlinkage long sys_pkey_free(int pkey);
+
+asmlinkage long sys_horizon_execve(const char __user *filename,
+                const char __user *const __user *argv,
+                const char __user *const __user *envp);
+asmlinkage long sys_horizon_execveat(int fd, const char __user *filename,
+                const char __user *const __user *argv,
+                const char __user *const __user *envp, int flags);
+asmlinkage long sys_horizon_servctl(unsigned int cmd,
+                unsigned long arg1, unsigned long arg2,
+                unsigned long arg3, unsigned long arg4,
+                unsigned long arg5);
 
 #endif

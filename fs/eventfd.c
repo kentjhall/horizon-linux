@@ -22,6 +22,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 
+#ifndef CONFIG_HORIZON
 struct eventfd_ctx {
 	struct kref kref;
 	wait_queue_head_t wqh;
@@ -36,6 +37,7 @@ struct eventfd_ctx {
 	__u64 count;
 	unsigned int flags;
 };
+#endif
 
 /**
  * eventfd_signal - Adds @n to the eventfd counter.

@@ -63,6 +63,15 @@ extern void exit_pi_state_list(struct task_struct *curr);
 #else
 extern int futex_cmpxchg_enabled;
 #endif
+
+#ifdef CONFIG_HORIZON
+extern void horizon_exit_pi_state_list(struct task_struct *curr);
+extern int horizon_handle_futex_death(u32 __user *uaddr, struct task_struct *curr, int pi);
+extern void horizon_exit_robust_list(struct task_struct *curr);
+
+long do_horizon_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+	           u32 __user *uaddr2, u32 val2, u32 val3);
+#endif
 #else
 static inline void exit_robust_list(struct task_struct *curr)
 {

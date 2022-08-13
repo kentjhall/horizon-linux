@@ -295,7 +295,11 @@ static void tls_thread_flush(void)
 {
 	write_sysreg(0, tpidr_el0);
 
+#ifdef CONFIG_HORIZON
+	if (is_compat_task() || test_thread_flag(TIF_HORIZON)) {
+#else
 	if (is_compat_task()) {
+#endif
 		current->thread.tp_value = 0;
 
 		/*
@@ -392,7 +396,12 @@ static void tls_thread_switch(struct task_struct *next)
 	tpidr = read_sysreg(tpidr_el0);
 	*task_user_tls(current) = tpidr;
 
+#ifdef CONFIG_HORIZON
+	if (is_compat_thread(task_thread_info(next)) ||
+	    test_ti_thread_flag(task_thread_info(next), TIF_HORIZON))
+#else
 	if (is_compat_thread(task_thread_info(next)))
+#endif
 		write_sysreg(next->thread.tp_value, tpidrro_el0);
 	else if (!arm64_kernel_unmapped_at_el0())
 		write_sysreg(0, tpidrro_el0);

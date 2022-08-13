@@ -37,6 +37,7 @@
 #include <asm/uaccess.h>
 #include <asm/asm-uaccess.h>
 #include <asm/unistd.h>
+#include <asm/horizon/unistd.h>
 #include <asm/kernel-pgtable.h>
 
 /*
@@ -365,6 +366,8 @@ alternative_insn eret, nop, ARM64_UNMAP_KERNEL_AT_EL0
  *
  * x7 is reserved for the system call number in 32-bit mode.
  */
+hscno	.req	x23		// horizon syscall number
+ti_fl	.req	x24		// thread info flags
 sc_nr	.req	x25		// number of system calls
 scno	.req	x26		// syscall number
 stbl	.req	x27		// syscall table pointer
@@ -919,9 +922,20 @@ ENDPROC(ret_from_fork)
  */
 	.align	6
 el0_svc:
+#ifdef CONFIG_HORIZON
+	and	hscno, x25, #ESR_ELx_xVC_IMM_MASK // horizon syscall number from esr
+#endif
 	adrp	stbl, sys_call_table		// load syscall table pointer
 	uxtw	scno, w8			// syscall number in w8
 	mov	sc_nr, #__NR_syscalls
+#ifdef CONFIG_HORIZON
+	ldr	ti_fl, [tsk, #TSK_TI_FLAGS]	// get flags
+	tbz	ti_fl, #TIF_HORIZON, 1f		// is horizon task?
+	adrp	stbl, horizon_sys_call_table	// load horizon syscall table pointer
+	mov	scno, hscno			// use horizon syscall number
+	mov	sc_nr, #__HNR_syscalls
+1:
+#endif
 el0_svc_naked:					// compat entry point
 	stp	x0, scno, [sp, #S_ORIG_X0]	// save the original x0 and syscall number
 	enable_dbg_and_irq

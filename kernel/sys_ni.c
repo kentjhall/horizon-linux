@@ -1,7 +1,10 @@
 
 #include <linux/linkage.h>
 #include <linux/errno.h>
+#include <linux/printk.h>
+#include <linux/horizon/result.h>
 
+#include <asm/ptrace.h>
 #include <asm/unistd.h>
 
 /*  we can't #include <linux/syscalls.h> here,
@@ -15,6 +18,17 @@ asmlinkage long sys_ni_syscall(void)
 {
 	return -ENOSYS;
 }
+
+#ifdef CONFIG_HORIZON
+asmlinkage long __hsys_ni_syscall(u64 reg0, u64 reg1, u64 reg2, u64 reg3,
+		u64 reg4, u64 reg5, int scno)
+{
+	pr_err("horizon unhandled syscall 0x%x "
+	       "(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n",
+	       scno, reg0, reg1, reg2, reg3, reg4, reg5);
+	return HZN_RESULT_UNKNOWN;
+}
+#endif
 
 cond_syscall(sys_quotactl);
 cond_syscall(sys32_quotactl);

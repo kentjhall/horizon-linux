@@ -5006,7 +5006,11 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
  *
  * Return: 0.
  */
+#ifdef CONFIG_HORIZON
+void do_sched_yield(void)
+#else
 SYSCALL_DEFINE0(sched_yield)
+#endif
 {
 	struct rq *rq = this_rq_lock();
 
@@ -5023,9 +5027,15 @@ SYSCALL_DEFINE0(sched_yield)
 	sched_preempt_enable_no_resched();
 
 	schedule();
+}
 
+#if CONFIG_HORIZON
+SYSCALL_DEFINE0(sched_yield)
+{
+	do_sched_yield();
 	return 0;
 }
+#endif
 
 #ifndef CONFIG_PREEMPT
 int __sched _cond_resched(void)

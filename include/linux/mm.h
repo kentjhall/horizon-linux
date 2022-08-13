@@ -2092,6 +2092,9 @@ extern unsigned long mmap_region(struct file *file, unsigned long addr,
 extern unsigned long do_mmap(struct file *file, unsigned long addr,
 	unsigned long len, unsigned long prot, unsigned long flags,
 	vm_flags_t vm_flags, unsigned long pgoff, unsigned long *populate);
+#ifdef CONFIG_HORIZON
+extern unsigned long do_sys_brk(unsigned long brk);
+#endif
 extern int do_munmap(struct mm_struct *, unsigned long, size_t);
 
 static inline unsigned long
@@ -2120,6 +2123,11 @@ extern int vm_munmap(unsigned long, size_t);
 extern unsigned long __must_check vm_mmap(struct file *, unsigned long,
         unsigned long, unsigned long,
         unsigned long, unsigned long);
+#ifdef CONFIG_HORIZON
+extern unsigned long vm_mremap(unsigned long addr, unsigned long old_len,
+		unsigned long new_len, unsigned long flags,
+		unsigned long new_addr);
+#endif
 
 struct vm_unmapped_area_info {
 #define VM_UNMAPPED_AREA_TOPDOWN 1

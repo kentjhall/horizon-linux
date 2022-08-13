@@ -76,6 +76,20 @@ static inline void init_poll_funcptr(poll_table *pt, poll_queue_proc qproc)
 	pt->_key   = ~0UL; /* all events enabled */
 }
 
+#ifdef CONFIG_HORIZON
+static inline bool file_can_poll(struct file *file)
+{
+        return file->f_op->poll;
+}
+
+static inline __poll_t vfs_poll(struct file *file, struct poll_table_struct *pt)
+{
+        if (unlikely(!file->f_op->poll))
+                return DEFAULT_POLLMASK;
+        return file->f_op->poll(file, pt);
+}
+#endif
+
 struct poll_table_entry {
 	struct file *filp;
 	unsigned long key;
@@ -163,6 +177,10 @@ extern int do_sys_poll(struct pollfd __user * ufds, unsigned int nfds,
 extern int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp,
 			   fd_set __user *exp, struct timespec64 *end_time);
 
+#ifdef CONFIG_HORIZON
+extern int poll_schedule_timeout(struct poll_wqueues *pwq, int state,
+				 ktime_t *expires, unsigned long slack);
+#endif
 extern int poll_select_set_timeout(struct timespec64 *to, time64_t sec,
 				   long nsec);
 

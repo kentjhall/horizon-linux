@@ -50,5 +50,7 @@
 #define SZ_64G				0x1000000000
 #define SZ_128G				0x2000000000
 #define SZ_256G				0x4000000000
+#define SZ_512G				0x8000000000
+#define SZ_64T				0x400000000000
 
 #endif /* __LINUX_SIZES_H__ */

@@ -80,6 +80,7 @@
 #include <linux/kcov.h>
 #include <linux/tegra_profiler.h>
 #include <linux/cpufreq_times.h>
+#include <linux/horizon.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -387,12 +388,29 @@ static inline void put_signal_struct(struct signal_struct *sig)
 		free_signal_struct(sig);
 }
 
+#ifdef CONFIG_HORIZON
+static inline void horizon_free(struct task_struct *tsk)
+{
+	struct hzn_session_request *iter, *tmp;
+
+	// horizon processes can't be horizon services
+	if (test_ti_thread_flag(task_thread_info(tsk), TIF_HORIZON))
+		return;
+
+	list_for_each_entry_safe(iter, tmp, &tsk->hzn_requests, entry)
+		hzn_session_request_free(iter);
+}
+#endif
+
 void __put_task_struct(struct task_struct *tsk)
 {
 	WARN_ON(!tsk->exit_state);
 	WARN_ON(atomic_read(&tsk->usage));
 	WARN_ON(tsk == current);
 
+#ifdef CONFIG_HORIZON
+	horizon_free(tsk);
+#endif
 	cgroup_free(tsk);
 	task_numa_free(tsk, true);
 	security_task_free(tsk);
@@ -1475,7 +1493,11 @@ init_task_pid(struct task_struct *task, enum pid_type type, struct pid *pid)
  * parts of the process environment (as per the clone
  * flags). The actual kick-off is left to the caller.
  */
+#ifdef CONFIG_HORIZON
+__latent_entropy struct task_struct *copy_process(
+#else
 static __latent_entropy struct task_struct *copy_process(
+#endif
 					unsigned long clone_flags,
 					unsigned long stack_start,
 					unsigned long stack_size,
@@ -1586,6 +1608,13 @@ static __latent_entropy struct task_struct *copy_process(
 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER);
 	p->flags |= PF_FORKNOEXEC;
+#ifdef CONFIG_HORIZON
+	p->hzn_cmd_addr = 0;
+	p->hzn_session_request = NULL;
+	INIT_LIST_HEAD(&p->hzn_requests);
+	spin_lock_init(&p->hzn_requests_lock);
+	p->hzn_requests_stop = false;
+#endif
 	INIT_LIST_HEAD(&p->children);
 	INIT_LIST_HEAD(&p->sibling);
 	rcu_copy_process(p);

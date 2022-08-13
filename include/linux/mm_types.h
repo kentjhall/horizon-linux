@@ -436,7 +436,6 @@ struct mm_struct {
 						 * by mmlist_lock
 						 */
 
-
 	unsigned long hiwater_rss;	/* High-watermark of RSS usage */
 	unsigned long hiwater_vm;	/* High-water virtual memory usage */
 
@@ -450,6 +449,9 @@ struct mm_struct {
 	unsigned long start_code, end_code, start_data, end_data;
 	unsigned long start_brk, brk, start_stack;
 	unsigned long arg_start, arg_end, env_start, env_end;
+#ifdef CONFIG_HORIZON
+	unsigned long hzn_alias_start, hzn_alias_code_start;
+#endif
 
 	unsigned long saved_auxv[AT_VECTOR_SIZE]; /* for /proc/PID/auxv */
 

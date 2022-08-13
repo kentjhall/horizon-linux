@@ -245,9 +245,16 @@ unsigned long move_page_tables(struct vm_area_struct *vma,
 	return len + old_addr - old_end;	/* how much done */
 }
 
+#ifdef CONFIG_HORIZON
+static unsigned long move_vma(struct vm_area_struct *vma,
+		unsigned long old_addr, unsigned long old_len,
+		unsigned long new_len, unsigned long new_addr,
+		bool *locked, unsigned long flags)
+#else
 static unsigned long move_vma(struct vm_area_struct *vma,
 		unsigned long old_addr, unsigned long old_len,
 		unsigned long new_len, unsigned long new_addr, bool *locked)
+#endif
 {
 	struct mm_struct *mm = vma->vm_mm;
 	struct vm_area_struct *new_vma;
@@ -335,11 +342,47 @@ static unsigned long move_vma(struct vm_area_struct *vma,
 	if (unlikely(vma->vm_flags & VM_PFNMAP))
 		untrack_pfn_moved(vma);
 
+#ifdef CONFIG_HORIZON
+	if (unlikely(!err && (flags & MREMAP_DONTUNMAP))) {
+		if (vm_flags & VM_ACCOUNT) {
+			/* Always put back VM_ACCOUNT since we won't unmap */
+			vma->vm_flags |= VM_ACCOUNT;
+
+			vm_acct_memory(new_len >> PAGE_SHIFT);
+		}
+
+		/*
+		 * VMAs can actually be merged back together in copy_vma
+		 * calling merge_vma. This can happen with anonymous vmas
+		 * which have not yet been faulted, so if we were to consider
+		 * this VMA split we'll end up adding VM_ACCOUNT on the
+		 * next VMA, which is completely unrelated if this VMA
+		 * was re-merged.
+		 */
+		if (split && new_vma == vma)
+			split = 0;
+
+		/* We always clear VM_LOCKED[ONFAULT] on the old vma */
+		vma->vm_flags &= VM_LOCKED_CLEAR_MASK;
+
+		/* Because we won't unmap we don't need to touch locked_vm */
+		goto out;
+	}
+#endif
+
 	if (do_munmap(mm, old_addr, old_len) < 0) {
 		/* OOM: unable to split vma, just get accounts right */
 		vm_unacct_memory(excess >> PAGE_SHIFT);
 		excess = 0;
 	}
+
+#ifdef CONFIG_HORIZON
+	if (vm_flags & VM_LOCKED) {
+		mm->locked_vm += new_len >> PAGE_SHIFT;
+		*locked = true;
+	}
+out:
+#endif
 	mm->hiwater_vm = hiwater_vm;
 
 	/* Restore VM_ACCOUNT if one or two pieces of vma left */
@@ -349,16 +392,24 @@ static unsigned long move_vma(struct vm_area_struct *vma,
 			vma->vm_next->vm_flags |= VM_ACCOUNT;
 	}
 
+#ifndef CONFIG_HORIZON
 	if (vm_flags & VM_LOCKED) {
 		mm->locked_vm += new_len >> PAGE_SHIFT;
 		*locked = true;
 	}
+#endif
 
 	return new_addr;
 }
 
+#ifdef CONFIG_HORIZON
+static struct vm_area_struct *vma_to_resize(unsigned long addr,
+	unsigned long old_len, unsigned long new_len, unsigned long flags,
+	unsigned long *p)
+#else
 static struct vm_area_struct *vma_to_resize(unsigned long addr,
 	unsigned long old_len, unsigned long new_len, unsigned long *p)
+#endif
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma = find_vma(mm, addr);
@@ -366,6 +417,12 @@ static struct vm_area_struct *vma_to_resize(unsigned long addr,
 
 	if (!vma || vma->vm_start > addr)
 		return ERR_PTR(-EFAULT);
+
+#ifdef CONFIG_HORIZON
+	if (flags & MREMAP_DONTUNMAP && (!vma_is_anonymous(vma) ||
+			vma->vm_flags & VM_SHARED))
+		return ERR_PTR(-EINVAL);
+#endif
 
 	if (is_vm_hugetlb_page(vma))
 		return ERR_PTR(-EINVAL);
@@ -409,8 +466,14 @@ static struct vm_area_struct *vma_to_resize(unsigned long addr,
 	return vma;
 }
 
+#ifdef CONFIG_HORIZON
+static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
+		unsigned long new_addr, unsigned long new_len, bool *locked,
+		unsigned long flags)
+#else
 static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
 		unsigned long new_addr, unsigned long new_len, bool *locked)
+#endif
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
@@ -439,11 +502,24 @@ static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
 		old_len = new_len;
 	}
 
+#ifdef CONFIG_HORIZON
+	vma = vma_to_resize(addr, old_len, new_len, flags, &charged);
+#else
 	vma = vma_to_resize(addr, old_len, new_len, &charged);
+#endif
 	if (IS_ERR(vma)) {
 		ret = PTR_ERR(vma);
 		goto out;
 	}
+
+#ifdef CONFIG_HORIZON
+	/* MREMAP_DONTUNMAP expands by old_len since old_len == new_len */
+	if (flags & MREMAP_DONTUNMAP &&
+		!may_expand_vm(mm, vma->vm_flags, old_len >> PAGE_SHIFT)) {
+		ret = -ENOMEM;
+		goto out;
+	}
+#endif
 
 	map_flags = MAP_FIXED;
 	if (vma->vm_flags & VM_MAYSHARE)
@@ -455,7 +531,11 @@ static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
 	if (offset_in_page(ret))
 		goto out1;
 
+#ifdef CONFIG_HORIZON
+	ret = move_vma(vma, addr, old_len, new_len, new_addr, locked, flags);
+#else
 	ret = move_vma(vma, addr, old_len, new_len, new_addr, locked);
+#endif
 	if (!(offset_in_page(ret)))
 		goto out;
 out1:
@@ -485,9 +565,15 @@ static int vma_expandable(struct vm_area_struct *vma, unsigned long delta)
  * MREMAP_FIXED option added 5-Dec-1999 by Benjamin LaHaise
  * This option implies MREMAP_MAYMOVE.
  */
+#ifdef CONFIG_HORIZON
+unsigned long vm_mremap(unsigned long addr, unsigned long old_len,
+		unsigned long new_len, unsigned long flags,
+		unsigned long new_addr)
+#else
 SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 		unsigned long, new_len, unsigned long, flags,
 		unsigned long, new_addr)
+#endif
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
@@ -495,14 +581,28 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	unsigned long charged = 0;
 	bool locked = false;
 
+#ifdef CONFIG_HORIZON
+	if (flags & ~(MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP))
+#else
 	if (flags & ~(MREMAP_FIXED | MREMAP_MAYMOVE))
+#endif
 		return ret;
 
 	if (flags & MREMAP_FIXED && !(flags & MREMAP_MAYMOVE))
 		return ret;
 
+#ifdef CONFIG_HORIZON
+	/*
+	 * MREMAP_DONTUNMAP is always a move and it does not allow resizing
+	 * in the process.
+	 */
+	if (flags & MREMAP_DONTUNMAP &&
+			(!(flags & MREMAP_MAYMOVE) || old_len != new_len))
+		return ret;
+
 	if (offset_in_page(addr))
 		return ret;
+#endif
 
 	old_len = PAGE_ALIGN(old_len);
 	new_len = PAGE_ALIGN(new_len);
@@ -518,9 +618,17 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	if (down_write_killable(&current->mm->mmap_sem))
 		return -EINTR;
 
+#ifdef CONFIG_HORIZON
+	if (flags & (MREMAP_FIXED | MREMAP_DONTUNMAP)) {
+#else
 	if (flags & MREMAP_FIXED) {
+#endif
 		ret = mremap_to(addr, old_len, new_addr, new_len,
+#ifdef CONFIG_HORIZON
+				&locked, flags);
+#else
 				&locked);
+#endif
 		goto out;
 	}
 
@@ -540,7 +648,11 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	/*
 	 * Ok, we need to grow..
 	 */
+#ifdef CONFIG_HORIZON
+	vma = vma_to_resize(addr, old_len, new_len, flags, &charged);
+#else
 	vma = vma_to_resize(addr, old_len, new_len, &charged);
+#endif
 	if (IS_ERR(vma)) {
 		ret = PTR_ERR(vma);
 		goto out;
@@ -589,7 +701,12 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 			goto out;
 		}
 
+#ifdef CONFIG_HORIZON
+		ret = move_vma(vma, addr, old_len, new_len, new_addr,
+			       &locked, flags);
+#else
 		ret = move_vma(vma, addr, old_len, new_len, new_addr, &locked);
+#endif
 	}
 out:
 	if (offset_in_page(ret)) {
@@ -601,3 +718,12 @@ out:
 		mm_populate(new_addr + old_len, new_len - old_len);
 	return ret;
 }
+
+#ifdef CONFIG_HORIZON
+SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
+		unsigned long, new_len, unsigned long, flags,
+		unsigned long, new_addr)
+{
+	return vm_mremap(addr, old_len, new_len, flags, new_addr);
+}
+#endif

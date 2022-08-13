@@ -64,6 +64,7 @@ config ARM64
 	select HAVE_ARCH_MMAP_RND_BITS
 	select HAVE_ARCH_MMAP_RND_COMPAT_BITS if COMPAT
 	select HAVE_ARCH_SECCOMP_FILTER
+	select HAVE_ARCH_SOFT_DIRTY
 	select HAVE_ARCH_TRACEHOOK
 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
 	select HAVE_ARM_SMCCC
@@ -250,6 +251,8 @@ config ARM64_NON_SHARED_TLBI
 source "init/Kconfig"
 
 source "kernel/Kconfig.freezer"
+
+source "kernel/horizon/Kconfig"
 
 source "arch/arm64/Kconfig.platforms"
 

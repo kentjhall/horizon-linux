@@ -96,6 +96,7 @@ struct thread_info {
 #define TIF_SINGLESTEP		21
 #define TIF_32BIT		22	/* 32bit process */
 #define TIF_SSBD		23	/* Wants SSB mitigation */
+#define TIF_HORIZON		30	/* is horizon process */
 #define TIF_DEPRECATED_WARN	31
 
 #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)

@@ -59,11 +59,23 @@ struct sched_param {
 #include <linux/gfp.h>
 #include <linux/magic.h>
 #include <linux/cgroup-defs.h>
+#include <linux/horizon.h>
 
 #include <asm/processor.h>
 
 #define SCHED_ATTR_SIZE_VER0	48	/* sizeof first published struct */
 
+#ifdef CONFIG_HORIZON
+extern struct task_struct *copy_process(
+			unsigned long clone_flags,
+			unsigned long stack_start,
+			unsigned long stack_size,
+			int __user *child_tidptr,
+			struct pid *pid,
+			int trace,
+			unsigned long tls,
+			int node);
+#endif
 /*
  * Extended scheduling parameters data structure.
  *
@@ -2040,6 +2052,29 @@ struct task_struct {
 
 	struct rcu_head rcu;
 
+#ifdef CONFIG_HORIZON
+	union {
+		/* used by horizon process */
+		struct {
+			u64				hzn_title_id;
+			u32				hzn_system_resource_size;
+			enum hzn_address_space_type	hzn_address_space_type;
+			atomic_t			hzn_request_state;
+			u32				hzn_thread_handle;
+		};
+
+		/* used by horizon service task */
+		struct {
+			unsigned long			hzn_cmd_addr;
+			struct hzn_session_request	*hzn_session_request;
+
+			spinlock_t			hzn_requests_lock;
+			struct list_head		hzn_requests;
+			bool				hzn_requests_stop;
+		};
+	};
+#endif
+
 	/*
 	 * cache last used pipe for splice
 	 */
@@ -3789,6 +3824,10 @@ static inline void inc_syscw(struct task_struct *tsk)
 static inline void inc_syscfs(struct task_struct *tsk)
 {
 }
+#endif
+
+#ifdef CONFIG_HORIZON
+extern void do_sched_yield(void);
 #endif
 
 #ifndef TASK_SIZE_OF

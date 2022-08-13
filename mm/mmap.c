@@ -173,7 +173,11 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 
 static int do_brk(unsigned long addr, unsigned long len);
 
+#ifdef CONFIG_HORIZON
+unsigned long do_sys_brk(unsigned long brk)
+#else
 SYSCALL_DEFINE1(brk, unsigned long, brk)
+#endif
 {
 	unsigned long retval;
 	unsigned long newbrk, oldbrk;
@@ -245,6 +249,13 @@ out:
 	up_write(&mm->mmap_sem);
 	return retval;
 }
+
+#ifdef CONFIG_HORIZON
+SYSCALL_DEFINE1(brk, unsigned long, brk)
+{
+	return do_sys_brk(brk);
+}
+#endif
 
 static long vma_compute_subtree_gap(struct vm_area_struct *vma)
 {
@@ -1371,6 +1382,12 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		if (!(file && path_noexec(&file->f_path)))
 			prot |= PROT_EXEC;
 
+#ifdef CONFIG_HORIZON
+	/* force arch specific MAP_FIXED handling in get_unmapped_area */
+	if (flags & MAP_FIXED_NOREPLACE)
+		flags |= MAP_FIXED;
+#endif
+
 	if (!(flags & MAP_FIXED))
 		addr = round_hint_to_min(addr);
 
@@ -1393,6 +1410,15 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
 	if (offset_in_page(addr))
 		return addr;
+
+#ifdef CONFIG_HORIZON
+	if (flags & MAP_FIXED_NOREPLACE) {
+		struct vm_area_struct *vma = find_vma(mm, addr);
+
+		if (vma && vma->vm_start <= addr)
+			return -EEXIST;
+	}
+#endif
 
 	if (prot == PROT_EXEC) {
 		pkey = execute_only_pkey(mm);
@@ -2747,6 +2773,7 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
 	 * Remove the vma's, and unmap the actual pages
 	 */
 	detach_vmas_to_be_unmapped(mm, vma, prev, end);
+
 	unmap_region(mm, vma, prev, start, end);
 
 	arch_unmap(mm, vma, start, end);
