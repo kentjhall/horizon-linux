@@ -252,7 +252,11 @@ static void tls_thread_flush(void)
 	if (system_supports_tpidr2())
 		write_sysreg_s(0, SYS_TPIDR2_EL0);
 
+#ifdef CONFIG_HORIZON
+	if (is_compat_task() || test_thread_flag(TIF_HORIZON)) {
+#else
 	if (is_compat_task()) {
+#endif
 		current->thread.uw.tp_value = 0;
 
 		/*
@@ -428,7 +432,12 @@ static void tls_thread_switch(struct task_struct *next)
 {
 	tls_preserve_current_state();
 
+#ifdef CONFIG_HORIZON
+	if (is_compat_thread(task_thread_info(next)) ||
+	    test_ti_thread_flag(task_thread_info(next), TIF_HORIZON))
+#else
 	if (is_compat_thread(task_thread_info(next)))
+#endif
 		write_sysreg(next->thread.uw.tp_value, tpidrro_el0);
 	else if (!arm64_kernel_unmapped_at_el0())
 		write_sysreg(0, tpidrro_el0);

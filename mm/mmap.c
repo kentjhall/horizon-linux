@@ -197,7 +197,11 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 
 static int do_brk_flags(unsigned long addr, unsigned long request, unsigned long flags,
 		struct list_head *uf);
+#ifdef CONFIG_HORIZON
+unsigned long do_brk(unsigned long brk)
+#else
 SYSCALL_DEFINE1(brk, unsigned long, brk)
+#endif
 {
 	unsigned long newbrk, oldbrk, origbrk;
 	struct mm_struct *mm = current->mm;
@@ -293,6 +297,13 @@ out:
 	mmap_write_unlock(mm);
 	return origbrk;
 }
+
+#ifdef CONFIG_HORIZON
+SYSCALL_DEFINE1(brk, unsigned long, brk)
+{
+	return do_brk(brk);
+}
+#endif
 
 static inline unsigned long vma_compute_gap(struct vm_area_struct *vma)
 {

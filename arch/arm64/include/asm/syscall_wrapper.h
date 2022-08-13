@@ -72,6 +72,39 @@ struct pt_regs;
 	ALLOW_ERROR_INJECTION(__arm64_sys_##sname, ERRNO);			\
 	asmlinkage long __arm64_sys_##sname(const struct pt_regs *__unused)
 
+#define __HSYSCALL_DEFINEx(x, name, ...)						\
+	asmlinkage long __arm64_hsys##name(const struct pt_regs *regs);			\
+	ALLOW_ERROR_INJECTION(__arm64_hsys##name, ERRNO);				\
+	static long __se_hsys##name(u64 *__out, __MAP(x,__SC_LONG,__VA_ARGS__));	\
+	static inline long __do_hsys##name(u64 *__out, __MAP(x,__SC_DECL,__VA_ARGS__));	\
+	asmlinkage long __arm64_hsys##name(const struct pt_regs *regs)			\
+	{										\
+		return __se_hsys##name((u64 *)&regs->regs[1],				\
+				SC_ARM64_REGS_TO_ARGS(x,__VA_ARGS__));			\
+	}										\
+	static long __se_hsys##name(u64 *__out, __MAP(x,__SC_LONG,__VA_ARGS__))		\
+	{										\
+		long ret = __do_hsys##name(__out, __MAP(x,__SC_CAST,__VA_ARGS__));	\
+		__MAP(x,__SC_TEST,__VA_ARGS__);						\
+		__PROTECT(x, ret,__MAP(x,__SC_ARGS,__VA_ARGS__));			\
+		return ret;								\
+	}										\
+	static inline long __do_hsys##name(u64 *__out, __MAP(x,__SC_DECL,__VA_ARGS__))
+
+#define HSYSCALL_DEFINE0(sname)							\
+	SYSCALL_METADATA(_##sname, 0);						\
+	asmlinkage long __arm64_hsys_##sname(const struct pt_regs *regs);	\
+	ALLOW_ERROR_INJECTION(__arm64_hsys_##sname, ERRNO);			\
+	static inline long __do_hsys##sname(u64 *__out);			\
+	asmlinkage long __arm64_hsys_##sname(const struct pt_regs *regs)	\
+	{									\
+		return __do_hsys##sname((u64 *)&regs->regs[1]);			\
+	}									\
+	static inline long __do_hsys##sname(u64 *__out)
+
+#define HSYSCALL_OUT(out) \
+	(*__out = (u64)(out))
+
 #define COND_SYSCALL(name)							\
 	asmlinkage long __weak __arm64_sys_##name(const struct pt_regs *regs)	\
 	{									\

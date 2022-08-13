@@ -65,6 +65,8 @@
 #include <linux/io_uring.h>
 #include <linux/syscall_user_dispatch.h>
 #include <linux/coredump.h>
+#include <linux/mman.h>
+#include <linux/horizon/handle_table.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -2157,3 +2159,123 @@ static int __init init_fs_exec_sysctls(void)
 
 fs_initcall(init_fs_exec_sysctls);
 #endif /* CONFIG_SYSCTL */
+
+#ifdef CONFIG_HORIZON
+static inline void horizon_pre_exec(void)
+{
+	// set this here since the loader may need to know
+	set_thread_flag(TIF_HORIZON);
+
+	// default values, may be updated by loader
+	current->hzn_title_id = 0;
+	current->hzn_address_space_type = HZN_IS_39_BIT;
+	current->hzn_system_resource_size = 0x1FE00000;
+}
+
+static inline int horizon_post_exec(void)
+{
+	unsigned long tls_addr;
+	unsigned long start_brk, start_code;
+
+	current->hzn_thread_handle =
+		hzn_handle_table_add(current->files, get_task_pid(current, PIDTYPE_PID), &hzn_thread_fops);
+	if (unlikely(current->hzn_thread_handle == HZN_INVALID_HANDLE)) {
+		put_task_struct(current);
+		return -ENFILE;
+	}
+
+	task_pt_regs(current)->regs[0] = 0;
+	task_pt_regs(current)->regs[1] = current->hzn_thread_handle;
+
+	BUG_ON(!current->mm);
+
+	spin_lock(&current->mm->arg_lock);
+	start_brk = current->mm->start_brk;
+	start_code = current->mm->start_code;
+	spin_unlock(&current->mm->arg_lock);
+
+	// alias code at code start
+	current->mm->hzn_alias_code_start = start_code;
+
+	// alias just past heap
+	current->mm->hzn_alias_start = start_brk + HZN_HEAP_REGION_SIZE(current) + PAGE_SIZE;
+
+	// TLS just past alias
+	tls_addr = vm_mmap(NULL, current->mm->hzn_alias_start + HZN_ALIAS_REGION_SIZE(current) + PAGE_SIZE,
+			   PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 0);
+	if (unlikely(IS_ERR_VALUE(tls_addr))) {
+		pr_err("horizon post exec vm_mmap: %ld\n", tls_addr);
+		return tls_addr;
+	}
+	if (unlikely(copy_to_user((void *)tls_addr, empty_zero_page, PAGE_SIZE))) {
+		vm_munmap(tls_addr, PAGE_SIZE);
+		return -EFAULT;
+	}
+
+	// set TLS pointer
+	current->thread.uw.tp_value = tls_addr;
+
+	/*
+	 * Protect against register corruption from context switch.
+	 * See comment in tls_thread_flush.
+	 */
+	barrier();
+	write_sysreg(tls_addr, tpidrro_el0);
+
+	return 0;
+}
+
+#define do_horizon_execve(argv, func, ...)						\
+({											\
+	int __ret;									\
+	char __name[TASK_COMM_LEN];							\
+	const char __user *__ustr;							\
+	struct user_arg_ptr __argv = { .ptr.native = argv };				\
+											\
+	horizon_pre_exec();								\
+											\
+	__name[TASK_COMM_LEN-1] = 0;							\
+	__ustr = get_user_arg_ptr(__argv, 0);						\
+	if (!IS_ERR(__ustr)) {								\
+		strncpy_from_user(__name, __ustr, TASK_COMM_LEN-1);			\
+											\
+		__ret = (func)(__VA_ARGS__);						\
+		if (!(__ret < 0)) {							\
+			__set_task_comm(current, __name, false);			\
+											\
+			__ret = horizon_post_exec();					\
+			if (__ret < 0 && !fatal_signal_pending(current))		\
+				/* Can't return to user-space at this point */		\
+				force_sigsegv(SIGSEGV);					\
+		}									\
+	} else										\
+		__ret = -EFAULT;							\
+											\
+	if (__ret < 0)									\
+		clear_thread_flag(TIF_HORIZON);						\
+											\
+	__ret;										\
+})
+
+SYSCALL_DEFINE3(horizon_execve,
+		const char __user *, filename,
+		const char __user *const __user *, argv,
+		const char __user *const __user *, envp)
+{
+	return do_horizon_execve(argv, do_execve, getname(filename), argv, envp);
+}
+
+SYSCALL_DEFINE5(horizon_execveat,
+		int, fd, const char __user *, filename,
+		const char __user *const __user *, argv,
+		const char __user *const __user *, envp,
+		int, flags)
+{
+	int lookup_flags = (flags & AT_EMPTY_PATH) ? LOOKUP_EMPTY : 0;
+
+	return do_horizon_execve(argv, do_execveat,
+			         fd,
+				 getname_flags(filename, lookup_flags, NULL),
+				 argv, envp, flags);
+}
+#endif

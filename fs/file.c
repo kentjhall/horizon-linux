@@ -441,6 +441,21 @@ static struct fdtable *close_files(struct files_struct * files)
 	return fdt;
 }
 
+#ifdef CONFIG_HORIZON
+struct files_struct *get_files_struct(struct task_struct *task)
+{
+	struct files_struct *files;
+
+	task_lock(task);
+	files = task->files;
+	if (files)
+		atomic_inc(&files->count);
+	task_unlock(task);
+
+	return files;
+}
+#endif
+
 void put_files_struct(struct files_struct *files)
 {
 	if (atomic_dec_and_test(&files->count)) {
@@ -496,9 +511,15 @@ static unsigned int find_next_fd(struct fdtable *fdt, unsigned int start)
 /*
  * allocate a file descriptor, mark it busy.
  */
+#ifdef CONFIG_HORIZON
+int __alloc_fd(struct files_struct *files,
+	       unsigned start, unsigned end, unsigned flags)
+{
+#else
 static int alloc_fd(unsigned start, unsigned end, unsigned flags)
 {
 	struct files_struct *files = current->files;
+#endif
 	unsigned int fd;
 	int error;
 	struct fdtable *fdt;
@@ -554,6 +575,13 @@ out:
 	return error;
 }
 
+#ifdef CONFIG_HORIZON
+static int alloc_fd(unsigned start, unsigned end, unsigned flags)
+{
+	return __alloc_fd(current->files, start, end, flags);
+}
+#endif
+
 int __get_unused_fd_flags(unsigned flags, unsigned long nofile)
 {
 	return alloc_fd(0, nofile, flags);
@@ -599,9 +627,15 @@ EXPORT_SYMBOL(put_unused_fd);
  * as if they had called fput(file).
  */
 
+#ifdef CONFIG_HORIZON
+void __fd_install(struct files_struct *files, unsigned int fd,
+		struct file *file)
+{
+#else
 void fd_install(unsigned int fd, struct file *file)
 {
 	struct files_struct *files = current->files;
+#endif
 	struct fdtable *fdt;
 
 	rcu_read_lock_sched();
@@ -622,6 +656,13 @@ void fd_install(unsigned int fd, struct file *file)
 	rcu_assign_pointer(fdt->fd[fd], file);
 	rcu_read_unlock_sched();
 }
+
+#ifdef CONFIG_HORIZON
+void fd_install(unsigned int fd, struct file *file)
+{
+	return __fd_install(current->files, fd, file);
+}
+#endif
 
 EXPORT_SYMBOL(fd_install);
 
@@ -650,9 +691,14 @@ static struct file *pick_file(struct files_struct *files, unsigned fd)
 	return file;
 }
 
+#ifdef CONFIG_HORIZON
+int __close_fd(struct files_struct *files, unsigned fd)
+{
+#else
 int close_fd(unsigned fd)
 {
 	struct files_struct *files = current->files;
+#endif
 	struct file *file;
 
 	spin_lock(&files->file_lock);
@@ -663,6 +709,12 @@ int close_fd(unsigned fd)
 
 	return filp_close(file, files);
 }
+#ifdef CONFIG_HORIZON
+int close_fd(unsigned fd)
+{
+	return __close_fd(current->files, fd);
+}
+#endif
 EXPORT_SYMBOL(close_fd); /* for ksys_close() */
 
 /**

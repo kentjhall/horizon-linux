@@ -8192,7 +8192,11 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
 	return ret;
 }
 
+#ifdef CONFIG_HORIZON
+void do_sched_yield(void)
+#else
 static void do_sched_yield(void)
+#endif
 {
 	struct rq_flags rf;
 	struct rq *rq;

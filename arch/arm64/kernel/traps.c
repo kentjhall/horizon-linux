@@ -607,6 +607,18 @@ static void cntfrq_read_handler(unsigned long esr, struct pt_regs *regs)
 	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
 }
 
+#ifdef CONFIG_HORIZON
+static void cntpct_read_handler(unsigned long esr, struct pt_regs *regs)
+{
+	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
+
+	isb();
+	if (rt != 31)
+		regs->regs[rt] = read_sysreg(cntpct_el0);
+	regs->pc += 4;
+}
+#endif
+
 static void mrs_handler(unsigned long esr, struct pt_regs *regs)
 {
 	u32 sysreg, rt;
@@ -659,6 +671,14 @@ static const struct sys64_hook sys64_hooks[] = {
 		.esr_val = ESR_ELx_SYS64_ISS_SYS_CNTFRQ,
 		.handler = cntfrq_read_handler,
 	},
+#ifdef CONFIG_HORIZON
+	{
+		/* Trap read access to CNTPCT_EL0 */
+		.esr_mask = ESR_ELx_SYS64_ISS_SYS_OP_MASK,
+		.esr_val = ESR_ELx_SYS64_ISS_SYS_CNTPCT,
+		.handler = cntpct_read_handler,
+	},
+#endif
 	{
 		/* Trap read access to CPUID registers */
 		.esr_mask = ESR_ELx_SYS64_ISS_SYS_MRS_OP_MASK,

@@ -44,6 +44,10 @@
 
 #define __ARCH_WANT_SYS_CLONE
 
+#ifndef CONFIG_HORIZON
+#define __NO_HORIZON
+#endif
+
 #ifndef __COMPAT_SYSCALL_NR
 #include <uapi/asm/unistd.h>
 #endif

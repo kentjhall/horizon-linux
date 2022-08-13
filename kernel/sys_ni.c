@@ -2,7 +2,10 @@
 
 #include <linux/linkage.h>
 #include <linux/errno.h>
+#include <linux/printk.h>
+#include <linux/horizon/result.h>
 
+#include <asm/ptrace.h>
 #include <asm/unistd.h>
 
 #ifdef CONFIG_ARCH_HAS_SYSCALL_WRAPPER
@@ -21,6 +24,17 @@ asmlinkage long sys_ni_syscall(void)
 {
 	return -ENOSYS;
 }
+
+#ifdef CONFIG_HORIZON
+asmlinkage long hsys_ni_syscall(const struct pt_regs *regs, int scno)
+{
+	pr_err("horizon unhandled syscall 0x%x "
+	       "(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n",
+	       scno, regs->regs[0], regs->regs[1], regs->regs[2],
+	       regs->regs[3], regs->regs[4], regs->regs[5]);
+	return HZN_RESULT_UNKNOWN;
+}
+#endif
 
 #ifndef COND_SYSCALL
 #define COND_SYSCALL(name) cond_syscall(sys_##name)
