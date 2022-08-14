@@ -34,6 +34,7 @@
 #include <linux/rseq.h>
 #include <linux/seqlock.h>
 #include <linux/kcsan.h>
+#include <linux/sched/horizon.h>
 #include <linux/horizon.h>
 
 /* task_struct member predeclarations (sorted alphabetically): */
@@ -582,6 +583,25 @@ struct sched_dl_entity {
 #endif
 };
 
+#ifdef CONFIG_HORIZON
+struct sched_hzn_entity {
+	struct list_head list;
+	int priority;
+	enum hzn_yield_type yield_type;
+	struct rq *rq;
+	volatile long state;
+};
+
+/* Used in hzn_entity->state: */
+#define HZN_FIXED	0L
+#define HZN_SWITCHABLE	1L
+
+#define set_hzn_state(tsk, state_value)				\
+	smp_store_mb((tsk)->hzn.state, (state_value))
+#define set_current_hzn_state(state_value)			\
+	set_hzn_state(current, state_value)
+#endif
+
 #ifdef CONFIG_UCLAMP_TASK
 /* Number of utilization clamp buckets (shorter alias) */
 #define UCLAMP_BUCKETS CONFIG_UCLAMP_BUCKETS_COUNT
@@ -696,6 +716,9 @@ struct task_struct {
 	struct task_group		*sched_task_group;
 #endif
 	struct sched_dl_entity		dl;
+#ifdef CONFIG_HORIZON
+	struct sched_hzn_entity		hzn;
+#endif
 
 #ifdef CONFIG_UCLAMP_TASK
 	/*
@@ -857,6 +880,7 @@ struct task_struct {
 		/* used by horizon process */
 		struct {
 			u64				hzn_title_id;
+			u8				hzn_ideal_core;
 			u32				hzn_system_resource_size;
 			enum hzn_address_space_type	hzn_address_space_type;
 			atomic_t			hzn_request_state;
@@ -1731,6 +1755,9 @@ static __always_inline bool is_idle_task(const struct task_struct *p)
 extern struct task_struct *curr_task(int cpu);
 extern void ia64_set_curr_task(int cpu, struct task_struct *p);
 
+#ifdef CONFIG_HORIZON
+void __yield(enum hzn_yield_type type);
+#endif
 void yield(void);
 
 union thread_union {
@@ -1967,10 +1994,6 @@ static inline bool vcpu_is_preempted(int cpu)
 
 extern long sched_setaffinity(pid_t pid, const struct cpumask *new_mask);
 extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
-
-#ifdef CONFIG_HORIZON
-extern void do_sched_yield(void);
-#endif
 
 #ifndef TASK_SIZE_OF
 #define TASK_SIZE_OF(tsk)	TASK_SIZE

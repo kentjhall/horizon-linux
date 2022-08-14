@@ -81,6 +81,6 @@ static inline u32 hzn_handle_table_add(struct files_struct *files,
 }
 
 extern const struct file_operations hzn_thread_fops;
-extern const struct file_operations hzn_hzn_session_fops;
+extern const struct file_operations hzn_session_fops;
 
 #endif

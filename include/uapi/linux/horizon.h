@@ -51,9 +51,11 @@ struct horizon_codeset_hdr {
 struct horizon_hdr {
 	__u32 magic;
 	__u64 title_id;
+	__u8 ideal_core;
 	__u8 is_64bit;
 	__u8 address_space_type;
 	__u32 system_resource_size;
+	__s32 main_thread_priority;
 	__u32 num_codesets;
 	struct horizon_codeset_hdr codesets[];
 };

@@ -2376,10 +2376,17 @@ static inline void queue_me(struct futex_q *q, struct futex_hash_bucket *hb,
 	 * non-PI's, so the ordering should still be consistent with
 	 * futex_requeue.
 	 */
-	if ((ret = __futex_unlock_pi(uaddr2, 0, hb)) != 0)
-		pr_warn("horizon failed to release PI futex at 0x%lx on "
-			"WAIT_PROCESS_WIDE_KEY_ATOMIC (__futex_unlock_pi() = %d)\n",
-			(unsigned long)uaddr2, ret);
+unlock:
+	if ((ret = __futex_unlock_pi(uaddr2, 0, hb)) != 0) {
+		if (ret == -EAGAIN)
+			goto unlock;
+		// it seems like it's acceptable for uaddr2 to not be owned by us,
+		// so we'll just except EPERM from checking
+		if (ret != -EPERM) 
+			pr_warn("horizon failed to release PI futex at 0x%lx on "
+				"WAIT_PROCESS_WIDE_KEY_ATOMIC (__futex_unlock_pi() = %d)\n",
+				(unsigned long)uaddr2, ret);
+	}
 #endif
 	spin_unlock(&hb->lock);
 }

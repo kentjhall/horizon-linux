@@ -1198,7 +1198,12 @@ struct file *get_task_exe_file(struct task_struct *task)
 	struct mm_struct *mm;
 
 	task_lock(task);
+#ifdef CONFIG_HORIZON
+	// so that horizon_servctl may safely switch out the mm
+	mm = task->mm ? task->active_mm : NULL;
+#else
 	mm = task->mm;
+#endif
 	if (mm) {
 		if (!(task->flags & PF_KTHREAD))
 			exe_file = get_mm_exe_file(mm);
@@ -1222,7 +1227,12 @@ struct mm_struct *get_task_mm(struct task_struct *task)
 	struct mm_struct *mm;
 
 	task_lock(task);
+#ifdef CONFIG_HORIZON
+	// so that horizon_servctl may safely switch out the mm
+	mm = task->mm ? task->active_mm : NULL;
+#else
 	mm = task->mm;
+#endif
 	if (mm) {
 		if (task->flags & PF_KTHREAD)
 			mm = NULL;

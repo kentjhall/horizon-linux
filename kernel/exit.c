@@ -692,7 +692,7 @@ static void exit_notify(struct task_struct *tsk, int group_dead)
 }
 
 #ifdef CONFIG_HORIZON
-static void horizon_exit(void)
+static void horizon_service_exit(void)
 {
 	struct hzn_named_service *iter, *tmp;
 	struct hzn_session_request *req;
@@ -792,7 +792,7 @@ void __noreturn do_exit(long code)
 	}
 
 #ifdef CONFIG_HORIZON
-	horizon_exit();
+	horizon_service_exit();
 #endif
 
 	profile_task_exit(tsk);
