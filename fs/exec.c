@@ -1957,14 +1957,18 @@ static inline void horizon_pre_exec(void)
 
 	// default values, may be updated by loader
 	current->hzn_title_id = 0;
+	current->hzn_ideal_core = 0;
 	current->hzn_address_space_type = HZN_IS_39_BIT;
 	current->hzn_system_resource_size = 0x1FE00000;
+	current->hzn.priority = 0;
 }
 
 static inline int horizon_post_exec(void)
 {
+	static const struct sched_param sp = { 0 };
 	unsigned long tls_addr;
 	unsigned long start_brk, start_code;
+	int ret;
 
 	current->hzn_thread_handle =
 		hzn_handle_table_add(current->files, get_task_pid(current, PIDTYPE_PID), &hzn_thread_fops);
@@ -1976,6 +1980,13 @@ static inline int horizon_post_exec(void)
 	task_pt_regs(current)->regs[0] = 0;
 	task_pt_regs(current)->regs[1] = current->hzn_thread_handle;
 
+	if (current->hzn_ideal_core >= (int)num_online_cpus())
+		return -EINVAL;
+	if ((ret = set_cpus_allowed_ptr(current, cpumask_of(current->hzn_ideal_core))) < 0)
+		return ret;
+
+	sched_setscheduler_nocheck(current, SCHED_HORIZON, &sp);
+
 	BUG_ON(!current->mm);
 
 	start_brk = current->mm->start_brk;
@@ -1984,11 +1995,11 @@ static inline int horizon_post_exec(void)
 	// alias code at code start
 	current->mm->hzn_alias_code_start = start_code;
 
-	// alias just past heap
-	current->mm->hzn_alias_start = start_brk + HZN_HEAP_REGION_SIZE(current) + PAGE_SIZE;
+	// alias sits before the heap
+	current->mm->hzn_alias_start = start_brk - HZN_ALIAS_REGION_SIZE(current);
 
-	// TLS just past alias
-	tls_addr = vm_mmap(NULL, current->mm->hzn_alias_start + HZN_ALIAS_REGION_SIZE(current) + PAGE_SIZE,
+	// TLS allocated within alias
+	tls_addr = vm_mmap(NULL, current->mm->hzn_alias_start + 0x18c000,
 			   PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 0);
 	if (unlikely(IS_ERR_VALUE(tls_addr))) {
 		pr_err("horizon post exec vm_mmap: %ld\n", tls_addr);

@@ -158,14 +158,14 @@ SYSCALL_DEFINE6(horizon_servctl, unsigned int, cmd,
 		while (list_empty(&current->hzn_requests)) {
 			spin_unlock(&current->hzn_requests_lock);
 			if (signal_pending(current)) {
-				set_current_state(TASK_RUNNING);
+				__set_current_state(TASK_RUNNING);
 				return SERVCTL_RET(HZN_RESULT_CANCELLED);
 			}
 			schedule();
 			set_current_state(TASK_INTERRUPTIBLE);
 			spin_lock(&current->hzn_requests_lock);
 		}
-		set_current_state(TASK_RUNNING);
+		__set_current_state(TASK_RUNNING);
 
 		// next request in the queue
 		request = list_first_entry(&current->hzn_requests,
@@ -288,7 +288,7 @@ SYSCALL_DEFINE6(horizon_servctl, unsigned int, cmd,
 		}
 
 		// add to the handle table of the requesting thread
-		handle = hzn_handle_table_add(requester_files, handler, &hzn_hzn_session_fops);
+		handle = hzn_handle_table_add(requester_files, handler, &hzn_session_fops);
 		put_files_struct(requester_files);
 		if (handle == HZN_INVALID_HANDLE) {
 			if (handler->service)
@@ -406,6 +406,7 @@ SYSCALL_DEFINE6(horizon_servctl, unsigned int, cmd,
 		}
 
 		// copy to/from pages to/from the service's specified address
+		ret = 0;
 		user_ptr = (void *)arg2;
 		for (i = 0; i < nr_pages; ++i) {
 			size_t to_copy = min((unsigned long)arg3 - (user_ptr - (void *)arg2), PAGE_SIZE - page_off);
@@ -551,12 +552,21 @@ out:
 
 		// a hack to map to requester's space, by saving/restoring the
 		// necessary state to trick vm_mmap into thinking we're them
+		//
+		// NOTE: messing with rss_stat unprotected seems suss, but in
+		// *theory* it's fine since the requester should just be
+		// sleeping while we process its synchronous request
 		current_rss_stat = current->rss_stat;
 		current->rss_stat = current->hzn_session_request->requester->rss_stat;
 		task_lock(current);
 		current_mm = current->mm;
 		current->mm = requester_mm;
+		task_unlock(current);
+		// get_task_mm() is modified to (hopefully) ensure we don't
+		// accidentally expose the wrong mm
 		succ = vm_mmap(file, arg1, arg3, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, existing_off) == arg1;
+		task_lock(current);
+		WARN_ON(!current->mm); // pretty sure this is impossible since we don't exit
 		current->mm = current_mm;
 		task_unlock(current);
 		current->hzn_session_request->requester->rss_stat = current->rss_stat;

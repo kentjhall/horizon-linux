@@ -5,6 +5,7 @@
 #include <linux/u64_stats_sync.h>
 #include <linux/sched/deadline.h>
 #include <linux/kernel_stat.h>
+#include <linux/sched/horizon.h>
 #include <linux/binfmts.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
@@ -123,6 +124,13 @@ static inline int fair_policy(int policy)
 	return policy == SCHED_NORMAL || policy == SCHED_BATCH;
 }
 
+#ifdef CONFIG_HORIZON
+static inline int hzn_policy(int policy)
+{
+	return policy == SCHED_HORIZON;
+}
+#endif
+
 static inline int rt_policy(int policy)
 {
 	return policy == SCHED_FIFO || policy == SCHED_RR;
@@ -135,6 +143,9 @@ static inline int dl_policy(int policy)
 static inline bool valid_policy(int policy)
 {
 	return idle_policy(policy) || fair_policy(policy) ||
+#ifdef CONFIG_HORIZON
+		hzn_policy(policy) ||
+#endif
 		rt_policy(policy) || dl_policy(policy);
 }
 
@@ -245,6 +256,9 @@ extern struct mutex sched_domains_mutex;
 
 struct cfs_rq;
 struct rt_rq;
+#ifdef CONFIG_HORIZON
+struct hzn_rq;
+#endif
 
 extern struct list_head task_groups;
 
@@ -556,6 +570,15 @@ struct dl_rq {
 #endif
 };
 
+#ifdef CONFIG_HORIZON
+struct hzn_rq {
+	unsigned int nr_running;
+	struct sched_hzn_entity *curr;
+	struct list_head queue[
+		HZN_LOWEST_THREAD_PRIORITY-HZN_HIGHEST_THREAD_PRIORITY+1];
+};
+#endif
+
 #ifdef CONFIG_SMP
 
 struct max_cpu_capacity {
@@ -678,6 +701,9 @@ struct rq {
 	struct cfs_rq cfs;
 	struct rt_rq rt;
 	struct dl_rq dl;
+#ifdef CONFIG_HORIZON
+	struct hzn_rq		hzn;
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this cpu: */
@@ -1367,7 +1393,9 @@ extern const struct sched_class dl_sched_class;
 extern const struct sched_class rt_sched_class;
 extern const struct sched_class fair_sched_class;
 extern const struct sched_class idle_sched_class;
-
+#ifdef CONFIG_HORIZON
+extern const struct sched_class hzn_sched_class;
+#endif
 
 #ifdef CONFIG_SMP
 
@@ -1949,6 +1977,9 @@ print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
 extern void init_rt_rq(struct rt_rq *rt_rq);
 extern void init_dl_rq(struct dl_rq *dl_rq);
+#ifdef CONFIG_HORIZON
+extern void init_hzn_rq(struct hzn_rq *hzn_rq);
+#endif
 
 extern void cfs_bandwidth_usage_inc(void);
 extern void cfs_bandwidth_usage_dec(void);

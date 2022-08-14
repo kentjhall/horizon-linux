@@ -194,6 +194,15 @@ extern struct task_group root_task_group;
 #endif
 
 #ifdef CONFIG_HORIZON
+#define INIT_HORIZON_SE(tsk)						\
+	.hzn		= {						\
+		.list		= LIST_HEAD_INIT(init_task.hzn.list),	\
+		.priority	= 0,					\
+		.yield_type	= HZN_YIELD_NONE,			\
+		.rq		= NULL,					\
+		.state		= HZN_FIXED,				\
+	},
+
 #define INIT_HORIZON(tsk)							\
         .hzn_cmd_addr   = 0,							\
         .hzn_session_request = NULL,						\
@@ -201,6 +210,7 @@ extern struct task_group root_task_group;
         .hzn_requests_lock = __SPIN_LOCK_UNLOCKED((tsk).hzn_requests_lock),	\
         .hzn_requests_stop = false,
 #else
+#define INIT_HORIZON_SE(tsk)
 #define INIT_HORIZON(tsk)
 #endif
 
@@ -233,6 +243,7 @@ extern struct task_group root_task_group;
 		.run_list	= LIST_HEAD_INIT(tsk.rt.run_list),	\
 		.time_slice	= RR_TIMESLICE,				\
 	},								\
+	INIT_HORIZON_SE(tsk)						\
 	.tasks		= LIST_HEAD_INIT(tsk.tasks),			\
 	INIT_PUSHABLE_TASKS(tsk)					\
 	INIT_CGROUP_SCHED(tsk)						\

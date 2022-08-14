@@ -399,9 +399,11 @@ asmlinkage long hsys_create_thread(long __unused, unsigned long entry,
 asmlinkage long hsys_start_thread(u32 thread_handle);
 asmlinkage long hsys_exit_thread(void);
 asmlinkage long hsys_sleep_thread(u64 ns);
-asmlinkage long hsys_get_thread_priority(u32 thread_handle);
+asmlinkage long hsys_get_thread_priority(long __unused, u32 thread_handle);
+asmlinkage long hsys_set_thread_priority(u32 thread_handle, s32 priority);
 asmlinkage long hsys_set_thread_core_mask(u32 thread_handle, s32 core_mask_0,
 		 				u64 core_mask_1);
+asmlinkage long hsys_get_current_processor_number(void);
 asmlinkage long hsys_clear_event(u32 event_handle);
 asmlinkage long hsys_reset_signal(u32 handle);
 asmlinkage long hsys_map_shared_memory(u32 shared_mem_handle,

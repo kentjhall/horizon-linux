@@ -2295,6 +2295,14 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->rt.on_rq		= 0;
 	p->rt.on_list		= 0;
 
+#ifdef CONFIG_HORIZON
+	INIT_LIST_HEAD(&p->hzn.list);
+	p->hzn.priority		= 0;
+	p->hzn.yield_type	= HZN_YIELD_NONE;
+	p->hzn.rq		= NULL;
+	p->hzn.state		= HZN_FIXED;
+#endif
+
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	INIT_HLIST_HEAD(&p->preempt_notifiers);
 #endif
@@ -2476,6 +2484,11 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		p->sched_reset_on_fork = 0;
 	}
 
+#ifdef CONFIG_HORIZON
+	if (hzn_policy(p->policy))
+		p->sched_class = &hzn_sched_class;
+	else
+#endif
 	if (dl_prio(p->prio)) {
 		put_cpu();
 		return -EAGAIN;
@@ -3379,11 +3392,22 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct pin_cookie cookie
 	 * Optimization: we know that if all tasks are in
 	 * the fair class we can call that function directly:
 	 */
+#ifdef CONFIG_HORIZON
+	if (likely((prev->sched_class == class || prev->sched_class == &hzn_sched_class) &&
+		   rq->nr_running == rq->cfs.h_nr_running + rq->hzn.nr_running)) {
+#else
 	if (likely(prev->sched_class == class &&
 		   rq->nr_running == rq->cfs.h_nr_running)) {
+#endif
 		p = fair_sched_class.pick_next_task(rq, prev, cookie);
 		if (unlikely(p == RETRY_TASK))
 			goto again;
+
+#ifdef CONFIG_HORIZON
+		/* assumes fair_sched_class->next == hzn_sched_class */
+		if (!p)
+			p = hzn_sched_class.pick_next_task(rq, prev, cookie);
+#endif
 
 		/* assumes fair_sched_class->next == idle_sched_class */
 		if (unlikely(!p))
@@ -3815,6 +3839,11 @@ void rt_mutex_setprio(struct task_struct *p, int prio)
 	 *      --> -dl task blocks on mutex A and could preempt the
 	 *          running task
 	 */
+#ifdef CONFIG_HORIZON
+	if (hzn_policy(p->policy)) // horizon tasks just stay horizon
+		;
+	else
+#endif
 	if (dl_prio(prio)) {
 		struct task_struct *pi_task = rt_mutex_get_top_task(p);
 		if (!dl_prio(p->normal_prio) ||
@@ -4106,6 +4135,11 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
 	else
 		p->prio = normal_prio(p);
 
+#ifdef CONFIG_HORIZON
+	if (hzn_policy(p->policy))
+		p->sched_class = &hzn_sched_class;
+	else
+#endif
 	if (dl_prio(p->prio))
 		p->sched_class = &dl_sched_class;
 	else if (rt_prio(p->prio))
@@ -5007,7 +5041,7 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
  * Return: 0.
  */
 #ifdef CONFIG_HORIZON
-void do_sched_yield(void)
+static void do_sched_yield(enum hzn_yield_type type)
 #else
 SYSCALL_DEFINE0(sched_yield)
 #endif
@@ -5015,7 +5049,12 @@ SYSCALL_DEFINE0(sched_yield)
 	struct rq *rq = this_rq_lock();
 
 	schedstat_inc(rq->yld_count);
+#ifdef CONFIG_HORIZON
+	((void (*)(struct rq *, enum hzn_yield_type))
+	 current->sched_class->yield_task)(rq, type);
+#else
 	current->sched_class->yield_task(rq);
+#endif
 
 	/*
 	 * Since we are going to call schedule() anyway, there's
@@ -5029,11 +5068,10 @@ SYSCALL_DEFINE0(sched_yield)
 	schedule();
 }
 
-#if CONFIG_HORIZON
+#ifdef CONFIG_HORIZON
 SYSCALL_DEFINE0(sched_yield)
 {
-	do_sched_yield();
-	return 0;
+	do_sched_yield(0); // meaningless param
 }
 #endif
 
@@ -5113,10 +5151,23 @@ EXPORT_SYMBOL(__cond_resched_softirq);
  * If you want to use yield() to be 'nice' for others, use cond_resched().
  * If you still want to use yield(), do not!
  */
+#ifdef CONFIG_HORIZON
+void __sched __yield(enum hzn_yield_type type);
+void __sched yield()
+{
+	return __yield(0); // meaningless param
+}
+void __sched __yield(enum hzn_yield_type type)
+#else
 void __sched yield(void)
+#endif
 {
 	set_current_state(TASK_RUNNING);
+#ifdef CONFIG_HORIZON
+	do_sched_yield(type);
+#else
 	sys_sched_yield();
+#endif
 }
 EXPORT_SYMBOL(yield);
 
@@ -7865,6 +7916,9 @@ void __init sched_init(void)
 		init_cfs_rq(&rq->cfs);
 		init_rt_rq(&rq->rt);
 		init_dl_rq(&rq->dl);
+#ifdef CONFIG_HORIZON
+		init_hzn_rq(&rq->hzn);
+#endif
 #ifdef CONFIG_FAIR_GROUP_SCHED
 		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);

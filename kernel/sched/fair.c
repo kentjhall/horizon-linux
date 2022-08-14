@@ -10213,7 +10213,11 @@ out:
 		this_rq->next_balance = next_balance;
 
 	/* Is there a task of a high priority class? */
+#ifdef CONFIG_HORIZON
+	if (this_rq->nr_running != this_rq->cfs.h_nr_running + this_rq->hzn.nr_running)
+#else
 	if (this_rq->nr_running != this_rq->cfs.h_nr_running)
+#endif
 		pulled_task = -1;
 
 	if (pulled_task)
@@ -11309,7 +11313,11 @@ static unsigned int get_rr_interval_fair(struct rq *rq, struct task_struct *task
  * All the scheduling class methods:
  */
 const struct sched_class fair_sched_class = {
+#ifdef CONFIG_HORIZON
+	.next			= &hzn_sched_class,
+#else
 	.next			= &idle_sched_class,
+#endif
 	.enqueue_task		= enqueue_task_fair,
 	.dequeue_task		= dequeue_task_fair,
 	.yield_task		= yield_task_fair,

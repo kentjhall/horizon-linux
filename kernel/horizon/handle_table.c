@@ -81,6 +81,6 @@ static int session_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-const struct file_operations hzn_hzn_session_fops = {
+const struct file_operations hzn_session_fops = {
 	.release = session_release,
 };

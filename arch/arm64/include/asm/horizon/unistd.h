@@ -19,7 +19,9 @@
 #define __HNR_exit_thread			0x0A
 #define __HNR_sleep_thread			0x0B
 #define __HNR_get_thread_priority		0x0C
+#define __HNR_set_thread_priority		0x0D
 #define __HNR_set_thread_core_mask		0x0F
+#define __HNR_get_current_processor_number	0x10
 #define __HNR_clear_event			0x12
 #define __HNR_map_shared_memory			0x13
 #define __HNR_unmap_shared_memory		0x14
@@ -54,7 +56,9 @@ __SYSCALL(__HNR_start_thread, hsys_start_thread)
 __SYSCALL(__HNR_exit_thread, hsys_exit_thread)
 __SYSCALL(__HNR_sleep_thread, hsys_sleep_thread)
 __SYSCALL(__HNR_get_thread_priority, hsys_get_thread_priority)
+__SYSCALL(__HNR_set_thread_priority, hsys_set_thread_priority)
 __SYSCALL(__HNR_set_thread_core_mask, hsys_set_thread_core_mask)
+__SYSCALL(__HNR_get_current_processor_number, hsys_get_current_processor_number)
 __SYSCALL(__HNR_clear_event, hsys_clear_event)
 __SYSCALL(__HNR_map_shared_memory, hsys_map_shared_memory)
 __SYSCALL(__HNR_unmap_shared_memory, hsys_unmap_shared_memory)

@@ -23,9 +23,23 @@
 #include <linux/futex.h>
 #include <asm/futex.h>
 #include <linux/eventpoll.h>
+#include <linux/sched/horizon.h>
 #include <linux/horizon.h>
 #include <linux/horizon/handle_table.h>
 #include <linux/horizon/result.h>
+#include <linux/horizon/types.h>
+
+static inline struct task_struct *get_handle_task(u32 thread_handle)
+{
+	struct file *thread_file =
+		hzn_handle_table_get(thread_handle, &hzn_thread_fops);
+	struct task_struct *tsk;
+	if (!thread_file)
+		return NULL;
+	tsk = get_pid_task(thread_file->private_data, PIDTYPE_PID);
+	fput(thread_file);
+	return tsk;
+}
 
 HSYSCALL_DEFINE2(set_heap_size, long, __unused, u64, size)
 {
@@ -46,13 +60,6 @@ HSYSCALL_DEFINE2(set_heap_size, long, __unused, u64, size)
 	return HZN_RESULT_SUCCESS;
 }
 
-enum memory_attribute {
-	MEMORY_ATTRIBUTE_LOCKED = (1 << 0),
-	MEMORY_ATTRIBUTE_IPC_LOCKED = (1 << 1),
-	MEMORY_ATTRIBUTE_DEVICE_SHARED = (1 << 2),
-	MEMORY_ATTRIBUTE_UNCACHED = (1 << 3),
-};
-
 HSYSCALL_DEFINE4(set_memory_attribute, unsigned long, addr, u64, size,
 		 u32, mask, u32, value)
 {
@@ -68,7 +75,7 @@ HSYSCALL_DEFINE4(set_memory_attribute, unsigned long, addr, u64, size,
 
 	// mask/attribute must match, and must be to set uncached
 	if (attributes != mask ||
-	    (attributes | MEMORY_ATTRIBUTE_UNCACHED) != MEMORY_ATTRIBUTE_UNCACHED)
+	    (attributes | HZN_MEMORY_ATTRIBUTE_UNCACHED) != HZN_MEMORY_ATTRIBUTE_UNCACHED)
 		return HZN_RESULT_INVALID_COMBINATION;
 
 	pr_warn("horizon set_memory_attribute: stubbed\n");
@@ -116,70 +123,6 @@ HSYSCALL_DEFINE3(unmap_memory, unsigned long, dst_addr, unsigned long, src_addr,
 	return HZN_RESULT_SUCCESS;
 }
 
-#define TLS_AREA_START(tsk) \
-	((tsk)->thread.tp_value)
-
-#define TLS_AREA_END(tsk) \
-	(TLS_AREA_START(tsk) + PAGE_SIZE)
-
-#define ALIAS_CODE_REGION_START(tsk) \
-	((tsk)->mm->hzn_alias_code_start)
-
-#define ALIAS_CODE_REGION_END(tsk) \
-	(ALIAS_CODE_REGION_START(tsk) + HZN_ALIAS_CODE_REGION_SIZE(tsk))
-
-#define ALIAS_REGION_START(tsk) \
-	((tsk)->mm->hzn_alias_start)
-
-#define ALIAS_REGION_END(tsk) \
-	(ALIAS_REGION_START(tsk) + HZN_ALIAS_REGION_SIZE(tsk))
-
-enum memory_state {
-	MEMORY_STATE_FREE = 0x00,
-	MEMORY_STATE_IO = 0x01,
-	MEMORY_STATE_STATIC = 0x02,
-	MEMORY_STATE_CODE = 0x03,
-	MEMORY_STATE_CODE_DATA = 0x04,
-	MEMORY_STATE_NORMAL = 0x05,
-	MEMORY_STATE_SHARED = 0x06,
-	MEMORY_STATE_ALIAS = 0x07,
-	MEMORY_STATE_ALIAS_CODE = 0x08,
-	MEMORY_STATE_ALIAS_CODE_DATA = 0x09,
-	MEMORY_STATE_IPC = 0x0A,
-	MEMORY_STATE_STACK = 0x0B,
-	MEMORY_STATE_THREAD_LOCAL = 0x0C,
-	MEMORY_STATE_TRANSFERRED = 0x0D,
-	MEMORY_STATE_SHARED_TRANSFERRED = 0x0E,
-	MEMORY_STATE_SHARED_CODE = 0x0F,
-	MEMORY_STATE_INACCESSIBLE = 0x10,
-	MEMORY_STATE_NON_SECURE_IPC = 0x11,
-	MEMORY_STATE_NON_DEVICE_IPC = 0x12,
-	MEMORY_STATE_KERNEL = 0x13,
-	MEMORY_STATE_GENERATED_CODE = 0x14,
-	MEMORY_STATE_CODE_OUT = 0x15,
-};
-
-enum memory_permission {
-	MEMORY_PERMISSION_NONE = (0 << 0),
-	MEMORY_PERMISSION_READ = (1 << 0),
-	MEMORY_PERMISSION_WRITE = (1 << 1),
-	MEMORY_PERMISSION_EXECUTE = (1 << 2),
-	MEMORY_PERMISSION_READ_WRITE = MEMORY_PERMISSION_READ | MEMORY_PERMISSION_WRITE,
-	MEMORY_PERMISSION_READ_EXECUTE = MEMORY_PERMISSION_READ | MEMORY_PERMISSION_EXECUTE,
-	MEMORY_PERMISSION_DONT_CARE = (1 << 28),
-};
-
-struct memory_info {
-	u64 addr;
-	u64 size;
-	enum memory_state state;
-	enum memory_attribute attr;
-	enum memory_permission perm;
-	u32 ipc_refcount;
-	u32 device_refcount;
-	u32 padding;
-};
-
 HSYSCALL_DEFINE3(query_memory, void __user *, memory_info, long, __unused,
 		 unsigned long, addr)
 {
@@ -200,9 +143,9 @@ HSYSCALL_DEFINE3(query_memory, void __user *, memory_info, long, __unused,
 	if (addr < HZN_ADDRESS_SPACE_START || addr >= HZN_ADDRESS_SPACE_END(current)) {
 		mi.addr = HZN_ADDRESS_SPACE_END(current);
 		mi.size = 0 - HZN_ADDRESS_SPACE_END(current);
-		mi.state = MEMORY_STATE_INACCESSIBLE;
+		mi.state = HZN_MEMORY_STATE_INACCESSIBLE;
 		mi.attr = 0;
-		mi.perm = MEMORY_PERMISSION_NONE;
+		mi.perm = HZN_MEMORY_PERMISSION_NONE;
 		mi.ipc_refcount = 0;
 		mi.device_refcount = 0;
 		pr_debug("horizon query_memory: 0x%lx out-of-range, max is 0x%lx\n", addr, HZN_ADDRESS_SPACE_END(current));
@@ -221,9 +164,9 @@ HSYSCALL_DEFINE3(query_memory, void __user *, memory_info, long, __unused,
 				mi.size = start_stack+1 - mi.addr;
 			WARN_ON(!vma);
 			up_read(&current->mm->mmap_sem);
-			mi.state = MEMORY_STATE_FREE;
+			mi.state = HZN_MEMORY_STATE_FREE;
 			mi.attr = 0;
-			mi.perm = MEMORY_PERMISSION_NONE;
+			mi.perm = HZN_MEMORY_PERMISSION_NONE;
 			mi.ipc_refcount = 0;
 			mi.device_refcount = 0;
 			pr_debug("horizon query_memory: 0x%lx no mapping addr=0x%llx, size=0x%llx\n", addr, mi.addr, mi.size);
@@ -233,37 +176,39 @@ HSYSCALL_DEFINE3(query_memory, void __user *, memory_info, long, __unused,
 			mi.size = vma->vm_end - vma->vm_start;
 			// Note: these values are the same as VM_* from the Linux kernel, so we'll just
 			// use vm_flags directly. Still not sure how Dont_Care is used though.
-			BUILD_BUG_ON(VM_NONE  != MEMORY_PERMISSION_NONE ||
-				     VM_READ  != MEMORY_PERMISSION_READ ||
-				     VM_WRITE != MEMORY_PERMISSION_WRITE ||
-				     VM_EXEC  != MEMORY_PERMISSION_EXECUTE);
+			BUILD_BUG_ON(VM_NONE  != HZN_MEMORY_PERMISSION_NONE ||
+				     VM_READ  != HZN_MEMORY_PERMISSION_READ ||
+				     VM_WRITE != HZN_MEMORY_PERMISSION_WRITE ||
+				     VM_EXEC  != HZN_MEMORY_PERMISSION_EXECUTE);
 			mi.perm =
-				(vma->vm_flags & (MEMORY_PERMISSION_NONE |
-						  MEMORY_PERMISSION_READ |
-						  MEMORY_PERMISSION_WRITE |
-						  MEMORY_PERMISSION_EXECUTE));
+				(vma->vm_flags & (HZN_MEMORY_PERMISSION_NONE |
+						  HZN_MEMORY_PERMISSION_READ |
+						  HZN_MEMORY_PERMISSION_WRITE |
+						  HZN_MEMORY_PERMISSION_EXECUTE));
 			up_read(&current->mm->mmap_sem);
 			// TODO handle other regions as they're implemented
-			if (addr >= TLS_AREA_START(current) &&
-			    addr < TLS_AREA_END(current))
-				mi.state = MEMORY_STATE_THREAD_LOCAL;
+			if (addr >= HZN_TLS_AREA_START(current) &&
+			    addr < HZN_TLS_AREA_END(current))
+				mi.state = HZN_MEMORY_STATE_THREAD_LOCAL;
 			else if (addr >= start_code && addr < end_code &&
-				 (mi.perm & MEMORY_PERMISSION_EXECUTE))
-				mi.state = MEMORY_STATE_CODE;
-			else if (addr >= start_data && addr < end_data)
-				/* mi.state = MEMORY_STATE_CODE; */
-				/* mi.state = MEMORY_STATE_NORMAL; */
-				mi.state = MEMORY_STATE_STATIC;
+				 (mi.perm & HZN_MEMORY_PERMISSION_EXECUTE))
+				mi.state = HZN_MEMORY_STATE_CODE;
+			else if (addr >= start_data && addr < end_data) {
+				if (mi.perm & HZN_MEMORY_PERMISSION_WRITE)
+					mi.state = HZN_MEMORY_STATE_CODE_DATA;
+				else
+					mi.state = HZN_MEMORY_STATE_CODE;
+			}
 			else if (addr >= start_brk && addr < brk)
-				mi.state = MEMORY_STATE_NORMAL;
-			else if (addr >= ALIAS_REGION_START(current) &&
-				 addr < ALIAS_REGION_END(current))
-				mi.state = MEMORY_STATE_ALIAS;
-			else if (addr >= ALIAS_CODE_REGION_START(current) &&
-				 addr < ALIAS_CODE_REGION_END(current))
-				mi.state = MEMORY_STATE_ALIAS_CODE;
+				mi.state = HZN_MEMORY_STATE_NORMAL;
+			else if (addr >= HZN_ALIAS_REGION_START(current) &&
+				 addr < HZN_ALIAS_REGION_END(current))
+				mi.state = HZN_MEMORY_STATE_ALIAS;
+			else if (addr >= HZN_ALIAS_CODE_REGION_START(current) &&
+				 addr < HZN_ALIAS_CODE_REGION_END(current))
+				mi.state = HZN_MEMORY_STATE_ALIAS_CODE;
 			else // have to assume it's the stack otherwise
-				mi.state = MEMORY_STATE_STACK;
+				mi.state = HZN_MEMORY_STATE_STACK;
 			mi.attr = 0; // TODO when we start dealing with attributes
 			mi.ipc_refcount = 0; // TODO probably
 			mi.device_refcount = 0; // TODO probably
@@ -292,17 +237,24 @@ HSYSCALL_DEFINE0(exit_process)
 	return HZN_RESULT_SUCCESS;
 }
 
+#define IDEAL_CORE_DONT_CARE ((s32)-1)
+#define IDEAL_CORE_USE_PROCESS_VALUE ((s32)-2)
+#define IDEAL_CORE_NO_UPDATE ((s32)-3)
+
 HSYSCALL_DEFINE6(create_thread, long, __unused, unsigned long, entry,
 		 unsigned long, thread_context, unsigned long, stack_top,
 		 s32, priority, s32, processor_id)
 {
-	int cpu = (int)processor_id;
+	int cpu = processor_id;
 	struct task_struct *p;
 	long tls_addr;
 	size_t off;
 	u32 handle;
 
-	if (cpu >= (int)num_online_cpus())
+	if (cpu == IDEAL_CORE_USE_PROCESS_VALUE)
+		cpu = current->hzn_ideal_core;
+
+	if (cpu < 0 || cpu >= (int)num_online_cpus())
 		return HZN_RESULT_INVALID_CORE_ID;
 
 	// TLS past current TLS
@@ -321,13 +273,19 @@ HSYSCALL_DEFINE6(create_thread, long, __unused, unsigned long, entry,
 
 	p = copy_process(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
 			 CLONE_THREAD | CLONE_SYSVSEM, stack_top, 0, NULL,
-			 NULL, 0, 0, cpu < 0 ? NUMA_NO_NODE : cpu_to_node(cpu));
+			 NULL, 0, 0, cpu_to_node(cpu));
 	if (IS_ERR(p)) {
 		vm_munmap(tls_addr, PAGE_SIZE);
 		return HZN_RESULT_OUT_OF_MEMORY; // for lack of a better reason
 	}
 
+	if (set_cpus_allowed_ptr(p, cpumask_of(cpu)) < 0)
+		return HZN_RESULT_INVALID_CORE_ID;
+	if (!set_hzn_priority(p, priority))
+		return HZN_RESULT_INVALID_PRIORITY;
+
 	p->hzn_title_id = current->hzn_title_id;
+	p->hzn_ideal_core = current->hzn_ideal_core;
 	p->hzn_system_resource_size = current->hzn_system_resource_size;
 	p->hzn_address_space_type = current->hzn_address_space_type;
 
@@ -354,13 +312,7 @@ HSYSCALL_DEFINE6(create_thread, long, __unused, unsigned long, entry,
 
 HSYSCALL_DEFINE1(start_thread, u32, thread_handle)
 {
-	struct file *thread_file =
-		hzn_handle_table_get(thread_handle, &hzn_thread_fops);
-	struct task_struct *tsk;
-	if (!thread_file)
-		return HZN_RESULT_INVALID_HANDLE;
-	tsk = get_pid_task(thread_file->private_data, PIDTYPE_PID);
-	fput(thread_file);
+	struct task_struct *tsk = get_handle_task(thread_handle);
 	if (!tsk)
 		return HZN_RESULT_INVALID_HANDLE;
 	wake_up_new_task(tsk);
@@ -376,30 +328,72 @@ HSYSCALL_DEFINE0(exit_thread)
 
 HSYSCALL_DEFINE1(sleep_thread, u64, ns)
 {
-	if (ns <= 0)
-		// going to be lazy and treat all yield scenarios the
-		// same for now, rather than worry about migration
-		do_sched_yield();
-	else {
-		struct timespec ts = ns_to_timespec(ns);
-		if (hrtimer_nanosleep(&ts, NULL, HRTIMER_MODE_REL, CLOCK_MONOTONIC) != 0)
-			return HZN_RESULT_CANCELLED;
+	long ret;
+	struct timespec ts;
+	s64 yield_type = ns;
+
+	switch (yield_type) {
+	case HZN_YIELD_TYPE_WITHOUT_CORE_MIGRATION:
+	case HZN_YIELD_TYPE_WITH_CORE_MIGRATION:
+	case HZN_YIELD_TYPE_TO_ANY_THREAD:
+		__yield(yield_type);
+		return HZN_RESULT_SUCCESS;
 	}
+	ts = ns_to_timespec(ns);
+	set_current_hzn_state(HZN_SWITCHABLE);
+	ret = hrtimer_nanosleep(&ts, NULL, HRTIMER_MODE_REL, CLOCK_MONOTONIC);
+	set_current_hzn_state(HZN_FIXED);
+	if (ret != 0)
+		return HZN_RESULT_CANCELLED;
 	return HZN_RESULT_SUCCESS;
 }
 
-HSYSCALL_DEFINE1(get_thread_priority, u32, thread_handle)
+HSYSCALL_DEFINE2(get_thread_priority, long, __unused, u32, thread_handle)
 {
-	pr_warn("horizon get_thread_priority: stubbed\n");
-	HSYSCALL_OUT(0);
+	struct task_struct *tsk = get_handle_task(thread_handle);
+	if (!tsk)
+		return HZN_RESULT_INVALID_HANDLE;
+	HSYSCALL_OUT(get_hzn_priority(tsk));
+	put_task_struct(tsk);
 	return HZN_RESULT_SUCCESS;
+}
+
+HSYSCALL_DEFINE2(set_thread_priority, u32, thread_handle, s32, priority)
+{
+	struct task_struct *tsk = get_handle_task(thread_handle);
+	bool succ;
+	if (!tsk)
+		return HZN_RESULT_INVALID_HANDLE;
+	succ = set_hzn_priority(tsk, priority);
+	put_task_struct(tsk);
+	return succ ? HZN_RESULT_SUCCESS : HZN_RESULT_INVALID_PRIORITY;
 }
 
 HSYSCALL_DEFINE3(set_thread_core_mask, u32, thread_handle, s32, core_mask_0,
 		 u64, core_mask_1)
 {
-	pr_warn("horizon set_thread_core_mask: stubbed\n");
+	struct task_struct *tsk = get_handle_task(thread_handle);
+	if (!tsk)
+		return HZN_RESULT_INVALID_HANDLE;
+	set_hzn_state(tsk, HZN_SWITCHABLE);
+	if (core_mask_0 == IDEAL_CORE_USE_PROCESS_VALUE)
+		set_cpus_allowed_ptr(tsk, cpumask_of(current->hzn_ideal_core));
+	else {
+		int cpu;
+		DECLARE_BITMAP(core_mask_bits, NR_CPUS) = { 0 };
+		for (cpu = 0; cpu < NR_CPUS; ++cpu)
+			if (core_mask_1 & (1ULL << cpu))
+				bitmap_set(core_mask_bits, cpu, 1);
+		set_cpus_allowed_ptr(tsk, to_cpumask(core_mask_bits));
+	}
+	set_hzn_state(tsk, HZN_FIXED);
+	put_task_struct(tsk);
 	return HZN_RESULT_SUCCESS;
+}
+
+HSYSCALL_DEFINE0(get_current_processor_number)
+{
+	return raw_smp_processor_id();
 }
 
 static inline long do_clear_event(struct file *file)
@@ -457,11 +451,11 @@ HSYSCALL_DEFINE4(map_shared_memory, u32, shared_mem_handle,
 
 	// these are all the same, so should be able to use the
 	// permission flags as-is (except Dont_Care)
-	BUILD_BUG_ON(PROT_NONE  != MEMORY_PERMISSION_NONE ||
-		     PROT_READ  != MEMORY_PERMISSION_READ ||
-		     PROT_WRITE != MEMORY_PERMISSION_WRITE ||
-		     PROT_EXEC  != MEMORY_PERMISSION_EXECUTE);
-	ret = vm_mmap(file, addr, size, memory_perm & ~MEMORY_PERMISSION_DONT_CARE, MAP_SHARED | MAP_FIXED, 0);
+	BUILD_BUG_ON(PROT_NONE  != HZN_MEMORY_PERMISSION_NONE ||
+		     PROT_READ  != HZN_MEMORY_PERMISSION_READ ||
+		     PROT_WRITE != HZN_MEMORY_PERMISSION_WRITE ||
+		     PROT_EXEC  != HZN_MEMORY_PERMISSION_EXECUTE);
+	ret = vm_mmap(file, addr, size, memory_perm & ~HZN_MEMORY_PERMISSION_DONT_CARE, MAP_SHARED | MAP_FIXED, 0);
 	fput(file);
 
 	if (ret != addr)
@@ -504,9 +498,9 @@ HSYSCALL_DEFINE4(create_transfer_memory, long, __unused, unsigned long, addr,
 	loff_t pos =  0;
 
 	switch (memory_perm) {
-	case MEMORY_PERMISSION_NONE:
-	case MEMORY_PERMISSION_READ:
-	case MEMORY_PERMISSION_READ_WRITE:
+	case HZN_MEMORY_PERMISSION_NONE:
+	case HZN_MEMORY_PERMISSION_READ:
+	case HZN_MEMORY_PERMISSION_READ_WRITE:
 		break;
 	default:
 		return HZN_RESULT_INVALID_NEW_MEMORY_PERMISSION;
@@ -607,7 +601,7 @@ HSYSCALL_DEFINE4(wait_synchronization, long, __unused,
 		    !file_can_poll(files[i])) {
 			if (hzn_is_pseudo_handle(handles[i]) || (files[i] && files[i]->f_op == &hzn_thread_fops)) // TODO process handles
 				pr_err("horizon wait_synchronization: unhandled thread: %u\n", handles[i]);
-			else if (files[i] && files[i]->f_op == &hzn_hzn_session_fops) // TODO session handles
+			else if (files[i] && files[i]->f_op == &hzn_session_fops) // TODO session handles
 				pr_err("horizon wait_synchronization: unhandled session\n");
 			else // TODO something else?
 				pr_err("horizon WAIT_SYNCHRONIZATION: unhandled unknown\n");
@@ -663,8 +657,10 @@ HSYSCALL_DEFINE4(wait_synchronization, long, __unused,
 			expire = timespec64_to_ktime(*end_time);
 			to = &expire;
 		}
+		set_current_hzn_state(HZN_SWITCHABLE);
 		if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE, to, slack))
 			err = HZN_RESULT_TIMED_OUT;
+		set_current_hzn_state(HZN_FIXED);
 	};
 	poll_freewait(&table);
 
@@ -691,7 +687,10 @@ HSYSCALL_DEFINE3(arbitrate_lock, u32, thread_handle, u32 __user *, addr,
 	// not really sure why it's necessary to only consider the given
 	// thread holding the lock, but might be worth looking into
 
-	if ((ret = do_horizon_futex(addr, FUTEX_LOCK_PI_PRIVATE, 0, NULL, NULL, 0, 0)) != 0) {
+	set_current_hzn_state(HZN_SWITCHABLE);
+	ret = do_horizon_futex(addr, FUTEX_LOCK_PI_PRIVATE, 0, NULL, NULL, 0, 0);
+	set_current_hzn_state(HZN_FIXED);
+	if (ret != 0) {
 		if (ret == -ERESTARTNOINTR || ret == -EWOULDBLOCK)
 			return HZN_RESULT_CANCELLED;
 		return HZN_RESULT_INVALID_ADDRESS;
@@ -721,8 +720,11 @@ HSYSCALL_DEFINE4(wait_process_wide_key_atomic, u32 __user *, key_addr,
 		return HZN_RESULT_INVALID_HANDLE;
 	}
 
-	if ((ret = do_horizon_futex(tag_addr, FUTEX_WAIT_REQUEUE_PI_PRIVATE, 0,
-				    timeout < 0 ? NULL : &ktimeout, key_addr, 0, 0)) != 0) {
+	set_current_hzn_state(HZN_SWITCHABLE);
+	do_horizon_futex(tag_addr, FUTEX_WAIT_REQUEUE_PI_PRIVATE, 0,
+			timeout < 0 ? NULL : &ktimeout, key_addr, 0, 0);
+	set_current_hzn_state(HZN_FIXED);
+	if (ret != 0) {
 		if (ret == -ERESTARTNOINTR || ret == -EWOULDBLOCK)
 			return HZN_RESULT_CANCELLED;
 		if (ret == -ETIMEDOUT)
@@ -786,7 +788,7 @@ HSYSCALL_DEFINE2(connect_to_named_port, long, __unused,
 	handler->id = 0;
 	handler->is_domain = false;
 
-	if ((handle = hzn_handle_table_add(current->files, handler, &hzn_hzn_session_fops)) ==
+	if ((handle = hzn_handle_table_add(current->files, handler, &hzn_session_fops)) ==
 	    HZN_INVALID_HANDLE) {
 		put_pid(service);
 		kfree(handler);
@@ -948,12 +950,12 @@ HSYSCALL_DEFINE1(send_sync_request, u32, session_handle)
 	bool interrupted = false;
 
 	if (session_handle == HZN_INVALID_HANDLE ||
-	    !(handler_file = hzn_handle_table_get(session_handle, &hzn_hzn_session_fops)))
+	    !(handler_file = hzn_handle_table_get(session_handle, &hzn_session_fops)))
 		return HZN_RESULT_INVALID_HANDLE;
 	handler = handler_file->private_data;
 	session_is_domain = handler->is_domain;
 
-	if (unlikely(get_user_pages_fast(TLS_AREA_START(current), 1, FOLL_WRITE, &tls_page) != 1)) {
+	if (unlikely(get_user_pages_fast(HZN_TLS_AREA_START(current), 1, FOLL_WRITE, &tls_page) != 1)) {
 		pr_err("horizon send_sync_request: "
 		       "unexpectedly failed to get TLS area page\n");
 		fput(handler_file);
@@ -1020,6 +1022,8 @@ HSYSCALL_DEFINE1(send_sync_request, u32, session_handle)
 	wake_up_process(service_task);
 	put_task_struct(service_task);
 
+	set_current_hzn_state(HZN_SWITCHABLE);
+
 	// wait for service to handle the request
 	set_current_state(TASK_INTERRUPTIBLE);
 	while (atomic_read(&current->hzn_request_state) == HZN_SESSION_REQUEST_PENDING) {
@@ -1030,7 +1034,9 @@ HSYSCALL_DEFINE1(send_sync_request, u32, session_handle)
 		schedule();
 		set_current_state(TASK_INTERRUPTIBLE);
 	}
-	set_current_state(TASK_RUNNING);
+	__set_current_state(TASK_RUNNING);
+
+	set_current_hzn_state(HZN_FIXED);
 
 	// check in case interrupted or the service exited before handling
 	if (atomic_read(&current->hzn_request_state) != HZN_SESSION_REQUEST_HANDLED)
@@ -1124,6 +1130,11 @@ HSYSCALL_DEFINE4(get_info, long, __unused, u32, info_type, u32, handle,
 	};
 
 	switch (info_type) {
+	case IS_CURRENT_PROCESS_BEING_DEBUGGED:
+	{
+		HSYSCALL_OUT(0);
+		return HZN_RESULT_SUCCESS;
+	}
 	case RANDOM_ENTROPY:
 	{
 		u64 rand;
@@ -1152,7 +1163,7 @@ HSYSCALL_DEFINE4(get_info, long, __unused, u32, info_type, u32, handle,
 		HSYSCALL_OUT(0xF);
 		break;
 	case MAP_REGION_BASE_ADDR:
-		HSYSCALL_OUT(ALIAS_REGION_START(process));
+		HSYSCALL_OUT(HZN_ALIAS_REGION_START(process));
 		break;
 	case MAP_REGION_SIZE:
 		HSYSCALL_OUT(HZN_ALIAS_REGION_SIZE(process));
@@ -1180,7 +1191,7 @@ HSYSCALL_DEFINE4(get_info, long, __unused, u32, info_type, u32, handle,
 		HSYSCALL_OUT(0);
 		break;
 	case ASLR_REGION_BASE_ADDR:
-		HSYSCALL_OUT(ALIAS_CODE_REGION_START(process));
+		HSYSCALL_OUT(HZN_ALIAS_CODE_REGION_START(process));
 		break;
 	case ASLR_REGION_SIZE:
 		HSYSCALL_OUT(HZN_ALIAS_CODE_REGION_SIZE(process));
@@ -1203,6 +1214,16 @@ HSYSCALL_DEFINE4(get_info, long, __unused, u32, info_type, u32, handle,
 	case SYSTEM_RESOURCE_SIZE:
 		HSYSCALL_OUT(process->hzn_system_resource_size);
 		break;
+	/*
+	 * Same deal as
+	 * TOTAL_PHYSICAL_MEMORY_AVAILABLE/TOTAL_PHYSICAL_MEMORY_USED for now.
+	 */
+	case TOTAL_PHYSICAL_MEMORY_AVAILABLE_WITHOUT_SYSTEM_RESOURCE:
+		HSYSCALL_OUT(0x60000000);
+		break;
+	case TOTAL_PHYSICAL_MEMORY_USED_WITHOUT_SYSTEM_RESOURCE:
+		HSYSCALL_OUT(0);
+		break;
 	default:
 		pr_err("horizon get_info: unhandled info id=%u, sub id=%llu\n", info_type, info_sub_type);
 		err = HZN_RESULT_UNKNOWN;
@@ -1211,9 +1232,7 @@ HSYSCALL_DEFINE4(get_info, long, __unused, u32, info_type, u32, handle,
 	if (!hzn_is_pseudo_handle(handle))
 		put_task_struct(process);
 
-	if (err != HZN_RESULT_SUCCESS)
-		return err;
-	return HZN_RESULT_SUCCESS;
+	return err;
 }
 
 HSYSCALL_DEFINE2(map_physical_memory, unsigned long, addr, u64, size)
@@ -1223,8 +1242,8 @@ HSYSCALL_DEFINE2(map_physical_memory, unsigned long, addr, u64, size)
 	if (size == 0 || !PAGE_ALIGNED(size))
 		return HZN_RESULT_INVALID_SIZE;
 	if (!(addr < addr + size) ||
-	    addr < ALIAS_REGION_START(current) ||
-	    addr + size >= ALIAS_REGION_END(current))
+	    addr < HZN_ALIAS_REGION_START(current) ||
+	    addr + size >= HZN_ALIAS_REGION_END(current))
 		return HZN_RESULT_INVALID_MEMORY_REGION;
 	if (current->hzn_system_resource_size == 0)
 		return HZN_RESULT_INVALID_STATE;
@@ -1241,8 +1260,8 @@ HSYSCALL_DEFINE2(unmap_physical_memory, unsigned long, addr, u64, size)
 	if (size == 0 || !PAGE_ALIGNED(size))
 		return HZN_RESULT_INVALID_SIZE;
 	if (!(addr < addr + size) ||
-	    addr < ALIAS_REGION_START(current) ||
-	    addr + size >= ALIAS_REGION_END(current))
+	    addr < HZN_ALIAS_REGION_START(current) ||
+	    addr + size >= HZN_ALIAS_REGION_END(current))
 		return HZN_RESULT_INVALID_MEMORY_REGION;
 	if (current->hzn_system_resource_size == 0)
 		return HZN_RESULT_INVALID_STATE;

@@ -67,8 +67,12 @@ static int load_horizon_binary(struct linux_binprm * bprm)
 	}
 
 	current->hzn_title_id = hdr->title_id;
+	current->hzn_ideal_core = hdr->ideal_core;
 	current->hzn_address_space_type = hdr->address_space_type;
 	current->hzn_system_resource_size = hdr->system_resource_size;
+
+	if (!set_hzn_priority(current, hdr->main_thread_priority))
+		return -EINVAL;
 
 	/*
 	 * Requires a mmap handler.
@@ -126,7 +130,8 @@ static int load_horizon_binary(struct linux_binprm * bprm)
 		(current->mm->start_data =
 		 HORIZON_TXTADDR(hdr) + hdr->codesets[0].segments[0].size);
 	current->mm->brk = 0 +
-		(current->mm->start_brk = HORIZON_TXTADDR(hdr) + total_size);
+		(current->mm->start_brk = HORIZON_TXTADDR(hdr) + total_size +
+		 HZN_ALIAS_REGION_SIZE(current));
 
 	retval = setup_arg_pages(bprm, STACK_TOP, EXSTACK_DEFAULT);
 	if (retval < 0)

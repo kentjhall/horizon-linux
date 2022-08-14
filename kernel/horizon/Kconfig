@@ -4,5 +4,7 @@ config HORIZON
 	bool "Horizon Linux kernel"
 	depends on ARM64
 	depends on FUTEX
+	depends on !TRANSPARENT_HUGEPAGE
+	select CHECKPOINT_RESTORE
 	select MEM_SOFT_DIRTY
 	default y
