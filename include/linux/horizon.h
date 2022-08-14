@@ -32,6 +32,19 @@ enum hzn_address_space_type {
 #define HZN_STACK_REGION_SIZE(tsk)					\
 	((tsk)->hzn_address_space_type == HZN_IS_39_BIT ? SZ_2G : 0)	\
 
+#define HZN_TLS_AREA_START(tsk) \
+	((tsk)->thread.uw.tp_value)
+#define HZN_TLS_AREA_END(tsk) \
+	(HZN_TLS_AREA_START(tsk) + PAGE_SIZE)
+#define HZN_ALIAS_CODE_REGION_START(tsk) \
+	((tsk)->mm->hzn_alias_code_start)
+#define HZN_ALIAS_CODE_REGION_END(tsk) \
+	(HZN_ALIAS_CODE_REGION_START(tsk) + HZN_ALIAS_CODE_REGION_SIZE(tsk))
+#define HZN_ALIAS_REGION_START(tsk) \
+	((tsk)->mm->hzn_alias_start)
+#define HZN_ALIAS_REGION_END(tsk) \
+	(HZN_ALIAS_REGION_START(tsk) + HZN_ALIAS_REGION_SIZE(tsk))
+
 #define HZN_ADDRESS_SPACE_START 0
 #define HZN_ADDRESS_SPACE_END(tsk) TASK_SIZE_OF(tsk)
 
