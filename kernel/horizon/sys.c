@@ -29,6 +29,8 @@
 #include <linux/horizon/result.h>
 #include <linux/horizon/types.h>
 
+#include "../sched/sched.h"
+
 static inline struct task_struct *get_handle_task(u32 thread_handle)
 {
 	struct file *thread_file =
@@ -66,7 +68,7 @@ HSYSCALL_DEFINE2(set_heap_size, long, __unused, u64, size)
 HSYSCALL_DEFINE4(set_memory_attribute, unsigned long, addr, u64, size,
 		 u32, mask, u32, value)
 {
-	enum memory_attribute attributes = mask | value;
+	enum hzn_memory_attribute attributes = mask | value;
 
 	// must be page-aligned
 	if (addr & ~PAGE_MASK)
@@ -132,7 +134,7 @@ HSYSCALL_DEFINE3(query_memory, void __user *, memory_info, long, __unused,
 		 unsigned long, addr)
 {
 	struct vm_area_struct *vma, *prev_vma;
-	struct memory_info mi;
+	struct hzn_memory_info mi;
 	unsigned long start_code, end_code, start_data, end_data;
 	unsigned long start_brk, brk, start_stack;
 
@@ -392,7 +394,7 @@ HSYSCALL_DEFINE3(set_thread_core_mask, u32, thread_handle, s32, core_mask_0,
 	else {
 		int cpu;
 		DECLARE_BITMAP(core_mask_bits, NR_CPUS) = { 0 };
-		for (cpu = 0; cpu < NR_CPUS; ++cpu)
+		for (cpu = 0; cpu < NR_CPUS && cpu < 8 * sizeof(core_mask_1); ++cpu)
 			if (core_mask_1 & (1ULL << cpu))
 				bitmap_set(core_mask_bits, cpu, 1);
 		set_cpus_allowed_ptr(tsk, to_cpumask(core_mask_bits));
@@ -453,7 +455,7 @@ HSYSCALL_DEFINE1(reset_signal, u32, handle)
 
 HSYSCALL_DEFINE4(map_shared_memory, u32, shared_mem_handle,
 		 unsigned long, addr, u64, size,
-		 enum memory_permission, memory_perm)
+		 enum hzn_memory_permission, memory_perm)
 {
 	struct file *file = __hzn_handle_table_get(shared_mem_handle);
 	unsigned long ret;
@@ -497,7 +499,7 @@ HSYSCALL_DEFINE3(unmap_shared_memory, u32, shared_mem_handle,
 }
 
 HSYSCALL_DEFINE4(create_transfer_memory, long, __unused, unsigned long, addr,
-		 u64, size, enum memory_permission, memory_perm)
+		 u64, size, enum hzn_memory_permission, memory_perm)
 {
 	u32 handle;
 	struct page **pages;
@@ -1280,5 +1282,62 @@ HSYSCALL_DEFINE2(unmap_physical_memory, unsigned long, addr, u64, size)
 		return HZN_RESULT_INVALID_STATE;
 
 	vm_munmap(addr, size);
+	return HZN_RESULT_SUCCESS;
+}
+
+HSYSCALL_DEFINE2(set_thread_activity, u32, thread_handle,
+		 enum hzn_thread_activity, thread_activity)
+{
+	u32 err = HZN_RESULT_SUCCESS;
+	struct task_struct *tsk = get_handle_task(thread_handle);
+	if (!tsk)
+		return HZN_RESULT_INVALID_HANDLE;
+
+	switch (thread_activity) {
+	case HZN_THREAD_ACTIVITY_RUNNABLE:
+		if (send_sig(SIGCONT, tsk, 1) < 0)
+			err = HZN_RESULT_INVALID_STATE;
+		break;
+	case HZN_THREAD_ACTIVITY_PAUSED:
+		if (send_sig(SIGSTOP, tsk, 1) < 0)
+			err = HZN_RESULT_INVALID_STATE;
+		while (task_running(task_rq(tsk), tsk))
+			cpu_relax();
+		// if task isn't running, SIGSTOP may not be delivered right
+		// away, but it'll be pending if the task decides to try
+		break;
+	default:
+		err = HZN_RESULT_INVALID_ENUM_VALUE;
+	}
+
+	put_task_struct(tsk);
+	return err;
+}
+
+HSYSCALL_DEFINE2(get_thread_context_3,
+		 struct hzn_thread_context_64 __user *, thread_context,
+		 u32, thread_handle)
+{
+	struct hzn_thread_context_64 context;
+	struct task_struct *tsk = get_handle_task(thread_handle);
+	if (!tsk)
+		return HZN_RESULT_INVALID_HANDLE;
+
+	memcpy(context.cpu_registers, task_pt_regs(tsk)->regs,
+	       sizeof(context.cpu_registers));
+	context.sp = task_pt_regs(tsk)->sp;
+	context.pc = task_pt_regs(tsk)->pc;
+	context.pstate = task_pt_regs(tsk)->pstate;
+	memcpy(context.vector_registers,
+	       tsk->thread.uw.fpsimd_state.vregs,
+	       sizeof(context.vector_registers));
+	context.fpcr = tsk->thread.uw.fpsimd_state.fpcr;
+	context.fpsr = tsk->thread.uw.fpsimd_state.fpsr;
+	context.tpidr = *task_user_tls(tsk);
+
+	put_task_struct(tsk);
+
+	if (copy_to_user(thread_context, &context, sizeof(*thread_context)))
+		return HZN_RESULT_INVALID_ADDRESS;
 	return HZN_RESULT_SUCCESS;
 }

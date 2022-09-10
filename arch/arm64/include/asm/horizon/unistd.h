@@ -42,8 +42,10 @@
 #define __HNR_get_info				0x29
 #define __HNR_map_physical_memory		0x2C
 #define __HNR_unmap_physical_memory		0x2D
+#define __HNR_set_thread_activity		0x32
+#define __HNR_get_thread_context_3		0x33
 
-#define __HNR_syscalls				(__HNR_unmap_physical_memory+1)
+#define __HNR_syscalls				(__HNR_get_thread_context_3+1)
 
 __SYSCALL(__HNR_set_heap_size, hsys_set_heap_size)
 __SYSCALL(__HNR_set_memory_attribute, hsys_set_memory_attribute)
@@ -79,3 +81,5 @@ __SYSCALL(__HNR_output_debug_string, hsys_output_debug_string)
 __SYSCALL(__HNR_get_info, hsys_get_info)
 __SYSCALL(__HNR_map_physical_memory, hsys_map_physical_memory)
 __SYSCALL(__HNR_unmap_physical_memory, hsys_unmap_physical_memory)
+__SYSCALL(__HNR_set_thread_activity, hsys_set_thread_activity)
+__SYSCALL(__HNR_get_thread_context_3, hsys_get_thread_context_3)

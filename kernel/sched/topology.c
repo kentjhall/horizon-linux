@@ -476,6 +476,9 @@ static void free_rootdomain(struct rcu_head *rcu)
 	cpudl_cleanup(&rd->cpudl);
 	free_cpumask_var(rd->dlo_mask);
 	free_cpumask_var(rd->rto_mask);
+#ifdef CONFIG_HORIZON
+	free_cpumask_var(rd->hzno_mask);
+#endif
 	free_cpumask_var(rd->online);
 	free_cpumask_var(rd->span);
 	free_pd(rd->pd);
@@ -542,6 +545,10 @@ static int init_rootdomain(struct root_domain *rd)
 		goto free_online;
 	if (!zalloc_cpumask_var(&rd->rto_mask, GFP_KERNEL))
 		goto free_dlo_mask;
+#ifdef CONFIG_HORIZON
+	if (!zalloc_cpumask_var(&rd->hzno_mask, GFP_KERNEL))
+		goto free_rto_mask;
+#endif
 
 #ifdef HAVE_RT_PUSH_IPI
 	rd->rto_cpu = -1;
@@ -552,7 +559,11 @@ static int init_rootdomain(struct root_domain *rd)
 	rd->visit_gen = 0;
 	init_dl_bw(&rd->dl_bw);
 	if (cpudl_init(&rd->cpudl) != 0)
+#ifdef CONFIG_HORIZON
+		goto free_hzno_mask;
+#else
 		goto free_rto_mask;
+#endif
 
 	if (cpupri_init(&rd->cpupri) != 0)
 		goto free_cpudl;
@@ -560,6 +571,10 @@ static int init_rootdomain(struct root_domain *rd)
 
 free_cpudl:
 	cpudl_cleanup(&rd->cpudl);
+#ifdef CONFIG_HORIZON
+free_hzno_mask:
+	free_cpumask_var(rd->hzno_mask);
+#endif
 free_rto_mask:
 	free_cpumask_var(rd->rto_mask);
 free_dlo_mask:

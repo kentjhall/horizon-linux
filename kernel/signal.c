@@ -2423,6 +2423,9 @@ static bool do_signal_stop(int signr)
 		if (task_set_jobctl_pending(current, signr | gstop))
 			sig->group_stop_count++;
 
+#ifdef CONFIG_HORIZON
+		if (!test_thread_flag(TIF_HORIZON)) {
+#endif
 		t = current;
 		while_each_thread(current, t) {
 			/*
@@ -2439,11 +2442,17 @@ static bool do_signal_stop(int signr)
 					ptrace_trap_notify(t);
 			}
 		}
+#ifdef CONFIG_HORIZON
+		}
+#endif
 	}
 
 	if (likely(!current->ptrace)) {
 		int notify = 0;
 
+#ifdef CONFIG_HORIZON
+		set_current_hzn_state(HZN_SWITCHABLE);
+#endif
 		/*
 		 * If there are no other threads in the group, or if there
 		 * is a group stop in progress and we are the last to stop,
@@ -2474,6 +2483,9 @@ static bool do_signal_stop(int signr)
 		/* Now we don't run again until woken by SIGCONT or SIGKILL */
 		cgroup_enter_frozen();
 		freezable_schedule();
+#ifdef CONFIG_HORIZON
+		set_current_hzn_state(HZN_FIXED);
+#endif
 		return true;
 	} else {
 		/*

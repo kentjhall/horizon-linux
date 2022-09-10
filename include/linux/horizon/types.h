@@ -7,14 +7,14 @@
 #ifndef _LINUX_HORIZON_TYPES_H
 #define _LINUX_HORIZON_TYPES_H
 
-enum memory_attribute {
+enum hzn_memory_attribute {
 	HZN_MEMORY_ATTRIBUTE_LOCKED = (1 << 0),
 	HZN_MEMORY_ATTRIBUTE_IPC_LOCKED = (1 << 1),
 	HZN_MEMORY_ATTRIBUTE_DEVICE_SHARED = (1 << 2),
 	HZN_MEMORY_ATTRIBUTE_UNCACHED = (1 << 3),
 };
 
-enum memory_state {
+enum hzn_memory_state {
 	HZN_MEMORY_STATE_FREE = 0x00,
 	HZN_MEMORY_STATE_IO = 0x01,
 	HZN_MEMORY_STATE_STATIC = 0x02,
@@ -39,7 +39,7 @@ enum memory_state {
 	HZN_MEMORY_STATE_CODE_OUT = 0x15,
 };
 
-enum memory_permission {
+enum hzn_memory_permission {
 	HZN_MEMORY_PERMISSION_NONE = (0 << 0),
 	HZN_MEMORY_PERMISSION_READ = (1 << 0),
 	HZN_MEMORY_PERMISSION_WRITE = (1 << 1),
@@ -49,15 +49,38 @@ enum memory_permission {
 	HZN_MEMORY_PERMISSION_DONT_CARE = (1 << 28),
 };
 
-struct memory_info {
+struct hzn_memory_info {
 	u64 addr;
 	u64 size;
-	enum memory_state state;
-	enum memory_attribute attr;
-	enum memory_permission perm;
+	enum hzn_memory_state state;
+	enum hzn_memory_attribute attr;
+	enum hzn_memory_permission perm;
 	u32 ipc_refcount;
 	u32 device_refcount;
 	u32 padding;
 };
+
+enum hzn_thread_activity {
+	HZN_THREAD_ACTIVITY_RUNNABLE = 0,
+	HZN_THREAD_ACTIVITY_PAUSED = 1,
+};
+
+struct hzn_thread_context_64 {
+	u64 cpu_registers[31];
+	u64 sp;
+	u64 pc;
+	u32 pstate;
+	u8 padding[4];
+	__uint128_t vector_registers[32];
+	u32 fpcr;
+	u32 fpsr;
+	u64 tpidr;
+};
+// Internally within the kernel, it expects the AArch64 version of the
+// thread context to be 800 bytes in size.
+__used static void ___hzn_thread_context_64_assert(void)
+{
+	BUILD_BUG_ON(sizeof(struct hzn_thread_context_64) != 0x320);
+}
 
 #endif

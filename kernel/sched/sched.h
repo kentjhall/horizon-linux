@@ -867,6 +867,11 @@ struct root_domain {
 	cpumask_var_t		rto_mask;
 	struct cpupri		cpupri;
 
+#ifdef CONFIG_HORIZON
+	cpumask_var_t		hzno_mask;
+	atomic_t		hzno_count;
+#endif
+
 	unsigned long		max_cpu_capacity;
 
 	/*
